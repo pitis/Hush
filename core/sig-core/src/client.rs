@@ -8,8 +8,15 @@ use tokio::sync::mpsc;
 use crate::actor::{self, Command};
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
-use crate::projection::{Conversation, Message, MessageKey, MessageStatus, ProjectionDb, Quote, Reaction};
+use crate::projection::db::MAX_ATTACHMENT;
+use crate::projection::{
+    Attachment, Conversation, LinkPreview, Message, MessageKey, MessageStatus, OutgoingFile, ProjectionDb, Quote,
+    Reaction,
+};
 use crate::send::{self, Job, SendJob};
+
+/// Signal's limit for attachments in one message.
+const MAX_ATTACHMENTS: usize = 32;
 
 /// The app's handle on the core. Cheap to call from any thread; Signal work happens on the core
 /// thread and reports back through the `EventListener`.
@@ -129,6 +136,15 @@ impl Client {
         self.send(Command::Start)
     }
 
+    /// Downloads an attachment that didn't download by itself (or failed). Reported through
+    /// `AttachmentChanged`.
+    pub fn download_attachment(&self, id: i64) -> Result<(), CoreError> {
+        if !self.is_linked() {
+            return Err(CoreError::NotLinked);
+        }
+        self.send(Command::Download(id))
+    }
+
     /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
     /// the chat). Call it on every change of the field; typing stops by itself after `TYPING_IDLE`
     /// (10 s) without one. Nothing is sent in Note to Self, or unless the account's typing indicators
@@ -202,8 +218,9 @@ impl Client {
         let queued = self.send(Command::Send(Job::Text(SendJob {
             key: key.clone(),
             conversation_id,
-            body,
+            body: Some(body),
             quote,
+            attachments: vec![],
         })));
         if let Err(e) = queued {
             self.db.set_failed(&key).await?;
@@ -224,14 +241,100 @@ impl Client {
             conversation_id: m.conversation_id.clone(),
             key: key.clone(),
         });
-        let body = m.body.unwrap_or_default();
+        let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
         self.send(Command::Send(Job::Text(SendJob {
             key,
             conversation_id: m.conversation_id,
-            body,
+            body: m.body,
             quote: m.quote,
+            attachments,
         })))?;
         Ok(true)
+    }
+
+    /// Sends files (with an optional caption) like `send_text`: shown at once as a pending
+    /// message, with a copy of each file kept by Semaphore; uploaded, then sent.
+    pub async fn send_attachments(
+        &self,
+        conversation_id: String,
+        files: Vec<OutgoingFile>,
+        caption: Option<String>,
+        quote: Option<Quote>,
+    ) -> Result<MessageKey, CoreError> {
+        let invalid = |message: String| CoreError::InvalidInput { message };
+        if files.is_empty() || files.len() > MAX_ATTACHMENTS {
+            return Err(invalid(format!(
+                "between 1 and {MAX_ATTACHMENTS} files can be sent at once"
+            )));
+        }
+        for f in &files {
+            let name = std::path::Path::new(&f.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size = std::fs::metadata(&f.path)
+                .map_err(|e| invalid(format!("{name} can't be read: {e}")))?
+                .len();
+            if size > MAX_ATTACHMENT {
+                return Err(invalid(format!("{name} is larger than 100 MB")));
+            }
+        }
+        if crate::send::recipient(&conversation_id).is_none() {
+            return Err(invalid(format!("not a conversation: {conversation_id}")));
+        }
+        let author = self.own_aci().ok_or(CoreError::NotLinked)?;
+        let body = caption.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+        let mut message = Message {
+            conversation_id: conversation_id.clone(),
+            author,
+            sent_at: self.next_sent_at(),
+            received_at: 0,
+            body: body.clone(),
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            edited: false,
+            deleted: false,
+            quote: quote.clone(),
+        };
+        // as in send_text: a timestamp collision takes the next one
+        for _ in 0..1000 {
+            message.received_at = message.sent_at;
+            if self.db.insert_outgoing(&message, &files).await? {
+                break;
+            }
+            message.sent_at = self.next_sent_at();
+        }
+        let key = message.key();
+        self.listener.on_event(CoreEvent::MessageChanged {
+            conversation_id: conversation_id.clone(),
+            key: key.clone(),
+        });
+        let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
+        let queued = self.send(Command::Send(Job::Text(SendJob {
+            key: key.clone(),
+            conversation_id,
+            body,
+            quote,
+            attachments,
+        })));
+        if let Err(e) = queued {
+            self.db.set_failed(&key).await?;
+            return Err(e);
+        }
+        Ok(key)
+    }
+
+    /// A message's files, in order.
+    pub async fn attachments(&self, key: MessageKey) -> Result<Vec<Attachment>, CoreError> {
+        Ok(self.db.attachments(&key).await?)
+    }
+
+    pub async fn attachment(&self, id: i64) -> Result<Option<Attachment>, CoreError> {
+        Ok(self.db.attachment(id).await?)
+    }
+
+    pub async fn link_preview(&self, key: MessageKey) -> Result<Option<LinkPreview>, CoreError> {
+        Ok(self.db.link_preview(&key).await?)
     }
 
     /// Reacts to a message with `emoji`, or takes back our reaction `emoji` (`remove`). It shows
@@ -666,5 +769,112 @@ mod tests {
         assert!(invalid(client.set_typing("c:nope".into(), true)));
         client.set_typing(format!("c:{ALICE}"), true).unwrap();
         client.set_typing(format!("c:{ALICE}"), false).unwrap();
+    }
+
+    use crate::projection::AttachmentState;
+
+    fn file_in(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn outgoing(path: String, content_type: &str) -> OutgoingFile {
+        OutgoingFile {
+            path,
+            content_type: content_type.into(),
+            width: Some(4),
+            height: Some(3),
+            is_voice_note: false,
+        }
+    }
+
+    #[test]
+    fn sent_files_show_at_once_with_their_caption_and_a_copy_of_each_file() {
+        let (dir, sink, client, rt) = as_me("client-send-files");
+        let src = dir.0.join("src");
+        let photo = file_in(&src, "beach.heic", b"heic");
+        let pdf = file_in(&src, "plan.pdf", b"pdf");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            let key = client
+                .send_attachments(
+                    conv.clone(),
+                    vec![outgoing(photo.clone(), "image/heic"), outgoing(pdf, "application/pdf")],
+                    Some(" sunset ".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let m = client.message(key.clone()).await.unwrap().unwrap();
+            assert_eq!(
+                (m.body.as_deref(), m.status, m.is_outgoing),
+                (Some("sunset"), MessageStatus::Pending, true)
+            );
+            let files = client.attachments(key.clone()).await.unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(
+                (
+                    files[0].content_type.as_str(),
+                    files[0].file_name.as_deref(),
+                    files[0].size
+                ),
+                ("image/heic", Some("beach.heic"), 4)
+            );
+            assert_eq!((files[0].width, files[0].state), (Some(4), AttachmentState::Ready));
+            // a copy in Semaphore's own folder: the original can go away
+            let copy = files[0].path.clone().unwrap();
+            assert_ne!(copy, photo);
+            std::fs::remove_file(&photo).unwrap();
+            assert_eq!(std::fs::read(&copy).unwrap(), b"heic");
+            // no caption is fine too
+            let key = client
+                .send_attachments(
+                    conv.clone(),
+                    vec![outgoing(copy, "image/heic")],
+                    Some("  ".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.message(key).await.unwrap().unwrap().body, None);
+        });
+        assert!(wait_for(
+            &sink,
+            |e| matches!(e, CoreEvent::MessageChanged { conversation_id, .. } if *conversation_id == conv)
+        ));
+    }
+
+    #[test]
+    fn sending_files_needs_files_that_exist_and_arent_too_big() {
+        let (dir, _sink, client, rt) = as_me("client-send-files-bad");
+        let conv = format!("c:{ALICE}");
+        let big = dir.0.join("big.bin");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        // sparse: no 100 MB actually written
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_ATTACHMENT + 1)
+            .unwrap();
+        rt.block_on(async {
+            let send = |files: Vec<OutgoingFile>| client.send_attachments(conv.clone(), files, None, None);
+            assert!(invalid(send(vec![]).await));
+            assert!(invalid(
+                send(vec![outgoing("/nope/missing.jpg".into(), "image/jpeg")]).await
+            ));
+            assert!(invalid(
+                send(vec![outgoing(big.to_string_lossy().into(), "application/zip")]).await
+            ));
+            assert!(client.conversations().await.unwrap().is_empty(), "nothing was stored");
+        });
+    }
+
+    #[test]
+    fn downloads_need_a_link() {
+        let dir = temp_dir("client-download-unlinked");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        assert!(matches!(client.download_attachment(1), Err(CoreError::NotLinked)));
     }
 }

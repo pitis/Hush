@@ -43,6 +43,12 @@ pub enum CoreEvent {
         reactor: String,
         emoji: String,
     },
+    /// A message's file was added or changed state (downloading, ready, failed).
+    AttachmentChanged {
+        conversation_id: String,
+        message: MessageKey,
+        id: i64,
+    },
     Connection {
         state: ConnectionState,
     },
@@ -68,6 +74,15 @@ pub fn from_applied(a: Applied) -> CoreEvent {
             who,
             started,
         },
+        Applied::AttachmentChanged {
+            conversation_id,
+            message,
+            id,
+        } => CoreEvent::AttachmentChanged {
+            conversation_id,
+            message,
+            id,
+        },
     }
 }
 
@@ -76,7 +91,7 @@ pub fn from_applied(a: Applied) -> CoreEvent {
 pub fn alert(op: &Op, applied: &[Applied], me: &str) -> Option<CoreEvent> {
     let conversation_id = applied.iter().find_map(|a| match a {
         Applied::MessageChanged { conversation_id, .. } => Some(conversation_id.clone()),
-        Applied::Typing { .. } => None,
+        Applied::Typing { .. } | Applied::AttachmentChanged { .. } => None,
     })?;
     match op {
         Op::InsertMessage(m) if !m.is_outgoing && m.author != me => Some(CoreEvent::NewMessage {

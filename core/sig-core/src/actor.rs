@@ -25,6 +25,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::download::{downloader, Download, Downloads};
 use crate::error::CoreError;
 use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
@@ -55,6 +56,8 @@ pub enum Command {
     },
     Start,
     Send(Job),
+    /// Download one attachment (the user asked for it).
+    Download(i64),
     /// The user is typing in a conversation (`started`), or stopped.
     Typing {
         conversation_id: String,
@@ -154,8 +157,9 @@ async fn run(
 ) {
     let opened = async {
         // ProjectionDb::open validates the key format before anything is interpolated.
-        let projection =
-            ProjectionDb::open(&format!("sqlite://{}", dir.join("projection.db").display()), Some(&key)).await?;
+        let projection = ProjectionDb::open(&format!("sqlite://{}", dir.join("projection.db").display()), Some(&key))
+            .await?
+            .with_files(dir.join("attachments"));
         let store =
             SqliteStore::open_with_options(sqlite_options(&dir.join("presage.db"), &key)?, OnNewIdentity::Trust)
                 .await
@@ -194,6 +198,20 @@ async fn run(
     let jobs: Jobs = Rc::new(RefCell::new(send_rx));
     let typing = Rc::new(RefCell::new(Typing::default()));
     let mut sending = false;
+    // Downloads queue here until receiving starts.
+    let (download_tx, download_rx) = mpsc::unbounded_channel::<Download>();
+    let downloads: Downloads = Rc::new(RefCell::new(download_rx));
+    let mut downloading = false;
+    let queues = Queues {
+        sends: send_tx.clone(),
+        downloads: download_tx.clone(),
+    };
+    // Downloads cut off by the previous run start over.
+    if let Err(e) = projection.reset_downloads().await {
+        listener.on_event(CoreEvent::Error {
+            message: format!("checking unfinished downloads failed: {e}"),
+        });
+    }
     // Sends queued by a previous run died with it.
     match projection.fail_all_pending().await {
         Ok(failed) => {
@@ -251,12 +269,22 @@ async fn run(
                             caught_up_rx.clone(),
                         ));
                     }
+                    if !downloading {
+                        downloading = true;
+                        tokio::task::spawn_local(supervise_downloader(
+                            m.clone(),
+                            projection.clone(),
+                            listener.clone(),
+                            downloads.clone(),
+                        ));
+                        let _ = download_tx.send(Download::Auto);
+                    }
                     let task = tokio::task::spawn_local(Box::pin(receive_loop(
                         m.clone(),
                         projection.clone(),
                         listener.clone(),
                         caught_up_tx.clone(),
-                        send_tx.clone(),
+                        queues.clone(),
                     )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
@@ -289,6 +317,9 @@ async fn run(
                         });
                     }
                 }
+            }
+            Command::Download(id) => {
+                let _ = download_tx.send(Download::One(id));
             }
             Command::Typing {
                 conversation_id,
@@ -389,13 +420,44 @@ async fn supervise_sender(
     }
 }
 
+/// Runs the downloader and restarts it if it panics: queued downloads stay queued, and the one in
+/// flight starts over.
+async fn supervise_downloader(
+    m: Manager<SqliteStore, Registered>,
+    db: ProjectionDb,
+    l: Arc<dyn EventListener>,
+    downloads: Downloads,
+) {
+    loop {
+        let task = tokio::task::spawn_local(Box::pin(downloader(
+            m.clone(),
+            db.clone(),
+            l.clone(),
+            downloads.clone(),
+        )));
+        match task.await {
+            Ok(()) => return,
+            Err(e) => {
+                l.on_event(CoreEvent::Error {
+                    message: format!("downloading stopped unexpectedly: {e}"),
+                });
+                if let Err(e) = db.reset_downloads().await {
+                    l.on_event(CoreEvent::Error {
+                        message: format!("checking unfinished downloads failed: {e}"),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Receives forever, reconnecting with exponential backoff (1 s → 60 s).
 async fn receive_loop(
     mut m: Manager<SqliteStore, Registered>,
     db: ProjectionDb,
     l: Arc<dyn EventListener>,
     caught_up: Rc<watch::Sender<bool>>,
-    jobs: mpsc::UnboundedSender<Job>,
+    queues: Queues,
 ) {
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
@@ -413,7 +475,7 @@ async fn receive_loop(
                 futures::pin_mut!(stream);
                 progress.connected();
                 while let Some(received) = stream.next().await {
-                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &jobs).await;
+                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && progress.titles_synced;
                         *ready |= progress.titles_synced;
@@ -468,7 +530,7 @@ async fn handle(
     me: &str,
     progress: &mut Progress,
     l: &dyn EventListener,
-    jobs: &mpsc::UnboundedSender<Job>,
+    queues: &Queues,
 ) {
     // Kinds and counts only: never message content.
     match &received {
@@ -493,17 +555,35 @@ async fn handle(
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
             let sender = content.metadata.sender.service_id_string();
-            if apply_received(db, l, &ops, &sender, me, progress.live).await {
+            let outcome = apply_received(db, l, &ops, &sender, me, progress.live).await;
+            if outcome.settings_changed {
                 // receipts held back while the read receipts setting was unknown; queued only
                 // now that the new setting is stored, so they can't go out under the old one
-                let _ = jobs.send(Job::Receipts);
+                let _ = queues.sends.send(Job::Receipts);
+            }
+            if outcome.attachments_added {
+                let _ = queues.downloads.send(Download::Auto);
             }
         }
     }
 }
 
+/// Where the receive loop hands work on to.
+#[derive(Clone)]
+struct Queues {
+    sends: mpsc::UnboundedSender<Job>,
+    downloads: mpsc::UnboundedSender<Download>,
+}
+
+/// What applying one received content changed beyond the projection.
+#[derive(Default)]
+struct Outcome {
+    settings_changed: bool,
+    attachments_added: bool,
+}
+
 /// Applies the ops of one received content and, when `live` (not catching up), announces what
-/// is worth a notification. True if it changed the privacy settings.
+/// is worth a notification.
 async fn apply_received(
     db: &ProjectionDb,
     l: &dyn EventListener,
@@ -511,12 +591,13 @@ async fn apply_received(
     sender: &str,
     me: &str,
     live: bool,
-) -> bool {
-    let mut settings_changed = false;
+) -> Outcome {
+    let mut outcome = Outcome::default();
     for op in ops {
         match db.apply(op).await {
             Ok(applied) => {
-                settings_changed |= matches!(op, Op::Settings { .. });
+                outcome.settings_changed |= matches!(op, Op::Settings { .. });
+                outcome.attachments_added |= matches!(op, Op::AddAttachments { .. }) && !applied.is_empty();
                 let new = if live { alert(op, &applied, me) } else { None };
                 applied.into_iter().for_each(|a| l.on_event(from_applied(a)));
                 if let Some(e) = new {
@@ -528,7 +609,7 @@ async fn apply_received(
             }),
         }
     }
-    settings_changed
+    outcome
 }
 
 fn content_kind(body: &presage::libsignal_service::content::ContentBody) -> &'static str {
@@ -663,14 +744,22 @@ mod tests {
             read_receipts: Some(false),
             typing_indicators: None,
         };
-        assert!(super::apply_received(&db, &Quiet, &[off], "me", "me", true).await);
+        assert!(
+            super::apply_received(&db, &Quiet, &[off], "me", "me", true)
+                .await
+                .settings_changed
+        );
         assert_eq!(db.settings().await.unwrap().read_receipts, Some(false));
         let typing = Op::Typing {
             conversation_id: "c:a".into(),
             who: "a".into(),
             started: true,
         };
-        assert!(!super::apply_received(&db, &Quiet, &[typing], "a", "me", true).await);
+        assert!(
+            !super::apply_received(&db, &Quiet, &[typing], "a", "me", true)
+                .await
+                .settings_changed
+        );
         assert_eq!(
             db.settings().await.unwrap(),
             Settings {

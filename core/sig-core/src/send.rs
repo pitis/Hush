@@ -13,9 +13,10 @@ use presage::libsignal_service::content::{
 };
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Aci, DeviceId, Pni, ServiceId};
+use presage::libsignal_service::sender::AttachmentSpec;
 use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 use presage::manager::Registered;
-use presage::proto::{data_message, receipt_message, typing_message};
+use presage::proto::{data_message, receipt_message, typing_message, AttachmentPointer};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::{mpsc, watch};
@@ -46,12 +47,14 @@ pub fn recipient(conversation_id: &str) -> Option<Recipient> {
     Some(Recipient::Group(key.try_into().ok()?))
 }
 
-/// A text message: queued as `Job::Text` once stored as `Pending`, and the content of an edit.
+/// A message: queued as `Job::Text` once stored as `Pending`, and the content of an edit.
 pub struct SendJob {
     pub key: MessageKey,
     pub conversation_id: String,
-    pub body: String,
+    pub body: Option<String>,
     pub quote: Option<Quote>,
+    /// Ids of its stored files, uploaded before it is sent.
+    pub attachments: Vec<i64>,
 }
 
 /// Everything the sender sends, in order.
@@ -87,9 +90,10 @@ fn group_context(conversation_id: &str) -> Option<GroupContextV2> {
     }
 }
 
-fn data_message(job: &SendJob) -> DataMessage {
+fn data_message(job: &SendJob, attachments: Vec<AttachmentPointer>) -> DataMessage {
     DataMessage {
-        body: Some(job.body.clone()),
+        body: job.body.clone(),
+        attachments,
         timestamp: Some(job.key.sent_at as u64),
         quote: job.quote.as_ref().map(|q| data_message::Quote {
             id: Some(q.sent_at as u64),
@@ -138,12 +142,13 @@ pub fn edit(original: &Message, new_body: String, at: u64) -> EditMessage {
             sent_at: at as i64,
         },
         conversation_id: original.conversation_id.clone(),
-        body: new_body,
+        body: Some(new_body),
         quote: original.quote.clone(),
+        attachments: vec![],
     };
     EditMessage {
         target_sent_timestamp: Some(original.sent_at as u64),
-        data_message: Some(data_message(&revision)),
+        data_message: Some(data_message(&revision, vec![])),
     }
 }
 
@@ -350,13 +355,18 @@ pub async fn sender(
 }
 
 async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener, job: SendJob) {
-    let result = send_to(
-        m,
-        &job.conversation_id,
-        data_message(&job).into(),
-        job.key.sent_at as u64,
-    )
-    .await;
+    let result = match upload(m, db, &job.attachments).await {
+        Ok(pointers) => {
+            send_to(
+                m,
+                &job.conversation_id,
+                data_message(&job, pointers).into(),
+                job.key.sent_at as u64,
+            )
+            .await
+        }
+        Err(e) => Err(format!("uploading failed: {e}")),
+    };
     let stored = match &result {
         Ok(()) => db
             .apply(&Op::SetStatus {
@@ -484,6 +494,49 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
     }
 }
 
+/// An upload that takes longer is given up (the message is Failed; retry uploads again).
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Uploads a message's stored files, in order, one at a time (only one is in memory at once).
+async fn upload(
+    m: &Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    ids: &[i64],
+) -> Result<Vec<AttachmentPointer>, String> {
+    let mut pointers = vec![];
+    for &id in ids {
+        let a = db
+            .attachment(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("a file of the message is gone")?;
+        let path = a.path.ok_or("a file of the message is missing")?;
+        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let spec = AttachmentSpec {
+            content_type: a.content_type,
+            length: bytes.len(),
+            file_name: a.file_name,
+            preview: None,
+            voice_note: Some(a.is_voice_note),
+            borderless: Some(false),
+            width: a.width,
+            height: a.height,
+            caption: None,
+            blur_hash: None,
+        };
+        let pointer = tokio::time::timeout(UPLOAD_TIMEOUT, Box::pin(m.upload_attachment(spec, bytes)))
+            .await
+            .map_err(|_| "timed out".to_string())?
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        pointers.push(pointer);
+    }
+    Ok(pointers)
+}
+
 fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis() as u64
 }
@@ -551,16 +604,46 @@ mod tests {
                 sent_at: 42,
             },
             conversation_id: format!("g:{}", "ab".repeat(32)),
-            body: "hi".into(),
+            body: Some("hi".into()),
+            attachments: vec![],
             quote: None,
         };
-        let g = data_message(&job).group_v2.expect("group context");
+        let g = data_message(&job, vec![]).group_v2.expect("group context");
         assert_eq!(g.master_key, Some(vec![0xab; 32]));
         let direct = SendJob {
             conversation_id: format!("c:{U}"),
             ..job
         };
-        assert_eq!(data_message(&direct).group_v2, None);
+        assert_eq!(data_message(&direct, vec![]).group_v2, None);
+    }
+
+    #[test]
+    fn files_go_out_in_order_with_their_caption() {
+        let job = SendJob {
+            key: MessageKey {
+                author: "me".into(),
+                sent_at: 42,
+            },
+            conversation_id: format!("c:{U}"),
+            body: None,
+            quote: None,
+            attachments: vec![1, 2],
+        };
+        let pointer = |name: &str| AttachmentPointer {
+            file_name: Some(name.into()),
+            ..Default::default()
+        };
+        let dm = data_message(&job, vec![pointer("a"), pointer("b")]);
+        assert_eq!(dm.body, None);
+        assert_eq!(dm.attachments, vec![pointer("a"), pointer("b")]);
+        let captioned = SendJob {
+            body: Some("look".into()),
+            ..job
+        };
+        assert_eq!(
+            data_message(&captioned, vec![pointer("a")]).body.as_deref(),
+            Some("look")
+        );
     }
 
     #[test]
@@ -571,14 +654,15 @@ mod tests {
                 sent_at: 42,
             },
             conversation_id: format!("c:{U}"),
-            body: "hi".into(),
+            body: Some("hi".into()),
+            attachments: vec![],
             quote: Some(Quote {
                 author: U.into(),
                 sent_at: 7,
                 text: Some("orig".into()),
             }),
         };
-        let dm = data_message(&job);
+        let dm = data_message(&job, vec![]);
         assert_eq!((dm.body.as_deref(), dm.timestamp), (Some("hi"), Some(42)));
         let q = dm.quote.unwrap();
         assert_eq!(

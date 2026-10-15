@@ -4,8 +4,9 @@
 use presage::libsignal_service::content::{
     sync_message, Content, ContentBody, DataMessage, EditMessage, ReceiptMessage, TypingMessage,
 };
+use presage::libsignal_service::prelude::ProtobufMessage;
 use presage::libsignal_service::protocol::ServiceId;
-use presage::proto::{receipt_message, typing_message};
+use presage::proto::{attachment_pointer, receipt_message, typing_message, AttachmentPointer};
 
 use super::ids::{aci, direct_id, group_id};
 use super::model::*;
@@ -39,6 +40,12 @@ pub enum Op {
         conversation_id: String,
         who: String,
         started: bool,
+    },
+    /// The files and link preview of a message inserted just before (ignored if it isn't stored).
+    AddAttachments {
+        message: MessageKey,
+        attachments: Vec<NewAttachment>,
+        preview: Option<NewPreview>,
     },
     /// Privacy settings from our phone; `None` leaves a setting as it is.
     Settings {
@@ -225,7 +232,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
             text: q.text.clone(),
         })
     });
-    vec![Op::InsertMessage(Message {
+    let message = Message {
         conversation_id: conv.to_string(),
         author: author.to_string(),
         sent_at,
@@ -240,7 +247,42 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         edited: false,
         deleted: false,
         quote,
-    })]
+    };
+    let attachments: Vec<_> = dm.attachments.iter().map(new_attachment).collect();
+    let preview = dm.preview.first().and_then(|p| {
+        Some(NewPreview {
+            url: p.url.clone()?,
+            title: p.title.clone(),
+            description: p.description.clone(),
+            image: p.image.as_ref().map(new_attachment),
+        })
+    });
+    let mut ops = vec![];
+    if !attachments.is_empty() || preview.is_some() {
+        ops.push(Op::AddAttachments {
+            message: message.key(),
+            attachments,
+            preview,
+        });
+    }
+    ops.insert(0, Op::InsertMessage(message));
+    ops
+}
+
+fn new_attachment(p: &AttachmentPointer) -> NewAttachment {
+    NewAttachment {
+        pointer: p.encode_to_vec(),
+        content_type: p
+            .content_type
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "application/octet-stream".into()),
+        file_name: p.file_name.clone(),
+        size: u64::from(p.size.unwrap_or(0)),
+        width: p.width,
+        height: p.height,
+        is_voice_note: p.flags.unwrap_or(0) & attachment_pointer::Flags::VoiceMessage as u32 != 0,
+    }
 }
 
 #[cfg(test)]
@@ -250,10 +292,12 @@ mod tests {
         sync_message, Content, ContentBody, DataMessage, EditMessage, GroupContextV2, Metadata, NullMessage,
         ReceiptMessage, SyncMessage, TypingMessage,
     };
+    use presage::libsignal_service::prelude::ProtobufMessage;
     use presage::libsignal_service::prelude::Uuid;
     use presage::libsignal_service::protocol::{Aci, DeviceId, ServiceId};
     use presage::proto::data_message::{self, StoryContext};
     use presage::proto::{receipt_message, typing_message};
+    use presage::proto::{AttachmentPointer, Preview};
 
     const ME: &str = "11111111-1111-1111-1111-111111111111";
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
@@ -486,8 +530,8 @@ mod tests {
             attachments: vec![Default::default()],
             ..Default::default()
         };
-        let m = one(project(&content(ALICE, 450, ContentBody::DataMessage(dm)), ME));
-        assert_eq!(m.body, None);
+        let ops = project(&content(ALICE, 450, ContentBody::DataMessage(dm)), ME);
+        assert!(matches!(&ops[..], [Op::InsertMessage(m), Op::AddAttachments { .. }] if m.body.is_none()));
     }
 
     #[test]
@@ -906,5 +950,91 @@ mod tests {
         );
         assert!(project(&content(ME, 3, config(None, None)), ME).is_empty());
         assert!(project(&content(ALICE, 4, config(Some(true), Some(true))), ME).is_empty());
+    }
+
+    fn pointer(content_type: &str, size: u32, flags: u32) -> AttachmentPointer {
+        AttachmentPointer {
+            content_type: Some(content_type.into()),
+            size: Some(size),
+            flags: Some(flags),
+            file_name: Some("f.bin".into()),
+            width: Some(640),
+            height: Some(480),
+            digest: Some(vec![9; 32]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn attachments_and_previews_come_with_their_message() {
+        let mut dm = text(100, "look");
+        dm.attachments = vec![pointer("image/jpeg", 1000, 0), pointer("audio/aac", 50, 1)];
+        dm.preview = vec![Preview {
+            url: Some("https://example.org".into()),
+            title: Some("Example".into()),
+            image: Some(pointer("image/png", 10, 0)),
+            ..Default::default()
+        }];
+        let ops = project(&content(ALICE, 150, ContentBody::DataMessage(dm.clone())), ME);
+        let [Op::InsertMessage(m), Op::AddAttachments {
+            message,
+            attachments,
+            preview,
+        }] = ops.as_slice()
+        else {
+            panic!("{ops:?}")
+        };
+        assert_eq!(message, &m.key());
+        assert_eq!(attachments.len(), 2);
+        let photo = &attachments[0];
+        assert_eq!(
+            (
+                photo.content_type.as_str(),
+                photo.size,
+                photo.width,
+                photo.height,
+                photo.is_voice_note
+            ),
+            ("image/jpeg", 1000, Some(640), Some(480), false)
+        );
+        assert_eq!(photo.file_name.as_deref(), Some("f.bin"));
+        // the stored pointer decodes back to what came in
+        assert_eq!(
+            AttachmentPointer::decode(photo.pointer.as_slice()).unwrap(),
+            dm.attachments[0]
+        );
+        assert!(attachments[1].is_voice_note);
+        let preview = preview.as_ref().unwrap();
+        assert_eq!(
+            (preview.url.as_str(), preview.title.as_deref()),
+            ("https://example.org", Some("Example"))
+        );
+        assert_eq!(preview.image.as_ref().unwrap().content_type, "image/png");
+    }
+
+    #[test]
+    fn a_message_with_only_a_file_is_kept_with_it() {
+        let dm = DataMessage {
+            timestamp: Some(100),
+            attachments: vec![AttachmentPointer {
+                content_type: None,
+                ..pointer("", 7, 0)
+            }],
+            ..Default::default()
+        };
+        let ops = project(&content(ALICE, 150, ContentBody::DataMessage(dm)), ME);
+        assert!(matches!(&ops[0], Op::InsertMessage(m) if m.body.is_none()));
+        let Op::AddAttachments {
+            attachments, preview, ..
+        } = &ops[1]
+        else {
+            panic!("{ops:?}")
+        };
+        assert_eq!(attachments[0].content_type, "application/octet-stream");
+        assert_eq!(preview, &None);
+        // a preview without a url is dropped
+        let mut dm = text(101, "hi");
+        dm.preview = vec![Preview::default()];
+        assert_eq!(project(&content(ALICE, 151, ContentBody::DataMessage(dm)), ME).len(), 1);
     }
 }

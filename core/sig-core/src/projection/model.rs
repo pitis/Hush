@@ -107,6 +107,88 @@ impl Message {
     }
 }
 
+/// Where a message's file is. Incoming files start `Pending` (not downloaded).
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentState {
+    Pending,
+    Downloading,
+    Ready,
+    Failed,
+}
+
+impl AttachmentState {
+    pub fn to_i64(self) -> i64 {
+        match self {
+            Self::Pending => 0,
+            Self::Downloading => 1,
+            Self::Ready => 2,
+            Self::Failed => 3,
+        }
+    }
+
+    pub fn from_i64(v: i64) -> Option<Self> {
+        [Self::Pending, Self::Downloading, Self::Ready, Self::Failed]
+            .into_iter()
+            .find(|s| s.to_i64() == v)
+    }
+}
+
+/// A file of a message (a photo, voice note, document…).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct Attachment {
+    pub id: i64,
+    pub message: MessageKey,
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub size: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub is_voice_note: bool,
+    /// The file on disk, once `Ready`.
+    pub path: Option<String>,
+    pub state: AttachmentState,
+}
+
+/// A received link preview (title, url, image), shown with its message.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image: Option<Attachment>,
+}
+
+/// A file to send, described by the app (it knows types and image sizes).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct OutgoingFile {
+    pub path: String,
+    pub content_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub is_voice_note: bool,
+}
+
+/// An attachment as a message carries it, before it is stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewAttachment {
+    /// The encoded `AttachmentPointer` it is downloaded with.
+    pub pointer: Vec<u8>,
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub size: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub is_voice_note: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image: Option<NewAttachment>,
+}
+
 /// Privacy settings synced from the phone; `None` until it has told us.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
