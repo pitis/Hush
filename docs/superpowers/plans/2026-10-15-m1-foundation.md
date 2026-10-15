@@ -293,6 +293,8 @@ git add -A && git commit -m "feat: scaffold Rust core, UniFFI bindings and Xcode
 - Create: `core/sig-core/src/projection/mod.rs`, `core/sig-core/src/projection/db.rs`, `core/sig-core/src/projection/model.rs`
 - Modify: `core/sig-core/src/lib.rs` (add `mod projection;` and re-exports)
 
+> **As built (PR #22, after review):** `upsert_conversation_title(id, title)` derives the kind from the id (`ConversationKind::from_id`, bad ids are `sqlx::Error::InvalidArgument`); `messages(conversation_id, before: Option<MessageKey>, limit)` pages by `(sent_at, author)`; `MessageStatus::from_i64` returns `Option`; `Message::key()`; `refresh_summary(&mut conn, conversation_id)` recomputes preview/last-at/unread from messages and **every later write (Task 4 `apply`) must call it inside its transaction**; deleted messages are stored with `body`/`quote_text` NULL (enforced by CHECK); statement logging is disabled (the key pragma would leak). The code below is the original draft; the repo is authoritative.
+
 **Interfaces:**
 - Produces (in `projection::model`, all `#[derive(uniffi::Record, Clone, Debug, PartialEq)]`):
   - `Conversation { id: String, kind: ConversationKind, title: String, last_message_at: i64, last_message_preview: String, unread_count: u32 }`
@@ -389,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_page_messages() {
         let db = db().await;
-        db.upsert_conversation_title("c:alice", ConversationKind::Direct, "Alice").await.unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
         for t in 1..=5 { db.insert_message(&msg("alice", t, &format!("m{t}"))).await.unwrap(); }
         let page = db.messages("c:alice", Some(5), 2).await.unwrap();
         assert_eq!(page.iter().map(|m| m.sent_at).collect::<Vec<_>>(), vec![3, 4]);
@@ -398,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_message_is_ignored_and_not_double_counted() {
         let db = db().await;
-        db.upsert_conversation_title("c:alice", ConversationKind::Direct, "Alice").await.unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
         assert!(db.insert_message(&msg("alice", 10, "hi")).await.unwrap());
         assert!(!db.insert_message(&msg("alice", 10, "hi")).await.unwrap());
         let convs = db.conversations().await.unwrap();
@@ -410,8 +412,8 @@ mod tests {
     #[tokio::test]
     async fn conversations_ordered_by_recency() {
         let db = db().await;
-        db.upsert_conversation_title("c:alice", ConversationKind::Direct, "Alice").await.unwrap();
-        db.upsert_conversation_title("c:bob", ConversationKind::Direct, "Bob").await.unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
+        db.upsert_conversation_title("c:bob", "Bob").await.unwrap();
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&Message { conversation_id: "c:bob".into(), ..msg("bob", 2, "b") }).await.unwrap();
         let ids: Vec<_> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
@@ -421,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn fts5_search_finds_words() {
         let db = db().await;
-        db.upsert_conversation_title("c:alice", ConversationKind::Direct, "Alice").await.unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
         db.insert_message(&msg("alice", 1, "lunch tomorrow at noon")).await.unwrap();
         db.insert_message(&msg("alice", 2, "unrelated")).await.unwrap();
         let hits = db.search("tomorrow", 10).await.unwrap();
@@ -432,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn outgoing_message_does_not_increment_unread() {
         let db = db().await;
-        db.upsert_conversation_title("c:alice", ConversationKind::Direct, "Alice").await.unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
         db.insert_message(&Message { is_outgoing: true, ..msg("me", 1, "yo") }).await.unwrap();
         assert_eq!(db.conversations().await.unwrap()[0].unread_count, 0);
     }
@@ -887,7 +889,7 @@ and at the top of `data_message`, before the empty-body check:
     #[tokio::test]
     async fn apply_reaction_edit_delete_receipt() {
         let db = db().await;
-        db.upsert_conversation_title("c:alice", ConversationKind::Direct, "Alice").await.unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
         db.insert_message(&Message { is_outgoing: true, status: MessageStatus::Sent, ..msg("me", 100, "orig") }).await.unwrap();
 
         db.apply(&Op::React { target_author: "me".into(), target_sent_at: 100, reactor: "alice".into(), emoji: Some("👍".into()) }).await.unwrap();
@@ -1022,7 +1024,7 @@ The `Receipt` test relies on the `messages_au` trigger only firing for `body` up
     - `fn link(&self, device_name: String)` (progress via events)
     - `fn start(&self)` (begin receive loop; emits Connection/Ready/MessageChanged)
     - `async fn conversations(&self) -> Result<Vec<Conversation>, CoreError>`
-    - `async fn messages(&self, conversation_id: String, before: Option<i64>, limit: u32) -> Result<Vec<Message>, CoreError>`
+    - `async fn messages(&self, conversation_id: String, before: Option<MessageKey>, limit: u32) -> Result<Vec<Message>, CoreError>`
     - `async fn search(&self, query: String, limit: u32) -> Result<Vec<Message>, CoreError>`
     - `async fn reactions(&self, author: String, sent_at: i64) -> Result<Vec<Reaction>, CoreError>`
 
@@ -1230,13 +1232,13 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb) {
     if let Ok(contacts) = m.store().contacts().await {
         for c in contacts.flatten() {
             let id = format!("c:{}", c.uuid);
-            let _ = db.upsert_conversation_title(&id, ConversationKind::Direct, &c.name).await;
+            let _ = db.upsert_conversation_title(&id, &c.name).await;
         }
     }
     if let Ok(groups) = m.store().groups().await {
         for (key, g) in groups.flatten() {
             let id = conversation_id(&Thread::Group(key));
-            let _ = db.upsert_conversation_title(&id, ConversationKind::Group, &g.title).await;
+            let _ = db.upsert_conversation_title(&id, &g.title).await;
         }
     }
 }
@@ -1272,7 +1274,7 @@ impl Client {
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     pub async fn conversations(&self) -> Result<Vec<Conversation>, CoreError> { Ok(self.db.conversations().await?) }
-    pub async fn messages(&self, conversation_id: String, before: Option<i64>, limit: u32) -> Result<Vec<Message>, CoreError> {
+    pub async fn messages(&self, conversation_id: String, before: Option<MessageKey>, limit: u32) -> Result<Vec<Message>, CoreError> {
         Ok(self.db.messages(&conversation_id, before, limit).await?)
     }
     pub async fn search(&self, query: String, limit: u32) -> Result<Vec<Message>, CoreError> { Ok(self.db.search(&query, limit).await?) }

@@ -1,0 +1,642 @@
+use std::str::FromStr;
+
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::{ConnectOptions, Row};
+
+use super::model::*;
+
+/// Encrypted SQLite store the UI reads from. Separate from presage's database because both use
+/// `sqlx::migrate!`, which would collide on `_sqlx_migrations`.
+///
+/// The pool has one connection, so a method must never call another `ProjectionDb` method while
+/// it holds a transaction: multi-step work goes through `&mut SqliteConnection` helpers.
+#[derive(Clone)]
+pub struct ProjectionDb {
+    pool: SqlitePool,
+}
+
+impl ProjectionDb {
+    /// Opens (creating if needed) and migrates the database. `key` is the 64-char hex SQLCipher
+    /// key; `None` opens an unencrypted database (tests).
+    pub async fn open(url: &str, key: Option<&str>) -> Result<Self, sqlx::Error> {
+        // Statement logging is off: the key pragma would otherwise be logged in clear at debug level.
+        let mut opts = SqliteConnectOptions::from_str(url)?
+            .create_if_missing(true)
+            .disable_statement_logging();
+        if let Some(k) = key {
+            if k.len() != 64 || !k.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(sqlx::Error::Configuration(
+                    "database key must be 64 hex characters".into(),
+                ));
+            }
+            opts = opts.pragma("key", format!("\"x'{k}'\""));
+        }
+        // One connection: in-memory databases are per connection, and the app's write volume is tiny.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(opts)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// Creates the conversation or updates its title; an empty title never replaces a known one.
+    pub async fn upsert_conversation_title(&self, id: &str, title: &str) -> Result<(), sqlx::Error> {
+        let kind = kind_of(id)?;
+        sqlx::query(
+            "INSERT INTO conversations(id, kind, title) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET title = CASE WHEN ?3 = '' THEN title ELSE ?3 END",
+        )
+        .bind(id)
+        .bind(kind_to_i64(kind))
+        .bind(title)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Inserts a message and refreshes its conversation's summary. Returns false (and changes
+    /// nothing) if a message with the same `(author, sent_at)` already exists. A deleted message
+    /// is stored without its text.
+    pub async fn insert_message(&self, m: &Message) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(&m.conversation_id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(&m.conversation_id)
+            .bind(kind_to_i64(kind))
+            .execute(&mut *tx)
+            .await?;
+        let quote = m.quote.as_ref();
+        let (body, quote_text) = if m.deleted {
+            (None, None)
+        } else {
+            (m.body.as_ref(), quote.and_then(|q| q.text.as_ref()))
+        };
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
+               status, edited, deleted, quote_author, quote_sent_at, quote_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )
+        .bind(&m.conversation_id)
+        .bind(&m.author)
+        .bind(m.sent_at)
+        .bind(m.received_at)
+        .bind(body)
+        .bind(m.is_outgoing)
+        .bind(m.status.to_i64())
+        .bind(m.edited)
+        .bind(m.deleted)
+        .bind(quote.map(|q| &q.author))
+        .bind(quote.map(|q| q.sent_at))
+        .bind(quote_text)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = res.rows_affected() == 1;
+        if inserted {
+            refresh_summary(&mut tx, &m.conversation_id).await?;
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// All conversations, most recent first.
+    pub async fn conversations(&self) -> Result<Vec<Conversation>, sqlx::Error> {
+        let rows = sqlx::query("SELECT * FROM conversations ORDER BY last_message_at DESC, id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_conversation).collect()
+    }
+
+    /// Up to `limit` messages of a conversation that come before `before` (or the newest ones),
+    /// oldest first. Messages are ordered by `(sent_at, author)`, so equal timestamps page correctly.
+    pub async fn messages(
+        &self,
+        conversation_id: &str,
+        before: Option<MessageKey>,
+        limit: u32,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let mut rows = match before {
+            Some(k) => {
+                sqlx::query(
+                    "SELECT * FROM messages WHERE conversation_id = ?1 AND (sent_at, author) < (?2, ?3)
+                     ORDER BY sent_at DESC, author DESC LIMIT ?4",
+                )
+                .bind(conversation_id)
+                .bind(k.sent_at)
+                .bind(k.author)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT * FROM messages WHERE conversation_id = ?1 ORDER BY sent_at DESC, author DESC LIMIT ?2",
+                )
+                .bind(conversation_id)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.reverse();
+        rows.iter().map(row_to_message).collect()
+    }
+
+    /// Full-text search over message bodies, newest first. The query is matched as a phrase, so
+    /// FTS5 operators in the input are plain text. Case and diacritics are folded; emoji, CJK
+    /// substrings and word prefixes don't match yet (search UI ticket).
+    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<Message>, sqlx::Error> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+        let rows = sqlx::query(
+            "SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid
+             WHERE messages_fts MATCH ?1 AND m.deleted = 0 ORDER BY m.sent_at DESC, m.author DESC LIMIT ?2",
+        )
+        .bind(phrase)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_message).collect()
+    }
+}
+
+/// Recomputes a conversation's last message time, preview and unread count from its messages.
+/// Every write that changes messages calls this inside its transaction.
+pub(crate) async fn refresh_summary(conn: &mut SqliteConnection, conversation_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE conversations SET
+           last_message_at = COALESCE((SELECT MAX(sent_at) FROM messages WHERE conversation_id = ?1), 0),
+           last_message_preview = COALESCE((SELECT body FROM messages WHERE conversation_id = ?1
+                                            ORDER BY sent_at DESC, author DESC LIMIT 1), ''),
+           unread_count = (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1
+                           AND is_outgoing = 0 AND deleted = 0 AND status < 3)
+         WHERE id = ?1",
+    )
+    .bind(conversation_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+fn kind_of(conversation_id: &str) -> Result<ConversationKind, sqlx::Error> {
+    ConversationKind::from_id(conversation_id)
+        .ok_or_else(|| sqlx::Error::InvalidArgument(format!("bad conversation id: {conversation_id:?}")))
+}
+
+fn kind_to_i64(kind: ConversationKind) -> i64 {
+    match kind {
+        ConversationKind::Direct => 0,
+        ConversationKind::Group => 1,
+    }
+}
+
+fn decode_err(what: String) -> sqlx::Error {
+    sqlx::Error::Decode(what.into())
+}
+
+fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
+    let id: String = r.try_get("id")?;
+    let kind = kind_of(&id)?;
+    let unread: i64 = r.try_get("unread_count")?;
+    Ok(Conversation {
+        kind,
+        title: r.try_get("title")?,
+        last_message_at: r.try_get("last_message_at")?,
+        last_message_preview: r.try_get("last_message_preview")?,
+        unread_count: u32::try_from(unread).map_err(|_| decode_err(format!("unread_count {unread}")))?,
+        id,
+    })
+}
+
+fn row_to_message(r: &SqliteRow) -> Result<Message, sqlx::Error> {
+    let status: i64 = r.try_get("status")?;
+    let quote_author: Option<String> = r.try_get("quote_author")?;
+    let quote_sent_at: Option<i64> = r.try_get("quote_sent_at")?;
+    Ok(Message {
+        conversation_id: r.try_get("conversation_id")?,
+        author: r.try_get("author")?,
+        sent_at: r.try_get("sent_at")?,
+        received_at: r.try_get("received_at")?,
+        body: r.try_get("body")?,
+        is_outgoing: r.try_get("is_outgoing")?,
+        status: MessageStatus::from_i64(status).ok_or_else(|| decode_err(format!("message status {status}")))?,
+        edited: r.try_get("edited")?,
+        deleted: r.try_get("deleted")?,
+        quote: match (quote_author, quote_sent_at) {
+            (Some(author), Some(sent_at)) => Some(Quote {
+                author,
+                sent_at,
+                text: r.try_get("quote_text")?,
+            }),
+            _ => None,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn db() -> ProjectionDb {
+        ProjectionDb::open("sqlite::memory:", None).await.unwrap()
+    }
+
+    fn msg(author: &str, sent_at: i64, body: &str) -> Message {
+        Message {
+            conversation_id: "c:alice".into(),
+            author: author.into(),
+            sent_at,
+            received_at: sent_at,
+            body: Some(body.into()),
+            is_outgoing: false,
+            status: MessageStatus::Delivered,
+            edited: false,
+            deleted: false,
+            quote: None,
+        }
+    }
+
+    fn in_conv(conv: &str, m: Message) -> Message {
+        Message {
+            conversation_id: conv.into(),
+            ..m
+        }
+    }
+
+    fn times(ms: &[Message]) -> Vec<i64> {
+        ms.iter().map(|m| m.sent_at).collect()
+    }
+
+    async fn alice(db: &ProjectionDb) {
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
+    }
+
+    async fn conv(db: &ProjectionDb, id: &str) -> Conversation {
+        db.conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap()
+    }
+
+    /// A temp file path removed on drop, even if the test panics.
+    struct TempDb(std::path::PathBuf);
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("semaphore-{tag}-{}.db", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            Self(p)
+        }
+        fn url(&self) -> String {
+            format!("sqlite://{}", self.0.display())
+        }
+    }
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_page_messages() {
+        let db = db().await;
+        for t in 1..=5 {
+            db.insert_message(&msg("alice", t, &format!("m{t}"))).await.unwrap();
+        }
+        assert_eq!(times(&db.messages("c:alice", None, 2).await.unwrap()), vec![4, 5]);
+        let before = MessageKey {
+            author: "alice".into(),
+            sent_at: 4,
+        };
+        assert_eq!(
+            times(&db.messages("c:alice", Some(before), 2).await.unwrap()),
+            vec![2, 3]
+        );
+        let before = MessageKey {
+            author: "alice".into(),
+            sent_at: 1,
+        };
+        assert!(db.messages("c:alice", Some(before), 2).await.unwrap().is_empty());
+        assert!(db.messages("c:alice", None, 0).await.unwrap().is_empty());
+        assert!(db.messages("c:nobody", None, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paging_keeps_messages_with_equal_timestamps() {
+        let db = db().await;
+        for (a, t) in [("alice", 1), ("bob", 2), ("carol", 2), ("alice", 3)] {
+            db.insert_message(&msg(a, t, "x")).await.unwrap();
+        }
+        let first = db.messages("c:alice", None, 2).await.unwrap();
+        let second = db.messages("c:alice", Some(first[0].key()), 2).await.unwrap();
+        let all: Vec<_> = second
+            .iter()
+            .chain(&first)
+            .map(|m| (m.author.as_str(), m.sent_at))
+            .collect();
+        assert_eq!(all, vec![("alice", 1), ("bob", 2), ("carol", 2), ("alice", 3)]);
+    }
+
+    #[tokio::test]
+    async fn messages_are_scoped_to_their_conversation() {
+        let db = db().await;
+        for (c, t) in [("c:alice", 1), ("c:bob", 2), ("c:alice", 3), ("c:bob", 4)] {
+            db.insert_message(&in_conv(c, msg("x", t, "m"))).await.unwrap();
+        }
+        assert_eq!(times(&db.messages("c:alice", None, 10).await.unwrap()), vec![1, 3]);
+        let before = MessageKey {
+            author: "x".into(),
+            sent_at: 4,
+        };
+        assert_eq!(times(&db.messages("c:bob", Some(before), 10).await.unwrap()), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn message_round_trips_all_fields() {
+        let db = db().await;
+        let m = Message {
+            is_outgoing: true,
+            status: MessageStatus::Failed,
+            edited: true,
+            quote: Some(Quote {
+                author: "bob".into(),
+                sent_at: 9,
+                text: Some("q".into()),
+            }),
+            ..msg("me", 10, "hi")
+        };
+        let no_quote_text = Message {
+            quote: Some(Quote {
+                author: "bob".into(),
+                sent_at: 8,
+                text: None,
+            }),
+            ..msg("me", 11, "a")
+        };
+        db.insert_message(&m).await.unwrap();
+        db.insert_message(&no_quote_text).await.unwrap();
+        assert_eq!(db.messages("c:alice", None, 10).await.unwrap(), vec![m, no_quote_text]);
+    }
+
+    #[tokio::test]
+    async fn every_status_round_trips() {
+        let db = db().await;
+        for (i, s) in MessageStatus::ALL.into_iter().enumerate() {
+            db.insert_message(&Message {
+                status: s,
+                ..msg("a", i as i64, "x")
+            })
+            .await
+            .unwrap();
+        }
+        let got: Vec<_> = db
+            .messages("c:alice", None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.status)
+            .collect();
+        assert_eq!(got, MessageStatus::ALL);
+    }
+
+    #[tokio::test]
+    async fn deleted_message_is_stored_without_text_and_hidden_from_search() {
+        let db = db().await;
+        let deleted = Message {
+            deleted: true,
+            quote: Some(Quote {
+                author: "b".into(),
+                sent_at: 1,
+                text: Some("quoted secret".into()),
+            }),
+            ..msg("alice", 1, "secret plan")
+        };
+        db.insert_message(&deleted).await.unwrap();
+        db.insert_message(&msg("alice", 2, "secret too")).await.unwrap();
+        let stored = &db.messages("c:alice", None, 10).await.unwrap()[0];
+        assert!(stored.deleted && stored.body.is_none());
+        assert_eq!(stored.quote.as_ref().unwrap().text, None);
+        assert_eq!(times(&db.search("secret", 10).await.unwrap()), vec![2]);
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_message_is_ignored_and_not_double_counted() {
+        let db = db().await;
+        assert!(db.insert_message(&msg("alice", 10, "hi")).await.unwrap());
+        assert!(!db.insert_message(&msg("alice", 10, "changed")).await.unwrap());
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (c.unread_count, c.last_message_preview.as_str(), c.last_message_at),
+            (1, "hi", 10)
+        );
+        assert_eq!(
+            db.messages("c:alice", None, 10).await.unwrap()[0].body.as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_timestamp_from_different_authors_are_distinct() {
+        let db = db().await;
+        assert!(db.insert_message(&msg("alice", 10, "a")).await.unwrap());
+        assert!(db.insert_message(&msg("bob", 10, "b")).await.unwrap());
+        assert_eq!(db.messages("c:alice", None, 10).await.unwrap().len(), 2);
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 2);
+    }
+
+    #[tokio::test]
+    async fn unread_counts_only_incoming_unread() {
+        let db = db().await;
+        for t in 1..=3 {
+            db.insert_message(&msg("alice", t, "in")).await.unwrap();
+        }
+        db.insert_message(&Message {
+            is_outgoing: true,
+            ..msg("me", 4, "out")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&Message {
+            status: MessageStatus::Read,
+            ..msg("alice", 5, "seen")
+        })
+        .await
+        .unwrap();
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 3);
+    }
+
+    #[tokio::test]
+    async fn older_message_does_not_replace_preview() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 10, "new")).await.unwrap();
+        db.insert_message(&msg("alice", 5, "old")).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.last_message_at, c.last_message_preview.as_str()), (10, "new"));
+    }
+
+    #[tokio::test]
+    async fn newest_message_without_text_clears_preview() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        db.insert_message(&Message {
+            body: None,
+            ..msg("alice", 2, "")
+        })
+        .await
+        .unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.last_message_at, c.last_message_preview.as_str()), (2, ""));
+        assert_eq!(db.search("hi", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversations_ordered_by_recency_then_id() {
+        let db = db().await;
+        alice(&db).await;
+        db.upsert_conversation_title("c:bob", "Bob").await.unwrap();
+        db.upsert_conversation_title("c:carol", "Carol").await.unwrap();
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        let ids: Vec<_> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["c:bob", "c:alice", "c:carol"]);
+    }
+
+    #[tokio::test]
+    async fn message_for_unknown_conversation_creates_it_with_kind_from_id() {
+        let db = db().await;
+        db.insert_message(&in_conv("g:abcd", msg("bob", 1, "x"))).await.unwrap();
+        let c = conv(&db, "g:abcd").await;
+        assert_eq!((c.kind, c.title.as_str()), (ConversationKind::Group, ""));
+    }
+
+    #[tokio::test]
+    async fn titles_update_but_empty_never_overwrites() {
+        let db = db().await;
+        alice(&db).await;
+        db.upsert_conversation_title("c:alice", "Alice Smith").await.unwrap();
+        db.upsert_conversation_title("c:alice", "").await.unwrap();
+        assert_eq!(conv(&db, "c:alice").await.title, "Alice Smith");
+        db.insert_message(&in_conv("c:new", msg("n", 1, "x"))).await.unwrap();
+        db.upsert_conversation_title("c:new", "New").await.unwrap();
+        assert_eq!(conv(&db, "c:new").await.title, "New");
+    }
+
+    #[tokio::test]
+    async fn bad_conversation_ids_are_rejected() {
+        let db = db().await;
+        for bad in ["", "alice", "x:1", "G:00"] {
+            assert!(db.upsert_conversation_title(bad, "t").await.is_err(), "{bad:?}");
+            assert!(
+                db.insert_message(&in_conv(bad, msg("a", 1, "x"))).await.is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(db.conversations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts5_search_finds_words_newest_first_with_limit() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "coffee at noon")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "more coffee")))
+            .await
+            .unwrap();
+        db.insert_message(&msg("alice", 3, "COFFEE again")).await.unwrap();
+        db.insert_message(&msg("alice", 4, "unrelated")).await.unwrap();
+        assert_eq!(times(&db.search("coffee", 2).await.unwrap()), vec![3, 2]);
+        assert_eq!(times(&db.search("coffee", 10).await.unwrap()), vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn search_folds_case_and_diacritics() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "Café LUNCH")).await.unwrap();
+        assert_eq!(db.search("cafe", 10).await.unwrap().len(), 1);
+        assert_eq!(db.search("lunch", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_treats_fts_syntax_as_text() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "say \"hi\" (now) AND NOT -x*"))
+            .await
+            .unwrap();
+        db.insert_message(&msg("alice", 2, "plain words")).await.unwrap();
+        assert_eq!(times(&db.search("\"hi\"", 10).await.unwrap()), vec![1]);
+        assert_eq!(times(&db.search("(now)", 10).await.unwrap()), vec![1]);
+        assert_eq!(times(&db.search("AND NOT", 10).await.unwrap()), vec![1]);
+        assert!(db.search("-x*", 10).await.is_ok());
+        assert!(db.search("\"", 10).await.unwrap().is_empty());
+        assert!(db.search("   ", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts_follows_body_updates_and_row_deletes() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "old words")).await.unwrap();
+        sqlx::query("UPDATE messages SET body = 'new words' WHERE author = 'alice' AND sent_at = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.search("old", 10).await.unwrap().is_empty());
+        assert_eq!(db.search("new", 10).await.unwrap().len(), 1);
+        sqlx::query("DELETE FROM messages").execute(&db.pool).await.unwrap();
+        db.insert_message(&msg("bob", 2, "fresh")).await.unwrap(); // may reuse the deleted rowid
+        assert!(db.search("new", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bad_rows_are_errors_not_panics() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
+        // Bypass the CHECK constraints the way a corrupt file could.
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE messages SET status = 9")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.messages("c:alice", None, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypted_file_reopens_with_key_and_rejects_wrong_or_missing_key() {
+        let f = TempDb::new("proj-enc");
+        let key = "ab".repeat(32);
+        {
+            let db = ProjectionDb::open(&f.url(), Some(&key)).await.unwrap();
+            alice(&db).await;
+        }
+        assert!(!std::fs::read(&f.0).unwrap().starts_with(b"SQLite format 3\0"));
+        let db = ProjectionDb::open(&f.url(), Some(&key)).await.unwrap();
+        assert_eq!(db.conversations().await.unwrap().len(), 1);
+        drop(db);
+        assert!(ProjectionDb::open(&f.url(), Some(&"cd".repeat(32))).await.is_err());
+        assert!(ProjectionDb::open(&f.url(), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_keys_are_rejected_before_creating_a_file() {
+        let f = TempDb::new("proj-badkey");
+        let quote_key = format!("{}'--", "a".repeat(60));
+        for bad in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+            quote_key,
+        ] {
+            let err = ProjectionDb::open(&f.url(), Some(&bad)).await.err().expect("must fail");
+            assert!(matches!(err, sqlx::Error::Configuration(_)), "{bad:?}: {err}");
+        }
+        assert!(!f.0.exists());
+    }
+}
