@@ -6,6 +6,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROFILE="${1:-release}"
+# Cargo reserves the profile name "debug" (it is "dev"), but its output directory is still debug/.
 DIR="$PROFILE"; [ "$PROFILE" = dev ] && DIR=debug
 [ "$PROFILE" = debug ] && PROFILE=dev
 cd "$ROOT/core"
@@ -16,7 +17,9 @@ rm -rf "$GEN" "$HDR" "$ROOT/app/Frameworks/SigCore.xcframework"
 mkdir -p "$GEN" "$HDR" "$ROOT/app/Frameworks"
 cargo run -q -p uniffi-bindgen -- generate --library "$LIB" --language swift --out-dir "$GEN"
 mv "$GEN"/*.h "$HDR/"
-mv "$GEN"/*.modulemap "$HDR/module.modulemap"
+maps=("$GEN"/*.modulemap)
+[ ${#maps[@]} -eq 1 ] || { echo "✗ expected one modulemap, got ${#maps[@]}" >&2; exit 1; }
+mv "${maps[0]}" "$HDR/module.modulemap"
 xcodebuild -create-xcframework -library "$LIB" -headers "$HDR" \
   -output "$ROOT/app/Frameworks/SigCore.xcframework" >/dev/null
 echo "built SigCore.xcframework ($DIR)"
