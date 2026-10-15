@@ -1,18 +1,48 @@
 import SwiftUI
+import UserNotifications
 
 @main
 struct SemaphoreApp: App {
     /// XCTest launches the app as its test host; it must not touch real data or the network then.
-    private let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    private let isTestHost: Bool
     /// One core per app (it locks the data folder), owned by the app so closing the window doesn't
     /// tear it down.
-    @State private var core = AppStore()
+    @State private var core: AppStore
+    /// Kept for the app's lifetime: Notification Center holds its delegate weakly.
+    private let notificationDelegate: NotificationDelegate?
+
+    init() {
+        let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        let core = AppStore(notifier: isTestHost ? nil : SystemNotifier())
+        self.isTestHost = isTestHost
+        _core = State(initialValue: core)
+        // set before launch finishes, so a click on a notification that launched the app arrives
+        notificationDelegate = isTestHost ? nil : NotificationDelegate(store: core)
+        if let notificationDelegate { UNUserNotificationCenter.current().delegate = notificationDelegate }
+    }
 
     var body: some Scene {
         Window("Semaphore", id: "main") {
             if isTestHost { EmptyView() } else { ContentView(core: core) }
         }
         .commands { ChatCommands(store: core) }
+        Settings { SettingsView() }
+    }
+}
+
+/// Preferences (⌘,).
+struct SettingsView: View {
+    @AppStorage(NotificationContent.key) private var content = NotificationContent.nameAndMessage
+
+    var body: some View {
+        Form {
+            Picker("Notification content", selection: $content) {
+                ForEach(NotificationContent.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.radioGroup)
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 

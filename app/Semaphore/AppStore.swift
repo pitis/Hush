@@ -33,6 +33,10 @@ final class AppStore {
         didSet {
             badge = ChatList.badge(conversations)
             NSApp?.dockTile.badgeLabel = badge
+            // a chat read here or on the phone takes its message notifications with it
+            for c in conversations where c.unreadCount == 0 && notified[c.id] == true {
+                removeNotifications(c.id)
+            }
         }
     }
     /// The dock badge: total unread.
@@ -49,6 +53,11 @@ final class AppStore {
     private(set) var composerWantsFocus = false
     /// Chats whose mark-read call is in flight.
     private var markingRead: Set<String> = []
+    /// Chats with notifications showing; true if any is for a message (reactions don't count as
+    /// unread, so those go away when the chat is opened).
+    private var notified: [String: Bool] = [:]
+    private let notifier: Notifier?
+    private let isAppActive: @MainActor () -> Bool
     private(set) var log: [LogLine] = []
     private(set) var lastError: String?
     private(set) var selectedId: String?
@@ -81,8 +90,19 @@ final class AppStore {
     private var refreshing = false
     private var refreshAgain = false
 
-    init(open: @escaping Opener = AppStore.openReal) {
+    init(
+        open: @escaping Opener = AppStore.openReal, notifier: Notifier? = nil,
+        isAppActive: @escaping @MainActor () -> Bool = { AppStore.appIsActive() }
+    ) {
         self.open = open
+        self.notifier = notifier
+        self.isAppActive = isAppActive
+    }
+
+    /// In front with the window on screen: then the chat list shows what's new, and notifications
+    /// stay quiet (as in Signal Desktop).
+    static func appIsActive() -> Bool {
+        NSApp.isActive && (NSApp.keyWindow?.occlusionState.contains(.visible) ?? false)
     }
 
     /// `~/Library/Application Support/Semaphore`. Changing it orphans the user's data.
@@ -108,6 +128,7 @@ final class AppStore {
             self.client = client
             if client.isLinked() {
                 ownAci = client.ownAci()
+                notifier?.authorize()
                 screen = .chats
                 try client.start()
                 refreshConversations()
@@ -138,6 +159,7 @@ final class AppStore {
         case .linked:
             Self.logger.notice("linked")
             ownAci = client?.ownAci()
+            notifier?.authorize()
             linkURL = nil
             lastError = nil
             screen = .chats
@@ -162,6 +184,10 @@ final class AppStore {
                 changedKeys.insert(key)
                 reloadMessages()
             }
+        case .newMessage(let conversationId, let key):
+            Task { await notify(conversationId, about: key, reaction: nil) }
+        case .newReaction(let conversationId, let target, let reactor, let emoji):
+            Task { await notify(conversationId, about: target, reaction: (reactor, emoji)) }
         case .typing(let conversationId, let who, let started):
             setTyping(conversationId, who: who, until: started ? now.addingTimeInterval(Self.typingTimeout) : nil)
         case .error(let message):
@@ -177,6 +203,7 @@ final class AppStore {
     /// Opens a conversation and loads its newest page.
     func select(_ id: String?) {
         guard id != selectedId else { return }
+        if let id { removeNotifications(id) }
         selectedId = id
         selectionGeneration += 1
         messages = []
@@ -266,6 +293,75 @@ final class AppStore {
         select(id)
         searchQuery = ""
         focusComposer()
+    }
+
+    // MARK: Notifications
+
+    /// Shows a notification for a new message, or for `reaction` to our message `key`, unless the
+    /// app is in front or notifications are off.
+    private func notify(_ conversationId: String, about key: MessageKey, reaction: (reactor: String, emoji: String)?)
+        async
+    {
+        guard let notifier, let client, !isAppActive() else { return }
+        let setting = NotificationContent.current()
+        guard setting != .off else { return }
+        do {
+            guard let m = try await client.message(key: key), !m.deleted else { return }
+            let author = reaction?.reactor ?? m.author
+            await loadName(author)
+            let groupTitle =
+                conversationId.hasPrefix("g:") ? try await client.title(conversationId: conversationId) ?? "Group" : nil
+            guard
+                let request = Notifications.request(
+                    setting: setting, conversationId: conversationId,
+                    id: "\(conversationId)|\(author)|\(key.sentAt)|\(reaction?.emoji ?? "")",
+                    sender: senderName(author), groupTitle: groupTitle, text: m.body, reaction: reaction?.emoji)
+            else { return }
+            notifier.post(request)
+            notified[conversationId] = notified[conversationId] == true || reaction == nil
+        } catch { append("notification failed: \(error)") }
+    }
+
+    private func removeNotifications(_ conversationId: String) {
+        notified[conversationId] = nil
+        notifier?.remove(conversationId: conversationId)
+    }
+
+    /// A click on a notification: brings up its chat, ready to type.
+    func openFromNotification(conversationId: String) async {
+        guard await ready() else { return }
+        select(conversationId)
+        focusComposer()
+        NSApp?.activate()
+    }
+
+    /// Reply typed into a notification: sends it and marks the chat read (the reply shows it was).
+    func replyFromNotification(conversationId: String, text: String) async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, await ready(), let client else { return }
+        do {
+            _ = try await client.sendText(conversationId: conversationId, body: body, quote: nil)
+            markRead(conversationId)
+        } catch {
+            lastError = "Your reply couldn't be sent: \(Self.describe(error))"
+            append("reply failed: \(error)")
+        }
+    }
+
+    func markReadFromNotification(conversationId: String) async {
+        guard await ready() else { return }
+        markRead(conversationId)
+        removeNotifications(conversationId)
+    }
+
+    /// Waits (up to 10 s) for the core to be open and linked: a click on a notification can
+    /// launch the app.
+    private func ready() async -> Bool {
+        for _ in 0..<100 {
+            if client != nil, screen == .chats { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return false
     }
 
     func focusSearch() { searchFocusRequest += 1 }
