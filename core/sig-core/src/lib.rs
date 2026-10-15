@@ -1,5 +1,7 @@
 uniffi::setup_scaffolding!();
 
+pub mod projection;
+
 /// Version of the Rust core, shown in the app's About panel.
 #[uniffi::export]
 pub fn core_version() -> String {

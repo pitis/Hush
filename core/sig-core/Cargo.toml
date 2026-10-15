@@ -11,3 +11,8 @@ crate-type = ["staticlib", "lib"]
 uniffi = { workspace = true }
 presage = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
+tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["rt", "macros"] }

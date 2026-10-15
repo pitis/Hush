@@ -3077,6 +3077,8 @@ version = "0.1.0"
 dependencies = [
  "presage",
  "presage-store-sqlite",
+ "sqlx",
+ "tokio",
  "uniffi",
 ]
 
