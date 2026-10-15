@@ -43,7 +43,6 @@ struct SemaphoreApp: App {
         }
         .commands { ChatCommands(store: core) }
         Window("Core Log", id: "core-log") { CoreLogView(store: core) }
-        // not in the test host: a menu bar extra keeps XCTest from attaching to it
         Settings { SettingsView(store: core) }
     }
 }
@@ -67,15 +66,20 @@ struct SettingsView: View {
             .pickerStyle(.radioGroup)
             Toggle("Open at login", isOn: $openAtLogin)
                 .onChange(of: openAtLogin) { _, on in
-                    do { try LoginItem.set(on) } catch {
-                        loginItemError = error.localizedDescription
+                    // putting the toggle back after a failure changes it again: nothing to do then
+                    guard on != LoginItem.isEnabled else { return }
+                    do {
+                        try LoginItem.set(on)
+                        loginItemError =
+                            LoginItem.needsApproval
+                            ? "Allow Semaphore in System Settings ▸ General ▸ Login Items." : nil
+                    } catch {
+                        loginItemError = "Couldn't change the login item: \(error.localizedDescription)"
                         openAtLogin = LoginItem.isEnabled
                     }
                 }
             Toggle("Show in menu bar", isOn: $showInMenuBar)
-            if let loginItemError {
-                Text("Couldn't change the login item: \(loginItemError)").font(.caption).foregroundStyle(.secondary)
-            }
+            if let loginItemError { Text(loginItemError).font(.caption).foregroundStyle(.secondary) }
             if store.screen == .chats {
                 Divider()
                 LabeledContent("Linked device") {
@@ -161,6 +165,8 @@ struct ChatCommands: Commands {
 /// Opening Semaphore at login (System Settings ▸ General ▸ Login Items lists it).
 enum LoginItem {
     static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+    /// Registered, but macOS waits for the user to allow it.
+    static var needsApproval: Bool { SMAppService.mainApp.status == .requiresApproval }
 
     static func set(_ on: Bool) throws {
         if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }

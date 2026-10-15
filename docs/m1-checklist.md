@@ -1,5 +1,7 @@
 # M1 sign-off: Semaphore next to Signal Desktop
 
+**Merge #42 before the week starts:** it fixes message loss on reconnect and unlinking from #41.
+
 Run both side by side for a week (#17). For each row, do the check in Semaphore and compare
 with Signal Desktop. `make release` installs the app; `make perf` measures the budget.
 
@@ -12,7 +14,7 @@ Legend: ✅ built (the PR that did it) · ◐ partly · ✗ not in M1 (where it 
 | Link as a secondary device with a QR code | ✅ #27, #28 | Fresh install → scan → chats appear |
 | Contact and group names | ✅ #26 | Names match the phone |
 | Connection banner (Connecting / Offline + Retry) | ✅ #41 | Wi-Fi off → banner; Retry |
-| Reconnect when the network returns (< 3 s) | ✅ #41, #42 | Wi-Fi off/on, time the banner |
+| Reconnect when the network returns (< 3 s) | ✅ #41 + #42 | Wi-Fi off/on, time the banner |
 | Removed on the phone → link again without restarting | ✅ #41, #42 | Phone ▸ Linked devices ▸ remove → Link Again |
 | Unlink this Mac (Settings) | ✅ #41 | Settings ▸ Unlink This Mac… |
 | Undecryptable message notice + session reset | ✅ #41, #42 | — (rare; seen after session problems) |
@@ -39,8 +41,8 @@ Legend: ✅ built (the PR that did it) · ◐ partly · ✗ not in M1 (where it 
 | Send text, 1:1 and groups, with pending/sent/delivered/read ticks | ✅ #29, #33 | Send both ways |
 | Failed send with Retry | ✅ #29 | Send offline |
 | Reply (quote) | ✅ #29, #31 | Context menu ▸ Reply |
-| Reactions in and out | ◐ #25, #33 | Shown and sent by the core; **no reaction picker in the app yet** |
-| Edit and delete for everyone, in and out | ◐ #25, #33 | Shown; **no Edit/Delete menu in the app yet** |
+| Reactions in and out | ◐ #25, #33 → #43 | Shown and sent by the core; **no reaction picker in the app yet (#43)** |
+| Edit and delete for everyone, in and out | ◐ #25, #33 → #43 | Shown; **no Edit/Delete menu in the app yet (#43)** |
 | Day separators, grouping, "edited", deleted | ✅ #31 | |
 | Stickers, shared contacts, payments, polls | ✗ (#24, needs decision) | They don't show at all |
 | Disappearing messages | ✗ (#24, needs decision) | Timer is ignored |
@@ -66,8 +68,8 @@ Legend: ✅ built (the PR that did it) · ◐ partly · ✗ not in M1 (where it 
 | Notifications with Reply and Mark as Read; content setting | ✅ #36 | App in background, receive |
 | No burst of notifications after being offline | ✅ #36 | Offline 1 h, reconnect |
 | Reaction notifications | ✅ #36 | React to your message from the phone |
-| Keeps running with the window closed; menu bar item with unread | ✅ #17 | Close the window; menu bar |
-| Open at login | ✅ #17 | Settings ▸ Open at login |
+| Keeps running with the window closed; menu bar item with unread | ✅ #44 | Close the window; dock click and the menu bar reopen it |
+| Open at login | ✅ #44 | Settings ▸ Open at login |
 | Core Log window | ✅ #41 | Window ▸ Core Log |
 | Calls | ✗ M3 (#19) | |
 

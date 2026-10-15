@@ -32,7 +32,8 @@ release: ## Build the Release app (release core: thin LTO, stripped) and install
 	scripts/build-core.sh release
 	cd app && xcodegen -q
 	$(XCB) -configuration Release build -quiet 2>&1 | $(XCB_FILTER)
-	@pkill -x Semaphore && sleep 1 || true
+	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; sleep 1
+	rm -rf /Applications/Semaphore.app
 	ditto build/Build/Products/Release/Semaphore.app /Applications/Semaphore.app
 	@echo "✓ /Applications/Semaphore.app"
 
