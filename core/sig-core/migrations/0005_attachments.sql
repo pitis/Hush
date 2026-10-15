@@ -1,8 +1,9 @@
 -- Files of messages. `position` orders them within the message; -1 is the link preview's image.
 -- `pointer` is the encoded AttachmentPointer to download from (NULL for our own until uploaded).
--- `file` is the file's name in the attachments folder once it is there.
+-- `file` is the file's name in the attachments folder once it is there (the id: AUTOINCREMENT,
+-- so a deleted attachment's id, and file name, is never given to another).
 CREATE TABLE attachments (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   message_author TEXT NOT NULL,
   message_sent_at INTEGER NOT NULL,
   position INTEGER NOT NULL,

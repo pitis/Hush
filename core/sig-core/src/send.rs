@@ -497,16 +497,13 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
 /// An upload that takes longer is given up (the message is Failed; retry uploads again).
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Uploads a message's stored files, in order.
+/// Uploads a message's stored files, in order, one at a time (only one is in memory at once).
 async fn upload(
     m: &Manager<SqliteStore, Registered>,
     db: &ProjectionDb,
     ids: &[i64],
 ) -> Result<Vec<AttachmentPointer>, String> {
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
-    let mut files = vec![];
+    let mut pointers = vec![];
     for &id in ids {
         let a = db
             .attachment(id)
@@ -530,13 +527,14 @@ async fn upload(
             caption: None,
             blur_hash: None,
         };
-        files.push((spec, bytes));
+        let pointer = tokio::time::timeout(UPLOAD_TIMEOUT, Box::pin(m.upload_attachment(spec, bytes)))
+            .await
+            .map_err(|_| "timed out".to_string())?
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        pointers.push(pointer);
     }
-    let uploaded = tokio::time::timeout(UPLOAD_TIMEOUT, Box::pin(m.upload_attachments(files)))
-        .await
-        .map_err(|_| "timed out".to_string())?
-        .map_err(|e| e.to_string())?;
-    uploaded.into_iter().map(|r| r.map_err(|e| e.to_string())).collect()
+    Ok(pointers)
 }
 
 fn now_ms() -> u64 {

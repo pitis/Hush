@@ -25,7 +25,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::download::{downloader, Download};
+use crate::download::{downloader, Download, Downloads};
 use crate::error::CoreError;
 use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
@@ -200,7 +200,8 @@ async fn run(
     let mut sending = false;
     // Downloads queue here until receiving starts.
     let (download_tx, download_rx) = mpsc::unbounded_channel::<Download>();
-    let mut download_rx = Some(download_rx);
+    let downloads: Downloads = Rc::new(RefCell::new(download_rx));
+    let mut downloading = false;
     let queues = Queues {
         sends: send_tx.clone(),
         downloads: download_tx.clone(),
@@ -268,8 +269,14 @@ async fn run(
                             caught_up_rx.clone(),
                         ));
                     }
-                    if let Some(rx) = download_rx.take() {
-                        tokio::task::spawn_local(downloader(m.clone(), projection.clone(), listener.clone(), rx));
+                    if !downloading {
+                        downloading = true;
+                        tokio::task::spawn_local(supervise_downloader(
+                            m.clone(),
+                            projection.clone(),
+                            listener.clone(),
+                            downloads.clone(),
+                        ));
                         let _ = download_tx.send(Download::Auto);
                     }
                     let task = tokio::task::spawn_local(Box::pin(receive_loop(
@@ -407,6 +414,37 @@ async fn supervise_sender(
                     for (conversation_id, key) in failed {
                         l.on_event(CoreEvent::MessageChanged { conversation_id, key });
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Runs the downloader and restarts it if it panics: queued downloads stay queued, and the one in
+/// flight starts over.
+async fn supervise_downloader(
+    m: Manager<SqliteStore, Registered>,
+    db: ProjectionDb,
+    l: Arc<dyn EventListener>,
+    downloads: Downloads,
+) {
+    loop {
+        let task = tokio::task::spawn_local(Box::pin(downloader(
+            m.clone(),
+            db.clone(),
+            l.clone(),
+            downloads.clone(),
+        )));
+        match task.await {
+            Ok(()) => return,
+            Err(e) => {
+                l.on_event(CoreEvent::Error {
+                    message: format!("downloading stopped unexpectedly: {e}"),
+                });
+                if let Err(e) = db.reset_downloads().await {
+                    l.on_event(CoreEvent::Error {
+                        message: format!("checking unfinished downloads failed: {e}"),
+                    });
                 }
             }
         }

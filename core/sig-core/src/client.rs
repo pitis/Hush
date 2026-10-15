@@ -8,14 +8,13 @@ use tokio::sync::mpsc;
 use crate::actor::{self, Command};
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
+use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
     Attachment, Conversation, LinkPreview, Message, MessageKey, MessageStatus, OutgoingFile, ProjectionDb, Quote,
     Reaction,
 };
 use crate::send::{self, Job, SendJob};
 
-/// Signal's limit for one attachment.
-pub const MAX_ATTACHMENT: u64 = 100 * 1024 * 1024;
 /// Signal's limit for attachments in one message.
 const MAX_ATTACHMENTS: usize = 32;
 
@@ -137,10 +136,6 @@ impl Client {
         self.send(Command::Start)
     }
 
-    /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
-    /// the chat). Call it on every change of the field; typing stops by itself after `TYPING_IDLE`
-    /// (10 s) without one. Nothing is sent in Note to Self, or unless the account's typing indicators
-    /// setting is on.
     /// Downloads an attachment that didn't download by itself (or failed). Reported through
     /// `AttachmentChanged`.
     pub fn download_attachment(&self, id: i64) -> Result<(), CoreError> {
@@ -150,6 +145,10 @@ impl Client {
         self.send(Command::Download(id))
     }
 
+    /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
+    /// the chat). Call it on every change of the field; typing stops by itself after `TYPING_IDLE`
+    /// (10 s) without one. Nothing is sent in Note to Self, or unless the account's typing indicators
+    /// setting is on.
     pub fn set_typing(&self, conversation_id: String, started: bool) -> Result<(), CoreError> {
         if !self.is_linked() {
             return Err(CoreError::NotLinked);

@@ -40,6 +40,9 @@ pub struct ProjectionDb {
     files: Option<PathBuf>,
 }
 
+/// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
+pub const MAX_ATTACHMENT: u64 = 100 * 1024 * 1024;
+
 /// Images and voice notes up to this size download as they arrive; anything else on request.
 pub const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
@@ -109,28 +112,42 @@ impl ProjectionDb {
             .files
             .clone()
             .ok_or_else(|| sqlx::Error::Configuration("no attachments folder".into()))?;
-        std::fs::create_dir_all(&dir)?;
+        // Copies can be slow (large files, files still in iCloud): made before the transaction,
+        // off the async threads, so the one database connection isn't held meanwhile.
+        let sources: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        let (copy_dir, sent_at) = (dir.clone(), m.sent_at);
+        let staged = tokio::task::spawn_blocking(move || stage_copies(&copy_dir, sent_at, &sources))
+            .await
+            .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))??;
+        let mut names: Vec<String> = staged.iter().map(|(name, _)| name.clone()).collect();
         let mut tx = self.pool.begin().await?;
-        if !insert_message_in(&mut tx, m).await? {
-            return Ok(false);
-        }
-        let mut copied = vec![];
-        let mut result = Ok(());
-        for (f, position) in files.iter().zip(0i64..) {
-            result = add_outgoing_file(&mut tx, m, f, position, &dir, &mut copied).await;
-            if result.is_err() {
-                break;
+        let result = async {
+            if !insert_message_in(&mut tx, m).await? {
+                return Ok(false);
             }
+            for (i, f) in files.iter().enumerate() {
+                let id = add_outgoing_file(&mut tx, m, f, i as i64, staged[i].1).await?;
+                let file = id.to_string();
+                std::fs::rename(dir.join(&names[i]), dir.join(&file))?;
+                names[i] = file.clone();
+                sqlx::query("UPDATE attachments SET file = ?2 WHERE id = ?1")
+                    .bind(id)
+                    .bind(&file)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Ok::<_, sqlx::Error>(true)
         }
+        .await;
         match result {
-            Ok(()) => {
+            Ok(true) => {
                 tx.commit().await?;
                 Ok(true)
             }
-            Err(e) => {
+            other => {
                 drop(tx); // rolled back: the message isn't stored either
-                self.remove_files(&copied);
-                Err(e)
+                self.remove_files(&names);
+                other
             }
         }
     }
@@ -616,17 +633,21 @@ impl ProjectionDb {
     }
 
     /// Pending (or Failed, tried again) → Downloading. Returns the attachment's conversation,
-    /// message and encoded pointer, or None if there is nothing to download.
+    /// message and encoded pointer, or None if there is nothing to download. Files declared
+    /// larger than `MAX_ATTACHMENT` (or of unknown size) are never fetched: the whole download
+    /// is held in memory.
     pub async fn start_download(&self, id: i64) -> Result<Option<(String, MessageKey, Vec<u8>)>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, i64, Vec<u8>)> = sqlx::query_as(
             "UPDATE attachments SET state = ?2 WHERE id = ?1 AND state IN (?3, ?4) AND pointer IS NOT NULL
+               AND size BETWEEN 1 AND ?5
              RETURNING message_author, message_sent_at, pointer",
         )
         .bind(id)
         .bind(AttachmentState::Downloading.to_i64())
         .bind(AttachmentState::Pending.to_i64())
         .bind(AttachmentState::Failed.to_i64())
+        .bind(MAX_ATTACHMENT as i64)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((author, sent_at, pointer)) = row else {
@@ -646,12 +667,25 @@ impl ProjectionDb {
         data: Result<Vec<u8>, String>,
     ) -> Result<Option<(String, MessageKey)>, sqlx::Error> {
         let file = id.to_string();
-        let written = data.and_then(|bytes| {
-            let dir = self.files.as_ref().ok_or("no attachments folder")?;
-            std::fs::create_dir_all(dir)
-                .and_then(|_| std::fs::write(dir.join(&file), bytes))
+        // the file is named by the id, which is never reused (AUTOINCREMENT): it is this
+        // attachment's own, even if its message was deleted meanwhile
+        let written = match (data, self.files.clone()) {
+            (Ok(bytes), Some(dir)) => {
+                let path = dir.join(&file);
+                let wrote = tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(path, bytes))
+                })
+                .await
                 .map_err(|e| e.to_string())
-        });
+                .and_then(|r| r.map_err(|e| e.to_string()));
+                if let Err(e) = &wrote {
+                    tracing::warn!(id, error = %e, "storing a downloaded attachment failed");
+                }
+                wrote
+            }
+            (Ok(_), None) => Err("no attachments folder".to_string()),
+            (Err(e), _) => Err(e),
+        };
         let (state, file) = match &written {
             Ok(()) => (AttachmentState::Ready, Some(file)),
             Err(_) => (AttachmentState::Failed, None),
@@ -691,8 +725,11 @@ impl ProjectionDb {
     fn remove_files(&self, files: &[String]) {
         if let Some(dir) = &self.files {
             for f in files {
-                if let Err(e) = std::fs::remove_file(dir.join(f)) {
-                    tracing::warn!(file = %f, error = %e, "removing an attachment file failed");
+                match std::fs::remove_file(dir.join(f)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        tracing::warn!(file = %f, error = %e, "removing an attachment file failed")
+                    }
+                    _ => {}
                 }
             }
         }
@@ -857,18 +894,38 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     Ok(inserted)
 }
 
-/// Stores one of our files: its row, and a copy named by its id in `dir` (noted in `copied`).
+/// Copies files into `dir` under temporary names; all or none. Returns each name and size.
+fn stage_copies(dir: &std::path::Path, sent_at: i64, sources: &[String]) -> std::io::Result<Vec<(String, u64)>> {
+    std::fs::create_dir_all(dir)?;
+    let mut staged = vec![];
+    for (i, source) in sources.iter().enumerate() {
+        let name = format!("{sent_at}-{i}.part");
+        match std::fs::copy(source, dir.join(&name)) {
+            Ok(size) => staged.push((name, size)),
+            Err(e) => {
+                let _ = std::fs::remove_file(dir.join(&name));
+                for (n, _) in &staged {
+                    let _ = std::fs::remove_file(dir.join(n));
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(staged)
+}
+
+/// The row of one of our files (Ready, its copy named by the returned id once renamed).
 async fn add_outgoing_file(
     conn: &mut SqliteConnection,
     m: &Message,
     f: &OutgoingFile,
     position: i64,
-    dir: &std::path::Path,
-    copied: &mut Vec<String>,
-) -> Result<(), sqlx::Error> {
-    let source = std::path::Path::new(&f.path);
-    let size = std::fs::metadata(source)?.len();
-    let id: i64 = sqlx::query_scalar(
+    size: u64,
+) -> Result<i64, sqlx::Error> {
+    let name = std::path::Path::new(&f.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    sqlx::query_scalar(
         "INSERT INTO attachments(message_author, message_sent_at, position, content_type, file_name, size,
            width, height, is_voice_note, state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) RETURNING id",
@@ -877,23 +934,14 @@ async fn add_outgoing_file(
     .bind(m.sent_at)
     .bind(position)
     .bind(&f.content_type)
-    .bind(source.file_name().map(|n| n.to_string_lossy().into_owned()))
+    .bind(name)
     .bind(size as i64)
     .bind(f.width)
     .bind(f.height)
     .bind(f.is_voice_note)
     .bind(AttachmentState::Ready.to_i64())
     .fetch_one(&mut *conn)
-    .await?;
-    let file = id.to_string();
-    std::fs::copy(source, dir.join(&file))?;
-    copied.push(file.clone());
-    sqlx::query("UPDATE attachments SET file = ?2 WHERE id = ?1")
-        .bind(id)
-        .bind(&file)
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
+    .await
 }
 
 /// Applies ops that arrived before this (just inserted) message.
@@ -2244,5 +2292,98 @@ mod tests {
         db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
         assert!(db.attachments(&k("alice", 1)).await.unwrap().is_empty());
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn ids_of_deleted_attachments_are_never_reused() {
+        // a download finishing for a deleted attachment must not land on another one's file
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
+        db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        let old = db.attachments(&k("alice", 1)).await.unwrap()[0].id;
+        db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
+        db.insert_message(&msg("alice", 2, "y")).await.unwrap();
+        db.apply(&add(k("alice", 2), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        assert_ne!(db.attachments(&k("alice", 2)).await.unwrap()[0].id, old);
+    }
+
+    #[tokio::test]
+    async fn files_too_big_or_of_unknown_size_never_download() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
+        db.apply(&add(
+            k("alice", 1),
+            vec![
+                new_attachment("application/zip", MAX_ATTACHMENT + 1, false),
+                new_attachment("application/zip", 0, false),
+                new_attachment("application/zip", MAX_ATTACHMENT, false),
+            ],
+            None,
+        ))
+        .await
+        .unwrap();
+        let ids: Vec<i64> = db
+            .attachments(&k("alice", 1))
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert!(db.start_download(ids[0]).await.unwrap().is_none());
+        assert!(db.start_download(ids[1]).await.unwrap().is_none());
+        assert!(db.start_download(ids[2]).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_download_finishing_after_its_message_was_deleted_leaves_no_file() {
+        let files = TempFiles::new("late");
+        let db = db().await.with_files(files.0.clone());
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
+        db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        let id = db.attachments(&k("alice", 1)).await.unwrap()[0].id;
+        db.start_download(id).await.unwrap().unwrap();
+        db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
+        assert_eq!(db.finish_download(id, Ok(b"late".to_vec())).await.unwrap(), None);
+        assert!(!files.0.join(id.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_file_vanished_stores_nothing() {
+        let files = TempFiles::new("rollback");
+        let src = TempFiles::new("rollback-src");
+        std::fs::create_dir_all(&src.0).unwrap();
+        let first = src.0.join("first.jpg");
+        std::fs::write(&first, b"1").unwrap();
+        let db = db().await.with_files(files.0.clone());
+        let mine = Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            body: None,
+            ..msg("me", 5, "")
+        };
+        let file = |path: &std::path::Path| OutgoingFile {
+            path: path.to_string_lossy().into(),
+            content_type: "image/jpeg".into(),
+            width: None,
+            height: None,
+            is_voice_note: false,
+        };
+        let result = db
+            .insert_outgoing(&mine, &[file(&first), file(&src.0.join("gone.jpg"))])
+            .await;
+        assert!(result.is_err());
+        assert!(db.message(&k("me", 5)).await.unwrap().is_none());
+        assert_eq!(std::fs::read_dir(&files.0).unwrap().count(), 0, "no copies left behind");
+        // and with the file there, everything is stored
+        assert!(db.insert_outgoing(&mine, &[file(&first)]).await.unwrap());
+        let stored = db.attachments(&k("me", 5)).await.unwrap();
+        assert_eq!((stored.len(), stored[0].size), (1, 1));
+        assert_eq!(std::fs::read(stored[0].path.as_ref().unwrap()).unwrap(), b"1");
     }
 }
