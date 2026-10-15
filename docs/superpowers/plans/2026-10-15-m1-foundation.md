@@ -757,13 +757,18 @@ Note: for a 1:1 *incoming* message, `Thread::try_from` returns `Contact(sender)`
 
 ### Task 4: Projector + DB — reactions, edits, deletes, receipts, typing, and `apply`
 
-> **As built (PR for #4):**
-> - **Ops:** `React { target: MessageKey, reactor, emoji: Option }`, `Edit { target, new_body, edited_at }`, `Delete { target }`, `SetStatus { targets: Vec<MessageKey>, status }` (receipts, plus the phone's read sync `SyncMessage.read`, which clears unread here too), and `Typing`.
-> - **Apply:** `ProjectionDb::apply(&Op) -> Vec<Applied>` with `Applied::{MessageChanged { conversation_id, key }, Typing { .. }}`. Each op is one transaction and calls `refresh_summary`.
-> - **Edits:** ordered by `edited_at` (migration 0002), so an older edit arriving late is ignored.
-> - **Reactions:** stored even before their message arrives.
-> - **Deletes:** clear the body, quote text and reactions.
-> - **Ignored:** story reactions, and typing in groups.
+> **As built (PR #25, after review):**
+> - **Ops:** `React { target: MessageKey, reactor, emoji: Option }`, `Edit { target, new_body, edited_at }`, `Delete { target }`, `SetStatus { targets: Vec<MessageKey>, status }` (receipts, plus the phone's read sync `SyncMessage.read`), and `Typing` (conversation from `direct_id`).
+> - **Apply:** `ProjectionDb::apply(&Op) -> Vec<Applied>` with `Applied::{MessageChanged { conversation_id, key }, Typing { .. }}`. Each op is one transaction. Every op that changes a `messages` row calls `refresh_summary`; reactions don't affect the summary. A repeated op reports no change.
+> - **Targets may name an edit revision:** Signal clients address an edited message by its latest revision's timestamp. Migration 0002 adds `message_revisions`, and every op resolves its target through it. Edits are ordered by `edited_at`.
+> - **Ops arriving before their message:**
+>   - a delete is remembered (`pending_deletes`) and the message is stored already deleted;
+>   - read state is remembered (`pending_status`);
+>   - a reaction is stored anyway;
+>   - an edit is dropped (rare).
+> - **Delete** clears the body, quote text, reactions and other messages' quotes of it. Reactions on deleted messages are dropped.
+> - **Ignored:** story reactions, typing in groups, and **admin deletes** (`DataMessage.adminDelete`). Admin deletes need group admin state to verify the sender (later ticket).
+> - **Receipts** aren't scoped to the sender's conversation. Accepted for M1: a receipt needs the exact ms timestamp, and it matches Desktop's "highest status" display in groups.
 > - **Read paths:** `message(&MessageKey)` and `reactions(&MessageKey)`.
 
 **Files:**
