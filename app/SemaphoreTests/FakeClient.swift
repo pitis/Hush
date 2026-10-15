@@ -75,8 +75,28 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
 
     func title(conversationId: String) async throws -> String? { titles[conversationId] }
 
+    private(set) var messageCalls: [(conversationId: String, before: MessageKey?)] = []
+    /// When set, `messages()` for this conversation waits for `releaseMessages()` first.
+    var holdMessagesFor: String?
+    private var heldMessages: CheckedContinuation<Void, Never>?
+    var isHoldingMessages: Bool { lock.withLock { heldMessages != nil } }
+
+    func releaseMessages() {
+        let c = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            defer { heldMessages = nil }
+            return heldMessages
+        }
+        c?.resume()
+    }
+
     func messages(conversationId: String, before: MessageKey?, limit: UInt32) async throws -> [Message] {
-        messageAnswers[conversationId] ?? []
+        lock.withLock { messageCalls.append((conversationId, before)) }
+        if conversationId == holdMessagesFor {
+            await withCheckedContinuation { c in lock.withLock { heldMessages = c } }
+        }
+        let all = lock.withLock { messageAnswers[conversationId] ?? [] }
+        let older = before.map { b in all.filter { ($0.sentAt, $0.author) < (b.sentAt, b.author) } } ?? all
+        return Array(older.suffix(Int(limit)))
     }
     func reactions(key: MessageKey) async throws -> [Reaction] { [] }
     func search(query: String, limit: UInt32) async throws -> [Message] { [] }
@@ -107,4 +127,11 @@ func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     XCTFail("condition not met in time", file: file, line: line)
+}
+
+func message(_ conv: String, _ author: String, _ sentAt: Int64, _ body: String = "x", outgoing: Bool = false) -> Message
+{
+    Message(
+        conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, isOutgoing: outgoing,
+        status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil)
 }

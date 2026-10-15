@@ -6,7 +6,7 @@ struct SemaphoreApp: App {
     private let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     /// One core per app (it locks the data folder), owned by the app so closing the window doesn't
     /// tear it down.
-    @State private var core = CoreBridge()
+    @State private var core = AppStore()
 
     var body: some Scene {
         Window("Semaphore", id: "main") {

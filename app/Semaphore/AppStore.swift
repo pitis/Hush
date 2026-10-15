@@ -2,9 +2,10 @@ import Foundation
 import OSLog
 import Observation
 
-/// App-side state fed by core events. Plan 2 grows this into the full app store.
+/// The app's state: linking, the conversation list, the open conversation and its messages.
+/// Fed by core events; every query result is checked against the current selection.
 @MainActor @Observable
-final class CoreBridge {
+final class AppStore {
     enum Screen: Equatable {
         case starting, link, chats
         case failed(String)
@@ -19,6 +20,8 @@ final class CoreBridge {
     typealias Opener = @Sendable (EventListener) throws -> any ClientProtocol
 
     static let logLimit = 200
+    static let pageSize: UInt32 = 100
+    static let typingTimeout: TimeInterval = 15
     static let deviceName = "Semaphore"
     /// App state for Console.app (subsystem dev.pitis.semaphore). Never URLs or message content.
     private static let logger = Logger(subsystem: "dev.pitis.semaphore", category: "app")
@@ -29,6 +32,18 @@ final class CoreBridge {
     private(set) var conversations: [Conversation] = []
     private(set) var log: [LogLine] = []
     private(set) var lastError: String?
+    private(set) var selectedId: String?
+    /// The open conversation's loaded messages, oldest first.
+    private(set) var messages: [Message] = []
+    private(set) var hasOlder = false
+    private(set) var reactions: [MessageKey: [Reaction]] = [:]
+    var replyTo: Message?
+    private var typingUntil: [String: Date] = [:]
+    private var senderNames: [String: String] = [:]
+    private var selectionGeneration = 0
+    /// The selection generation the in-flight messages load belongs to, if any.
+    private var loadingGeneration: Int?
+    private var reloadMessagesAgain = false
 
     private let open: Opener
     private var client: (any ClientProtocol)?
@@ -37,7 +52,7 @@ final class CoreBridge {
     private var refreshing = false
     private var refreshAgain = false
 
-    init(open: @escaping Opener = CoreBridge.openReal) {
+    init(open: @escaping Opener = AppStore.openReal) {
         self.open = open
     }
 
@@ -83,7 +98,7 @@ final class CoreBridge {
         do { try client.link(deviceName: Self.deviceName) } catch { lastError = Self.describe(error) }
     }
 
-    func handle(_ event: CoreEvent) {
+    func handle(_ event: CoreEvent, now: Date = .now) {
         switch event {
         case .linkUrl(let url):
             Self.logger.notice("link code ready")
@@ -112,13 +127,121 @@ final class CoreBridge {
         case .messageChanged(let conversationId, let key):
             append("message \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
             refreshConversations()
+            if conversationId == selectedId { reloadMessages() }
         case .typing(let conversationId, _, let started):
-            append("typing \(conversationId) \(started ? "started" : "stopped")")
+            typingUntil[conversationId] = started ? now.addingTimeInterval(Self.typingTimeout) : nil
         case .error(let message):
             // error text can mention ids or numbers: keep it out of the system log
             Self.logger.error("core error: \(message, privacy: .private)")
             lastError = message
             append("error: \(message)")
+        }
+    }
+
+    // MARK: Open conversation
+
+    /// Opens a conversation and loads its newest page.
+    func select(_ id: String?) {
+        guard id != selectedId else { return }
+        selectedId = id
+        selectionGeneration += 1
+        messages = []
+        reactions = [:]
+        hasOlder = false
+        replyTo = nil
+        reloadMessages()
+    }
+
+    /// Prepends the page before the oldest loaded message.
+    func loadOlder() async {
+        guard let client, let id = selectedId, hasOlder, let oldest = messages.first else { return }
+        let generation = selectionGeneration
+        do {
+            let page = try await client.messages(
+                conversationId: id, before: MessageKey(author: oldest.author, sentAt: oldest.sentAt),
+                limit: Self.pageSize)
+            guard generation == selectionGeneration else { return }
+            messages.insert(contentsOf: page, at: 0)
+            hasOlder = page.count == Int(Self.pageSize)
+            await loadDetails(for: page, generation: generation)
+        } catch { append("query failed: \(error)") }
+    }
+
+    func send(_ text: String) async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let client, let id = selectedId, !body.isEmpty else { return }
+        let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body) }
+        replyTo = nil
+        do {
+            _ = try await client.sendText(conversationId: id, body: body, quote: quote)
+            reloadMessages()
+            refreshConversations()
+        } catch {
+            lastError = Self.describe(error)
+            append("send failed: \(error)")
+        }
+    }
+
+    func retry(_ key: MessageKey) async {
+        guard let client else { return }
+        do { _ = try await client.retry(key: key) } catch { append("retry failed: \(error)") }
+    }
+
+    func isTyping(_ conversationId: String, now: Date = .now) -> Bool {
+        (typingUntil[conversationId] ?? .distantPast) > now
+    }
+
+    func isOwn(_ message: Message) -> Bool { message.isOutgoing }
+
+    /// A group member's display name: their contact name, else a short id. Never empty.
+    func senderName(_ author: String) -> String {
+        senderNames[author] ?? String(author.prefix(8))
+    }
+
+    /// Reloads the newest page of the open conversation (keeping any older pages already loaded
+    /// out of it: the window resets to the newest page). Coalesced like the list refresh.
+    private func reloadMessages() {
+        guard let client, let id = selectedId else { return }
+        let generation = selectionGeneration
+        // coalesce only with a load for the same selection; a new selection starts its own load
+        if loadingGeneration == generation {
+            reloadMessagesAgain = true
+            return
+        }
+        loadingGeneration = generation
+        reloadMessagesAgain = false
+        Task {
+            repeat {
+                reloadMessagesAgain = false
+                do {
+                    let page = try await client.messages(conversationId: id, before: nil, limit: Self.pageSize)
+                    // the user may have switched chats meanwhile
+                    guard generation == selectionGeneration else { return }
+                    let olderLoaded = messages.filter { m in
+                        page.first.map { (m.sentAt, m.author) < ($0.sentAt, $0.author) } ?? false
+                    }
+                    messages = olderLoaded + page
+                    if olderLoaded.isEmpty { hasOlder = page.count == Int(Self.pageSize) }
+                    await loadDetails(for: page, generation: generation)
+                } catch { append("query failed: \(error)") }
+            } while reloadMessagesAgain && generation == selectionGeneration
+            if loadingGeneration == generation { loadingGeneration = nil }
+        }
+    }
+
+    /// Reactions for the given messages and names for unknown group senders.
+    private func loadDetails(for page: [Message], generation: Int) async {
+        guard let client else { return }
+        for m in page {
+            let key = MessageKey(author: m.author, sentAt: m.sentAt)
+            if let r = try? await client.reactions(key: key), generation == selectionGeneration {
+                reactions[key] = r.isEmpty ? nil : r
+            }
+            if !m.isOutgoing, senderNames[m.author] == nil,
+                let name = try? await client.title(conversationId: "c:\(m.author)")
+            {
+                senderNames[m.author] = name
+            }
         }
     }
 
@@ -168,7 +291,7 @@ final class CoreBridge {
 final class Listener: EventListener {
     private let deliver: @Sendable (CoreEvent) -> Void
 
-    init(bridge: CoreBridge) {
+    init(bridge: AppStore) {
         deliver = { [weak bridge] event in
             Task { @MainActor in bridge?.handle(event) }
         }
