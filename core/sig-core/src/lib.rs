@@ -4,6 +4,7 @@ mod actor;
 mod client;
 mod error;
 mod events;
+mod logging;
 pub mod projection;
 
 pub use client::Client;

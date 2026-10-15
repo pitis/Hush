@@ -18,6 +18,8 @@ chrono = "0.4"
 futures = "0.3"
 thiserror = "2"
 tracing = "0.1"
+tracing-oslog = "0.3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros"] }
