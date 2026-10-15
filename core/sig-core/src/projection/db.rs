@@ -1247,7 +1247,9 @@ impl ProjectionDb {
                    expires_in, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(author, sent_at) DO UPDATE SET
-                   status = MAX(messages.status, excluded.status)",
+                   status = MAX(messages.status, excluded.status),
+                   expires_at = COALESCE(MIN(messages.expires_at, excluded.expires_at),
+                                         messages.expires_at, excluded.expires_at)",
             )
             .bind(&msg.conversation_id)
             .bind(&msg.author)
@@ -1269,8 +1271,10 @@ impl ProjectionDb {
             .await?;
             for (reactor, emoji) in &m.reactions {
                 sqlx::query(
+                    // never onto a message deleted here: the archive predates the deletion
                     "INSERT OR IGNORE INTO reactions(target_author, target_sent_at, reactor, emoji)
-                     VALUES (?1, ?2, ?3, ?4)",
+                     SELECT ?1, ?2, ?3, ?4
+                     WHERE (SELECT deleted FROM messages WHERE author = ?1 AND sent_at = ?2) = 0",
                 )
                 .bind(&msg.author)
                 .bind(msg.sent_at)
@@ -1290,7 +1294,8 @@ impl ProjectionDb {
                 sqlx::query(
                     "INSERT OR IGNORE INTO attachments(message_author, message_sent_at, position,
                        content_type, file_name, size, width, height, is_voice_note, pointer, state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                     WHERE (SELECT deleted FROM messages WHERE author = ?1 AND sent_at = ?2) = 0",
                 )
                 .bind(&msg.author)
                 .bind(msg.sent_at)
@@ -1309,7 +1314,8 @@ impl ProjectionDb {
             if let Some(p) = &m.preview {
                 sqlx::query(
                     "INSERT OR IGNORE INTO link_previews(message_author, message_sent_at, url, title, description)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     SELECT ?1, ?2, ?3, ?4, ?5
+                     WHERE (SELECT deleted FROM messages WHERE author = ?1 AND sent_at = ?2) = 0",
                 )
                 .bind(&msg.author)
                 .bind(msg.sent_at)
@@ -2064,6 +2070,73 @@ mod tests {
             }
             eprintln!("100k messages imported in {:?}", started.elapsed());
             assert_eq!(db.conversations().await.unwrap().len(), 50);
+        }
+
+        /// A message deleted here must not grow imported files, reactions or previews: the
+        /// archive predates the deletion.
+        #[tokio::test]
+        async fn a_deleted_message_gains_no_imported_content() {
+            let db = db().await;
+            let mut gone = in_conv("c:alice", msg("alice", 5, ""));
+            gone.deleted = true;
+            gone.body = None;
+            db.insert_message(&gone).await.unwrap();
+            let mut m = imported("c:alice", "alice", 5, "resurrected", MessageStatus::Read);
+            m.reactions = vec![("bob".into(), "👍".into())];
+            m.attachments = vec![ImportAttachment {
+                position: 0,
+                content_type: "image/png".into(),
+                file_name: None,
+                size: 9,
+                width: None,
+                height: None,
+                is_voice_note: false,
+                pointer: Some(vec![1, 2]),
+            }];
+            m.preview = Some(crate::history::import::ImportPreview {
+                url: "https://example.com".into(),
+                title: Some("t".into()),
+                description: None,
+                image: None,
+            });
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let stored = db.message(&key("alice", 5)).await.unwrap().unwrap();
+            assert!(stored.deleted);
+            assert_eq!(stored.body, None);
+            assert!(db.reactions(&key("alice", 5)).await.unwrap().is_empty());
+            assert!(db.attachments(&key("alice", 5)).await.unwrap().is_empty());
+            assert!(db.link_preview(&key("alice", 5)).await.unwrap().is_none());
+        }
+
+        /// Raising a disappearing message to Read must not leave its timer unstarted: the
+        /// archive's expiry fills a missing one, and an earlier one is never extended.
+        #[tokio::test]
+        async fn an_imported_read_status_starts_a_missing_timer() {
+            let db = db().await;
+            let mut live = in_conv("c:alice", msg("alice", 5, "vanishes"));
+            live.expires_in = 60;
+            db.insert_message(&live).await.unwrap();
+            let mut m = imported("c:alice", "alice", 5, "vanishes", MessageStatus::Read);
+            m.message.expires_in = 60;
+            m.message.expires_at = Some(99_000);
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let stored = db.message(&key("alice", 5)).await.unwrap().unwrap();
+            assert_eq!(
+                (stored.status, stored.expires_at),
+                (MessageStatus::Read, Some(99_000)),
+                "the archive's timer start fills the gap"
+            );
+            // an already ticking timer is never pushed later
+            let mut earlier = in_conv("c:alice", msg("alice", 6, "soon"));
+            earlier.expires_in = 60;
+            earlier.expires_at = Some(50_000);
+            db.insert_message(&earlier).await.unwrap();
+            let mut m = imported("c:alice", "alice", 6, "soon", MessageStatus::Read);
+            m.message.expires_in = 60;
+            m.message.expires_at = Some(80_000);
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let stored = db.message(&key("alice", 6)).await.unwrap().unwrap();
+            assert_eq!(stored.expires_at, Some(50_000), "the earlier expiry wins");
         }
 
         #[tokio::test]

@@ -348,31 +348,32 @@ async fn pause(retry: Duration, cancel: &mut watch::Receiver<bool>) -> bool {
     }
 }
 
+/// A scripted server and a silent listener, shared by the fetch and driver tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::sync::Mutex;
 
     use super::*;
     use crate::events::{CoreEvent, EventListener};
 
-    struct Quiet;
+    pub(crate) struct Quiet;
     impl EventListener for Quiet {
         fn on_event(&self, _: CoreEvent) {}
     }
 
     /// Plays a script: each `wait` answer in turn (hanging when it runs out), then serves
     /// `file`, honoring (or ignoring) offsets and cutting each download after `cut_after` bytes.
-    struct Fake {
-        waits: Vec<Result<Polled, HistoryError>>,
-        file: Vec<u8>,
-        cut_after: Option<usize>,
-        honors_range: bool,
-        gone: bool,
-        offsets_seen: Mutex<Vec<u64>>,
+    pub(crate) struct Fake {
+        pub waits: Vec<Result<Polled, HistoryError>>,
+        pub file: Vec<u8>,
+        pub cut_after: Option<usize>,
+        pub honors_range: bool,
+        pub gone: bool,
+        pub offsets_seen: Mutex<Vec<u64>>,
     }
 
     impl Fake {
-        fn new(waits: Vec<Result<Polled, HistoryError>>, file: Vec<u8>) -> Self {
+        pub fn new(waits: Vec<Result<Polled, HistoryError>>, file: Vec<u8>) -> Self {
             Self {
                 waits,
                 file,
@@ -414,6 +415,12 @@ mod tests {
             }))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Fake, Quiet};
+    use super::*;
 
     async fn db() -> ProjectionDb {
         ProjectionDb::open("sqlite::memory:", None).await.unwrap()
