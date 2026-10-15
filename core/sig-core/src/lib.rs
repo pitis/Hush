@@ -2,6 +2,7 @@ uniffi::setup_scaffolding!();
 
 mod actor;
 mod client;
+mod download;
 mod error;
 mod events;
 mod logging;

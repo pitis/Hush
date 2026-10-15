@@ -191,6 +191,12 @@ final class AppStore {
             if notifiedMessages[key] != nil { Task { await removeIfDeleted(key) } }
         case .newMessage(let conversationId, let key):
             Task { await notify(conversationId, about: key, reaction: nil) }
+        case .attachmentChanged(let conversationId, let message, _):
+            // a download finished (or started, or failed): its message in the open chat updates
+            if conversationId == selectedId {
+                changedKeys.insert(message)
+                reloadMessages()
+            }
         case .newReaction(let conversationId, let target, let reactor, let emoji):
             Task { await notify(conversationId, about: target, reaction: (reactor, emoji)) }
         case .typing(let conversationId, let who, let started):

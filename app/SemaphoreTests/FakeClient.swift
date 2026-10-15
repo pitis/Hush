@@ -86,6 +86,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return 0
     }
     func setTyping(conversationId: String, started: Bool) throws {}
+    func downloadAttachment(id: Int64) throws {}
+    func sendAttachments(conversationId: String, files: [OutgoingFile], caption: String?, quote: Quote?) async throws
+        -> MessageKey
+    { MessageKey(author: aci ?? "", sentAt: 0) }
+    func attachments(key: MessageKey) async throws -> [Attachment] { [] }
+    func attachment(id: Int64) async throws -> Attachment? { nil }
+    func linkPreview(key: MessageKey) async throws -> LinkPreview? { nil }
 
     private(set) var titleCalls = 0
     var reactionAnswers: [MessageKey: [Reaction]] = [:]
