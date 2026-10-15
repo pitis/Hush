@@ -10,7 +10,16 @@ final class CoreBridge {
         case failed(String)
     }
 
+    struct LogLine: Identifiable, Equatable {
+        let id: Int
+        let text: String
+    }
+
+    /// Opens the core; injectable so tests can use a fake client.
+    typealias Opener = @Sendable (EventListener) throws -> any ClientProtocol
+
     static let logLimit = 200
+    static let deviceName = "Semaphore"
     /// App state for Console.app (subsystem dev.pitis.semaphore). Never URLs or message content.
     private static let logger = Logger(subsystem: "dev.pitis.semaphore", category: "app")
 
@@ -18,22 +27,38 @@ final class CoreBridge {
     private(set) var linkURL: String?
     private(set) var connection: ConnectionState = .offline
     private(set) var conversations: [Conversation] = []
-    private(set) var log: [String] = []
+    private(set) var log: [LogLine] = []
     private(set) var lastError: String?
-    private var client: Client?
 
-    /// Opens the core (off the main thread) with the Keychain key, then either starts receiving
-    /// or starts linking.
+    private let open: Opener
+    private var client: (any ClientProtocol)?
+    private var booted = false
+    private var nextLogId = 0
+    private var refreshing = false
+    private var refreshAgain = false
+
+    init(open: @escaping Opener = CoreBridge.openReal) {
+        self.open = open
+    }
+
+    /// `~/Library/Application Support/Semaphore`. Changing it orphans the user's data.
+    nonisolated static func dataDirectory() throws -> URL {
+        try FileManager.default
+            .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("Semaphore", isDirectory: true)
+    }
+
+    nonisolated static func openReal(listener: EventListener) throws -> any ClientProtocol {
+        try Client.open(dataDir: dataDirectory().path, dbKeyHex: Keychain().dbKey(), listener: listener)
+    }
+
+    /// Opens the core (off the main thread), then either starts receiving or starts linking. Runs once.
     func boot() async {
+        guard !booted else { return }
+        booted = true
         let listener = Listener(bridge: self)
-        let opened = await Task.detached { () -> Result<Client, Error> in
-            Result {
-                let dir = try FileManager.default
-                    .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-                    .appendingPathComponent("Semaphore", isDirectory: true)
-                return try Client.open(dataDir: dir.path, dbKeyHex: try Keychain().dbKey(), listener: listener)
-            }
-        }.value
+        let open = self.open
+        let opened = await Task.detached { Result { try open(listener) } }.value
         do {
             let client = try opened.get()
             self.client = client
@@ -43,20 +68,19 @@ final class CoreBridge {
                 refreshConversations()
             } else {
                 screen = .link
-                try client.link(deviceName: "Semaphore")
+                try client.link(deviceName: Self.deviceName)
             }
-        } catch CoreError.AlreadyOpen {
-            Self.logger.error("already running")
-            screen = .failed("Semaphore is already running.")
         } catch {
-            screen = .failed("\(error)")
+            Self.logger.error("boot failed")
+            screen = .failed(Self.describe(error))
         }
     }
 
-    /// Asks the core for a new linking QR code after a failed attempt.
+    /// Asks the core for a new linking QR code after a failed or expired attempt.
     func retryLink() {
+        guard let client, linkURL == nil else { return }
         lastError = nil
-        do { try client?.link(deviceName: "Semaphore") } catch { lastError = "\(error)" }
+        do { try client.link(deviceName: Self.deviceName) } catch { lastError = Self.describe(error) }
     }
 
     func handle(_ event: CoreEvent) {
@@ -64,10 +88,12 @@ final class CoreBridge {
         case .linkUrl(let url):
             Self.logger.notice("link code ready")
             linkURL = url
+            lastError = nil
             screen = .link
         case .linked:
             Self.logger.notice("linked")
             linkURL = nil
+            lastError = nil
             screen = .chats
             do { try client?.start() } catch { append("start failed: \(error)") }
         case .connection(let state):
@@ -76,7 +102,8 @@ final class CoreBridge {
             if state == .unlinked {
                 linkURL = nil
                 screen = .link
-            } else {
+            } else if client?.isLinked() == true, screen != .chats {
+                // only a linked core moves us to the chats (a core failure mid-link must not)
                 screen = .chats
             }
         case .ready, .conversationsChanged:
@@ -87,22 +114,49 @@ final class CoreBridge {
         case .typing(let conversationId, _, let started):
             append("typing \(conversationId) \(started ? "started" : "stopped")")
         case .error(let message):
-            Self.logger.error("core error: \(message, privacy: .public)")
+            // error text can mention ids or numbers: keep it out of the system log
+            Self.logger.error("core error: \(message, privacy: .private)")
             lastError = message
             append("error: \(message)")
         }
     }
 
+    /// One query at a time; events arriving meanwhile cause exactly one more pass, so a burst
+    /// can't flood the core and an older result can never overwrite a newer one.
     private func refreshConversations() {
         guard let client else { return }
+        if refreshing {
+            refreshAgain = true
+            return
+        }
+        refreshing = true
         Task {
-            do { conversations = try await client.conversations() } catch { append("query failed: \(error)") }
+            repeat {
+                refreshAgain = false
+                do { conversations = try await client.conversations() } catch { append("query failed: \(error)") }
+            } while refreshAgain
+            refreshing = false
         }
     }
 
-    private func append(_ line: String) {
-        log.append(line)
+    private func append(_ text: String) {
+        log.append(LogLine(id: nextLogId, text: text))
+        nextLogId += 1
         if log.count > Self.logLimit { log.removeFirst(log.count - Self.logLimit) }
+    }
+
+    private static func describe(_ error: Error) -> String {
+        switch error {
+        case CoreError.AlreadyOpen:
+            return "Semaphore is already running."
+        case KeychainError.status(errSecInteractionNotAllowed), KeychainError.status(errSecAuthFailed),
+            KeychainError.status(errSecUserCanceled):
+            return "Semaphore couldn't read its key from your keychain. Unlock the keychain, allow access, and reopen."
+        case CoreError.Storage(let message):
+            return "Semaphore couldn't open its data: \(message)"
+        default:
+            return "\(error)"
+        }
     }
 }
 

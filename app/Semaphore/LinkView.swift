@@ -23,7 +23,7 @@ struct LinkView: View {
                 }
             }
             .frame(width: 280, height: 280)
-            if let error {
+            if let error, url == nil {
                 Text(error).foregroundStyle(.red).font(.callout).multilineTextAlignment(.center)
                     .frame(maxWidth: 360)
                 Button("Try again", action: retry).keyboardShortcut(.defaultAction)

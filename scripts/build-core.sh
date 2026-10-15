@@ -10,6 +10,8 @@ PROFILE="${1:-release}"
 DIR="$PROFILE"; [ "$PROFILE" = dev ] && DIR=debug
 [ "$PROFILE" = debug ] && PROFILE=dev
 cd "$ROOT/core"
+# Match the app's deployment target so C code built by cargo (SQLCipher, libsignal) links without warnings.
+export MACOSX_DEPLOYMENT_TARGET=15.0
 cargo build -p sig-core --target aarch64-apple-darwin --profile "$PROFILE"
 LIB="$ROOT/core/target/aarch64-apple-darwin/$DIR/libsig_core.a"
 GEN="$ROOT/app/Generated"; HDR="$ROOT/core/target/uniffi-headers"

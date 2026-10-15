@@ -9,3 +9,5 @@ make setup   # once: brew tools, Rust target, git hooks
 make run     # build the core + app and launch it
 make check   # lint + all tests
 ```
+
+Building the app needs the owner's Apple Development certificate (see `app/project.yml`).

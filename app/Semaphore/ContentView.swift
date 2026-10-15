@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State private var core = CoreBridge()
+    let core: CoreBridge
 
     var body: some View {
         Group {
@@ -24,7 +24,7 @@ struct ContentView: View {
                         .badge(Int(conversation.unreadCount))
                     }
                     .frame(minWidth: 260)
-                    List(core.log.reversed(), id: \.self) { Text($0).font(.caption.monospaced()) }
+                    List(core.log.reversed()) { Text($0.text).font(.caption.monospaced()) }
                         .frame(minWidth: 320)
                 }
             }

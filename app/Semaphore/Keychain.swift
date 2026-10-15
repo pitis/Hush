@@ -16,8 +16,9 @@ struct Keychain {
         let hex = bytes.map { String(format: "%02x", $0) }.joined()
         var item = baseQuery
         item[kSecValueData as String] = Data(hex.utf8)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        // The login keychain ties access to the app's code signature (see app/project.yml).
         let status = SecItemAdd(item as CFDictionary, nil)
+        if status == errSecDuplicateItem, let winner = try read() { return winner }  // created concurrently
         guard status == errSecSuccess else { throw KeychainError.status(status) }
         return hex
     }
