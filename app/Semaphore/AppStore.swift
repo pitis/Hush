@@ -481,7 +481,7 @@ final class AppStore {
         do {
             guard let m = try await client.message(key: key), !m.deleted else { return }
             // a message with files reads "📷 Photo" (or "📷 caption"), as in Desktop
-            var text = m.body
+            var text = Placeholder.text(m.kind) ?? m.body
             do {
                 if let first = try await client.attachments(key: key).first {
                     text = Files.describe(Files.summary(first), body: m.body)
@@ -832,11 +832,12 @@ final class AppStore {
                     // older loaded messages that changed are fetched one by one
                     let pageKeys = Set(page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
                     for key in changed.subtracting(pageKeys) {
-                        if let fresh = try await client.message(key: key), generation == selectionGeneration,
+                        let fresh = try await client.message(key: key)
+                        guard generation == selectionGeneration,
                             let i = messages.firstIndex(where: { $0.author == key.author && $0.sentAt == key.sentAt })
-                        {
-                            messages[i] = fresh
-                        }
+                        else { continue }
+                        // gone: its disappearing timer ran out
+                        if let fresh { messages[i] = fresh } else { messages.remove(at: i) }
                     }
                     // details only for messages that are new or changed
                     let needDetails = messages.filter { m in

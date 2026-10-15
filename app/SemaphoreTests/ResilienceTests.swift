@@ -4,7 +4,7 @@ import XCTest
 
 final class TimelineEventTests: XCTestCase {
     func testChatEventsSitAmongMessagesByTime() {
-        let event = ChatEvent(id: 1, conversationId: "c:a", at: 15, kind: .decryptionFailed, author: "a")
+        let event = ChatEvent(id: 1, conversationId: "c:a", at: 15, kind: .decryptionFailed, author: "a", value: nil)
         let items = Timeline.items(for: [message("c:a", "a", 10), message("c:a", "a", 20)], events: [event])
         let ids = items.compactMap { item -> String? in
             if case .day = item { return nil }
@@ -101,7 +101,7 @@ final class AppStoreResilienceTests: XCTestCase {
         store.select("c:a")
         await eventually { store.messages.count == 1 }
         fake.eventAnswers["c:a"] = [
-            ChatEvent(id: 1, conversationId: "c:a", at: 20, kind: .decryptionFailed, author: "a")
+            ChatEvent(id: 1, conversationId: "c:a", at: 20, kind: .decryptionFailed, author: "a", value: nil)
         ]
         store.handle(.chatEventAdded(conversationId: "c:a"))
         await eventually { store.events.count == 1 }

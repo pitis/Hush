@@ -208,7 +208,8 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
     Conversation(
         id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
         unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
-        lastMessageDeleted: false, lastMessageFile: nil, lastMessageUndecryptable: false)
+        lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
+        lastMessageUndecryptable: false)
 }
 
 final class Counter: @unchecked Sendable {
@@ -238,5 +239,6 @@ func message(_ conv: String, _ author: String, _ sentAt: Int64, _ body: String =
 {
     Message(
         conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, isOutgoing: outgoing,
-        status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil)
+        status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil, kind: .normal, expiresIn: 0,
+        expiresAt: nil)
 }
