@@ -21,7 +21,7 @@ struct ConversationHeader: View {
     let conversation: Conversation
 
     var body: some View {
-        let title = AppStore.displayTitle(conversation)
+        let title = store.title(conversation)
         HStack(spacing: 12) {
             Avatar(id: conversation.id, name: title, size: 36)
             VStack(alignment: .leading, spacing: 1) {
@@ -46,6 +46,7 @@ struct TimelineList: View {
     @State private var atBottom = true
     @State private var nearTop = false
     @State private var unseenNew = false
+    @Environment(\.controlActiveState) private var activeState
 
     var body: some View {
         let isGroup = conversation.kind == .group
@@ -105,6 +106,12 @@ struct TimelineList: View {
                 unseenNew = false
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
+            // read once the newest message is on screen in the key window, like Desktop
+            .onChange(of: atBottom) { _, _ in markReadIfSeen() }
+            .onChange(of: activeState) { _, _ in markReadIfSeen() }
+            .onChange(of: conversation.unreadCount) { _, _ in markReadIfSeen() }
+            .onChange(of: conversation.id) { _, _ in markReadIfSeen() }
+            .onAppear { markReadIfSeen() }
             .overlay(alignment: .bottomTrailing) {
                 if unseenNew {
                     Button {
@@ -119,6 +126,14 @@ struct TimelineList: View {
                     .padding(16)
                 }
             }
+        }
+    }
+
+    private func markReadIfSeen() {
+        if ChatList.shouldMarkRead(
+            atBottom: atBottom, windowKey: activeState == .key, unread: conversation.unreadCount)
+        {
+            store.markRead(conversation.id)
         }
     }
 
@@ -219,10 +234,6 @@ struct MessageRow: View {
 
     @ViewBuilder private var tick: some View {
         switch Timeline.tick(for: message.status) {
-        case .clock: Image(systemName: "clock")
-        case .single: Image(systemName: "checkmark")
-        case .double: Image(systemName: "checkmark.circle")
-        case .doubleFilled: Image(systemName: "checkmark.circle.fill")
         case .failed:
             Button(action: retry) {
                 Label("Retry", systemImage: "exclamationmark.triangle.fill").labelStyle(.titleAndIcon)
@@ -230,6 +241,7 @@ struct MessageRow: View {
             .buttonStyle(.plain)
             .foregroundStyle(.yellow)
             .accessibilityLabel("Not sent. Retry")
+        case let other: TickIcon(tick: other)
         }
     }
 
@@ -245,5 +257,23 @@ struct MessageRow: View {
         .background(Theme.field, in: Capsule())
         .overlay(Capsule().stroke(Theme.window, lineWidth: 2))
         .offset(y: -6)
+    }
+}
+
+/// A message's delivery state, in bubbles and in the chat list.
+struct TickIcon: View {
+    let tick: Timeline.Tick
+
+    var body: some View {
+        Group {
+            switch tick {
+            case .clock: Image(systemName: "clock")
+            case .single: Image(systemName: "checkmark")
+            case .double: Image(systemName: "checkmark.circle")
+            case .doubleFilled: Image(systemName: "checkmark.circle.fill")
+            case .failed: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+            }
+        }
+        .accessibilityLabel(Timeline.accessibilityLabel(for: tick))
     }
 }

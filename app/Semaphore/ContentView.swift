@@ -39,5 +39,17 @@ struct ContentView: View {
         .background(Theme.window)
         .preferredColorScheme(.dark)
         .task { await core.boot() }
+        .task {
+            // "Today" separators become "Yesterday" at midnight
+            var day = Calendar.current.startOfDay(for: .now)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                let today = Calendar.current.startOfDay(for: .now)
+                if today != day {
+                    day = today
+                    core.refreshDays()
+                }
+            }
+        }
     }
 }

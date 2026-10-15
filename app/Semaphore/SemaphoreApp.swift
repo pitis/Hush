@@ -12,5 +12,41 @@ struct SemaphoreApp: App {
         Window("Semaphore", id: "main") {
             if isTestHost { EmptyView() } else { ContentView(core: core) }
         }
+        .commands { ChatCommands(store: core) }
+    }
+}
+
+/// Signal Desktop's navigation shortcuts, plus ⌘K for the chat search.
+struct ChatCommands: Commands {
+    let store: AppStore
+
+    var body: some Commands {
+        CommandMenu("Chats") {
+            Group {
+                Button("Find Chat…") { store.focusSearch() }.keyboardShortcut("k")
+                Button("Search") { store.focusSearch() }.keyboardShortcut("f")
+                Divider()
+                Button("Previous Chat") { store.selectNeighbor(step: -1, unreadOnly: false) }
+                    .keyboardShortcut(.upArrow, modifiers: .option)
+                Button("Next Chat") { store.selectNeighbor(step: 1, unreadOnly: false) }
+                    .keyboardShortcut(.downArrow, modifiers: .option)
+                Button("Previous Unread Chat") { store.selectNeighbor(step: -1, unreadOnly: true) }
+                    .keyboardShortcut(.upArrow, modifiers: [.option, .shift])
+                Button("Next Unread Chat") { store.selectNeighbor(step: 1, unreadOnly: true) }
+                    .keyboardShortcut(.downArrow, modifiers: [.option, .shift])
+                Menu("Jump to Chat") {
+                    ForEach(1...9, id: \.self) { n in
+                        Button("Chat \(n)") { store.selectChat(at: n) }
+                            .keyboardShortcut(KeyEquivalent(Character("\(n)")))
+                    }
+                }
+                Divider()
+                Button("Focus Composer") { store.focusComposer() }.keyboardShortcut("t", modifiers: [.command, .shift])
+                    .disabled(store.selectedId == nil)
+                Button("Close Chat") { store.select(nil) }.keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(store.selectedId == nil)
+            }
+            .disabled(store.screen != .chats)
+        }
     }
 }

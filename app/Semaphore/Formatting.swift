@@ -69,12 +69,6 @@ struct Formatting {
         return f
     }
 
-    /// The sidebar's second line.
-    static func preview(_ c: Conversation) -> String {
-        guard c.lastMessageAt > 0 else { return "" }
-        return c.lastMessagePreview.isEmpty ? "Attachment" : c.lastMessagePreview
-    }
-
     /// Up to two initials from the first letters/digits of the first two words; "#" if none.
     static func initials(_ name: String) -> String {
         // letters and digits only; emoji like 🅰️ count as letters to Unicode but aren't initials

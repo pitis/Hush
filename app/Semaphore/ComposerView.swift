@@ -73,6 +73,7 @@ struct ComposerView: View {
             focused = true
         }
         .onChange(of: text) { _, new in Composer.saveDraft(new, for: conversationId) }
+        .onChange(of: store.composerFocusRequest) { _, _ in focused = true }
     }
 
     private func submit() {

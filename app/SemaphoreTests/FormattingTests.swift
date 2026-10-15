@@ -36,16 +36,6 @@ final class FormattingTests: XCTestCase {
         XCTAssertEqual(f.dayTitle(ms(date(2025, 10, 12, 10, 0)), now: now), "Oct 12, 2025")
     }
 
-    func testPreviewText() {
-        var c = conversation("c:a")
-        c.lastMessagePreview = "hi"
-        XCTAssertEqual(Formatting.preview(c), "hi")
-        c.lastMessagePreview = ""
-        XCTAssertEqual(Formatting.preview(c), "Attachment")
-        c.lastMessageAt = 0
-        XCTAssertEqual(Formatting.preview(c), "")
-    }
-
     func testInitialsAndStableAvatarColor() {
         XCTAssertEqual(Formatting.initials("He Be Hatin"), "HB")
         XCTAssertEqual(Formatting.initials("bob"), "B")
