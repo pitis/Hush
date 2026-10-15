@@ -26,7 +26,7 @@ sigmac/
 
 **Rust core (`sig-core`)**
 - Built on **presage** (+ `presage-store-sqlite`, SQLCipher), pinned to a git rev. CDSI feature off in M1 (avoids the BoringSSL/OpenSSL conflict; contacts come from phone sync).
-- **Projection DB** (own SQLite tables, same encrypted file): `conversations`, `messages` (body, quote ref, edit history, deleted flag, status), `reactions`, `attachments`, FTS5 `messages_fts`. Presage `Content` events are projected in; UI queries only the projection (fast list/unread/search).
+- **Projection DB** (own SQLite file `projection.db`, same SQLCipher key — separate from presage.db because both use sqlx migrations): `conversations`, `messages` (body, quote ref, edit history, deleted flag, status), `reactions`, `attachments`, FTS5 `messages_fts`. Presage `Content` events are projected in; UI queries only the projection (fast list/unread/search).
 - **UniFFI API** (async + callback interface):
   - `Client::open(db_path, db_key)`, `link(device_name, on_qr)`, `start()`
   - `conversations()`, `messages(conv_id, before, limit)`, `search(q)`
