@@ -13,9 +13,15 @@ struct ContentView: View {
                     "Semaphore couldn't start", systemImage: "exclamationmark.octagon", description: Text(message))
             case .link:
                 LinkView(url: core.linkURL, error: core.lastError, retry: core.retryLink)
+            case .unlinked:
+                UnlinkedView(store: core)
             case .chats:
                 NavigationSplitView {
-                    SidebarView(store: core).navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
+                    VStack(spacing: 0) {
+                        ConnectionBanner(store: core)
+                        SidebarView(store: core)
+                    }
+                    .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
                 } detail: {
                     if let c = core.selectedConversation {
                         ConversationView(store: core, conversation: c)
@@ -50,6 +56,94 @@ struct ContentView: View {
                     core.refreshDays()
                 }
             }
+        }
+    }
+}
+
+/// Shown over the chat list while not connected, like Desktop's: what is going on, and Retry.
+struct ConnectionBanner: View {
+    let store: AppStore
+
+    var body: some View {
+        switch store.connection {
+        case .online, .unlinked:
+            EmptyView()
+        case .connecting:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Connecting…").font(.system(size: 12))
+                Spacer()
+            }
+            .padding(10)
+            .background(Theme.selection)
+        case .offline:
+            HStack(spacing: 8) {
+                Image(systemName: "wifi.slash")
+                Text("Offline. Messages will arrive once you're connected.").font(.system(size: 12))
+                Spacer(minLength: 4)
+                Button("Retry", action: store.retryConnection).controlSize(.small)
+            }
+            .padding(10)
+            .background(Color.orange.opacity(0.25))
+        }
+    }
+}
+
+/// This Mac was removed on the phone (or the account is gone): link again from nothing.
+struct UnlinkedView: View {
+    let store: AppStore
+    @State private var working = false
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("This Mac is no longer linked", systemImage: "iphone.slash")
+        } description: {
+            Text(
+                "It was removed from your phone's linked devices. Link it again to keep using Semaphore here. "
+                    + "Messages stored on this Mac are removed first.")
+        } actions: {
+            Button {
+                working = true
+                Task {
+                    await store.linkAgain()
+                    working = false
+                }
+            } label: {
+                Text("Link Again")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(working)
+        }
+    }
+}
+
+/// Window ▸ Core Log: what went wrong recently (ids and reasons, never message text).
+struct CoreLogView: View {
+    let store: AppStore
+
+    var body: some View {
+        Group {
+            if store.errors.isEmpty {
+                ContentUnavailableView("No errors", systemImage: "checkmark.circle")
+            } else {
+                List(store.errors.reversed()) { line in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(line.at, format: .dateTime.hour().minute().second()).monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Text(line.text).textSelection(.enabled)
+                    }
+                    .font(.system(size: 12))
+                }
+            }
+        }
+        .frame(minWidth: 520, minHeight: 300)
+        .toolbar {
+            Button("Copy All") {
+                let text = store.errors.map { "\($0.at.formatted(.iso8601)) \($0.text)" }.joined(separator: "\n")
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+            .disabled(store.errors.isEmpty)
         }
     }
 }

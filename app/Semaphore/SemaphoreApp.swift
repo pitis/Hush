@@ -10,6 +10,8 @@ struct SemaphoreApp: App {
     @State private var core: AppStore
     /// Kept for the app's lifetime: Notification Center holds its delegate weakly.
     private let notificationDelegate: NotificationDelegate?
+    /// Reconnects as soon as the network comes back.
+    private let networkWatch: NetworkWatch?
 
     init() {
         let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
@@ -20,6 +22,7 @@ struct SemaphoreApp: App {
         // set before launch finishes, so a click on a notification that launched the app arrives
         notificationDelegate = isTestHost ? nil : NotificationDelegate(store: core)
         if let notificationDelegate { UNUserNotificationCenter.current().delegate = notificationDelegate }
+        networkWatch = isTestHost ? nil : NetworkWatch { core.networkReturned() }
     }
 
     var body: some Scene {
@@ -27,13 +30,18 @@ struct SemaphoreApp: App {
             if isTestHost { EmptyView() } else { ContentView(core: core) }
         }
         .commands { ChatCommands(store: core) }
-        Settings { SettingsView() }
+        Window("Core Log", id: "core-log") { CoreLogView(store: core) }
+        Settings { SettingsView(store: core) }
     }
 }
 
 /// Preferences (⌘,).
 struct SettingsView: View {
+    let store: AppStore
     @AppStorage(NotificationContent.key) private var content = NotificationContent.nameAndMessage
+    @State private var confirmUnlink = false
+    @State private var unlinkFailed: String?
+    @State private var working = false
 
     var body: some View {
         Form {
@@ -41,9 +49,42 @@ struct SettingsView: View {
                 ForEach(NotificationContent.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.radioGroup)
+            if store.screen == .chats {
+                Divider()
+                LabeledContent("Linked device") {
+                    Button("Unlink This Mac…", role: .destructive) { confirmUnlink = true }.disabled(working)
+                }
+            }
         }
         .padding(20)
-        .frame(width: 420)
+        .frame(width: 440)
+        .confirmationDialog("Unlink this Mac?", isPresented: $confirmUnlink) {
+            Button("Unlink", role: .destructive) { unlink(tellServer: true) }
+        } message: {
+            Text("Your messages and files are removed from this Mac. Your phone keeps them.")
+        }
+        .alert(
+            "The server couldn't be reached", isPresented: .constant(unlinkFailed != nil),
+            presenting: unlinkFailed
+        ) { _ in
+            Button("Unlink Anyway", role: .destructive) { unlink(tellServer: false) }
+            Button("Cancel", role: .cancel) { unlinkFailed = nil }
+        } message: { reason in
+            Text(
+                "\(reason)\n\nUnlinking anyway removes everything here, but your phone keeps listing this Mac "
+                    + "until you remove it there.")
+        }
+    }
+
+    private func unlink(tellServer: Bool) {
+        unlinkFailed = nil
+        working = true
+        Task {
+            let failed = await store.unlinkThisMac(tellServer: tellServer)
+            working = false
+            unlinkFailed = tellServer ? failed : nil
+            if !tellServer, let failed { store.showError(failed) }
+        }
     }
 }
 

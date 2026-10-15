@@ -10,8 +10,8 @@ use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
-    Attachment, Conversation, LinkPreview, Message, MessageKey, MessageStatus, OutgoingFile, ProjectionDb, Quote,
-    Reaction, SearchHit,
+    Attachment, ChatEvent, Conversation, LinkPreview, Message, MessageKey, MessageStatus, OutgoingFile, ProjectionDb,
+    Quote, Reaction, SearchHit,
 };
 use crate::send::{self, Job, SendJob};
 
@@ -30,6 +30,7 @@ pub struct Client {
     linked: Arc<AtomicBool>,
     own_aci: Arc<Mutex<Option<String>>>,
     listener: Arc<dyn EventListener>,
+    data_dir: PathBuf,
     /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
     last_sent_at: Mutex<i64>,
 }
@@ -98,8 +99,9 @@ impl Client {
         crate::logging::init();
         let linked = Arc::new(AtomicBool::new(false));
         let own_aci = Arc::new(Mutex::new(None));
+        let data_dir = PathBuf::from(data_dir);
         let h = actor::spawn(
-            PathBuf::from(data_dir),
+            data_dir.clone(),
             db_key_hex,
             listener.clone(),
             linked.clone(),
@@ -112,6 +114,7 @@ impl Client {
             linked,
             own_aci,
             listener,
+            data_dir,
             last_sent_at: Mutex::new(0),
         }))
     }
@@ -134,6 +137,22 @@ impl Client {
     /// Starts receiving (idempotent). Emits `Connection`, `MessageChanged`, `Ready`, …
     pub fn start(&self) -> Result<(), CoreError> {
         self.send(Command::Start)
+    }
+
+    /// Reconnects now: when the network comes back, or the user taps "Retry".
+    pub fn reconnect(&self) -> Result<(), CoreError> {
+        self.send(Command::Reconnect)
+    }
+
+    /// Starts a new secure session with the contact of a 1:1 chat (after messages from them
+    /// couldn't be decrypted).
+    pub fn reset_session(&self, conversation_id: String) -> Result<(), CoreError> {
+        if !matches!(send::recipient(&conversation_id), Some(send::Recipient::Direct(_))) {
+            return Err(CoreError::InvalidInput {
+                message: format!("not a 1:1 chat: {conversation_id}"),
+            });
+        }
+        self.send(Command::ResetSession { conversation_id })
     }
 
     /// Downloads an attachment that didn't download by itself (or failed). Reported through
@@ -322,6 +341,42 @@ impl Client {
             return Err(e);
         }
         Ok(key)
+    }
+
+    /// Unlinks this Mac and removes all its Signal data (databases and files): after telling the
+    /// server (`tell_server`; a `Network` error if it can't be reached, and nothing is removed),
+    /// or only here (the phone already removed it). The core stops; open a new `Client` to link
+    /// again. The app removes the database key.
+    pub async fn unlink(&self, tell_server: bool) -> Result<(), CoreError> {
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        self.send(Command::Unlink { tell_server, done })?;
+        stopped
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })?;
+        // the core thread is ending: wait for it, so nothing writes the files again
+        drop(self.commands.lock().ok().and_then(|mut c| c.take()));
+        if let Some(thread) = self.thread.lock().ok().and_then(|mut t| t.take()) {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+        let storage = |e: std::io::Error| CoreError::Storage { message: e.to_string() };
+        for db in ["presage.db", "projection.db"] {
+            for suffix in ["", "-wal", "-shm"] {
+                match std::fs::remove_file(self.data_dir.join(format!("{db}{suffix}"))) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
+                    _ => {}
+                }
+            }
+        }
+        match std::fs::remove_dir_all(self.data_dir.join("attachments")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(e)),
+            _ => Ok(()),
+        }
+    }
+
+    /// A chat's events (e.g. undecryptable messages) from `since` (ms) on.
+    pub async fn chat_events(&self, conversation_id: String, since: i64) -> Result<Vec<ChatEvent>, CoreError> {
+        Ok(self.db.chat_events(&conversation_id, since).await?)
     }
 
     /// A message's files, in order.
@@ -887,5 +942,27 @@ mod tests {
         let sink = Arc::new(Sink(Mutex::new(vec![])));
         let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
         assert!(matches!(client.download_attachment(1), Err(CoreError::NotLinked)));
+    }
+
+    #[test]
+    fn unlinking_wipes_this_macs_data_and_closes_the_core() {
+        let dir = temp_dir("client-unlink");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        std::fs::create_dir_all(dir.0.join("attachments")).unwrap();
+        std::fs::write(dir.0.join("attachments").join("1"), b"photo").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async { client.unlink(false).await.unwrap() });
+        for gone in ["presage.db", "projection.db", "attachments"] {
+            assert!(!dir.0.join(gone).exists(), "{gone} is still there");
+        }
+        assert!(matches!(client.start(), Err(CoreError::Closed)));
+        // the data folder is free again: a new core starts from nothing
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let fresh = Client::open(dir.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
+        assert!(!fresh.is_linked());
     }
 }

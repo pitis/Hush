@@ -43,6 +43,10 @@ pub enum CoreEvent {
         reactor: String,
         emoji: String,
     },
+    /// Something was added to a chat's timeline that isn't a message (`Client::chat_events`).
+    ChatEventAdded {
+        conversation_id: String,
+    },
     /// A message's file was added or changed state (downloading, ready, failed).
     AttachmentChanged {
         conversation_id: String,

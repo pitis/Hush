@@ -29,7 +29,7 @@ use crate::download::{downloader, Download, Downloads};
 use crate::error::CoreError;
 use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
-use crate::projection::{project, Op, ProjectionDb};
+use crate::projection::{project, ChatEventKind, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
 use crate::typing::{Typing, TYPING_IDLE};
 
@@ -62,6 +62,20 @@ pub enum Command {
     Typing {
         conversation_id: String,
         started: bool,
+    },
+    /// Reconnect now (the network came back, or the user asked): skips the wait, and drops a
+    /// connection that may have died with the old network.
+    Reconnect,
+    /// Starts a new secure session with a contact whose messages couldn't be decrypted.
+    ResetSession {
+        conversation_id: String,
+    },
+    /// Stops the core for good, after telling the server this device is unlinked if
+    /// `tell_server` (an error if that fails: nothing is stopped then). The caller removes the
+    /// data once the thread has ended.
+    Unlink {
+        tell_server: bool,
+        done: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -230,6 +244,7 @@ async fn run(
     }
 
     let receiving = Rc::new(Cell::new(false));
+    let wake = Rc::new(tokio::sync::Notify::new());
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Command::Link { device_name } => {
@@ -285,6 +300,8 @@ async fn run(
                         listener.clone(),
                         caught_up_tx.clone(),
                         queues.clone(),
+                        wake.clone(),
+                        linked.clone(),
                     )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
@@ -317,6 +334,42 @@ async fn run(
                         });
                     }
                 }
+            }
+            Command::Reconnect => wake.notify_one(),
+            Command::ResetSession { conversation_id } => match (&manager, crate::send::recipient(&conversation_id)) {
+                (Some(m), Some(crate::send::Recipient::Direct(to))) => {
+                    let (mut m, l) = (m.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let at = chrono::Utc::now().timestamp_millis() as u64;
+                        if let Err(e) = Box::pin(m.send_session_reset(&to, at)).await {
+                            l.on_event(CoreEvent::Error {
+                                message: format!("resetting the session with {conversation_id} failed: {e}"),
+                            });
+                        }
+                    });
+                }
+                _ => listener.on_event(CoreEvent::Error {
+                    message: format!("a session can't be reset with {conversation_id}"),
+                }),
+            },
+            Command::Unlink { tell_server, done } => {
+                if let (true, Some(m)) = (tell_server, &manager) {
+                    match tokio::time::timeout(Duration::from_secs(15), Box::pin(m.unlink_self())).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let _ = done.send(Err(e.to_string()));
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = done.send(Err("the server didn't answer".into()));
+                            continue;
+                        }
+                    }
+                }
+                linked.store(false, Ordering::SeqCst);
+                let _ = done.send(Ok(()));
+                // everything on this thread (receiving, sending, downloads) ends with it
+                return;
             }
             Command::Download(id) => {
                 let _ = download_tx.send(Download::One(id));
@@ -458,6 +511,8 @@ async fn receive_loop(
     l: Arc<dyn EventListener>,
     caught_up: Rc<watch::Sender<bool>>,
     queues: Queues,
+    wake: Rc<tokio::sync::Notify>,
+    linked: Arc<AtomicBool>,
 ) {
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
@@ -474,13 +529,27 @@ async fn receive_loop(
                 });
                 futures::pin_mut!(stream);
                 progress.connected();
-                while let Some(received) = stream.next().await {
+                let mut woken = false;
+                loop {
+                    let received = tokio::select! {
+                        received = stream.next() => received,
+                        // asked to reconnect: this connection may be dead with the old network
+                        _ = wake.notified() => {
+                            woken = true;
+                            None
+                        }
+                    };
+                    let Some(received) = received else { break };
                     handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && progress.titles_synced;
                         *ready |= progress.titles_synced;
                         first
                     });
+                }
+                if woken {
+                    backoff = Duration::from_secs(1);
+                    continue;
                 }
                 if connected.elapsed() >= STABLE_CONNECTION {
                     backoff = Duration::from_secs(1);
@@ -489,6 +558,15 @@ async fn receive_loop(
                     message: "the connection to the server closed".into(),
                 });
             }
+            Err(presage::Error::ServiceError(e)) if is_unlinked(&e) => {
+                // removed on the phone: retrying can't help, the app offers to link again
+                tracing::warn!("this device is no longer linked");
+                linked.store(false, Ordering::SeqCst);
+                l.on_event(CoreEvent::Connection {
+                    state: ConnectionState::Unlinked,
+                });
+                return;
+            }
             Err(e) => l.on_event(CoreEvent::Error {
                 message: format!("connecting failed: {e}"),
             }),
@@ -496,8 +574,34 @@ async fn receive_loop(
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Offline,
         });
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(60));
+        if pause(backoff, &wake).await {
+            backoff = Duration::from_secs(1);
+        } else {
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        }
+    }
+}
+
+/// Waits `backoff` before reconnecting, or less if woken. True if woken.
+async fn pause(backoff: Duration, wake: &tokio::sync::Notify) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => false,
+        _ = wake.notified() => true,
+    }
+}
+
+/// The server saying this device isn't linked any more: a 401/403, either as an answer or when
+/// the websocket is set up (the phone removed it, or the account is gone).
+fn is_unlinked(e: &presage::libsignal_service::prelude::ServiceError) -> bool {
+    use presage::libsignal_service::prelude::ServiceError;
+    match e {
+        ServiceError::Unauthorized => true,
+        ServiceError::WsError(ws) => matches!(
+            ws.as_ref(),
+            reqwest_websocket::Error::Handshake(reqwest_websocket::HandshakeError::UnexpectedStatusCode(status))
+                if *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
+        ),
+        _ => false,
     }
 }
 
@@ -548,9 +652,24 @@ async fn handle(
         }
         Received::Contacts => sync_titles(m, db, l).await,
         // Ids only: never log message content.
-        Received::DecryptionError(sender) => l.on_event(CoreEvent::Error {
-            message: format!("a message from {} couldn't be decrypted", sender.service_id_string()),
-        }),
+        Received::DecryptionError(sender) => {
+            l.on_event(CoreEvent::Error {
+                message: format!("a message from {} couldn't be decrypted", sender.service_id_string()),
+            });
+            // shown in the chat, with a way to reset the session
+            let conversation_id = direct_id(&sender);
+            let at = chrono::Utc::now().timestamp_millis();
+            let author = sender.raw_uuid().to_string();
+            match db
+                .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author)
+                .await
+            {
+                Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+                Err(e) => l.on_event(CoreEvent::Error {
+                    message: format!("recording an undecryptable message failed: {e}"),
+                }),
+            }
+        }
         Received::Content(content) => {
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
@@ -687,6 +806,40 @@ mod tests {
         fn on_event(&self, e: CoreEvent) {
             self.0.lock().unwrap().push(e);
         }
+    }
+
+    /// Only "this device is no longer linked" stops receiving for good; anything else is retried.
+    #[test]
+    fn an_unlinked_device_is_told_apart_from_a_network_error() {
+        use presage::libsignal_service::prelude::ServiceError;
+        use reqwest_websocket::HandshakeError;
+        let handshake = |status: u16| {
+            ServiceError::WsError(Box::new(reqwest_websocket::Error::Handshake(
+                HandshakeError::UnexpectedStatusCode(http::StatusCode::from_u16(status).unwrap()),
+            )))
+        };
+        assert!(super::is_unlinked(&ServiceError::Unauthorized));
+        assert!(super::is_unlinked(&handshake(401)));
+        assert!(super::is_unlinked(&handshake(403)));
+        assert!(!super::is_unlinked(&handshake(500)));
+        assert!(!super::is_unlinked(&handshake(429)));
+        assert!(!super::is_unlinked(&ServiceError::WsClosing { reason: "gone" }));
+    }
+
+    /// "Retry now" and the network coming back cut the wait before reconnecting short.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_request_ends_the_wait_at_once() {
+        let wake = tokio::sync::Notify::new();
+        let started = tokio::time::Instant::now();
+        assert!(
+            !super::pause(std::time::Duration::from_secs(30), &wake).await,
+            "waited it out"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+        wake.notify_one();
+        assert!(super::pause(std::time::Duration::from_secs(30), &wake).await, "woken");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     /// Each connection starts by catching up; it is live only once the server queue is drained.
