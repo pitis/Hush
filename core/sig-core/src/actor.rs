@@ -243,6 +243,8 @@ async fn run(
         return;
     }
 
+    // Disappearing messages go once their timer runs out, connected or not.
+    tokio::task::spawn_local(expire(projection.clone(), listener.clone()));
     let receiving = Rc::new(Cell::new(false));
     let wake = Rc::new(tokio::sync::Notify::new());
     while let Some(cmd) = rx.recv().await {
@@ -449,6 +451,29 @@ async fn link(
         });
     }
     Ok(m)
+}
+
+/// How often messages whose disappearing timer ran out are looked for.
+const EXPIRY_SWEEP: Duration = Duration::from_secs(5);
+
+/// Removes disappearing messages as their timers run out, for as long as the core runs.
+async fn expire(db: ProjectionDb, l: Arc<dyn EventListener>) {
+    loop {
+        match db.delete_expired(chrono::Utc::now().timestamp_millis()).await {
+            Ok(gone) if gone.is_empty() => {}
+            Ok(gone) => {
+                tracing::info!(count = gone.len(), "disappearing messages removed");
+                for (conversation_id, key) in gone {
+                    l.on_event(CoreEvent::MessageChanged { conversation_id, key });
+                }
+                l.on_event(CoreEvent::ConversationsChanged);
+            }
+            Err(e) => l.on_event(CoreEvent::Error {
+                message: format!("removing disappearing messages failed: {e}"),
+            }),
+        }
+        tokio::time::sleep(EXPIRY_SWEEP).await;
+    }
 }
 
 /// Runs the sender and restarts it if it panics. Jobs queued meanwhile stay queued; the one in
@@ -917,6 +942,9 @@ mod tests {
                 edited: false,
                 deleted: false,
                 quote: None,
+                kind: crate::projection::MessageKind::Normal,
+                expires_in: 0,
+                expires_at: None,
             })
         };
         let sink = Sink(Default::default());

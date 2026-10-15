@@ -698,6 +698,9 @@ mod tests {
                 sent_at: 5,
                 text: Some("q".into()),
             }),
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         }
     }
 

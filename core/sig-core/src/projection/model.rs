@@ -32,6 +32,10 @@ pub struct Conversation {
     pub last_message_deleted: bool,
     /// The last message's first file, so the list can say "Photo", "Voice Message"…
     pub last_message_file: Option<FileSummary>,
+    /// The chat's disappearing-message timer in seconds (0: off).
+    pub expire_timer: u32,
+    /// What the last message is (placeholders are worded by the app).
+    pub last_message_kind: MessageKind,
     /// The latest thing in the chat is a message that couldn't be decrypted (the preview says
     /// so; the other `last_message_*` fields are then empty).
     pub last_message_undecryptable: bool,
@@ -88,6 +92,44 @@ pub struct Reaction {
     pub emoji: String,
 }
 
+/// What a message is. `Normal` is text and/or files; the others have nothing we can show yet and
+/// are shown as placeholders (worded like Signal Desktop's).
+#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
+pub enum MessageKind {
+    Normal,
+    Sticker { emoji: Option<String> },
+    Contact { name: Option<String> },
+    Payment,
+    Poll { question: Option<String> },
+    GiftBadge,
+}
+
+impl MessageKind {
+    /// Stored as a number and an optional text.
+    pub fn to_row(&self) -> (i64, Option<&str>) {
+        match self {
+            Self::Normal => (0, None),
+            Self::Sticker { emoji } => (1, emoji.as_deref()),
+            Self::Contact { name } => (2, name.as_deref()),
+            Self::Payment => (3, None),
+            Self::Poll { question } => (4, question.as_deref()),
+            Self::GiftBadge => (5, None),
+        }
+    }
+
+    pub fn from_row(kind: i64, text: Option<String>) -> Option<Self> {
+        Some(match kind {
+            0 => Self::Normal,
+            1 => Self::Sticker { emoji: text },
+            2 => Self::Contact { name: text },
+            3 => Self::Payment,
+            4 => Self::Poll { question: text },
+            5 => Self::GiftBadge,
+            _ => return None,
+        })
+    }
+}
+
 /// Identity of a message, and the paging cursor for `messages`.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct MessageKey {
@@ -109,6 +151,11 @@ pub struct Message {
     pub edited: bool,
     pub deleted: bool,
     pub quote: Option<Quote>,
+    pub kind: MessageKind,
+    /// Disappearing-message timer in seconds (0: it stays).
+    pub expires_in: u32,
+    /// When it disappears (ms), once its timer started: when read, or when we sent it.
+    pub expires_at: Option<i64>,
 }
 
 impl Message {
@@ -128,6 +175,8 @@ pub enum ChatEventKind {
     DecryptionFailed,
     /// We started a new secure session with `author`.
     SessionReset,
+    /// `author` set the disappearing-message timer to `value` seconds (0: off).
+    TimerChanged,
 }
 
 impl ChatEventKind {
@@ -135,11 +184,12 @@ impl ChatEventKind {
         match self {
             Self::DecryptionFailed => 0,
             Self::SessionReset => 1,
+            Self::TimerChanged => 2,
         }
     }
 
     pub fn from_i64(v: i64) -> Option<Self> {
-        [Self::DecryptionFailed, Self::SessionReset]
+        [Self::DecryptionFailed, Self::SessionReset, Self::TimerChanged]
             .into_iter()
             .find(|k| k.to_i64() == v)
     }
@@ -153,6 +203,8 @@ pub struct ChatEvent {
     pub at: i64,
     pub kind: ChatEventKind,
     pub author: String,
+    /// The new timer of a `TimerChanged` (seconds).
+    pub value: Option<i64>,
 }
 
 /// Marks the matched words in a search snippet (Unicode private-use characters, so message text

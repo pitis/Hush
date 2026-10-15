@@ -24,6 +24,10 @@ pub enum Applied {
         message: MessageKey,
         id: i64,
     },
+    /// Something was added to a chat's timeline that isn't a message.
+    ChatEvent {
+        conversation_id: String,
+    },
 }
 
 /// Encrypted SQLite store the UI reads from. Separate from presage's database because both use
@@ -167,7 +171,8 @@ impl ProjectionDb {
         let rows = sqlx::query(
             "SELECT c.*, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
                m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
-               a.is_voice_note AS file_voice, m.sent_at AS last_sent_at,
+               a.is_voice_note AS file_voice, m.sent_at AS last_sent_at, m.kind AS last_kind,
+               m.kind_text AS last_kind_text,
                (SELECT MAX(at) FROM chat_events e WHERE e.conversation_id = c.id AND e.kind = 0) AS failed_at
              FROM conversations c LEFT JOIN messages m ON m.id = (SELECT id FROM messages
                WHERE conversation_id = c.id ORDER BY sent_at DESC, author DESC LIMIT 1)
@@ -344,8 +349,8 @@ impl ProjectionDb {
 
     /// A chat's events from `since` (ms) on, oldest first.
     pub async fn chat_events(&self, conversation_id: &str, since: i64) -> Result<Vec<ChatEvent>, sqlx::Error> {
-        let rows: Vec<(i64, String, i64, i64, String)> = sqlx::query_as(
-            "SELECT id, conversation_id, at, kind, author FROM chat_events
+        let rows: Vec<(i64, String, i64, i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, conversation_id, at, kind, author, value FROM chat_events
              WHERE conversation_id = ?1 AND at >= ?2 ORDER BY at, id",
         )
         .bind(conversation_id)
@@ -353,13 +358,14 @@ impl ProjectionDb {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(id, conversation_id, at, kind, author)| {
+            .map(|(id, conversation_id, at, kind, author, value)| {
                 Ok(ChatEvent {
                     id,
                     conversation_id,
                     at,
                     kind: ChatEventKind::from_i64(kind).ok_or_else(|| decode_err(format!("chat event kind {kind}")))?,
                     author,
+                    value,
                 })
             })
             .collect()
@@ -596,12 +602,97 @@ impl ProjectionDb {
                     .bind(status.to_i64())
                     .execute(&mut *tx)
                     .await?;
+                    if *status == MessageStatus::Read {
+                        start_timer(&mut tx, target).await?;
+                    }
                     out.extend(changed(finish_update(&mut tx, target, res.rows_affected()).await?));
                 }
                 tx.commit().await?;
                 Ok(out)
             }
+            Op::SetTimer {
+                conversation_id,
+                author,
+                seconds,
+                at,
+            } => {
+                let kind = kind_of(conversation_id)?;
+                let mut tx = self.pool.begin().await?;
+                sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+                    .bind(conversation_id)
+                    .bind(kind_to_i64(kind))
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE conversations SET expire_timer = ?2, timer_at = ?3 WHERE id = ?1 AND timer_at <= ?3",
+                )
+                .bind(conversation_id)
+                .bind(i64::from(*seconds))
+                .bind(at)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO chat_events(conversation_id, at, kind, author, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .bind(conversation_id)
+                .bind(at)
+                .bind(ChatEventKind::TimerChanged.to_i64())
+                .bind(author)
+                .bind(i64::from(*seconds))
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(vec![Applied::ChatEvent {
+                    conversation_id: conversation_id.clone(),
+                }])
+            }
         }
+    }
+
+    /// The chat's disappearing-message timer (seconds, 0: off), for our own new messages.
+    pub async fn expire_timer(&self, conversation_id: &str) -> Result<u32, sqlx::Error> {
+        let t: Option<i64> = sqlx::query_scalar("SELECT expire_timer FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(t.and_then(|t| u32::try_from(t).ok()).unwrap_or(0))
+    }
+
+    /// Removes the messages whose timer ran out by `now_ms`: rows, search index, reactions,
+    /// previews and files. Returns them.
+    pub async fn delete_expired(&self, now_ms: i64) -> Result<Vec<(String, MessageKey)>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let expired: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT conversation_id, author, sent_at FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        )
+        .bind(now_ms)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut files = vec![];
+        let mut out = vec![];
+        for (conversation_id, author, sent_at) in expired {
+            let key = MessageKey { author, sent_at };
+            files.extend(forget_deleted_text(&mut tx, &key).await?);
+            sqlx::query("DELETE FROM messages WHERE author = ?1 AND sent_at = ?2")
+                .bind(&key.author)
+                .bind(key.sent_at)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM message_revisions WHERE author = ?1 AND original_sent_at = ?2")
+                .bind(&key.author)
+                .bind(key.sent_at)
+                .execute(&mut *tx)
+                .await?;
+            out.push((conversation_id, key));
+        }
+        let mut conversations: Vec<&String> = out.iter().map(|(c, _)| c).collect();
+        conversations.dedup();
+        for c in conversations {
+            refresh_summary(&mut tx, c).await?;
+        }
+        tx.commit().await?;
+        self.remove_files(&files);
+        Ok(out)
     }
 
     /// Pending → Failed (a send that didn't go out). No other transition.
@@ -1083,10 +1174,12 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     } else {
         (m.body.as_ref(), quote.and_then(|q| q.text.as_ref()))
     };
+    let (kind, kind_text) = m.kind.to_row();
     let res = sqlx::query(
         "INSERT OR IGNORE INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
-           status, edited, deleted, quote_author, quote_sent_at, quote_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+           status, edited, deleted, quote_author, quote_sent_at, quote_text, kind, kind_text, expires_in,
+           expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
     )
     .bind(&m.conversation_id)
     .bind(&m.author)
@@ -1100,10 +1193,21 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     .bind(quote.map(|q| &q.author))
     .bind(quote.map(|q| q.sent_at))
     .bind(quote_text)
+    .bind(kind)
+    .bind(kind_text)
+    .bind(i64::from(m.expires_in))
+    .bind(m.expires_at)
     .execute(&mut *conn)
     .await?;
     let inserted = res.rows_affected() == 1;
     if inserted {
+        // every message carries its chat's current timer: the newest one says what it is now
+        sqlx::query("UPDATE conversations SET expire_timer = ?2, timer_at = ?3 WHERE id = ?1 AND timer_at <= ?3")
+            .bind(&m.conversation_id)
+            .bind(i64::from(m.expires_in))
+            .bind(m.sent_at)
+            .execute(&mut *conn)
+            .await?;
         apply_pending(conn, &m.key()).await?;
         refresh_summary(conn, &m.conversation_id).await?;
     }
@@ -1160,6 +1264,20 @@ async fn add_outgoing_file(
     .await
 }
 
+/// Starts a read message's disappearing timer (once).
+async fn start_timer(conn: &mut SqliteConnection, key: &MessageKey) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE messages SET expires_at = ?3 + expires_in * 1000
+         WHERE author = ?1 AND sent_at = ?2 AND expires_in > 0 AND expires_at IS NULL",
+    )
+    .bind(&key.author)
+    .bind(key.sent_at)
+    .bind(chrono::Utc::now().timestamp_millis())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Applies ops that arrived before this (just inserted) message.
 async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<(), sqlx::Error> {
     let deleted = sqlx::query("DELETE FROM pending_deletes WHERE author = ?1 AND sent_at = ?2")
@@ -1193,6 +1311,9 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
             .bind(status)
             .execute(&mut *conn)
             .await?;
+        if status >= MessageStatus::Read.to_i64() {
+            start_timer(conn, key).await?;
+        }
     }
     Ok(())
 }
@@ -1269,6 +1390,11 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
     let status = status.unwrap_or(MessageStatus::Sent.to_i64());
     Ok(Conversation {
         last_message_undecryptable: undecryptable,
+        expire_timer: u32::try_from(r.try_get::<i64, _>("expire_timer")?).unwrap_or(0),
+        last_message_kind: match r.try_get::<Option<i64>, _>("last_kind")? {
+            Some(kind) if !undecryptable => message_kind(kind, r.try_get("last_kind_text")?)?,
+            _ => MessageKind::Normal,
+        },
         last_message_author: if undecryptable {
             String::new()
         } else {
@@ -1317,7 +1443,14 @@ fn row_to_message(r: &SqliteRow) -> Result<Message, sqlx::Error> {
             }),
             _ => None,
         },
+        kind: message_kind(r.try_get("kind")?, r.try_get("kind_text")?)?,
+        expires_in: u32::try_from(r.try_get::<i64, _>("expires_in")?).unwrap_or(0),
+        expires_at: r.try_get("expires_at")?,
     })
+}
+
+fn message_kind(kind: i64, text: Option<String>) -> Result<MessageKind, sqlx::Error> {
+    MessageKind::from_row(kind, text).ok_or_else(|| decode_err(format!("message kind {kind}")))
 }
 
 #[cfg(test)]
@@ -1340,6 +1473,9 @@ mod tests {
             edited: false,
             deleted: false,
             quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         }
     }
 
@@ -2939,5 +3075,110 @@ mod tests {
         let c = conv(&db, "c:bob").await;
         assert_eq!((c.last_message_at, c.last_message_preview.as_str()), (70, "back"));
         assert!(!c.last_message_undecryptable);
+    }
+
+    #[tokio::test]
+    async fn placeholder_kinds_are_kept_and_named_in_the_chat_list() {
+        let db = db().await;
+        let sticker = Message {
+            body: None,
+            kind: MessageKind::Sticker {
+                emoji: Some("🙂".into()),
+            },
+            ..msg("alice", 1, "")
+        };
+        db.insert_message(&sticker).await.unwrap();
+        assert_eq!(db.message(&k("alice", 1)).await.unwrap().unwrap().kind, sticker.kind);
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (c.last_message_kind, c.unread_count),
+            (sticker.kind, 1),
+            "it counts as unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incoming_disappearing_message_starts_its_timer_when_read_and_then_goes() {
+        let files = TempFiles::new("expiry");
+        let db = db().await.with_files(files.0.clone());
+        db.insert_message(&Message {
+            expires_in: 60,
+            ..msg("alice", 1, "secret plan")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&msg("alice", 2, "stays")).await.unwrap();
+        db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        let id = db.attachments(&k("alice", 1)).await.unwrap()[0].id;
+        db.start_download(id).await.unwrap();
+        db.finish_download(id, Ok(b"jpg".to_vec())).await.unwrap();
+        let path = db.attachment(id).await.unwrap().unwrap().path.unwrap();
+        let far_future = i64::MAX / 2;
+        assert!(
+            db.delete_expired(far_future).await.unwrap().is_empty(),
+            "unread: not started"
+        );
+        assert_eq!(db.message(&k("alice", 1)).await.unwrap().unwrap().expires_at, None);
+        db.apply(&Op::SetStatus {
+            targets: vec![k("alice", 1), k("alice", 2)],
+            status: MessageStatus::Read,
+        })
+        .await
+        .unwrap();
+        let at = db.message(&k("alice", 1)).await.unwrap().unwrap().expires_at.unwrap();
+        assert_eq!(
+            db.message(&k("alice", 2)).await.unwrap().unwrap().expires_at,
+            None,
+            "no timer"
+        );
+        assert!(db.delete_expired(at - 1).await.unwrap().is_empty(), "not yet");
+        assert_eq!(
+            db.delete_expired(at).await.unwrap(),
+            vec![("c:alice".to_string(), k("alice", 1))]
+        );
+        assert!(db.message(&k("alice", 1)).await.unwrap().is_none());
+        assert!(
+            db.search("secret", None, 10).await.unwrap().is_empty(),
+            "out of the search index"
+        );
+        assert!(!std::path::Path::new(&path).exists(), "its file too");
+        assert_eq!(conv(&db, "c:alice").await.last_message_preview, "stays");
+    }
+
+    #[tokio::test]
+    async fn a_timer_change_sets_the_chat_timer_and_shows_in_the_chat() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        let applied = db
+            .apply(&Op::SetTimer {
+                conversation_id: "c:alice".into(),
+                author: "alice".into(),
+                seconds: 604_800,
+                at: 5,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            vec![Applied::ChatEvent {
+                conversation_id: "c:alice".into()
+            }]
+        );
+        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 604_800);
+        assert_eq!(conv(&db, "c:alice").await.expire_timer, 604_800);
+        let event = &db.chat_events("c:alice", 0).await.unwrap()[0];
+        assert_eq!((event.kind, event.value), (ChatEventKind::TimerChanged, Some(604_800)));
+        // an older message doesn't undo it; a newer one carries the chat's current timer
+        db.insert_message(&msg("alice", 3, "old")).await.unwrap();
+        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 604_800);
+        db.insert_message(&Message {
+            expires_in: 3600,
+            ..msg("alice", 9, "new")
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 3600);
     }
 }
