@@ -13,6 +13,9 @@ pub enum CoreError {
     NotLinked,
     #[error("{message}")]
     InvalidInput { message: String },
+    /// The server couldn't be reached or refused.
+    #[error("{message}")]
+    Network { message: String },
 }
 
 impl From<sqlx::Error> for CoreError {

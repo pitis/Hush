@@ -169,6 +169,22 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
             }
         }
     }
+    private(set) var reconnects = 0
+    private(set) var sessionResets: [String] = []
+    private(set) var unlinks: [Bool] = []
+    var unlinkError: Error?
+    var eventAnswers: [String: [ChatEvent]] = [:]
+    func reconnect() throws { lock.withLock { reconnects += 1 } }
+    func resetSession(conversationId: String) throws { lock.withLock { sessionResets.append(conversationId) } }
+    func unlink(tellServer: Bool) async throws {
+        lock.withLock { unlinks.append(tellServer) }
+        if let unlinkError { throw unlinkError }
+        setLinked(false)
+    }
+    func chatEvents(conversationId: String, since: Int64) async throws -> [ChatEvent] {
+        lock.withLock { (eventAnswers[conversationId] ?? []).filter { $0.at >= since } }
+    }
+
     func countNewer(conversationId: String, key: MessageKey) async throws -> UInt32 {
         if let delay = lock.withLock({ countDelays[key] }) { try? await Task.sleep(for: delay) }
         return lock.withLock { newerCounts[key] ?? 0 }

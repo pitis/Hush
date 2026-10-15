@@ -7,13 +7,15 @@ import Observation
 @MainActor @Observable
 final class AppStore {
     enum Screen: Equatable {
-        case starting, link, chats
+        /// `unlinked`: this Mac was removed on the phone; linking again starts from nothing.
+        case starting, link, chats, unlinked
         case failed(String)
     }
 
     struct LogLine: Identifiable, Equatable {
         let id: Int
         let text: String
+        var at = Date()
     }
 
     /// Opens the core; injectable so tests can use a fake client.
@@ -77,12 +79,20 @@ final class AppStore {
     private var conversationsLoaded = false
     private let notifier: Notifier?
     private let isAppActive: @MainActor () -> Bool
+    /// Removes the database key (with the data: unlinking, linking again).
+    private let forgetKey: () -> Void
     private(set) var log: [LogLine] = []
     private(set) var lastError: String?
+    /// The core's recent errors, for the Core Log window (ids and reasons, never message text).
+    private(set) var errors: [LogLine] = []
     private(set) var selectedId: String?
     /// The open conversation's loaded messages, oldest first.
     private(set) var messages: [Message] = [] {
-        didSet { timelineItems = Timeline.items(for: messages) }
+        didSet { timelineItems = Timeline.items(for: messages, events: events) }
+    }
+    /// The open conversation's events (undecryptable messages…) over the loaded time span.
+    private(set) var events: [ChatEvent] = [] {
+        didSet { timelineItems = Timeline.items(for: messages, events: events) }
     }
     /// Rows for the timeline, recomputed only when `messages` change.
     private(set) var timelineItems: [Timeline.Item] = []
@@ -116,11 +126,13 @@ final class AppStore {
 
     init(
         open: @escaping Opener = AppStore.openReal, notifier: Notifier? = nil,
-        isAppActive: @escaping @MainActor () -> Bool = { AppStore.appIsActive() }
+        isAppActive: @escaping @MainActor () -> Bool = { AppStore.appIsActive() },
+        forgetKey: @escaping () -> Void = { Keychain().delete() }
     ) {
         self.open = open
         self.notifier = notifier
         self.isAppActive = isAppActive
+        self.forgetKey = forgetKey
     }
 
     /// In front with the window on screen: then the chat list shows what's new, and notifications
@@ -193,7 +205,8 @@ final class AppStore {
             connection = state
             if state == .unlinked {
                 linkURL = nil
-                screen = .link
+                // removed on the phone while in use; otherwise a linking attempt failed
+                screen = screen == .chats ? .unlinked : .link
             } else if client?.isLinked() == true, screen != .chats {
                 // only a linked core moves us to the chats (a core failure mid-link must not)
                 screen = .chats
@@ -221,11 +234,16 @@ final class AppStore {
             Task { await notify(conversationId, about: target, reaction: (reactor, emoji)) }
         case .typing(let conversationId, let who, let started):
             setTyping(conversationId, who: who, until: started ? now.addingTimeInterval(Self.typingTimeout) : nil)
+        case .chatEventAdded(let conversationId):
+            refreshConversations()
+            if conversationId == selectedId { reloadEvents() }
         case .error(let message):
             // error text can mention ids or numbers: keep it out of the system log
             Self.logger.error("core error: \(message, privacy: .private)")
             lastError = message
             append("error: \(message)")
+            errors.append(LogLine(id: nextLogId, text: message))
+            if errors.count > Self.logLimit { errors.removeFirst(errors.count - Self.logLimit) }
         }
     }
 
@@ -239,6 +257,7 @@ final class AppStore {
         selectionGeneration += 1
         messages = []
         reactions = [:]
+        events = []
         attachments = [:]
         previews = [:]
         outgoingFiles = []
@@ -261,6 +280,7 @@ final class AppStore {
             guard generation == selectionGeneration, messages.first == oldest else { return }
             messages.insert(contentsOf: page, at: 0)
             hasOlder = page.count == Int(Self.pageSize)
+            reloadEvents()
             await loadDetails(for: page, generation: generation)
         } catch { append("query failed: \(error)") }
     }
@@ -475,6 +495,84 @@ final class AppStore {
 
     func focusSearch() { searchFocusRequest += 1 }
 
+    // MARK: Connection and linking
+
+    /// "Retry" on the connection banner: reconnects now.
+    func retryConnection() {
+        do { try client?.reconnect() } catch { showError("Couldn't reconnect: \(Self.describe(error))") }
+    }
+
+    /// The network came back: reconnect at once rather than after the backoff.
+    func networkReturned() {
+        if screen == .chats { retryConnection() }
+    }
+
+    /// Starts a new secure session with a contact whose messages couldn't be decrypted.
+    func resetSession(_ conversationId: String) {
+        do { try client?.resetSession(conversationId: conversationId) } catch {
+            showError("Couldn't reset the session: \(Self.describe(error))")
+        }
+    }
+
+    /// After the phone removed this Mac: removes what is left of the old link and shows a new
+    /// code.
+    func linkAgain() async {
+        if let failed = await unlinkThisMac(tellServer: false) { showError(failed) }
+    }
+
+    /// Unlinks this Mac and removes all its data, telling the server first if `tellServer`.
+    /// Returns why it couldn't (nothing is removed then), or nil once it is done and a new
+    /// linking code is on its way.
+    func unlinkThisMac(tellServer: Bool) async -> String? {
+        guard let client else { return "Semaphore isn't running." }
+        do {
+            try await client.unlink(tellServer: tellServer)
+        } catch {
+            Self.logger.error("unlink failed: \(Self.describe(error), privacy: .private)")
+            return Self.describe(error)
+        }
+        await restart()
+        return nil
+    }
+
+    /// Starts over with a fresh, unlinked core: everything shown is forgotten, and the key goes
+    /// with the data it protected.
+    private func restart() async {
+        client = nil
+        forgetKey()
+        conversations = []
+        select(nil)
+        searchQuery = ""
+        searchScope = nil
+        typingUntil = [:]
+        senderNames = [:]
+        unnamedAuthors = []
+        notified = [:]
+        notifiedMessages = [:]
+        conversationsLoaded = false
+        ownAci = nil
+        linkURL = nil
+        lastError = nil
+        connection = .offline
+        screen = .starting
+        booted = false
+        await boot()
+    }
+
+    /// The open conversation's events since its oldest loaded message (all if it is loaded
+    /// from the start).
+    private func reloadEvents() {
+        guard let client, let id = selectedId else { return }
+        let generation = selectionGeneration
+        let since = hasOlder ? messages.first?.sentAt ?? 0 : 0
+        Task {
+            do {
+                let found = try await client.chatEvents(conversationId: id, since: since)
+                if generation == selectionGeneration { events = found }
+            } catch { append("query failed: \(error)") }
+        }
+    }
+
     // MARK: Search
 
     static let searchLimit: UInt32 = 50
@@ -570,7 +668,7 @@ final class AppStore {
     func composerTookFocus() { composerWantsFocus = false }
 
     /// Recomputes day separators ("Today" becomes "Yesterday" after midnight).
-    func refreshDays() { timelineItems = Timeline.items(for: messages) }
+    func refreshDays() { timelineItems = Timeline.items(for: messages, events: events) }
 
     func isTyping(_ conversationId: String, now: Date = .now) -> Bool {
         typingUntil[conversationId]?.values.contains { $0 > now } ?? false
@@ -651,6 +749,7 @@ final class AppStore {
                     await loadDetails(for: needDetails, generation: generation)
                 } catch { append("query failed: \(error)") }
             } while reloadMessagesAgain && generation == selectionGeneration
+            if generation == selectionGeneration { reloadEvents() }
             if loadingGeneration == generation { loadingGeneration = nil }
         }
     }

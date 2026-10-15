@@ -117,6 +117,35 @@ impl Message {
     }
 }
 
+/// Something that happened in a chat that isn't a message.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatEventKind {
+    /// A message from `author` arrived but couldn't be decrypted (a broken session).
+    DecryptionFailed,
+}
+
+impl ChatEventKind {
+    pub fn to_i64(self) -> i64 {
+        match self {
+            Self::DecryptionFailed => 0,
+        }
+    }
+
+    pub fn from_i64(v: i64) -> Option<Self> {
+        (v == 0).then_some(Self::DecryptionFailed)
+    }
+}
+
+/// Shown in a chat's timeline among its messages, at `at`.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ChatEvent {
+    pub id: i64,
+    pub conversation_id: String,
+    pub at: i64,
+    pub kind: ChatEventKind,
+    pub author: String,
+}
+
 /// Marks the matched words in a search snippet (Unicode private-use characters, so message text
 /// can't contain them by accident).
 pub const HIGHLIGHT_START: char = '\u{E000}';

@@ -7,11 +7,13 @@ enum Timeline {
         case day(String, ms: Int64)
         /// `first`/`last`: the message starts/ends a run of the same sender.
         case message(Message, first: Bool, last: Bool)
+        case event(ChatEvent)
 
         var id: String {
             switch self {
             case .day(_, let ms): "day-\(ms)"
             case .message(let m, _, _): "\(m.author)-\(m.sentAt)"
+            case .event(let e): "event-\(e.id)"
             }
         }
     }
@@ -20,21 +22,48 @@ enum Timeline {
 
     static let runGap: Int64 = 3 * 60 * 1000
 
-    static func items(for messages: [Message], calendar: Calendar = .autoupdatingCurrent, now: Date = .now)
-        -> [Item]
-    {
+    /// Day separators, messages (grouped in runs) and chat events, in time order. An event
+    /// breaks a run of messages.
+    static func items(
+        for messages: [Message], events: [ChatEvent] = [], calendar: Calendar = .autoupdatingCurrent,
+        now: Date = .now
+    ) -> [Item] {
         let fmt = Formatting(calendar: calendar)
+        let entries: [Entry] = (messages.map(Entry.message) + events.map(Entry.event)).enumerated()
+            .sorted { ($0.element.at, $0.offset) < ($1.element.at, $1.offset) }.map(\.element)
         var items: [Item] = []
-        for (i, m) in messages.enumerated() {
-            let prev = i > 0 ? messages[i - 1] : nil
-            let next = i + 1 < messages.count ? messages[i + 1] : nil
-            let newDay = prev.map { !sameDay($0, m, calendar) } ?? true
-            if newDay { items.append(.day(fmt.dayTitle(m.sentAt, now: now), ms: m.sentAt)) }
-            let first = newDay || !sameRun(prev, m, calendar)
-            let last = next.map { !sameRun(m, $0, calendar) } ?? true
-            items.append(.message(m, first: first, last: last))
+        for (i, entry) in entries.enumerated() {
+            let prev = i > 0 ? entries[i - 1] : nil
+            let newDay = prev.map { !calendar.isDate(date($0.at), inSameDayAs: date(entry.at)) } ?? true
+            if newDay { items.append(.day(fmt.dayTitle(entry.at, now: now), ms: entry.at)) }
+            switch entry {
+            case .event(let e):
+                items.append(.event(e))
+            case .message(let m):
+                let next = i + 1 < entries.count ? entries[i + 1].message : nil
+                let first = newDay || !sameRun(prev?.message, m, calendar)
+                let last = next.map { !sameRun(m, $0, calendar) } ?? true
+                items.append(.message(m, first: first, last: last))
+            }
         }
         return items
+    }
+
+    private enum Entry {
+        case message(Message)
+        case event(ChatEvent)
+
+        var at: Int64 {
+            switch self {
+            case .message(let m): m.sentAt
+            case .event(let e): e.at
+            }
+        }
+
+        var message: Message? {
+            if case .message(let m) = self { return m }
+            return nil
+        }
     }
 
     /// What the timeline does when its last message changes: follow it when the reader is at the
@@ -75,7 +104,7 @@ enum Timeline {
     }
 
     private static func sameDay(_ a: Message, _ b: Message, _ cal: Calendar) -> Bool {
-        cal.isDate(date(a), inSameDayAs: date(b))
+        cal.isDate(date(a.sentAt), inSameDayAs: date(b.sentAt))
     }
 
     private static func sameRun(_ a: Message?, _ b: Message, _ cal: Calendar) -> Bool {
@@ -84,5 +113,5 @@ enum Timeline {
             && sameDay(a, b, cal)
     }
 
-    private static func date(_ m: Message) -> Date { Date(timeIntervalSince1970: Double(m.sentAt) / 1000) }
+    private static func date(_ ms: Int64) -> Date { Date(timeIntervalSince1970: Double(ms) / 1000) }
 }

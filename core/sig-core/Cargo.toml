@@ -16,6 +16,10 @@ tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
 hex = "0.4"
 chrono = "0.4"
 futures = "0.3"
+# to tell "this device was unlinked" (a 401/403 websocket handshake) from a network error; both are
+# already in the build through libsignal-service
+reqwest-websocket = "0.6"
+http = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-oslog = "0.3"
@@ -23,4 +27,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 
 [dev-dependencies]
 rand = "0.9"
-tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros", "test-util"] }

@@ -306,6 +306,54 @@ impl ProjectionDb {
             .collect()
     }
 
+    /// Records something that happened in a chat (see `ChatEvent`).
+    pub async fn add_chat_event(
+        &self,
+        conversation_id: &str,
+        at: i64,
+        kind: ChatEventKind,
+        author: &str,
+    ) -> Result<(), sqlx::Error> {
+        let conv_kind = kind_of(conversation_id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(conversation_id)
+            .bind(kind_to_i64(conv_kind))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO chat_events(conversation_id, at, kind, author) VALUES (?1, ?2, ?3, ?4)")
+            .bind(conversation_id)
+            .bind(at)
+            .bind(kind.to_i64())
+            .bind(author)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+
+    /// A chat's events from `since` (ms) on, oldest first.
+    pub async fn chat_events(&self, conversation_id: &str, since: i64) -> Result<Vec<ChatEvent>, sqlx::Error> {
+        let rows: Vec<(i64, String, i64, i64, String)> = sqlx::query_as(
+            "SELECT id, conversation_id, at, kind, author FROM chat_events
+             WHERE conversation_id = ?1 AND at >= ?2 ORDER BY at, id",
+        )
+        .bind(conversation_id)
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, conversation_id, at, kind, author)| {
+                Ok(ChatEvent {
+                    id,
+                    conversation_id,
+                    at,
+                    kind: ChatEventKind::from_i64(kind).ok_or_else(|| decode_err(format!("chat event kind {kind}")))?,
+                    author,
+                })
+            })
+            .collect()
+    }
+
     /// How many messages of a conversation are newer than `key` (to load enough of it to show
     /// that message).
     pub async fn count_newer(&self, conversation_id: &str, key: &MessageKey) -> Result<u32, sqlx::Error> {
@@ -2789,5 +2837,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.search("believ", None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_events_are_kept_per_chat_in_time_order() {
+        let db = db().await;
+        db.add_chat_event("c:alice", 20, ChatEventKind::DecryptionFailed, "alice")
+            .await
+            .unwrap();
+        db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice")
+            .await
+            .unwrap();
+        db.add_chat_event("c:bob", 15, ChatEventKind::DecryptionFailed, "bob")
+            .await
+            .unwrap();
+        let events = db.chat_events("c:alice", 0).await.unwrap();
+        assert_eq!(events.iter().map(|e| e.at).collect::<Vec<_>>(), [10, 20]);
+        assert_eq!(
+            (events[0].kind, events[0].author.as_str()),
+            (ChatEventKind::DecryptionFailed, "alice")
+        );
+        assert_eq!(
+            db.chat_events("c:alice", 15).await.unwrap().len(),
+            1,
+            "only since the oldest shown"
+        );
     }
 }

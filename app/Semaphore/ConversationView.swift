@@ -85,6 +85,10 @@ struct TimelineList: View {
                         case .day(let title, _):
                             Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.secondaryText)
                                 .padding(.vertical, 10)
+                        case .event(let e):
+                            ChatEventRow(
+                                event: e, name: store.senderName(e.author),
+                                reset: { store.resetSession(e.conversationId) })
                         case .message(let m, let first, let last):
                             let key = MessageKey(author: m.author, sentAt: m.sentAt)
                             MessageRow(
@@ -332,5 +336,26 @@ struct TickIcon: View {
             }
         }
         .accessibilityLabel(Timeline.accessibilityLabel(for: tick))
+    }
+}
+
+/// Something that happened in the chat, centered between messages (Desktop's chat events).
+struct ChatEventRow: View {
+    let event: ChatEvent
+    let name: String
+    let reset: () -> Void
+
+    var body: some View {
+        VStack(spacing: 6) {
+            switch event.kind {
+            case .decryptionFailed:
+                Label("A message from \(name) couldn't be decrypted", systemImage: "exclamationmark.lock")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondaryText)
+                Button("Reset Secure Session", action: reset).controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
     }
 }
