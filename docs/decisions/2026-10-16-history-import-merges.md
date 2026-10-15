@@ -25,12 +25,17 @@ downloads it and imports it. The archive holds pointers to files, not the files.
    - **Risk:** merge edge cases, such as an item already here being imported with different state.
      Test on a real phone. If merging misbehaves, fall back to Desktop's behaviour: wipe on
      relink, then import into an empty database.
-3. **Media: recent only, like Desktop.** Files whose transit-CDN upload is recent enough (about
-   45 days) download as usual. Older ones show as no longer available. Desktop's
-   attachment backfill (asking the phone to upload a file again) is out of scope for M2.
+3. **Media: recent only, like Desktop.** Desktop's rule decides which files can still be
+   downloaded: the file has a transit-CDN key and was uploaded within the last 90 days (2× the
+   server's 45-day queue time). Those download as usual. Older ones show as no longer available.
+   Desktop's attachment backfill (asking the phone to upload a file again) is out of scope for M2.
+4. **On cancel or a failed transfer, stay linked and continue without history.** Desktop unlinks
+   in these cases. We keep the device linked, since existing data is kept anyway.
+5. **After a crash mid-import, resume.** Desktop leaves the device unlinked instead. We resume
+   from saved state; the (author, sent_at) key makes a repeated import harmless.
 
 ## References
 
-- Issue #18 (M2 epic)
+- Issue #18 (M2 epic); spec `docs/superpowers/specs/2026-10-16-m2-history-sync-design.md`
 - Signal Desktop: `ts/services/backups/import.preload.ts`, `ts/textsecure/Provisioner.preload.ts`
 - Signal-Server: `DeviceController` `GET /v1/devices/transfer_archive`
