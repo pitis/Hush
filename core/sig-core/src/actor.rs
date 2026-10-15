@@ -30,8 +30,9 @@ use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, ProjectionDb};
 
-/// libsignal's post-quantum key generation (libcrux ML-KEM) uses very large stack frames,
-/// especially in debug builds; the default 2 MB thread stack overflows while finishing a link.
+/// libsignal's post-quantum crypto (libcrux ML-KEM key generation, also run by presage's pre-key
+/// refresh while receiving, and session decryption) uses very large stack frames in debug builds;
+/// the default 2 MB thread stack overflowed both while linking and while receiving. This is the fix.
 const CORE_THREAD_STACK: usize = 64 * 1024 * 1024;
 
 /// The builder for the core thread (shared with tests so they exercise the same stack size).
@@ -179,7 +180,7 @@ async fn run(
                     });
                     continue;
                 }
-                // boxed: presage's provisioning future is large, keep it off the thread stack
+                // boxed to keep the large provisioning future off the stack (the stack size is the real fix)
                 match Box::pin(link(&store, device_name, listener.as_ref())).await {
                     Ok(m) => {
                         manager = Some(m);

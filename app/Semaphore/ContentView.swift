@@ -17,7 +17,8 @@ struct ContentView: View {
                 ContentUnavailableView(
                     core.connection == .online ? "Connected — no messages yet" : "Connecting…",
                     systemImage: "bubble.left.and.bubble.right",
-                    description: Text("New messages appear here as they arrive. Older history isn't synced yet."))
+                    description: Text(
+                        core.lastError ?? "New messages appear here as they arrive. Older history isn't synced yet."))
             case .chats:
                 HSplitView {
                     List(core.conversations, id: \.id) { conversation in
