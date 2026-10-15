@@ -566,6 +566,8 @@ Run: `cd core && cargo test -p sig-core projection`
 
 ### Task 3: Projector — text messages (incoming, synced-from-phone, groups) and skipping the rest
 
+> **As built (PR for #3):** `Op` has only `InsertMessage` here; Task 4 adds the other variants. The projector picks the conversation from the message's own group context first, then `Thread::try_from` (presage checks a sync transcript's destination before its group, which would put a phone-sent group message into a 1:1 chat). Author ids go through `ids::aci(string, binary)`, because newer clients may send only `*AciBinary` fields; Task 4 must use it for reaction targets too. Test helpers are in `projector.rs` (`content`, `text`, `sent_sync`).
+
 **Files:**
 - Create: `core/sig-core/src/projection/projector.rs`
 - Create: `core/sig-core/src/projection/ids.rs`
