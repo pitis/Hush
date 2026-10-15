@@ -73,7 +73,20 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return true
     }
 
-    func title(conversationId: String) async throws -> String? { titles[conversationId] }
+    private(set) var titleCalls = 0
+    var reactionAnswers: [MessageKey: [Reaction]] = [:]
+    private(set) var reactionCalls = 0
+
+    func title(conversationId: String) async throws -> String? {
+        lock.withLock { titleCalls += 1 }
+        return titles[conversationId]
+    }
+
+    func message(key: MessageKey) async throws -> Message? {
+        lock.withLock {
+            messageAnswers.values.flatMap { $0 }.first { $0.author == key.author && $0.sentAt == key.sentAt }
+        }
+    }
 
     private(set) var messageCalls: [(conversationId: String, before: MessageKey?)] = []
     /// When set, `messages()` for this conversation waits for `releaseMessages()` first.
@@ -98,7 +111,12 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         let older = before.map { b in all.filter { ($0.sentAt, $0.author) < (b.sentAt, b.author) } } ?? all
         return Array(older.suffix(Int(limit)))
     }
-    func reactions(key: MessageKey) async throws -> [Reaction] { [] }
+    func reactions(key: MessageKey) async throws -> [Reaction] {
+        lock.withLock {
+            reactionCalls += 1
+            return reactionAnswers[key] ?? []
+        }
+    }
     func search(query: String, limit: UInt32) async throws -> [Message] { [] }
 }
 

@@ -38,8 +38,14 @@ final class AppStore {
     private(set) var hasOlder = false
     private(set) var reactions: [MessageKey: [Reaction]] = [:]
     var replyTo: Message?
-    private var typingUntil: [String: Date] = [:]
+    /// Who is typing where, until when (per sender: in groups several people can type).
+    private var typingUntil: [String: [String: Date]] = [:]
     private var senderNames: [String: String] = [:]
+    /// Authors whose name lookup found nothing (not asked again).
+    private var unnamedAuthors: Set<String> = []
+    private var loadingOlder = false
+    /// Keys whose message or reactions changed since the last reload of the open chat.
+    private var changedKeys: Set<MessageKey> = []
     private var selectionGeneration = 0
     /// The selection generation the in-flight messages load belongs to, if any.
     private var loadingGeneration: Int?
@@ -127,9 +133,12 @@ final class AppStore {
         case .messageChanged(let conversationId, let key):
             append("message \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
             refreshConversations()
-            if conversationId == selectedId { reloadMessages() }
-        case .typing(let conversationId, _, let started):
-            typingUntil[conversationId] = started ? now.addingTimeInterval(Self.typingTimeout) : nil
+            if conversationId == selectedId {
+                changedKeys.insert(key)
+                reloadMessages()
+            }
+        case .typing(let conversationId, let who, let started):
+            setTyping(conversationId, who: who, until: started ? now.addingTimeInterval(Self.typingTimeout) : nil)
         case .error(let message):
             // error text can mention ids or numbers: keep it out of the system log
             Self.logger.error("core error: \(message, privacy: .private)")
@@ -147,20 +156,23 @@ final class AppStore {
         selectionGeneration += 1
         messages = []
         reactions = [:]
+        changedKeys = []
         hasOlder = false
         replyTo = nil
         reloadMessages()
     }
 
-    /// Prepends the page before the oldest loaded message.
+    /// Prepends the page before the oldest loaded message. Ignored while one is loading.
     func loadOlder() async {
-        guard let client, let id = selectedId, hasOlder, let oldest = messages.first else { return }
+        guard let client, let id = selectedId, hasOlder, !loadingOlder, let oldest = messages.first else { return }
+        loadingOlder = true
+        defer { loadingOlder = false }
         let generation = selectionGeneration
         do {
             let page = try await client.messages(
                 conversationId: id, before: MessageKey(author: oldest.author, sentAt: oldest.sentAt),
                 limit: Self.pageSize)
-            guard generation == selectionGeneration else { return }
+            guard generation == selectionGeneration, messages.first == oldest else { return }
             messages.insert(contentsOf: page, at: 0)
             hasOlder = page.count == Int(Self.pageSize)
             await loadDetails(for: page, generation: generation)
@@ -171,11 +183,10 @@ final class AppStore {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let client, let id = selectedId, !body.isEmpty else { return }
         let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body) }
-        replyTo = nil
         do {
+            // the core announces the new pending message itself
             _ = try await client.sendText(conversationId: id, body: body, quote: quote)
-            reloadMessages()
-            refreshConversations()
+            replyTo = nil
         } catch {
             lastError = Self.describe(error)
             append("send failed: \(error)")
@@ -184,26 +195,37 @@ final class AppStore {
 
     func retry(_ key: MessageKey) async {
         guard let client else { return }
-        do { _ = try await client.retry(key: key) } catch { append("retry failed: \(error)") }
+        do {
+            if try await !client.retry(key: key) { append("retry skipped: the message isn't failed") }
+        } catch { append("retry failed: \(error)") }
     }
 
     func isTyping(_ conversationId: String, now: Date = .now) -> Bool {
-        (typingUntil[conversationId] ?? .distantPast) > now
+        typingUntil[conversationId]?.values.contains { $0 > now } ?? false
     }
-
-    func isOwn(_ message: Message) -> Bool { message.isOutgoing }
 
     /// A group member's display name: their contact name, else a short id. Never empty.
     func senderName(_ author: String) -> String {
         senderNames[author] ?? String(author.prefix(8))
     }
 
-    /// Reloads the newest page of the open conversation (keeping any older pages already loaded
-    /// out of it: the window resets to the newest page). Coalesced like the list refresh.
+    private func setTyping(_ conversationId: String, who: String, until: Date?) {
+        typingUntil[conversationId, default: [:]][who] = until
+        if typingUntil[conversationId]?.isEmpty == true { typingUntil[conversationId] = nil }
+        guard let until else { return }
+        // clear it when it expires so the views update without another event
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, until.timeIntervalSinceNow)))
+            guard let self, self.typingUntil[conversationId]?[who] == until else { return }
+            self.setTyping(conversationId, who: who, until: nil)
+        }
+    }
+
+    /// Reloads the newest page of the open conversation and merges it with older pages already
+    /// loaded. Coalesced like the list refresh; a new selection starts its own load.
     private func reloadMessages() {
         guard let client, let id = selectedId else { return }
         let generation = selectionGeneration
-        // coalesce only with a load for the same selection; a new selection starts its own load
         if loadingGeneration == generation {
             reloadMessagesAgain = true
             return
@@ -213,34 +235,70 @@ final class AppStore {
         Task {
             repeat {
                 reloadMessagesAgain = false
+                let changed = changedKeys
+                changedKeys = []
                 do {
                     let page = try await client.messages(conversationId: id, before: nil, limit: Self.pageSize)
-                    // the user may have switched chats meanwhile
-                    guard generation == selectionGeneration else { return }
-                    let olderLoaded = messages.filter { m in
-                        page.first.map { (m.sentAt, m.author) < ($0.sentAt, $0.author) } ?? false
+                    guard generation == selectionGeneration else { return }  // switched chats meanwhile
+                    let previous = Set(messages.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
+                    messages = Self.merge(loaded: messages, newest: page, pageSize: Self.pageSize, hasOlder: &hasOlder)
+                    // older loaded messages that changed are fetched one by one
+                    let pageKeys = Set(page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
+                    for key in changed.subtracting(pageKeys) {
+                        if let fresh = try await client.message(key: key), generation == selectionGeneration,
+                            let i = messages.firstIndex(where: { $0.author == key.author && $0.sentAt == key.sentAt })
+                        {
+                            messages[i] = fresh
+                        }
                     }
-                    messages = olderLoaded + page
-                    if olderLoaded.isEmpty { hasOlder = page.count == Int(Self.pageSize) }
-                    await loadDetails(for: page, generation: generation)
+                    // details only for messages that are new or changed
+                    let needDetails = messages.filter { m in
+                        let k = MessageKey(author: m.author, sentAt: m.sentAt)
+                        return !previous.contains(k) || changed.contains(k)
+                    }
+                    await loadDetails(for: needDetails, generation: generation)
                 } catch { append("query failed: \(error)") }
             } while reloadMessagesAgain && generation == selectionGeneration
             if loadingGeneration == generation { loadingGeneration = nil }
         }
     }
 
-    /// Reactions for the given messages and names for unknown group senders.
+    /// The loaded window after a reload: older loaded messages followed by the newest page. If
+    /// the newest page doesn't reach back to what was loaded (a burst of new messages), the
+    /// window restarts at the newest page so there is never a gap.
+    static func merge(loaded: [Message], newest page: [Message], pageSize: UInt32, hasOlder: inout Bool)
+        -> [Message]
+    {
+        guard let first = page.first else { return loaded.isEmpty ? [] : loaded }
+        let older = loaded.filter { ($0.sentAt, $0.author) < (first.sentAt, first.author) }
+        let pageIsFull = page.count == Int(pageSize)
+        let newestLoaded = loaded.last.map { ($0.sentAt, $0.author) }
+        if pageIsFull, let newestLoaded, newestLoaded < (first.sentAt, first.author) {
+            hasOlder = true
+            return page
+        }
+        if older.isEmpty { hasOlder = pageIsFull }
+        return older + page
+    }
+
+    /// Reactions and unknown group-sender names for the given messages.
     private func loadDetails(for page: [Message], generation: Int) async {
         guard let client else { return }
+        let isGroup = selectedId?.hasPrefix("g:") == true
         for m in page {
             let key = MessageKey(author: m.author, sentAt: m.sentAt)
-            if let r = try? await client.reactions(key: key), generation == selectionGeneration {
-                reactions[key] = r.isEmpty ? nil : r
-            }
-            if !m.isOutgoing, senderNames[m.author] == nil,
-                let name = try? await client.title(conversationId: "c:\(m.author)")
-            {
-                senderNames[m.author] = name
+            do {
+                let r = try await client.reactions(key: key)
+                if generation == selectionGeneration { reactions[key] = r.isEmpty ? nil : r }
+            } catch { append("query failed: \(error)") }
+            if isGroup, !m.isOutgoing, senderNames[m.author] == nil, !unnamedAuthors.contains(m.author) {
+                do {
+                    if let name = try await client.title(conversationId: "c:\(m.author)") {
+                        senderNames[m.author] = name
+                    } else {
+                        unnamedAuthors.insert(m.author)
+                    }
+                } catch { append("query failed: \(error)") }
             }
         }
     }

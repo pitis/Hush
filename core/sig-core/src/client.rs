@@ -177,6 +177,10 @@ impl Client {
         let m = self.db.message(&key).await?.ok_or(CoreError::InvalidInput {
             message: "unknown message".into(),
         })?;
+        self.listener.on_event(CoreEvent::MessageChanged {
+            conversation_id: m.conversation_id.clone(),
+            key: key.clone(),
+        });
         let body = m.body.unwrap_or_default();
         self.send(Command::Send(SendJob {
             key,
@@ -207,6 +211,10 @@ impl Client {
 
     pub async fn search(&self, query: String, limit: u32) -> Result<Vec<Message>, CoreError> {
         Ok(self.db.search(&query, limit).await?)
+    }
+
+    pub async fn message(&self, key: MessageKey) -> Result<Option<Message>, CoreError> {
+        Ok(self.db.message(&key).await?)
     }
 
     pub async fn reactions(&self, key: MessageKey) -> Result<Vec<Reaction>, CoreError> {
