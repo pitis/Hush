@@ -13,30 +13,31 @@ struct ContentView: View {
                     "Semaphore couldn't start", systemImage: "exclamationmark.octagon", description: Text(message))
             case .link:
                 LinkView(url: core.linkURL, error: core.lastError, retry: core.retryLink)
-            case .chats where core.conversations.isEmpty:
-                ContentUnavailableView(
-                    core.connection == .online ? "Connected — no messages yet" : "Connecting…",
-                    systemImage: "bubble.left.and.bubble.right",
-                    description: Text(
-                        core.lastError ?? "New messages appear here as they arrive. Older history isn't synced yet."))
             case .chats:
-                HSplitView {
-                    List(core.conversations, id: \.id) { conversation in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(conversation.title.isEmpty ? conversation.id : conversation.title).bold()
-                                .lineLimit(1)
-                            Text(conversation.lastMessagePreview).lineLimit(1).foregroundStyle(.secondary)
-                        }
-                        .badge(Int(conversation.unreadCount))
+                NavigationSplitView {
+                    SidebarView(store: core).navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
+                } detail: {
+                    if let c = core.selectedConversation {
+                        ConversationView(store: core, conversation: c)
+                    } else {
+                        ContentUnavailableView(
+                            core.conversations.isEmpty
+                                ? (core.connection == .online ? "Connected — no messages yet" : "Connecting…")
+                                : "Select a chat",
+                            systemImage: "bubble.left.and.bubble.right",
+                            description: Text(
+                                core.lastError
+                                    ?? (core.conversations.isEmpty
+                                        ? "New messages appear here as they arrive. Older history isn't synced yet."
+                                        : "")))
                     }
-                    .frame(minWidth: 260)
-                    List(core.log.reversed()) { Text($0.text).font(.caption.monospaced()) }
-                        .frame(minWidth: 320)
                 }
+                .navigationTitle("")
             }
         }
-        .frame(minWidth: 720, minHeight: 480)
-        .navigationTitle("Semaphore — \(String(describing: core.connection))")
+        .frame(minWidth: 820, minHeight: 520)
+        .background(Theme.window)
+        .preferredColorScheme(.dark)
         .task { await core.boot() }
     }
 }

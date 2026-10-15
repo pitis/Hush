@@ -39,12 +39,19 @@
 - Tests (FakeClient): selection loads messages; MessageChanged for the selection refreshes it, for another conversation only refreshes the list; stale selection result dropped; send inserts via client and refreshes; typing expiry.
 
 ### Task 3 (#11): Sidebar
+
+> **As built (PR #31):** the list, search (⌘F), rows, relative times, unread badges and typing are done. Keyboard navigation, the ⌘K switcher, the dock badge, sidebar ticks/deleted preview and minute-refreshing times moved to #32.
 - `NavigationSplitView` sidebar (min 300 pt): "Chats" header, search field (filters by title, ⌘F focuses), rows = avatar (initials, stable color from id) · title (bold if unread) · preview (one line, "Photo"/"Attachment" when body nil, "This message was deleted" when deleted) · relative time (Now / 11m / 14:05 / Mon / Jul 18) · unread badge (blue capsule) · ticks for own last message.
 - Keyboard: ↑/↓ moves selection, ⌘1–9 jumps, ⌘K quick switcher (fuzzy title).
 - Dock badge = total unread.
 - Tests: relative time formatter (all buckets, timezone Europe/Vienna in test), preview text rules, fuzzy matcher, avatar color stability.
 
 ### Task 4 (#12): Conversation view
+
+> **As built (PR #31):**
+> - **Scrolling:** at-bottom and near-top come from `onScrollGeometryChange` (pure decisions in `Timeline`, tested). Your own new message always scrolls into view. Timeline rows are computed only when messages change (`AppStore.timelineItems`), and the header is a separate view.
+> - **Retry** is a button.
+> - **Mark read when visible:** moved to #32 (needs #8).
 - Header: avatar, title, connection subtitle if not online.
 - Timeline: day separators ("Today", "Yesterday", "Mon 13 Oct"), bubbles grouped (same sender within 3 min → tight spacing, sender name shown in groups on first of run), quote block inside bubble, "edited" label, deleted → italic "This message was deleted", reactions as a pill under the bubble (emoji + count), time + ticks (pending clock, sent ✓, delivered ✓✓, read ✓✓ filled, failed ⚠ with "Retry" on click).
 - Auto-scroll only when at bottom; "↓ new messages" pill otherwise. Older messages load when scrolled near the top, keeping position.
@@ -53,6 +60,10 @@
 - Tests: grouping and day-separator computation (pure function over `[Message]`), tick state mapping, scroll decision (atBottom/new message → scroll or pill).
 
 ### Task 5 (#13): Composer
+
+> **As built (PR #31):**
+> - **Keys:** ↩ sends via `onKeyPress`, with `onSubmit` as a fallback. ⇧↩/⌥↩ are left to the field, so the newline goes at the cursor. ↩ while an input method is composing commits the composition and doesn't send.
+> - **Failures:** the text is restored if the core can't take the message.
 - Rounded multiline field (grows to 6 lines), placeholder "Message", ↩ sends / ⇧↩ newline, send disabled when empty/whitespace, reply banner (Esc cancels), emoji button opens the system character palette, draft per conversation kept in memory and `UserDefaults`.
 - Tests: send/newline key handling decision, trimming, draft save/restore per conversation, reply state cleared after send.
 
