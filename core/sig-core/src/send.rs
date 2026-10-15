@@ -1,6 +1,9 @@
 //! Outgoing messages: recipient parsing and the sender task on the core thread.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use presage::libsignal_service::content::DataMessage;
 use presage::libsignal_service::prelude::Uuid;
@@ -58,30 +61,32 @@ fn data_message(job: &SendJob) -> DataMessage {
     }
 }
 
+/// A send that takes longer than this is reported Failed (it may still go out; a receipt fixes it).
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The job queue, shared so a restarted sender keeps the jobs queued before a crash.
+pub type Jobs = Rc<RefCell<mpsc::UnboundedReceiver<SendJob>>>;
+
 /// Sends queued messages in order, once the server queue has been drained (presage: sessions,
-/// profile keys and sender keys must be up to date before encrypting).
+/// profile keys and sender keys must be up to date before encrypting). Sends share the session
+/// store with the receive loop on this thread; presage is used this way by design.
 pub async fn sender(
     mut m: Manager<SqliteStore, Registered>,
     db: ProjectionDb,
     l: Arc<dyn EventListener>,
-    mut jobs: mpsc::UnboundedReceiver<SendJob>,
+    jobs: Jobs,
     mut caught_up: watch::Receiver<bool>,
 ) {
     if caught_up.wait_for(|ready| *ready).await.is_err() {
         return;
     }
-    while let Some(job) = jobs.recv().await {
-        let result = match recipient(&job.conversation_id) {
-            Some(Recipient::Direct(to)) => Box::pin(m.send_message(to, data_message(&job), job.key.sent_at as u64))
-                .await
-                .map_err(|e| e.to_string()),
-            Some(Recipient::Group(key)) => {
-                Box::pin(m.send_message_to_group(&key, data_message(&job), job.key.sent_at as u64))
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-            None => Err("not a conversation id".to_string()),
-        };
+    loop {
+        // the RefCell borrow is never held across the send itself
+        let next = std::future::poll_fn(|cx| jobs.borrow_mut().poll_recv(cx)).await;
+        let Some(job) = next else { return };
+        let result = tokio::time::timeout(SEND_TIMEOUT, send_one(&mut m, &job))
+            .await
+            .unwrap_or_else(|_| Err("timed out".to_string()));
         let stored = match &result {
             Ok(()) => db
                 .apply(&Op::SetStatus {
@@ -93,8 +98,10 @@ pub async fn sender(
             Err(_) => db.set_failed(&job.key).await,
         };
         if let Err(e) = result {
+            // presage also fails a send whose message was delivered but whose sync transcript or
+            // local copy failed; a delivery receipt then lifts the row out of Failed.
             l.on_event(CoreEvent::Error {
-                message: format!("sending to {} failed: {e}", job.conversation_id),
+                message: format!("a message to {} may not have been sent: {e}", job.conversation_id),
             });
         }
         if let Err(e) = stored {
@@ -106,6 +113,19 @@ pub async fn sender(
             conversation_id: job.conversation_id.clone(),
             key: job.key,
         });
+    }
+}
+
+async fn send_one(m: &mut Manager<SqliteStore, Registered>, job: &SendJob) -> Result<(), String> {
+    let at = job.key.sent_at as u64;
+    match recipient(&job.conversation_id) {
+        Some(Recipient::Direct(to)) => Box::pin(m.send_message(to, data_message(job), at))
+            .await
+            .map_err(|e| e.to_string()),
+        Some(Recipient::Group(key)) => Box::pin(m.send_message_to_group(&key, data_message(job), at))
+            .await
+            .map_err(|e| e.to_string()),
+        None => Err("not a conversation id".to_string()),
     }
 }
 

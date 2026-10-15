@@ -27,10 +27,10 @@
 ### Task 1 (#7): Send text with optimistic state
 **Core**
 - `Command::Send { key: MessageKey, conversation_id, body, quote: Option<Quote> }`; `Client::send_text(conversation_id, body, quote) -> Result<MessageKey, CoreError>` inserts an outgoing `Pending` row (author = own ACI, `sent_at` = now ms, unique) **before** queueing, returns the key; emits `MessageChanged`.
-- Actor: waits for the first `QueueEmpty` (sends queue until then), builds `DataMessage { body, timestamp, quote }`, `c:<uuid>` → `send_message(ServiceId, …)`, `c:PNI:<uuid>` → PNI ServiceId, `g:<hex>` → `send_message_to_group(key, …)`. Success → `SetStatus Sent`; error → status `Failed` + `Error` event. presage stores its own copy; the projector must not double-insert it (same `(author, sent_at)` → `INSERT OR IGNORE`).
+- Actor: waits for the first `QueueEmpty` (sends queue until then), builds `DataMessage { body, timestamp, quote }`, `c:<uuid>` → `send_message(ServiceId, …)`, `c:PNI:<uuid>` → PNI ServiceId, `g:<hex>` → `send_message_to_group(key, …)`. Success → `SetStatus Sent`; error or 60 s timeout → status `Failed` + `Error` event. presage stores its own copy in its store only; the server does not echo our own sends back to this device.
 - `ProjectionDb::set_failed(key)` (only Pending → Failed). `Client::retry(key)` re-queues a Failed message (Failed → Pending).
 - `Client::own_aci() -> Option<String>`.
-- Tests: recipient parsing for all id forms + invalid ids; optimistic insert → Pending, preview updated, not unread; set_failed only from Pending; retry flips Failed → Pending; the presage echo of a sent message is deduplicated.
+- Tests: recipient parsing for all id forms + invalid ids; optimistic insert → Pending, preview updated, not unread; set_failed only from Pending; retry flips Failed → Pending; Pending rows left by a previous run become Failed at startup (a receipt still lifts them); a crashed sender is restarted and its in-flight message becomes Failed.
 
 ### Task 2 (#10): AppStore
 - `@MainActor @Observable AppStore` (replaces `CoreBridge`; keeps its link/boot logic and tests): `conversations`, `selectedId`, `messages: [Message]` for the selection (newest window of 100, `loadOlder()` pages 100 more), `typing: [conversationId: Date]` expiring after 15 s, `send(text)`, `retry(key)`.
