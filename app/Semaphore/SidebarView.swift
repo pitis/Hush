@@ -38,8 +38,8 @@ struct SidebarView: View {
                 .focusable()
                 .focused($listFocused)
                 .focusEffectDisabled()
-                .onKeyPress(.downArrow) { move(1) }
-                .onKeyPress(.upArrow) { move(-1) }
+                .onKeyPress(.downArrow) { moveInSearch(1) }
+                .onKeyPress(.upArrow) { moveInSearch(-1) }
                 .onChange(of: store.selectedId) { _, id in
                     // keyboard navigation can select a chat that is scrolled out of view
                     if let id, !browsingResults { proxy.scrollTo(id) }
@@ -92,8 +92,17 @@ struct SidebarView: View {
 
     @ViewBuilder private var messageResults: some View {
         if store.searchResults.isEmpty {
-            Text("No messages found").font(.system(size: 13)).foregroundStyle(Theme.secondaryText)
-                .padding(.horizontal, 10).padding(.vertical, 12)
+            Group {
+                if store.searchPending {
+                    Text("Searching…")
+                } else if let failed = store.searchFailed {
+                    Text("Search failed: \(failed)").foregroundStyle(.yellow)
+                } else {
+                    Text("No messages found")
+                }
+            }
+            .font(.system(size: 13)).foregroundStyle(Theme.secondaryText)
+            .padding(.horizontal, 10).padding(.vertical, 12)
         } else {
             SectionTitle("Messages")
             ForEach(Array(store.searchResults.enumerated()), id: \.offset) { i, hit in

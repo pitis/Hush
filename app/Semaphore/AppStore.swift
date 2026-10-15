@@ -49,7 +49,13 @@ final class AppStore {
     /// Search only in this chat (⇧⌘F), or everywhere.
     private(set) var searchScope: String? { didSet { if searchScope != oldValue { scheduleSearch() } } }
     private(set) var searchResults: [SearchHit] = []
+    /// A search for the current query is on its way (results are empty meanwhile, never stale).
+    private(set) var searchPending = false
+    /// Why the last search failed, if it did.
+    private(set) var searchFailed: String?
     private var searchTask: Task<Void, Never>?
+    /// Bumped by each `open(hit)`: only the latest one moves the timeline.
+    private var openGeneration = 0
     /// A message found by search: highlighted for a moment, and scrolled to (`scrollRequest`).
     private(set) var highlighted: MessageKey?
     private(set) var scrollTarget: MessageKey?
@@ -490,19 +496,29 @@ final class AppStore {
     /// Looks the query up once typing pauses; a newer query cancels an older one.
     private func scheduleSearch() {
         searchTask?.cancel()
+        // results of an older query must never be shown (or opened) under this one
+        searchResults = []
+        searchFailed = nil
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let client, !query.isEmpty else {
-            searchResults = []
+            searchPending = false
             return
         }
+        searchPending = true
         let scope = searchScope
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
             do {
                 let hits = try await client.search(query: query, conversationId: scope, limit: Self.searchLimit)
-                if !Task.isCancelled { searchResults = hits }
-            } catch { append("search failed: \(error)") }
+                guard !Task.isCancelled else { return }
+                searchResults = hits
+            } catch {
+                guard !Task.isCancelled else { return }
+                Self.logger.error("search failed: \(error, privacy: .private)")
+                searchFailed = Self.describe(error)
+            }
+            searchPending = false
         }
     }
 
@@ -512,23 +528,28 @@ final class AppStore {
         let conversationId = hit.message.conversationId
         select(conversationId)
         guard let client else { return }
-        let generation = selectionGeneration
+        openGeneration += 1
+        let (generation, opening) = (selectionGeneration, openGeneration)
+        // a newer open (arrowing on through results) or another chat makes this one moot
+        let current = { generation == self.selectionGeneration && opening == self.openGeneration }
+        var page: [Message] = []
         do {
             let newer = try await client.countNewer(conversationId: conversationId, key: key)
+            guard current() else { return }
             guard newer < Self.jumpLimit else {
                 return showError("That message is too far back to show yet.")
             }
             let limit = max(Self.pageSize, newer + 50)
-            let page = try await client.messages(conversationId: conversationId, before: nil, limit: limit)
-            guard generation == selectionGeneration else { return }
+            page = try await client.messages(conversationId: conversationId, before: nil, limit: limit)
+            guard current() else { return }
             if page.count > messages.count {
                 messages = page
                 hasOlder = page.count == Int(limit)
-                await loadDetails(for: page, generation: generation)
             }
         } catch {
             return showError("Couldn't open that message: \(Self.describe(error))")
         }
+        // to the message at once; details (reactions, files) follow, those around it first
         highlighted = key
         scrollTarget = key
         scrollRequest += 1
@@ -536,6 +557,14 @@ final class AppStore {
             try? await Task.sleep(for: .seconds(2))
             if highlighted == key { highlighted = nil }
         }
+        let at = page.firstIndex { $0.author == key.author && $0.sentAt == key.sentAt } ?? page.count
+        let near = Array(page[max(0, at - 30)..<min(page.count, at + 30)])
+        let nearKeys = Set(near.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
+        await loadDetails(for: near, generation: generation)
+        guard current() else { return }
+        await loadDetails(
+            for: page.filter { !nearKeys.contains(MessageKey(author: $0.author, sentAt: $0.sentAt)) },
+            generation: generation)
     }
     func focusComposer() { composerWantsFocus = true }
     func composerTookFocus() { composerWantsFocus = false }

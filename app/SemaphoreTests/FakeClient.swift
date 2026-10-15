@@ -158,8 +158,11 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     private(set) var searches: [(query: String, conversationId: String?)] = []
     var searchAnswers: [String: [SearchHit]] = [:]
     var newerCounts: [MessageKey: UInt32] = [:]
+    var searchError: Error?
+    var countDelays: [MessageKey: Duration] = [:]
     func search(query: String, conversationId: String?, limit: UInt32) async throws -> [SearchHit] {
-        lock.withLock {
+        if let searchError { throw searchError }
+        return lock.withLock {
             searches.append((query, conversationId))
             return (searchAnswers[query] ?? []).filter {
                 conversationId == nil || $0.message.conversationId == conversationId
@@ -167,7 +170,8 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         }
     }
     func countNewer(conversationId: String, key: MessageKey) async throws -> UInt32 {
-        lock.withLock { newerCounts[key] ?? 0 }
+        if let delay = lock.withLock({ countDelays[key] }) { try? await Task.sleep(for: delay) }
+        return lock.withLock { newerCounts[key] ?? 0 }
     }
 }
 

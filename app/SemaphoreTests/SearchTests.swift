@@ -38,6 +38,48 @@ final class AppStoreSearchTests: XCTestCase {
         await eventually { store.searchResults.isEmpty }
     }
 
+    func testANewQueryNeverShowsTheOldOnesResults() async {
+        let fake = FakeClient(linked: true)
+        fake.searchAnswers["lunch"] = [hit("c:a", "a", 2)]
+        let store = await linkedStore(fake)
+        store.searchQuery = "lunch"
+        await eventually { store.searchResults.count == 1 }
+        store.searchQuery = "lunchroom"
+        XCTAssertTrue(store.searchResults.isEmpty, "cleared at once, not after the pause")
+        XCTAssertTrue(store.searchPending)
+        await eventually { !store.searchPending }
+        XCTAssertTrue(store.searchResults.isEmpty)
+    }
+
+    func testAFailedSearchSaysSo() async {
+        let fake = FakeClient(linked: true)
+        fake.searchError = TestError(description: "broken")
+        let store = await linkedStore(fake)
+        store.searchQuery = "lunch"
+        await eventually { store.searchFailed != nil }
+        XCTAssertTrue(store.searchResults.isEmpty)
+        XCTAssertFalse(store.searchPending)
+    }
+
+    func testArrowingQuicklyEndsOnTheLastResultPicked() async {
+        let fake = FakeClient(linked: true)
+        fake.messageAnswers["c:a"] = (1...300).map { message("c:a", "a", Int64($0)) }
+        let far = MessageKey(author: "a", sentAt: 10)
+        let near = MessageKey(author: "a", sentAt: 290)
+        fake.newerCounts[far] = 290
+        fake.newerCounts[near] = 10
+        fake.countDelays[far] = .milliseconds(80)  // slower: more to load
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        let (farHit, nearHit) = (hit("c:a", "a", 10), hit("c:a", "a", 290))
+        let first = Task { await store.open(farHit) }
+        try? await Task.sleep(for: .milliseconds(5))
+        let second = Task { await store.open(nearHit) }
+        _ = await (first.value, second.value)
+        XCTAssertEqual(store.highlighted, near)
+        XCTAssertEqual(store.scrollTarget, near)
+    }
+
     func testSearchInChatLooksOnlyThere() async {
         let fake = FakeClient(linked: true)
         fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
