@@ -191,7 +191,16 @@ final class AppStore {
         (typingUntil[conversationId] ?? .distantPast) > now
     }
 
-    func isOwn(_ message: Message) -> Bool { message.isOutgoing }
+    var selectedConversation: Conversation? {
+        selectedId.flatMap { id in conversations.first { $0.id == id } }
+    }
+
+    /// A conversation's name, or a short form of its id until the name is known.
+    nonisolated static func displayTitle(_ c: Conversation) -> String {
+        if !c.title.isEmpty { return c.title }
+        if c.id.hasPrefix("g:") { return "Group" }
+        return String(c.id.dropFirst(2).prefix(8))
+    }
 
     /// A group member's display name: their contact name, else a short id. Never empty.
     func senderName(_ author: String) -> String {
