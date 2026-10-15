@@ -3,9 +3,9 @@ import XCTest
 @testable import Semaphore
 
 @MainActor
-final class CoreBridgeTests: XCTestCase {
-    private func bridge(_ fake: FakeClient) -> CoreBridge {
-        CoreBridge(open: { _ in fake })
+final class AppStoreTests: XCTestCase {
+    private func bridge(_ fake: FakeClient) -> AppStore {
+        AppStore(open: { _ in fake })
     }
 
     // MARK: boot
@@ -33,7 +33,7 @@ final class CoreBridgeTests: XCTestCase {
     func testBootRunsOnce() async {
         let fake = FakeClient(linked: false)
         let opens = Counter()
-        let b = CoreBridge(open: { _ in
+        let b = AppStore(open: { _ in
             opens.increment()
             return fake
         })
@@ -44,13 +44,13 @@ final class CoreBridgeTests: XCTestCase {
     }
 
     func testBootShowsAlreadyRunningWhenTheDataIsLocked() async {
-        let b = CoreBridge(open: { _ in throw CoreError.AlreadyOpen })
+        let b = AppStore(open: { _ in throw CoreError.AlreadyOpen })
         await b.boot()
         XCTAssertEqual(b.screen, .failed("Semaphore is already running."))
     }
 
     func testBootShowsAKeychainHintWhenTheKeyIsUnavailable() async {
-        let b = CoreBridge(open: { _ in throw KeychainError.status(errSecInteractionNotAllowed) })
+        let b = AppStore(open: { _ in throw KeychainError.status(errSecInteractionNotAllowed) })
         await b.boot()
         guard case .failed(let message) = b.screen else { return XCTFail("\(b.screen)") }
         XCTAssertTrue(message.contains("keychain"), message)
@@ -142,7 +142,7 @@ final class CoreBridgeTests: XCTestCase {
     }
 
     func testFailedScreenIsNotReplacedByConnectionEvents() async {
-        let b = CoreBridge(open: { _ in throw CoreError.AlreadyOpen })
+        let b = AppStore(open: { _ in throw CoreError.AlreadyOpen })
         await b.boot()
         b.handle(.connection(state: .offline))
         XCTAssertEqual(b.screen, .failed("Semaphore is already running."))
@@ -194,14 +194,14 @@ final class CoreBridgeTests: XCTestCase {
     // MARK: log
 
     func testLogIsCappedOldestFirstOutAndAllowsRepeats() {
-        let b = CoreBridge(open: { _ in FakeClient(linked: false) })
-        for i in 0..<(CoreBridge.logLimit + 10) {
+        let b = AppStore(open: { _ in FakeClient(linked: false) })
+        for i in 0..<(AppStore.logLimit + 10) {
             b.handle(.error(message: "e\(i)"))
         }
-        XCTAssertEqual(b.log.count, CoreBridge.logLimit)
+        XCTAssertEqual(b.log.count, AppStore.logLimit)
         XCTAssertEqual(b.log.first?.text, "error: e10")
-        b.handle(.typing(conversationId: "c:a", who: "a", started: true))
-        b.handle(.typing(conversationId: "c:a", who: "a", started: true))
+        b.handle(.error(message: "same"))
+        b.handle(.error(message: "same"))
         let last2 = b.log.suffix(2)
         XCTAssertEqual(Set(last2.map(\.text)).count, 1)
         XCTAssertEqual(Set(last2.map(\.id)).count, 2)
@@ -210,7 +210,7 @@ final class CoreBridgeTests: XCTestCase {
     }
 
     func testDataDirectoryIsApplicationSupportSemaphore() throws {
-        let dir = try CoreBridge.dataDirectory()
+        let dir = try AppStore.dataDirectory()
         XCTAssertEqual(dir.lastPathComponent, "Semaphore")
         XCTAssertEqual(dir.deletingLastPathComponent().lastPathComponent, "Application Support")
     }

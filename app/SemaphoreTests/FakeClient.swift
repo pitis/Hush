@@ -73,12 +73,50 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return true
     }
 
-    func title(conversationId: String) async throws -> String? { titles[conversationId] }
+    private(set) var titleCalls = 0
+    var reactionAnswers: [MessageKey: [Reaction]] = [:]
+    private(set) var reactionCalls = 0
+
+    func title(conversationId: String) async throws -> String? {
+        lock.withLock { titleCalls += 1 }
+        return titles[conversationId]
+    }
+
+    func message(key: MessageKey) async throws -> Message? {
+        lock.withLock {
+            messageAnswers.values.flatMap { $0 }.first { $0.author == key.author && $0.sentAt == key.sentAt }
+        }
+    }
+
+    private(set) var messageCalls: [(conversationId: String, before: MessageKey?)] = []
+    /// When set, `messages()` for this conversation waits for `releaseMessages()` first.
+    var holdMessagesFor: String?
+    private var heldMessages: CheckedContinuation<Void, Never>?
+    var isHoldingMessages: Bool { lock.withLock { heldMessages != nil } }
+
+    func releaseMessages() {
+        let c = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            defer { heldMessages = nil }
+            return heldMessages
+        }
+        c?.resume()
+    }
 
     func messages(conversationId: String, before: MessageKey?, limit: UInt32) async throws -> [Message] {
-        messageAnswers[conversationId] ?? []
+        lock.withLock { messageCalls.append((conversationId, before)) }
+        if conversationId == holdMessagesFor {
+            await withCheckedContinuation { c in lock.withLock { heldMessages = c } }
+        }
+        let all = lock.withLock { messageAnswers[conversationId] ?? [] }
+        let older = before.map { b in all.filter { ($0.sentAt, $0.author) < (b.sentAt, b.author) } } ?? all
+        return Array(older.suffix(Int(limit)))
     }
-    func reactions(key: MessageKey) async throws -> [Reaction] { [] }
+    func reactions(key: MessageKey) async throws -> [Reaction] {
+        lock.withLock {
+            reactionCalls += 1
+            return reactionAnswers[key] ?? []
+        }
+    }
     func search(query: String, limit: UInt32) async throws -> [Message] { [] }
 }
 
@@ -107,4 +145,11 @@ func eventually(
         try? await Task.sleep(for: .milliseconds(10))
     }
     XCTFail("condition not met in time", file: file, line: line)
+}
+
+func message(_ conv: String, _ author: String, _ sentAt: Int64, _ body: String = "x", outgoing: Bool = false) -> Message
+{
+    Message(
+        conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, isOutgoing: outgoing,
+        status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil)
 }

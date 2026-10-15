@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
-    let core: CoreBridge
+    let core: AppStore
 
     var body: some View {
         Group {
