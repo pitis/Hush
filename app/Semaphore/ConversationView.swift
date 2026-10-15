@@ -111,6 +111,9 @@ struct TimelineList: View {
             .onChange(of: activeState) { _, _ in markReadIfSeen() }
             .onChange(of: conversation.unreadCount) { _, _ in markReadIfSeen() }
             .onChange(of: conversation.id) { _, _ in markReadIfSeen() }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) {
+                _ in markReadIfSeen()
+            }
             .onAppear { markReadIfSeen() }
             .overlay(alignment: .bottomTrailing) {
                 if unseenNew {
@@ -130,8 +133,10 @@ struct TimelineList: View {
     }
 
     private func markReadIfSeen() {
+        let visible = NSApp.keyWindow?.occlusionState.contains(.visible) ?? false
         if ChatList.shouldMarkRead(
-            atBottom: atBottom, windowKey: activeState == .key, unread: conversation.unreadCount)
+            atBottom: atBottom, windowKey: activeState == .key, windowVisible: visible,
+            unread: conversation.unreadCount)
         {
             store.markRead(conversation.id)
         }

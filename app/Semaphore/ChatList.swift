@@ -52,9 +52,10 @@ enum ChatList {
         return total > 0 ? "\(total)" : nil
     }
 
-    /// The open chat is read once its newest message is on screen in the key window.
-    static func shouldMarkRead(atBottom: Bool, windowKey: Bool, unread: UInt32) -> Bool {
-        atBottom && windowKey && unread > 0
+    /// The open chat is read once its newest message is on screen in the key window, and the
+    /// window is actually visible (not while the screen is locked or asleep).
+    static func shouldMarkRead(atBottom: Bool, windowKey: Bool, windowVisible: Bool, unread: UInt32) -> Bool {
+        atBottom && windowKey && windowVisible && unread > 0
     }
 
     private static func oneLine(_ text: String) -> String {

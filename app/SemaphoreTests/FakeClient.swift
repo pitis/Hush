@@ -77,8 +77,10 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func edit(key: MessageKey, newBody: String) async throws {}
     func deleteForEveryone(key: MessageKey) async throws {}
     private(set) var markedRead: [String] = []
+    var markReadError: Error?
     func markRead(conversationId: String) async throws -> UInt32 {
         lock.withLock { markedRead.append(conversationId) }
+        if let markReadError { throw markReadError }
         return 0
     }
     func setTyping(conversationId: String, started: Bool) throws {}

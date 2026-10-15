@@ -20,23 +20,29 @@ struct SemaphoreApp: App {
 struct ChatCommands: Commands {
     let store: AppStore
 
+    /// Chat shortcuts work from anywhere and land in the new chat's composer, like Desktop.
+    private func switchChat(_ action: () -> Void) {
+        action()
+        store.focusComposer()
+    }
+
     var body: some Commands {
         CommandMenu("Chats") {
             Group {
                 Button("Find Chat…") { store.focusSearch() }.keyboardShortcut("k")
                 Button("Search") { store.focusSearch() }.keyboardShortcut("f")
                 Divider()
-                Button("Previous Chat") { store.selectNeighbor(step: -1, unreadOnly: false) }
+                Button("Previous Chat") { switchChat { store.selectNeighbor(step: -1, unreadOnly: false) } }
                     .keyboardShortcut(.upArrow, modifiers: .option)
-                Button("Next Chat") { store.selectNeighbor(step: 1, unreadOnly: false) }
+                Button("Next Chat") { switchChat { store.selectNeighbor(step: 1, unreadOnly: false) } }
                     .keyboardShortcut(.downArrow, modifiers: .option)
-                Button("Previous Unread Chat") { store.selectNeighbor(step: -1, unreadOnly: true) }
+                Button("Previous Unread Chat") { switchChat { store.selectNeighbor(step: -1, unreadOnly: true) } }
                     .keyboardShortcut(.upArrow, modifiers: [.option, .shift])
-                Button("Next Unread Chat") { store.selectNeighbor(step: 1, unreadOnly: true) }
+                Button("Next Unread Chat") { switchChat { store.selectNeighbor(step: 1, unreadOnly: true) } }
                     .keyboardShortcut(.downArrow, modifiers: [.option, .shift])
                 Menu("Jump to Chat") {
                     ForEach(1...9, id: \.self) { n in
-                        Button("Chat \(n)") { store.selectChat(at: n) }
+                        Button("Chat \(n)") { switchChat { store.selectChat(at: n) } }
                             .keyboardShortcut(KeyEquivalent(Character("\(n)")))
                     }
                 }

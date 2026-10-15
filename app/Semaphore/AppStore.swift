@@ -41,9 +41,12 @@ final class AppStore {
     private(set) var ownAci: String?
     /// The chat list's search text; the list and keyboard navigation show only matching chats.
     var searchQuery = ""
-    /// Bumped to ask the views to focus the search field or the composer.
+    /// Bumped to ask the sidebar to focus the search field.
     private(set) var searchFocusRequest = 0
-    private(set) var composerFocusRequest = 0
+    /// Set to move focus to the composer (a click on a chat, ↩ in the search, a shortcut); the
+    /// composer clears it. Switching chats with the arrows in the list or the search leaves focus
+    /// there.
+    private(set) var composerWantsFocus = false
     /// Chats whose mark-read call is in flight.
     private var markingRead: Set<String> = []
     private(set) var log: [LogLine] = []
@@ -236,6 +239,7 @@ final class AppStore {
         Task {
             defer { markingRead.remove(conversationId) }
             do { _ = try await client.markRead(conversationId: conversationId) } catch {
+                lastError = "Couldn't mark the chat read: \(Self.describe(error))"
                 append("mark read failed: \(error)")
             }
         }
@@ -265,7 +269,8 @@ final class AppStore {
     }
 
     func focusSearch() { searchFocusRequest += 1 }
-    func focusComposer() { composerFocusRequest += 1 }
+    func focusComposer() { composerWantsFocus = true }
+    func composerTookFocus() { composerWantsFocus = false }
 
     /// Recomputes day separators ("Today" becomes "Yesterday" after midnight).
     func refreshDays() { timelineItems = Timeline.items(for: messages) }

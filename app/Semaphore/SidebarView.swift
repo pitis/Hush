@@ -41,6 +41,7 @@ struct SidebarView: View {
                             let selected = c.id == store.selectedId
                             Button {
                                 store.select(c.id)
+                                store.focusComposer()
                             } label: {
                                 ConversationRow(
                                     conversation: c, title: store.title(c), selected: selected,

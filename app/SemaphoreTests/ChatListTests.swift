@@ -80,10 +80,15 @@ final class ChatListTests: XCTestCase {
     }
 
     func testMarkReadOnlyWhenTheNewestMessageIsSeen() {
-        XCTAssertTrue(ChatList.shouldMarkRead(atBottom: true, windowKey: true, unread: 2))
-        XCTAssertFalse(ChatList.shouldMarkRead(atBottom: false, windowKey: true, unread: 2))
-        XCTAssertFalse(ChatList.shouldMarkRead(atBottom: true, windowKey: false, unread: 2))
-        XCTAssertFalse(ChatList.shouldMarkRead(atBottom: true, windowKey: true, unread: 0))
+        func mark(bottom: Bool = true, key: Bool = true, visible: Bool = true, unread: UInt32 = 2) -> Bool {
+            ChatList.shouldMarkRead(atBottom: bottom, windowKey: key, windowVisible: visible, unread: unread)
+        }
+        XCTAssertTrue(mark())
+        XCTAssertFalse(mark(bottom: false))
+        XCTAssertFalse(mark(key: false))
+        // key but not on screen: screen locked or asleep, the user is away
+        XCTAssertFalse(mark(visible: false))
+        XCTAssertFalse(mark(unread: 0))
     }
 
     func testOwnChatIsNoteToSelf() {
@@ -106,9 +111,62 @@ final class AppStoreChatListTests: XCTestCase {
         fake.conversationAnswers = [.success([conversation("c:a")])]
         store.handle(.conversationsChanged)
         await eventually { store.conversations.first?.unreadCount == 0 }
+        XCTAssertNil(store.badge)
         store.markRead("c:a")  // nothing unread
         try? await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(fake.markedRead, ["c:a"])
+    }
+
+    func testAFailedMarkReadIsShownAndCanBeRetried() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a", unread: 2)])]
+        fake.markReadError = TestError(description: "offline")
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 1 }
+        store.markRead("c:a")
+        await eventually { store.lastError != nil }
+        fake.markReadError = nil
+        store.markRead("c:a")
+        await eventually { fake.markedRead == ["c:a", "c:a"] }
+    }
+
+    func testSearchNarrowsKeyboardNavigationAndReturnOpensAMatch() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [
+            .success([conversation("c:alice"), conversation("c:bob"), conversation("c:carol")])
+        ]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 3 }
+        store.searchQuery = "c:b"
+        XCTAssertEqual(store.visibleConversations.map(\.id), ["c:bob"])
+        store.selectChat(at: 1)
+        XCTAssertEqual(store.selectedId, "c:bob")
+        store.selectNeighbor(step: 1, unreadOnly: false)  // wraps within the matches only
+        XCTAssertEqual(store.selectedId, "c:bob")
+        // ↩ opens the first match when the open chat isn't one, ends the search, moves to the composer
+        store.select("c:alice")
+        store.searchQuery = "car"
+        store.openSearchResult()
+        XCTAssertEqual(store.selectedId, "c:carol")
+        XCTAssertEqual(store.searchQuery, "")
+        XCTAssertTrue(store.composerWantsFocus)
+    }
+
+    func testOnlyExplicitRequestsMoveFocusToTheComposer() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 2 }
+        // arrows in the search or the list switch chats but leave focus where it is
+        store.selectNeighbor(step: 1, unreadOnly: false)
+        XCTAssertFalse(store.composerWantsFocus)
+        store.focusComposer()
+        XCTAssertTrue(store.composerWantsFocus)
+        store.composerTookFocus()
+        XCTAssertFalse(store.composerWantsFocus)
     }
 
     func testDockBadgeFollowsTheList() async {
