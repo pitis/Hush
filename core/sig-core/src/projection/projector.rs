@@ -2,9 +2,8 @@
 //! the returned ops to the database.
 
 use presage::libsignal_service::content::{sync_message, Content, ContentBody, DataMessage};
-use presage::store::Thread;
 
-use super::ids::{aci, conversation_id};
+use super::ids::{aci, direct_id, group_id};
 use super::model::*;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12,48 +11,61 @@ pub enum Op {
     InsertMessage(Message),
 }
 
-/// The ops one received `Content` produces. `me` is our own ACI (canonical UUID string).
-/// Content we don't show yet (calls, stories, receipts, …) yields no ops.
+/// The ops one received (or locally sent) `Content` produces. `me` is our own ACI as a canonical
+/// UUID string. Content we don't show yet (calls, stories, receipts, …) yields no ops.
 pub fn project(content: &Content, me: &str) -> Vec<Op> {
+    // The sender is always an ACI (sealed sender certificates carry the ACI).
     let sender = content.metadata.sender.raw_uuid().to_string();
     let received_at = content.metadata.server_timestamp.timestamp_millis();
     match &content.body {
         ContentBody::DataMessage(dm) => {
-            let Some(conv) = thread_of(dm, content) else {
+            let outgoing = sender == me;
+            // Our own messages (as presage saves them after sending) belong to the recipient's chat.
+            let peer = if outgoing {
+                content.metadata.destination
+            } else {
+                content.metadata.sender
+            };
+            let Some(conv) = group_of(dm).unwrap_or_else(|| Some(direct_id(&peer))) else {
                 return vec![];
             };
-            data_message(dm, &conv, &sender, received_at, sender == me)
+            data_message(dm, &conv, &sender, received_at, outgoing)
         }
-        ContentBody::SynchronizeMessage(sm) => match &sm.content {
-            Some(sync_message::Content::Sent(sent)) => match &sent.message {
-                Some(dm) => {
-                    let Some(conv) = thread_of(dm, content) else {
-                        return vec![];
-                    };
-                    data_message(dm, &conv, me, received_at, true)
-                }
-                None => vec![],
-            },
+        // libsignal-service already drops sync messages that aren't from our account; checked
+        // again here because accepting one would put words in our mouth.
+        ContentBody::SynchronizeMessage(sm) if sender == me => match &sm.content {
+            Some(sync_message::Content::Sent(sent)) => {
+                let Some(dm) = &sent.message else { return vec![] };
+                let conv = match group_of(dm) {
+                    Some(group) => group,
+                    None => sent.parse_destination_service_id().map(|d| direct_id(&d)),
+                };
+                let Some(conv) = conv else { return vec![] };
+                data_message(dm, &conv, me, received_at, true)
+            }
             _ => vec![],
         },
         _ => vec![],
     }
 }
 
-/// The conversation a data message belongs to. The group context wins over a sync transcript's
-/// destination, so a group message sent from the phone never lands in a 1:1 chat.
-fn thread_of(dm: &DataMessage, content: &Content) -> Option<String> {
-    if let Some(key) = dm.group_v2.as_ref().and_then(|g| g.master_key.as_deref()) {
-        let key: [u8; 32] = key.try_into().ok()?;
-        return Some(conversation_id(&Thread::Group(key)));
-    }
-    Thread::try_from(content).ok().map(|t| conversation_id(&t))
+/// `Some(conversation)` if the message is a group message: `Some(None)` when its group context is
+/// malformed (the message is dropped rather than shown in a 1:1 chat), `None` if it has none.
+fn group_of(dm: &DataMessage) -> Option<Option<String>> {
+    let key = dm.group_v2.as_ref()?.master_key.as_deref()?;
+    Some(<[u8; 32]>::try_from(key).ok().map(|k| group_id(&k)))
 }
 
 fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, outgoing: bool) -> Vec<Op> {
     let Some(sent_at) = dm.timestamp.and_then(|t| i64::try_from(t).ok()) else {
         return vec![];
     };
+    // Not shown yet: story replies (they belong to the story, M4), view-once media (M4), and
+    // messages with nothing visible to us yet (stickers, shared contacts, payments, polls; see the
+    // "Needs decision" card).
+    if dm.story_context.is_some() || dm.is_view_once == Some(true) {
+        return vec![];
+    }
     if dm.body.is_none() && dm.attachments.is_empty() {
         return vec![];
     }
@@ -90,25 +102,33 @@ mod tests {
     };
     use presage::libsignal_service::prelude::Uuid;
     use presage::libsignal_service::protocol::{Aci, DeviceId, ServiceId};
-    use presage::proto::data_message;
+    use presage::proto::data_message::{self, StoryContext};
 
     const ME: &str = "11111111-1111-1111-1111-111111111111";
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+    const BOB: &str = "33333333-3333-3333-3333-333333333333";
+    const KEY: [u8; 32] = [7u8; 32];
 
-    fn sid(u: &str) -> ServiceId {
-        ServiceId::from(Aci::from(Uuid::parse_str(u).unwrap()))
+    fn uuid(u: &str) -> Uuid {
+        Uuid::parse_str(u).unwrap()
     }
 
-    fn content(sender: &str, server_ts: i64, body: ContentBody) -> Content {
-        let t = chrono::DateTime::from_timestamp_millis(server_ts).unwrap();
+    fn sid(u: &str) -> ServiceId {
+        ServiceId::from(Aci::from(uuid(u)))
+    }
+
+    /// Content from `sender` to `dest`. The client clock is 10 s behind the server's, so tests
+    /// can tell which timestamp the projector used.
+    fn content_to(sender: &str, dest: &str, server_ts: i64, body: ContentBody) -> Content {
+        let ts = |ms| chrono::DateTime::from_timestamp_millis(ms).unwrap();
         Content {
             metadata: Metadata {
                 sender: sid(sender),
-                destination: sid(ME),
+                destination: sid(dest),
                 sender_device: DeviceId::new(1).unwrap(),
                 pni_verified: None,
-                client_timestamp: t,
-                server_timestamp: t,
+                client_timestamp: ts(server_ts - 10_000),
+                server_timestamp: ts(server_ts),
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,
@@ -116,6 +136,10 @@ mod tests {
             },
             body,
         }
+    }
+
+    fn content(sender: &str, server_ts: i64, body: ContentBody) -> Content {
+        content_to(sender, ME, server_ts, body)
     }
 
     fn text(ts: u64, body: &str) -> DataMessage {
@@ -126,14 +150,27 @@ mod tests {
         }
     }
 
-    fn sent_sync(dest: &str, dm: DataMessage) -> ContentBody {
+    fn in_group(mut dm: DataMessage, key: Vec<u8>) -> DataMessage {
+        dm.group_v2 = Some(GroupContextV2 {
+            master_key: Some(key),
+            ..Default::default()
+        });
+        dm
+    }
+
+    fn sync(sent: sync_message::Sent) -> ContentBody {
         ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(sync_message::Content::Sent(sync_message::Sent {
-                destination_service_id: Some(dest.into()),
-                timestamp: dm.timestamp,
-                message: Some(dm),
-                ..Default::default()
-            })),
+            content: Some(sync_message::Content::Sent(sent)),
+            ..Default::default()
+        })
+    }
+
+    /// A Sent transcript to `dest` whose own timestamp differs from the message's.
+    fn sent_sync(dest: &str, dm: DataMessage) -> ContentBody {
+        sync(sync_message::Sent {
+            destination_service_id: Some(dest.into()),
+            timestamp: Some(999_999),
+            message: Some(dm),
             ..Default::default()
         })
     }
@@ -165,9 +202,42 @@ mod tests {
             ME,
         ));
         assert_eq!(m.conversation_id, format!("c:{ALICE}"));
-        assert_eq!((m.author.as_str(), m.sent_at), (ME, 200));
+        assert_eq!((m.author.as_str(), m.sent_at, m.received_at), (ME, 200, 250));
         assert!(m.is_outgoing);
         assert_eq!(m.status, MessageStatus::Sent);
+    }
+
+    #[test]
+    fn sent_transcript_with_binary_destination_only() {
+        let sent = sync_message::Sent {
+            destination_service_id_binary: Some(uuid(ALICE).as_bytes().to_vec()),
+            message: Some(text(220, "bin")),
+            ..Default::default()
+        };
+        let m = one(project(&content(ME, 270, sync(sent)), ME));
+        assert_eq!(m.conversation_id, format!("c:{ALICE}"));
+        assert!(m.is_outgoing);
+    }
+
+    #[test]
+    fn sent_transcript_to_pni_gets_a_distinct_pni_conversation() {
+        let m = one(project(
+            &content(ME, 280, sent_sync(&format!("PNI:{BOB}"), text(230, "hi"))),
+            ME,
+        ));
+        assert_eq!(m.conversation_id, format!("c:PNI:{BOB}"));
+    }
+
+    #[test]
+    fn sent_transcript_without_usable_destination_is_dropped_not_put_in_note_to_self() {
+        for dest in [None, Some("garbage".to_string())] {
+            let sent = sync_message::Sent {
+                destination_service_id: dest.clone(),
+                message: Some(text(240, "x")),
+                ..Default::default()
+            };
+            assert!(project(&content(ME, 290, sync(sent)), ME).is_empty(), "{dest:?}");
+        }
     }
 
     #[test]
@@ -178,19 +248,38 @@ mod tests {
     }
 
     #[test]
-    fn group_text_uses_group_conversation() {
-        let mut dm = text(300, "group hi");
-        dm.group_v2 = Some(GroupContextV2 {
-            master_key: Some(vec![7u8; 32]),
-            ..Default::default()
-        });
-        let m = one(project(&content(ALICE, 300, ContentBody::DataMessage(dm.clone())), ME));
-        assert_eq!(m.conversation_id, format!("g:{}", hex::encode([7u8; 32])));
-        assert_eq!(m.author, ALICE);
-        // the same group message sent from my phone
-        let m = one(project(&content(ME, 301, sent_sync(ALICE, dm)), ME));
-        assert_eq!(m.conversation_id, format!("g:{}", hex::encode([7u8; 32])));
+    fn own_data_message_goes_to_the_recipient_not_note_to_self() {
+        // How presage stores a message this device sent.
+        let c = content_to(ME, ALICE, 160, ContentBody::DataMessage(text(110, "mine")));
+        let m = one(project(&c, ME));
+        assert_eq!(m.conversation_id, format!("c:{ALICE}"));
+        assert_eq!(m.author, ME);
         assert!(m.is_outgoing);
+        assert_eq!(m.status, MessageStatus::Sent);
+    }
+
+    #[test]
+    fn group_text_uses_group_conversation() {
+        let dm = in_group(text(300, "group hi"), KEY.to_vec());
+        let m = one(project(&content(ALICE, 310, ContentBody::DataMessage(dm.clone())), ME));
+        assert_eq!(m.conversation_id, format!("g:{}", hex::encode(KEY)));
+        assert_eq!((m.author.as_str(), m.sent_at, m.received_at), (ALICE, 300, 310));
+        // the same group message sent from my phone, even if the transcript names a destination
+        let m = one(project(&content(ME, 320, sent_sync(ALICE, dm)), ME));
+        assert_eq!(m.conversation_id, format!("g:{}", hex::encode(KEY)));
+        assert!(m.is_outgoing);
+    }
+
+    #[test]
+    fn group_message_with_malformed_key_is_dropped_not_shown_in_a_direct_chat() {
+        let dm = in_group(text(330, "x"), vec![7u8; 31]);
+        assert!(project(&content(ALICE, 340, ContentBody::DataMessage(dm.clone())), ME).is_empty());
+        assert!(project(&content(ME, 340, sent_sync(ALICE, dm)), ME).is_empty());
+    }
+
+    #[test]
+    fn sync_message_from_someone_else_is_ignored() {
+        assert!(project(&content(ALICE, 350, sent_sync(BOB, text(345, "forged"))), ME).is_empty());
     }
 
     #[test]
@@ -198,7 +287,7 @@ mod tests {
         let mut dm = text(400, "reply");
         dm.quote = Some(data_message::Quote {
             id: Some(100),
-            author_aci: Some(ME.into()),
+            author_aci: Some(BOB.into()),
             text: Some("orig".into()),
             ..Default::default()
         });
@@ -206,7 +295,7 @@ mod tests {
         assert_eq!(
             m.quote,
             Some(Quote {
-                author: ME.into(),
+                author: BOB.into(),
                 sent_at: 100,
                 text: Some("orig".into())
             })
@@ -214,20 +303,29 @@ mod tests {
 
         let q = dm.quote.as_mut().unwrap();
         q.author_aci = None;
-        q.author_aci_binary = Some(Uuid::parse_str(ME).unwrap().as_bytes().to_vec());
+        q.author_aci_binary = Some(uuid(BOB).as_bytes().to_vec());
         let m = one(project(&content(ALICE, 400, ContentBody::DataMessage(dm)), ME));
-        assert_eq!(m.quote.unwrap().author, ME);
+        assert_eq!(m.quote.unwrap().author, BOB);
     }
 
     #[test]
-    fn quote_without_author_or_id_is_dropped_not_fatal() {
-        let mut dm = text(410, "reply");
-        dm.quote = Some(data_message::Quote {
-            id: Some(1),
-            ..Default::default()
-        });
-        let m = one(project(&content(ALICE, 410, ContentBody::DataMessage(dm)), ME));
-        assert_eq!((m.body.as_deref(), m.quote), (Some("reply"), None));
+    fn incomplete_quote_is_dropped_but_message_kept() {
+        let quotes = [
+            data_message::Quote {
+                id: Some(1),
+                ..Default::default()
+            },
+            data_message::Quote {
+                author_aci: Some(ALICE.into()),
+                ..Default::default()
+            },
+        ];
+        for q in quotes {
+            let mut dm = text(410, "reply");
+            dm.quote = Some(q);
+            let m = one(project(&content(ALICE, 410, ContentBody::DataMessage(dm)), ME));
+            assert_eq!((m.body.as_deref(), m.quote), (Some("reply"), None));
+        }
     }
 
     #[test]
@@ -242,27 +340,78 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_content_is_skipped() {
+    fn story_replies_and_view_once_are_not_shown_yet() {
+        let mut reply = text(460, "nice story");
+        reply.story_context = Some(StoryContext::default());
+        let mut view_once = DataMessage {
+            timestamp: Some(461),
+            attachments: vec![Default::default()],
+            ..Default::default()
+        };
+        view_once.is_view_once = Some(true);
+        for dm in [reply.clone(), in_group(reply, KEY.to_vec()), view_once] {
+            assert!(
+                project(&content(ALICE, 470, ContentBody::DataMessage(dm.clone())), ME).is_empty(),
+                "{dm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_without_visible_text_or_attachments_is_skipped() {
+        let reaction = DataMessage {
+            timestamp: Some(502),
+            reaction: Some(data_message::Reaction {
+                emoji: Some("👍".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let delete = DataMessage {
+            timestamp: Some(503),
+            delete: Some(data_message::Delete {
+                target_sent_timestamp: Some(1),
+            }),
+            ..Default::default()
+        };
+        let mut group_update = in_group(
+            DataMessage {
+                timestamp: Some(504),
+                ..Default::default()
+            },
+            KEY.to_vec(),
+        );
+        group_update.group_v2.as_mut().unwrap().group_change = Some(vec![1]);
+        let timer = DataMessage {
+            timestamp: Some(505),
+            flags: Some(2),
+            expire_timer: Some(60),
+            ..Default::default()
+        };
+        // pinned M1 behaviour until decided: stickers have no body or attachments and are skipped
+        let sticker = DataMessage {
+            timestamp: Some(506),
+            sticker: Some(Default::default()),
+            ..Default::default()
+        };
         let skipped = [
             ContentBody::NullMessage(NullMessage::default()),
-            // empty data message (e.g. a profile key update)
             ContentBody::DataMessage(DataMessage {
                 timestamp: Some(501),
                 ..Default::default()
             }),
-            // text without a timestamp can't be identified
             ContentBody::DataMessage(DataMessage {
-                body: Some("x".into()),
+                body: Some("no timestamp".into()),
                 ..Default::default()
             }),
-            // sync messages other than Sent
+            ContentBody::DataMessage(reaction),
+            ContentBody::DataMessage(delete),
+            ContentBody::DataMessage(group_update),
+            ContentBody::DataMessage(timer),
+            ContentBody::DataMessage(sticker),
             ContentBody::SynchronizeMessage(SyncMessage::default()),
-            // a Sent transcript with no message
-            ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(sync_message::Sent {
-                    destination_service_id: Some(ALICE.into()),
-                    ..Default::default()
-                })),
+            sync(sync_message::Sent {
+                destination_service_id: Some(ALICE.into()),
                 ..Default::default()
             }),
         ];
