@@ -4,6 +4,15 @@ struct SidebarView: View {
     @Bindable var store: AppStore
     @FocusState private var searchFocused: Bool
     @FocusState private var listFocused: Bool
+    /// The message result picked with the arrows while browsing results.
+    @State private var resultIndex: Int?
+
+    private var searching: Bool { !store.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty }
+    /// Arrows step through message results (in a chat search, or when no chat matches) rather
+    /// than chats.
+    private var browsingResults: Bool {
+        searching && (store.searchScope != nil || store.visibleConversations.isEmpty)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -14,69 +23,187 @@ struct SidebarView: View {
             .padding(.horizontal, 18)
             .padding(.top, 14)
             .padding(.bottom, 10)
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondaryText)
-                TextField("Search", text: $store.searchQuery).textFieldStyle(.plain).focused($searchFocused)
-                    // like Desktop's search: arrows pick a chat, ↩ opens it, Esc ends the search
-                    .onKeyPress(.downArrow) { move(1) }
-                    .onKeyPress(.upArrow) { move(-1) }
-                    .onKeyPress(.return) {
-                        store.openSearchResult()
-                        return .handled
-                    }
-                    .onExitCommand {
-                        store.searchQuery = ""
-                        searchFocused = false
-                    }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Theme.field, in: RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
+            searchField
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(store.visibleConversations, id: \.id) { c in
-                            let selected = c.id == store.selectedId
-                            Button {
-                                store.select(c.id)
-                                store.focusComposer()
-                            } label: {
-                                ConversationRow(
-                                    conversation: c, title: store.title(c), selected: selected,
-                                    line: ChatList.line(
-                                        c, selected: selected, typing: store.isTyping(c.id),
-                                        draft: Composer.draft(for: c.id),
-                                        authorName: store.senderName(c.lastMessageAuthor))
-                                )
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityAddTraits(selected ? .isSelected : [])
-                            .id(c.id)
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        if store.searchScope == nil {
+                            if searching && !store.visibleConversations.isEmpty { SectionTitle("Chats") }
+                            ForEach(store.visibleConversations, id: \.id) { c in chatRow(c) }
                         }
+                        if searching { messageResults }
                     }
                     .padding(.horizontal, 8)
                 }
                 .focusable()
                 .focused($listFocused)
                 .focusEffectDisabled()
-                .onKeyPress(.downArrow) { move(1) }
-                .onKeyPress(.upArrow) { move(-1) }
+                .onKeyPress(.downArrow) { moveInSearch(1) }
+                .onKeyPress(.upArrow) { moveInSearch(-1) }
                 .onChange(of: store.selectedId) { _, id in
                     // keyboard navigation can select a chat that is scrolled out of view
-                    if let id { proxy.scrollTo(id) }
+                    if let id, !browsingResults { proxy.scrollTo(id) }
                 }
+                .onChange(of: resultIndex) { _, i in if let i { proxy.scrollTo("result-\(i)") } }
             }
         }
         .background(Theme.sidebar)
         .onChange(of: store.searchFocusRequest) { _, _ in searchFocused = true }
+        .onChange(of: store.searchResults) { _, _ in resultIndex = nil }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondaryText)
+            if let scope = store.searchScope {
+                let title = store.conversations.first { $0.id == scope }.map(store.title) ?? "this chat"
+                HStack(spacing: 3) {
+                    Text("In \(title)").font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    Button(action: store.endSearch) { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Search all chats")
+                }
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(Theme.selection, in: Capsule())
+            }
+            TextField("Search", text: $store.searchQuery).textFieldStyle(.plain).focused($searchFocused)
+                // like Desktop's search: arrows pick a chat or message, ↩ opens it, Esc ends the search
+                .onKeyPress(.downArrow) { moveInSearch(1) }
+                .onKeyPress(.upArrow) { moveInSearch(-1) }
+                .onKeyPress(.return) {
+                    if browsingResults, let i = resultIndex, store.searchResults.indices.contains(i) {
+                        Task { await store.open(store.searchResults[i]) }
+                    } else {
+                        store.openSearchResult()
+                    }
+                    return .handled
+                }
+                .onExitCommand {
+                    store.endSearch()
+                    searchFocused = false
+                }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Theme.field, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder private var messageResults: some View {
+        if store.searchResults.isEmpty {
+            Group {
+                if store.searchPending {
+                    Text("Searching…")
+                } else if let failed = store.searchFailed {
+                    Text("Search failed: \(failed)").foregroundStyle(.yellow)
+                } else {
+                    Text("No messages found")
+                }
+            }
+            .font(.system(size: 13)).foregroundStyle(Theme.secondaryText)
+            .padding(.horizontal, 10).padding(.vertical, 12)
+        } else {
+            SectionTitle("Messages")
+            ForEach(Array(store.searchResults.enumerated()), id: \.offset) { i, hit in
+                Button {
+                    resultIndex = i
+                    Task { await store.open(hit) }
+                } label: {
+                    SearchResultRow(
+                        hit: hit, chatTitle: chatTitle(hit.message.conversationId),
+                        sender: hit.message.isOutgoing ? "You" : store.senderName(hit.message.author),
+                        selected: resultIndex == i)
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(resultIndex == i ? .isSelected : [])
+                .id("result-\(i)")
+            }
+        }
+    }
+
+    private func chatRow(_ c: Conversation) -> some View {
+        let selected = c.id == store.selectedId
+        return Button {
+            store.select(c.id)
+            store.focusComposer()
+        } label: {
+            ConversationRow(
+                conversation: c, title: store.title(c), selected: selected,
+                line: ChatList.line(
+                    c, selected: selected, typing: store.isTyping(c.id), draft: Composer.draft(for: c.id),
+                    authorName: store.senderName(c.lastMessageAuthor))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .id(c.id)
+    }
+
+    private func chatTitle(_ id: String) -> String {
+        store.conversations.first { $0.id == id }.map(store.title) ?? String(id.dropFirst(2).prefix(8))
     }
 
     private func move(_ step: Int) -> KeyPress.Result {
         store.selectNeighbor(step: step, unreadOnly: false)
         return .handled
+    }
+
+    /// In the search field: through message results when browsing them (each opens as it is
+    /// picked, like stepping through matches), else through the chats.
+    private func moveInSearch(_ step: Int) -> KeyPress.Result {
+        guard browsingResults, !store.searchResults.isEmpty else { return move(step) }
+        let last = store.searchResults.count - 1
+        let next = resultIndex.map { min(max($0 + step, 0), last) } ?? (step > 0 ? 0 : last)
+        resultIndex = next
+        Task { await store.open(store.searchResults[next]) }
+        return .handled
+    }
+}
+
+struct SectionTitle: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+
+    var body: some View {
+        Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.secondaryText)
+            .padding(.horizontal, 10).padding(.top, 10).padding(.bottom, 2)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// A message found by search: its chat, when, who wrote it, the matching text highlighted.
+struct SearchResultRow: View {
+    let hit: SearchHit
+    let chatTitle: String
+    let sender: String
+    let selected: Bool
+
+    var body: some View {
+        let m = hit.message
+        HStack(alignment: .top, spacing: 12) {
+            Avatar(id: m.conversationId, name: chatTitle, size: 36)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(chatTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Spacer(minLength: 6)
+                    TimelineView(.everyMinute) { context in
+                        Text(Formatting().listTime(m.sentAt, now: context.date)).font(.system(size: 11))
+                            .foregroundStyle(Theme.secondaryText)
+                    }
+                }
+                (m.conversationId.hasPrefix("g:") || m.isOutgoing ? Text("\(sender): ") : Text(""))
+                    .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+                    + Text(SearchText.highlighted(hit.snippet)).font(.system(size: 12))
+            }
+            .lineLimit(2)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(selected ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 10))
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 }
 

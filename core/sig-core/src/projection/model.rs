@@ -117,6 +117,19 @@ impl Message {
     }
 }
 
+/// Marks the matched words in a search snippet (Unicode private-use characters, so message text
+/// can't contain them by accident).
+pub const HIGHLIGHT_START: char = '\u{E000}';
+pub const HIGHLIGHT_END: char = '\u{E001}';
+
+/// A message found by search, with the text around the match (matches between
+/// `HIGHLIGHT_START` and `HIGHLIGHT_END`).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct SearchHit {
+    pub message: Message,
+    pub snippet: String,
+}
+
 /// Where a message's file is. Incoming files start `Pending` (not downloaded).
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentState {

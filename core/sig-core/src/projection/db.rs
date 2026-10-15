@@ -205,24 +205,121 @@ impl ProjectionDb {
         rows.iter().map(row_to_message).collect()
     }
 
-    /// Full-text search over message bodies, newest first. The query is matched as a phrase, so
-    /// FTS5 operators in the input are plain text. Case and diacritics are folded; emoji, CJK
-    /// substrings and word prefixes don't match yet (search UI ticket).
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<Message>, sqlx::Error> {
-        if query.trim().is_empty() {
-            return Ok(vec![]);
+    /// Search over message bodies, newest first, optionally in one conversation. All words must
+    /// match, the last one as a prefix ("see tomo"), with case and diacritics folded. Queries of
+    /// three or more characters also match inside words and in text without spaces (Chinese,
+    /// Japanese…); shorter ones outside ASCII ("明天", "🎉") are looked for as plain text. FTS5
+    /// operators in the input are plain text.
+    pub async fn search(
+        &self,
+        query: &str,
+        conversation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let query = query.trim();
+        let mut hits = vec![];
+        if let Some(words) = word_query(query) {
+            hits.extend(self.fts_search(Index::Words, &words, conversation_id, limit).await?);
         }
-        let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+        if query.chars().count() >= 3 {
+            let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+            hits.extend(
+                self.fts_search(Index::Trigrams, &phrase, conversation_id, limit)
+                    .await?,
+            );
+        } else if !query.is_empty() && (!query.is_ascii() || word_query(query).is_none()) {
+            hits.extend(self.text_search(query, conversation_id, limit).await?);
+        }
+        // newest first, each message once
+        hits.sort_by(|a, b| (b.message.sent_at, &b.message.author).cmp(&(a.message.sent_at, &a.message.author)));
+        hits.dedup_by(|a, b| a.message.key() == b.message.key());
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    async fn fts_search(
+        &self,
+        index: Index,
+        matching: &str,
+        conversation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        // The newest by arrival (rowid), which FTS5 walks without sorting every match; `search`
+        // orders these by time. The highlight markers are U+E000 and U+E001.
+        let sql = match index {
+            Index::Words => {
+                "SELECT m.*, snippet(messages_fts, 0, char(57344), char(57345), '…', 12) AS snippet
+                 FROM messages_fts f JOIN messages m ON m.id = f.rowid
+                 WHERE messages_fts MATCH ?1 AND m.deleted = 0 AND (?2 IS NULL OR m.conversation_id = ?2)
+                 ORDER BY f.rowid DESC LIMIT ?3"
+            }
+            Index::Trigrams => {
+                "SELECT m.*, snippet(messages_trigram, 0, char(57344), char(57345), '…', 12) AS snippet
+                 FROM messages_trigram f JOIN messages m ON m.id = f.rowid
+                 WHERE messages_trigram MATCH ?1 AND m.deleted = 0 AND (?2 IS NULL OR m.conversation_id = ?2)
+                 ORDER BY f.rowid DESC LIMIT ?3"
+            }
+        };
+        let rows = sqlx::query(sql)
+            .bind(matching)
+            .bind(conversation_id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(SearchHit {
+                    message: row_to_message(r)?,
+                    snippet: r.try_get("snippet")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Plain-text search, for short queries no index can find.
+    async fn text_search(
+        &self,
+        needle: &str,
+        conversation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let pattern = format!(
+            "%{}%",
+            needle.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
         let rows = sqlx::query(
-            "SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid
-             WHERE messages_fts MATCH ?1 AND m.deleted = 0 ORDER BY m.sent_at DESC, m.author DESC LIMIT ?2",
+            "SELECT * FROM messages WHERE body LIKE ?1 ESCAPE '\\' AND deleted = 0
+               AND (?2 IS NULL OR conversation_id = ?2)
+             ORDER BY sent_at DESC, author DESC LIMIT ?3",
         )
-        .bind(phrase)
+        .bind(pattern)
+        .bind(conversation_id)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_message).collect()
+        rows.iter()
+            .map(|r| {
+                let message = row_to_message(r)?;
+                let snippet = text_snippet(message.body.as_deref().unwrap_or_default(), needle);
+                Ok(SearchHit { message, snippet })
+            })
+            .collect()
     }
+
+    /// How many messages of a conversation are newer than `key` (to load enough of it to show
+    /// that message).
+    pub async fn count_newer(&self, conversation_id: &str, key: &MessageKey) -> Result<u32, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND (sent_at, author) > (?2, ?3)",
+        )
+        .bind(conversation_id)
+        .bind(key.sent_at)
+        .bind(&key.author)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
     /// Applies one projection op atomically. Targets may name an edit revision. Deletes and read
     /// state for messages not stored yet are remembered and applied when the message arrives;
     /// reactions are stored regardless; other ops on unknown messages change nothing.
@@ -856,6 +953,63 @@ async fn forget_deleted_text(conn: &mut SqliteConnection, key: &MessageKey) -> R
     Ok(files.into_iter().flatten().collect())
 }
 
+/// The two full-text indexes over message bodies.
+enum Index {
+    /// Whole words and prefixes, case and diacritics folded (unicode61).
+    Words,
+    /// Any three characters in a row (trigram).
+    Trigrams,
+}
+
+/// The words of a query for the unicode61 index: each quoted (so FTS5 syntax is plain text), all
+/// required, the last one a prefix. None if a part has no letters or digits (an emoji, ":)"):
+/// that index can't see it, so its matches would ignore that part.
+fn word_query(query: &str) -> Option<String> {
+    let parts: Vec<&str> = query.split_whitespace().collect();
+    if parts.iter().any(|w| !w.chars().any(char::is_alphanumeric)) {
+        return None;
+    }
+    let words: Vec<String> = parts
+        .iter()
+        .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+        .collect();
+    let (last, rest) = words.split_last()?;
+    Some(
+        rest.iter()
+            .chain([&format!("{last}*")])
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Up to about 40 characters around the first match of `needle`, the match marked. Case is
+/// ignored for ASCII only, as SQLite's LIKE does: ASCII lowercasing keeps every byte where it
+/// was, so positions found in the lowercased text are always character boundaries of the body
+/// (full Unicode lowercasing can change lengths and cut a character in half).
+fn text_snippet(body: &str, needle: &str) -> String {
+    let Some(at) = body.to_ascii_lowercase().find(&needle.to_ascii_lowercase()) else {
+        return body.chars().take(40).collect();
+    };
+    let end = at + needle.len();
+    let before: String = body[..at]
+        .chars()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after: String = body[end..].chars().take(20).collect();
+    let dots = |cut: bool| if cut { "…" } else { "" };
+    format!(
+        "{}{before}{HIGHLIGHT_START}{}{HIGHLIGHT_END}{after}{}",
+        dots(before.len() < at),
+        &body[at..end],
+        dots(after.len() < body.len() - end)
+    )
+}
+
 /// Inserts a message and refreshes its conversation's summary (see `insert_message`).
 async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<bool, sqlx::Error> {
     let kind = kind_of(&m.conversation_id)?;
@@ -1117,6 +1271,10 @@ mod tests {
         }
     }
 
+    fn hit_times(hits: &[SearchHit]) -> Vec<i64> {
+        hits.iter().map(|h| h.message.sent_at).collect()
+    }
+
     fn times(ms: &[Message]) -> Vec<i64> {
         ms.iter().map(|m| m.sent_at).collect()
     }
@@ -1271,7 +1429,7 @@ mod tests {
         let stored = &db.messages("c:alice", None, 10).await.unwrap()[0];
         assert!(stored.deleted && stored.body.is_none());
         assert_eq!(stored.quote.as_ref().unwrap().text, None);
-        assert_eq!(times(&db.search("secret", 10).await.unwrap()), vec![2]);
+        assert_eq!(hit_times(&db.search("secret", None, 10).await.unwrap()), vec![2]);
         assert_eq!(conv(&db, "c:alice").await.unread_count, 1);
     }
 
@@ -1342,7 +1500,7 @@ mod tests {
         .unwrap();
         let c = conv(&db, "c:alice").await;
         assert_eq!((c.last_message_at, c.last_message_preview.as_str()), (2, ""));
-        assert_eq!(db.search("hi", 10).await.unwrap().len(), 1);
+        assert_eq!(db.search("hi", None, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1401,16 +1559,16 @@ mod tests {
             .unwrap();
         db.insert_message(&msg("alice", 3, "COFFEE again")).await.unwrap();
         db.insert_message(&msg("alice", 4, "unrelated")).await.unwrap();
-        assert_eq!(times(&db.search("coffee", 2).await.unwrap()), vec![3, 2]);
-        assert_eq!(times(&db.search("coffee", 10).await.unwrap()), vec![3, 2, 1]);
+        assert_eq!(hit_times(&db.search("coffee", None, 2).await.unwrap()), vec![3, 2]);
+        assert_eq!(hit_times(&db.search("coffee", None, 10).await.unwrap()), vec![3, 2, 1]);
     }
 
     #[tokio::test]
     async fn search_folds_case_and_diacritics() {
         let db = db().await;
         db.insert_message(&msg("alice", 1, "Café LUNCH")).await.unwrap();
-        assert_eq!(db.search("cafe", 10).await.unwrap().len(), 1);
-        assert_eq!(db.search("lunch", 10).await.unwrap().len(), 1);
+        assert_eq!(db.search("cafe", None, 10).await.unwrap().len(), 1);
+        assert_eq!(db.search("lunch", None, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1420,12 +1578,13 @@ mod tests {
             .await
             .unwrap();
         db.insert_message(&msg("alice", 2, "plain words")).await.unwrap();
-        assert_eq!(times(&db.search("\"hi\"", 10).await.unwrap()), vec![1]);
-        assert_eq!(times(&db.search("(now)", 10).await.unwrap()), vec![1]);
-        assert_eq!(times(&db.search("AND NOT", 10).await.unwrap()), vec![1]);
-        assert!(db.search("-x*", 10).await.is_ok());
-        assert!(db.search("\"", 10).await.unwrap().is_empty());
-        assert!(db.search("   ", 10).await.unwrap().is_empty());
+        assert_eq!(hit_times(&db.search("\"hi\"", None, 10).await.unwrap()), vec![1]);
+        assert_eq!(hit_times(&db.search("(now)", None, 10).await.unwrap()), vec![1]);
+        assert_eq!(hit_times(&db.search("AND NOT", None, 10).await.unwrap()), vec![1]);
+        assert!(db.search("-x*", None, 10).await.is_ok());
+        // a lone quote is plain text too: it finds the message that has one
+        assert_eq!(hit_times(&db.search("\"", None, 10).await.unwrap()), vec![1]);
+        assert!(db.search("   ", None, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1436,11 +1595,11 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        assert!(db.search("old", 10).await.unwrap().is_empty());
-        assert_eq!(db.search("new", 10).await.unwrap().len(), 1);
+        assert!(db.search("old", None, 10).await.unwrap().is_empty());
+        assert_eq!(db.search("new", None, 10).await.unwrap().len(), 1);
         sqlx::query("DELETE FROM messages").execute(&db.pool).await.unwrap();
         db.insert_message(&msg("bob", 2, "fresh")).await.unwrap(); // may reuse the deleted rowid
-        assert!(db.search("new", 10).await.unwrap().is_empty());
+        assert!(db.search("new", None, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1588,8 +1747,8 @@ mod tests {
         assert!(db.apply(&edit("first", 10)).await.unwrap().is_empty()); // older edit arriving late
         let m = db.message(&k("alice", 1)).await.unwrap().unwrap();
         assert_eq!((m.body.as_deref(), m.edited), (Some("second"), true));
-        assert_eq!(db.search("second", 5).await.unwrap().len(), 1);
-        assert!(db.search("typo", 5).await.unwrap().is_empty());
+        assert_eq!(db.search("second", None, 5).await.unwrap().len(), 1);
+        assert!(db.search("typo", None, 5).await.unwrap().is_empty());
         assert_eq!(conv(&db, "c:alice").await.last_message_preview, "second");
     }
 
@@ -1639,7 +1798,7 @@ mod tests {
         let m = db.message(&k("alice", 2)).await.unwrap().unwrap();
         assert!(m.deleted && m.body.is_none() && m.quote.unwrap().text.is_none());
         assert!(db.reactions(&k("alice", 2)).await.unwrap().is_empty());
-        assert!(db.search("secret", 5).await.unwrap().is_empty());
+        assert!(db.search("secret", None, 5).await.unwrap().is_empty());
         let c = conv(&db, "c:alice").await;
         assert_eq!((c.last_message_preview.as_str(), c.unread_count), ("", 1));
         let edit = Op::Edit {
@@ -1824,7 +1983,7 @@ mod tests {
         db.insert_message(&msg("alice", 2, "secret")).await.unwrap();
         let m = db.message(&k("alice", 2)).await.unwrap().unwrap();
         assert!(m.deleted && m.body.is_none());
-        assert!(db.search("secret", 5).await.unwrap().is_empty());
+        assert!(db.search("secret", None, 5).await.unwrap().is_empty());
         assert_eq!(raw_fts_hits(&db, "secret").await, 0);
         let c = conv(&db, "c:alice").await;
         assert_eq!((c.last_message_preview.as_str(), c.unread_count), ("", 1));
@@ -2427,5 +2586,208 @@ mod tests {
                 is_voice_note: true
             })
         );
+    }
+
+    /// The highlighted part of a snippet, between the markers.
+    fn marked(snippet: &str) -> Vec<String> {
+        snippet
+            .split(HIGHLIGHT_START)
+            .skip(1)
+            .filter_map(|s| s.split(HIGHLIGHT_END).next().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_last_word_matches_as_a_prefix_and_all_words_must_match() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "see you tomorrow at noon"))
+            .await
+            .unwrap();
+        db.insert_message(&msg("alice", 2, "tomorrow then")).await.unwrap();
+        assert_eq!(hit_times(&db.search("tomo", None, 10).await.unwrap()), vec![2, 1]);
+        assert_eq!(hit_times(&db.search("see tomo", None, 10).await.unwrap()), vec![1]);
+        // only the last word is a prefix: "se" alone isn't a word here
+        assert!(db.search("se tomorrow", None, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hits_come_with_a_highlighted_snippet() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "Let's have lunch tomorrow, ok?"))
+            .await
+            .unwrap();
+        let hits = db.search("lunch tom", None, 10).await.unwrap();
+        assert_eq!(marked(&hits[0].snippet), ["lunch", "tomorrow"]);
+        assert!(hits[0].snippet.contains("Let's have"));
+    }
+
+    #[tokio::test]
+    async fn search_can_be_limited_to_one_chat() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "coffee?")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "coffee!")))
+            .await
+            .unwrap();
+        assert_eq!(
+            hit_times(&db.search("coffee", Some("c:bob"), 10).await.unwrap()),
+            vec![2]
+        );
+        assert_eq!(db.search("coffee", None, 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn words_inside_words_cjk_and_emoji_are_found() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "我们明天见")).await.unwrap();
+        db.insert_message(&msg("alice", 2, "party 🎉 tonight")).await.unwrap();
+        db.insert_message(&msg("alice", 3, "unbelievable")).await.unwrap();
+        let cjk = db.search("明天", None, 10).await.unwrap();
+        assert_eq!(hit_times(&cjk), vec![1]);
+        assert_eq!(marked(&cjk[0].snippet), ["明天"]);
+        assert_eq!(hit_times(&db.search("🎉", None, 10).await.unwrap()), vec![2]);
+        let inside = db.search("believ", None, 10).await.unwrap();
+        assert_eq!(hit_times(&inside), vec![3]);
+        // a message found both ways is listed once
+        assert_eq!(db.search("unbeliev", None, 10).await.unwrap().len(), 1);
+        // deleted messages stay hidden (here the plain-text path; the indexes' in older tests)
+        db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
+        assert!(db.search("明天", None, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn newer_messages_are_counted_to_reach_an_old_one() {
+        let db = db().await;
+        for t in 1..=5 {
+            db.insert_message(&msg("alice", t, "x")).await.unwrap();
+        }
+        db.insert_message(&in_conv("c:bob", msg("bob", 9, "y"))).await.unwrap();
+        assert_eq!(db.count_newer("c:alice", &k("alice", 2)).await.unwrap(), 3);
+        assert_eq!(db.count_newer("c:alice", &k("alice", 5)).await.unwrap(), 0);
+    }
+
+    /// The issue's budget: results in under 50 ms over 100 000 messages (release build:
+    /// `cargo test --release -- --ignored search_is_fast`).
+    #[tokio::test]
+    #[ignore]
+    async fn search_is_fast_on_a_hundred_thousand_messages() {
+        // as the app has it: an encrypted database file
+        let file = TempDb::new("search-speed");
+        let db = ProjectionDb::open(&file.url(), Some(&"ab".repeat(32))).await.unwrap();
+        let words = [
+            "coffee",
+            "tomorrow",
+            "lunch",
+            "meeting",
+            "photo",
+            "我们明天见",
+            "party 🎉",
+        ];
+        for t in 0..100_000i64 {
+            let body = format!(
+                "{} number {t} {}",
+                words[t as usize % words.len()],
+                words[(t as usize / 7) % words.len()]
+            );
+            db.insert_message(&in_conv(
+                &format!("c:{}", t % 50),
+                msg(&format!("u{}", t % 50), t, &body),
+            ))
+            .await
+            .unwrap();
+        }
+        for q in ["coffee", "tomo", "lunch meet", "明天", "🎉", "offe", "火星"] {
+            let started = std::time::Instant::now();
+            let hits = db.search(q, None, 50).await.unwrap();
+            let took = started.elapsed();
+            println!("{q:?}: {} hits in {took:?}", hits.len());
+            assert!(took < std::time::Duration::from_millis(50), "{q:?} took {took:?}");
+            let started = std::time::Instant::now();
+            let hits = db.search(q, Some("c:7"), 50).await.unwrap();
+            let took = started.elapsed();
+            println!("{q:?} in one chat: {} hits in {took:?}", hits.len());
+            assert!(
+                took < std::time::Duration::from_millis(50),
+                "{q:?} in one chat took {took:?}"
+            );
+        }
+    }
+
+    /// A sender controls message text: characters whose lowercase has another length must not
+    /// make a snippet cut a character in half, or lose its highlight.
+    #[tokio::test]
+    async fn snippets_never_cut_a_character() {
+        let db = db().await;
+        // Ⱥ grows by a byte when lowercased and K shrinks by two: same total length, shifted
+        db.insert_message(&msg("alice", 1, "ȺȺ明天KȺ")).await.unwrap();
+        db.insert_message(&msg("alice", 2, "Ⱥ明天KȺ")).await.unwrap();
+        let hits = db.search("明天", None, 10).await.unwrap();
+        assert_eq!(hit_times(&hits), vec![2, 1]);
+        for h in hits {
+            assert_eq!(marked(&h.snippet), ["明天"]);
+        }
+        assert!(db.search("İ", None, 10).await.is_ok());
+        // ASCII case still doesn't matter
+        db.insert_message(&msg("alice", 3, "Ünïcödé café")).await.unwrap();
+        assert_eq!(marked(&db.search("é", None, 10).await.unwrap()[0].snippet), ["é"]);
+    }
+
+    #[test]
+    fn snippets_mark_the_match_with_context_on_both_sides() {
+        let long = format!("{}needle{}", "a".repeat(30), "b".repeat(30));
+        let s = text_snippet(&long, "NEEDLE");
+        assert_eq!(marked(&s), ["needle"]);
+        assert!(s.starts_with('…') && s.ends_with('…'), "{s}");
+        // at the very start and end: no dots
+        assert_eq!(text_snippet("needle", "needle"), "\u{E000}needle\u{E001}");
+        // no match: the beginning, unmarked
+        assert_eq!(text_snippet("hello", "x"), "hello");
+        // Ω shrinks and Ⱥ grows when lowercased: never a cut character, the match still marked
+        assert_eq!(marked(&text_snippet("\u{2126}明天\u{023A}", "明天")), ["明天"]);
+        assert_eq!(marked(&text_snippet("İstanbul 明天", "明天")), ["明天"]);
+        assert_eq!(marked(&text_snippet("go 👍🏽 now", "👍🏽")), ["👍🏽"]);
+    }
+
+    #[tokio::test]
+    async fn words_with_emoji_or_symbols_must_all_match() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi there")).await.unwrap();
+        db.insert_message(&msg("alice", 2, "hi 🎉 everyone")).await.unwrap();
+        db.insert_message(&msg("alice", 3, "ok :) bye")).await.unwrap();
+        assert_eq!(hit_times(&db.search("hi 🎉", None, 10).await.unwrap()), vec![2]);
+        assert_eq!(hit_times(&db.search(":)", None, 10).await.unwrap()), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn every_search_path_respects_the_chat() {
+        let db = db().await;
+        for (conv, t, body) in [("c:alice", 1, "unbelievable 明天"), ("c:bob", 2, "unbelievable 明天")] {
+            db.insert_message(&in_conv(conv, msg(&conv[2..], t, body)))
+                .await
+                .unwrap();
+        }
+        for q in ["unbeliev", "believ", "明天"] {
+            assert_eq!(
+                hit_times(&db.search(q, Some("c:bob"), 10).await.unwrap()),
+                vec![2],
+                "{q}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_from_before_the_trigram_index_are_found_too() {
+        // migration 0006 indexes what is already there ('rebuild'): simulate an older database
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "unbelievable")).await.unwrap();
+        sqlx::query("INSERT INTO messages_trigram(messages_trigram) VALUES ('delete-all')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.search("believ", None, 10).await.unwrap().is_empty());
+        sqlx::query("INSERT INTO messages_trigram(messages_trigram) VALUES ('rebuild')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.search("believ", None, 10).await.unwrap().len(), 1);
     }
 }

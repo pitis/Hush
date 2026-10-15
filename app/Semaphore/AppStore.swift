@@ -43,8 +43,23 @@ final class AppStore {
     private(set) var badge: String?
     /// Our own ACI once linked (Note to Self is `c:<it>`).
     private(set) var ownAci: String?
-    /// The chat list's search text; the list and keyboard navigation show only matching chats.
-    var searchQuery = ""
+    /// The chat list's search text; the list and keyboard navigation show only matching chats,
+    /// and matching messages are looked up (`searchResults`).
+    var searchQuery = "" { didSet { if searchQuery != oldValue { scheduleSearch() } } }
+    /// Search only in this chat (⇧⌘F), or everywhere.
+    private(set) var searchScope: String? { didSet { if searchScope != oldValue { scheduleSearch() } } }
+    private(set) var searchResults: [SearchHit] = []
+    /// A search for the current query is on its way (results are empty meanwhile, never stale).
+    private(set) var searchPending = false
+    /// Why the last search failed, if it did.
+    private(set) var searchFailed: String?
+    private var searchTask: Task<Void, Never>?
+    /// Bumped by each `open(hit)`: only the latest one moves the timeline.
+    private var openGeneration = 0
+    /// A message found by search: highlighted for a moment, and scrolled to (`scrollRequest`).
+    private(set) var highlighted: MessageKey?
+    private(set) var scrollTarget: MessageKey?
+    private(set) var scrollRequest = 0
     /// Bumped to ask the sidebar to focus the search field.
     private(set) var searchFocusRequest = 0
     /// Set to move focus to the composer (a click on a chat, ↩ in the search, a shortcut); the
@@ -339,6 +354,11 @@ final class AppStore {
     /// ↩ in the search: opens the selected match (or the first), ends the search and moves to the
     /// composer.
     func openSearchResult() {
+        // searching a chat, or no chat matches: the newest message found
+        if searchScope != nil || visibleConversations.isEmpty {
+            if let hit = searchResults.first { Task { await open(hit) } }
+            return
+        }
         let shown = visibleConversations
         let id = shown.contains { $0.id == selectedId } ? selectedId : shown.first?.id
         guard let id else { return }
@@ -454,6 +474,98 @@ final class AppStore {
     }
 
     func focusSearch() { searchFocusRequest += 1 }
+
+    // MARK: Search
+
+    static let searchLimit: UInt32 = 50
+    /// How far back a search result can be shown: the open chat is loaded up to it.
+    static let jumpLimit: UInt32 = 10_000
+
+    /// ⇧⌘F: search the open chat only.
+    func searchInChat() {
+        guard let id = selectedId else { return }
+        searchScope = id
+        focusSearch()
+    }
+
+    func endSearch() {
+        searchQuery = ""
+        searchScope = nil
+    }
+
+    /// Looks the query up once typing pauses; a newer query cancels an older one.
+    private func scheduleSearch() {
+        searchTask?.cancel()
+        // results of an older query must never be shown (or opened) under this one
+        searchResults = []
+        searchFailed = nil
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let client, !query.isEmpty else {
+            searchPending = false
+            return
+        }
+        searchPending = true
+        let scope = searchScope
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            do {
+                let hits = try await client.search(query: query, conversationId: scope, limit: Self.searchLimit)
+                guard !Task.isCancelled else { return }
+                searchResults = hits
+            } catch {
+                guard !Task.isCancelled else { return }
+                Self.logger.error("search failed: \(error, privacy: .private)")
+                searchFailed = Self.describe(error)
+            }
+            searchPending = false
+        }
+    }
+
+    /// Opens a search result: its chat, loaded back to the message, scrolled to and highlighted.
+    func open(_ hit: SearchHit) async {
+        let key = MessageKey(author: hit.message.author, sentAt: hit.message.sentAt)
+        let conversationId = hit.message.conversationId
+        select(conversationId)
+        guard let client else { return }
+        openGeneration += 1
+        let (generation, opening) = (selectionGeneration, openGeneration)
+        // a newer open (arrowing on through results) or another chat makes this one moot
+        let current = { generation == self.selectionGeneration && opening == self.openGeneration }
+        var page: [Message] = []
+        do {
+            let newer = try await client.countNewer(conversationId: conversationId, key: key)
+            guard current() else { return }
+            guard newer < Self.jumpLimit else {
+                return showError("That message is too far back to show yet.")
+            }
+            let limit = max(Self.pageSize, newer + 50)
+            page = try await client.messages(conversationId: conversationId, before: nil, limit: limit)
+            guard current() else { return }
+            if page.count > messages.count {
+                messages = page
+                hasOlder = page.count == Int(limit)
+            }
+        } catch {
+            return showError("Couldn't open that message: \(Self.describe(error))")
+        }
+        // to the message at once; details (reactions, files) follow, those around it first
+        highlighted = key
+        scrollTarget = key
+        scrollRequest += 1
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            if highlighted == key { highlighted = nil }
+        }
+        let at = page.firstIndex { $0.author == key.author && $0.sentAt == key.sentAt } ?? page.count
+        let near = Array(page[max(0, at - 30)..<min(page.count, at + 30)])
+        let nearKeys = Set(near.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
+        await loadDetails(for: near, generation: generation)
+        guard current() else { return }
+        await loadDetails(
+            for: page.filter { !nearKeys.contains(MessageKey(author: $0.author, sentAt: $0.sentAt)) },
+            generation: generation)
+    }
     func focusComposer() { composerWantsFocus = true }
     func composerTookFocus() { composerWantsFocus = false }
 
