@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod fetch;
+pub(crate) mod import;
 pub(crate) mod read;
 #[cfg(test)]
 pub(crate) mod test_archive;
