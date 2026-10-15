@@ -120,19 +120,25 @@ impl Message {
 /// Something that happened in a chat that isn't a message.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatEventKind {
-    /// A message from `author` arrived but couldn't be decrypted (a broken session).
+    /// A message between us and `author` couldn't be decrypted, by us or by them (presage
+    /// doesn't tell which): a broken session.
     DecryptionFailed,
+    /// We started a new secure session with `author`.
+    SessionReset,
 }
 
 impl ChatEventKind {
     pub fn to_i64(self) -> i64 {
         match self {
             Self::DecryptionFailed => 0,
+            Self::SessionReset => 1,
         }
     }
 
     pub fn from_i64(v: i64) -> Option<Self> {
-        (v == 0).then_some(Self::DecryptionFailed)
+        [Self::DecryptionFailed, Self::SessionReset]
+            .into_iter()
+            .find(|k| k.to_i64() == v)
     }
 }
 

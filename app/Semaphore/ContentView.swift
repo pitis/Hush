@@ -98,9 +98,12 @@ struct UnlinkedView: View {
         ContentUnavailableView {
             Label("This Mac is no longer linked", systemImage: "iphone.slash")
         } description: {
-            Text(
-                "It was removed from your phone's linked devices. Link it again to keep using Semaphore here. "
-                    + "Messages stored on this Mac are removed first.")
+            VStack(spacing: 8) {
+                Text(
+                    "It was removed from your phone's linked devices. Link it again to keep using Semaphore here. "
+                        + "Messages stored on this Mac are removed first.")
+                if let error = store.lastError { Text(error).foregroundStyle(.yellow) }
+            }
         } actions: {
             Button {
                 working = true

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use futures::{channel::oneshot as fut_oneshot, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
-use presage::libsignal_service::protocol::Aci;
+use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
@@ -335,16 +335,28 @@ async fn run(
                     }
                 }
             }
-            Command::Reconnect => wake.notify_one(),
+            // wakes only what waits now: a stored request would later drop a fresh connection
+            Command::Reconnect => wake.notify_waiters(),
+            // presage resets sessions by ACI only (it panics on a PNI)
             Command::ResetSession { conversation_id } => match (&manager, crate::send::recipient(&conversation_id)) {
-                (Some(m), Some(crate::send::Recipient::Direct(to))) => {
-                    let (mut m, l) = (m.clone(), listener.clone());
+                (Some(m), Some(crate::send::Recipient::Direct(to @ ServiceId::Aci(_)))) => {
+                    let (mut m, l, db) = (m.clone(), listener.clone(), projection.clone());
                     tokio::task::spawn_local(async move {
-                        let at = chrono::Utc::now().timestamp_millis() as u64;
-                        if let Err(e) = Box::pin(m.send_session_reset(&to, at)).await {
-                            l.on_event(CoreEvent::Error {
+                        let at = chrono::Utc::now().timestamp_millis();
+                        if let Err(e) = Box::pin(m.send_session_reset(&to, at as u64)).await {
+                            return l.on_event(CoreEvent::Error {
                                 message: format!("resetting the session with {conversation_id} failed: {e}"),
                             });
+                        }
+                        let author = to.raw_uuid().to_string();
+                        match db
+                            .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author)
+                            .await
+                        {
+                            Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+                            Err(e) => l.on_event(CoreEvent::Error {
+                                message: format!("recording a session reset failed: {e}"),
+                            }),
                         }
                     });
                 }
@@ -548,6 +560,12 @@ async fn receive_loop(
                     });
                 }
                 if woken {
+                    // The server already counts what this connection read as delivered: handle
+                    // all of it before dropping the connection (it ends once nothing comes for
+                    // a moment; a dead one has nothing more).
+                    while let Ok(Some(received)) = tokio::time::timeout(DRAIN, stream.next()).await {
+                        handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
+                    }
                     backoff = Duration::from_secs(1);
                     continue;
                 }
@@ -581,6 +599,9 @@ async fn receive_loop(
         }
     }
 }
+
+/// On a reconnect request, the old connection is read until it is quiet this long.
+const DRAIN: Duration = Duration::from_secs(1);
 
 /// Waits `backoff` before reconnecting, or less if woken. True if woken.
 async fn pause(backoff: Duration, wake: &tokio::sync::Notify) -> bool {
@@ -837,9 +858,23 @@ mod tests {
         );
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(30));
         let started = tokio::time::Instant::now();
-        wake.notify_one();
-        assert!(super::pause(std::time::Duration::from_secs(30), &wake).await, "woken");
+        let (woken, ()) = tokio::join!(super::pause(std::time::Duration::from_secs(30), &wake), async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            wake.notify_waiters();
+        });
+        assert!(woken);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A request while nothing waits (connecting, handling a message) isn't kept: it would
+    /// later drop a fresh connection, and with it messages the server counts as delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_request_is_never_kept_for_later() {
+        let wake = tokio::sync::Notify::new();
+        wake.notify_waiters();
+        let started = tokio::time::Instant::now();
+        assert!(!super::pause(std::time::Duration::from_secs(5), &wake).await);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
     }
 
     /// Each connection starts by catching up; it is live only once the server queue is drained.
