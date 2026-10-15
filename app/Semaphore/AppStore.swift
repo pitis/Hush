@@ -106,6 +106,9 @@ final class AppStore {
     var replyTo: Message?
     /// The message of ours being edited in the composer, if any.
     private(set) var editing: Message?
+    /// Our reactions sent but not back from the core yet (nil: taken back), so a second click
+    /// acts on what we just did.
+    private var pendingReactions: [MessageKey: String?] = [:]
     /// Who is typing where, until when (per sender: in groups several people can type).
     private var typingUntil: [String: [String: Date]] = [:]
     private var senderNames: [String: String] = [:]
@@ -268,6 +271,7 @@ final class AppStore {
         selectionGeneration += 1
         messages = []
         reactions = [:]
+        pendingReactions = [:]
         events = []
         attachments = [:]
         previews = [:]
@@ -340,11 +344,26 @@ final class AppStore {
     func react(to m: Message, with emoji: String) async {
         guard let client else { return }
         let key = MessageKey(author: m.author, sentAt: m.sentAt)
-        let mine = MessageActions.mine(reactions[key] ?? [], me: ownAci)
-        let (emoji, remove) = MessageActions.reaction(choosing: emoji, mine: mine)
-        do { try await client.react(target: key, emoji: emoji, remove: remove) } catch {
+        let (emoji, remove) = MessageActions.reaction(choosing: emoji, mine: myReaction(to: m))
+        do {
+            try await client.react(target: key, emoji: emoji, remove: remove)
+            pendingReactions[key] = .some(remove ? nil : emoji)
+        } catch {
             showError("Couldn't react: \(Self.describe(error))")
         }
+    }
+
+    /// Our reaction to a message, counting one just sent.
+    func myReaction(to m: Message) -> String? {
+        let key = MessageKey(author: m.author, sentAt: m.sentAt)
+        if let pending = pendingReactions[key] { return pending }
+        return MessageActions.mine(reactions[key] ?? [], me: ownAci)
+    }
+
+    /// Replies to a message (ends editing: the two don't mix).
+    func reply(to m: Message) {
+        editing = nil
+        replyTo = m
     }
 
     /// Puts one of our messages in the composer to edit it.
@@ -384,7 +403,8 @@ final class AppStore {
 
     /// Adds files to the tray of the open chat (each once).
     func addFiles(_ files: [OutgoingFile]) {
-        guard selectedId != nil else { return }
+        // an edit changes the text only (as in Desktop)
+        guard selectedId != nil, editing == nil else { return }
         for f in files where !outgoingFiles.contains(where: { $0.path == f.path }) { outgoingFiles.append(f) }
     }
 
@@ -825,6 +845,12 @@ final class AppStore {
                     }
                     await loadDetails(for: needDetails, generation: generation)
                 } catch { append("query failed: \(error)") }
+                // the message being edited was deleted (here or on the phone): nothing left to edit
+                if let e = editing,
+                    messages.contains(where: { $0.author == e.author && $0.sentAt == e.sentAt && $0.deleted })
+                {
+                    editing = nil
+                }
             } while reloadMessagesAgain && generation == selectionGeneration
             if generation == selectionGeneration { reloadEvents() }
             if loadingGeneration == generation { loadingGeneration = nil }
@@ -858,7 +884,10 @@ final class AppStore {
             // separately: one failing query doesn't take the others' details with it
             do {
                 let r = try await client.reactions(key: key)
-                if generation == selectionGeneration { reactions[key] = r.isEmpty ? nil : r }
+                if generation == selectionGeneration {
+                    reactions[key] = r.isEmpty ? nil : r
+                    pendingReactions[key] = nil  // the core's word now
+                }
             } catch { append("query failed: \(error)") }
             do {
                 let files = try await client.attachments(key: key)

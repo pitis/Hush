@@ -31,6 +31,17 @@ final class MessageActionsTests: XCTestCase {
         XCTAssertFalse(MessageActions.canEdit(mine(hour, body: nil), me: "me", now: now))
     }
 
+    func testOnlyRealEmojiFromThePaletteBecomeReactions() {
+        XCTAssertTrue(MessageActions.isReaction("😂"))
+        XCTAssertTrue(MessageActions.isReaction("👍🏽"))
+        XCTAssertTrue(MessageActions.isReaction("🇦🇹"))
+        XCTAssertTrue(MessageActions.isReaction("❤️"))
+        XCTAssertFalse(MessageActions.isReaction("1"))
+        XCTAssertFalse(MessageActions.isReaction("#"))
+        XCTAssertFalse(MessageActions.isReaction("©"))
+        XCTAssertFalse(MessageActions.isReaction("a"))
+    }
+
     func testPickingYourReactionAgainTakesItBackAndAnotherReplacesIt() {
         let reactions = [Reaction(reactor: "me", emoji: "❤️"), Reaction(reactor: "alice", emoji: "👍")]
         XCTAssertEqual(MessageActions.mine(reactions, me: "me"), "❤️")
@@ -117,5 +128,40 @@ final class AppStoreMessageActionsTests: XCTestCase {
         let store = await store(fake)
         await store.deleteForEveryone(store.messages[1])
         XCTAssertEqual(fake.deletedForEveryone, [MessageKey(author: "me", sentAt: 2)])
+    }
+
+    func testReactingAgainBeforeTheFirstOneIsSentTakesItBack() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        await store.react(to: store.messages[0], with: "❤️")  // queued: not in the stored reactions yet
+        XCTAssertEqual(store.myReaction(to: store.messages[0]), "❤️")
+        await store.react(to: store.messages[0], with: "❤️")
+        XCTAssertEqual(fake.reacted.map(\.remove), [false, true])
+        XCTAssertNil(store.myReaction(to: store.messages[0]))
+    }
+
+    func testReplyingLeavesEditModeAndFilesWaitTillTheEditIsDone() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.startEditing(store.messages[1])
+        store.addFiles([
+            OutgoingFile(path: "/tmp/a.png", contentType: "image/png", width: 1, height: 1, isVoiceNote: false)
+        ])
+        XCTAssertTrue(store.outgoingFiles.isEmpty, "an edit can't add files")
+        store.reply(to: store.messages[0])
+        XCTAssertNil(store.editing)
+        XCTAssertEqual(store.replyTo?.sentAt, 1)
+    }
+
+    func testAMessageDeletedWhileBeingEditedEndsTheEdit() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.startEditing(store.messages[1])
+        var gone = message("c:a", "me", 2, "typo", outgoing: true)
+        gone.deleted = true
+        gone.body = nil
+        fake.messageAnswers["c:a"] = [message("c:a", "alice", 1), gone]
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "me", sentAt: 2)))
+        await eventually { store.editing == nil }
     }
 }

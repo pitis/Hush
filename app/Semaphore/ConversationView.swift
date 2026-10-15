@@ -97,11 +97,12 @@ struct TimelineList: View {
                                 reactions: store.reactions[key] ?? [],
                                 files: store.attachments[key] ?? [], preview: store.previews[key],
                                 highlighted: store.highlighted == key,
-                                reply: { store.replyTo = m },
+                                reply: { store.reply(to: m) },
                                 retry: { Task { await store.retry(key) } },
                                 download: store.download, open: open,
                                 actions: MessageRow.Actions(
-                                    me: store.ownAci, canEdit: MessageActions.canEdit(m, me: store.ownAci),
+                                    me: store.ownAci, mine: store.myReaction(to: m),
+                                    canEdit: MessageActions.canEdit(m, me: store.ownAci),
                                     canDelete: MessageActions.canDelete(m, me: store.ownAci),
                                     react: { emoji in Task { await store.react(to: m, with: emoji) } },
                                     edit: { store.startEditing(m) },
@@ -217,6 +218,8 @@ struct MessageRow: View {
     /// React, edit, delete (after Signal Desktop).
     struct Actions {
         var me: String?
+        /// Our reaction, counting one just sent.
+        var mine: String?
         var canEdit = false
         var canDelete = false
         var react: (String) -> Void = { _ in }
@@ -227,7 +230,7 @@ struct MessageRow: View {
     }
 
     private var outgoing: Bool { message.isOutgoing }
-    private var mine: String? { MessageActions.mine(reactions, me: actions.me) }
+    private var mine: String? { actions.mine }
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -493,9 +496,7 @@ struct ReactionPicker: View {
             // receives the emoji picked in the palette
             TextField("", text: $other).focused($otherFocused).frame(width: 1).opacity(0.01)
                 .onChange(of: other) { _, new in
-                    if let first = new.first, first.unicodeScalars.first?.properties.isEmoji == true {
-                        choose(String(first))
-                    }
+                    if let first = new.first, MessageActions.isReaction(String(first)) { choose(String(first)) }
                     other = ""
                 }
         }

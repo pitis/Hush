@@ -20,6 +20,13 @@ enum MessageActions {
         canDelete(m, me: me, now: now) && !(m.body ?? "").isEmpty
     }
 
+    /// A picked character that can be a reaction: an emoji, not a digit or symbol that only has
+    /// an emoji form ("1", "#", "©").
+    static func isReaction(_ s: String) -> Bool {
+        guard s.count == 1, let first = s.unicodeScalars.first else { return false }
+        return s.unicodeScalars.count > 1 || first.properties.isEmojiPresentation
+    }
+
     /// Our reaction among a message's reactions.
     static func mine(_ reactions: [Reaction], me: String?) -> String? {
         reactions.first { $0.reactor == me }?.emoji

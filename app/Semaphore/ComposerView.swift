@@ -59,6 +59,7 @@ struct ComposerView: View {
                     Image(systemName: "paperclip").font(.system(size: 18))
                 }
                 .accessibilityLabel("Attach files")
+                .disabled(store.editing != nil)
                 .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
                 .padding(.bottom, 9)
                 Button {
@@ -101,7 +102,11 @@ struct ComposerView: View {
             text = Composer.draft(for: conversationId)
             takeFocusIfAsked()
         }
-        .onChange(of: conversationId) { _, new in text = Composer.draft(for: new) }
+        .onChange(of: conversationId) { _, new in
+            // an edit doesn't follow to another chat, nor does the draft it put aside
+            draftBeforeEdit = nil
+            text = Composer.draft(for: new)
+        }
         .onChange(of: text) { _, new in
             if store.editing == nil { Composer.saveDraft(new, for: conversationId) }
         }
