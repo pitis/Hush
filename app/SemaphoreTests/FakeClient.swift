@@ -63,7 +63,9 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
 
     func ownAci() -> String? { aci }
 
+    var sendError: Error?
     func sendText(conversationId: String, body: String, quote: Quote?) async throws -> MessageKey {
+        if let sendError { throw sendError }
         lock.withLock { sent.append((conversationId, body, quote)) }
         return MessageKey(author: aci ?? "", sentAt: Int64(sent.count))
     }

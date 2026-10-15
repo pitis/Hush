@@ -26,7 +26,7 @@ use sqlx::ConnectOptions;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::CoreError;
-use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
+use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
@@ -399,7 +399,7 @@ async fn receive_loop(
 ) {
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
-    let mut titles_synced = false;
+    let mut progress = Progress::default();
     loop {
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Connecting,
@@ -411,11 +411,12 @@ async fn receive_loop(
                     state: ConnectionState::Online,
                 });
                 futures::pin_mut!(stream);
+                progress.connected();
                 while let Some(received) = stream.next().await {
-                    handle(received, &m, &db, &me, &mut titles_synced, l.as_ref(), &jobs).await;
+                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &jobs).await;
                     caught_up.send_if_modified(|ready| {
-                        let first = !*ready && titles_synced;
-                        *ready |= titles_synced;
+                        let first = !*ready && progress.titles_synced;
+                        *ready |= progress.titles_synced;
                         first
                     });
                 }
@@ -438,12 +439,34 @@ async fn receive_loop(
     }
 }
 
+/// How far receiving has got.
+#[derive(Default)]
+struct Progress {
+    /// Contact and group names were copied once (after the first drained queue).
+    titles_synced: bool,
+    /// This connection has drained the server queue: what arrives now is new.
+    live: bool,
+}
+
+impl Progress {
+    /// A new connection: what the server queued while we were away is history, not news.
+    fn connected(&mut self) {
+        self.live = false;
+    }
+
+    /// The server queue is drained. True the first time ever: names need syncing then.
+    fn drained(&mut self) -> bool {
+        self.live = true;
+        !std::mem::replace(&mut self.titles_synced, true)
+    }
+}
+
 async fn handle(
     received: Received,
     m: &Manager<SqliteStore, Registered>,
     db: &ProjectionDb,
     me: &str,
-    titles_synced: &mut bool,
+    progress: &mut Progress,
     l: &dyn EventListener,
     jobs: &mpsc::UnboundedSender<Job>,
 ) {
@@ -456,9 +479,8 @@ async fn handle(
     }
     match received {
         Received::QueueEmpty => {
-            if !*titles_synced {
+            if progress.drained() {
                 sync_titles(m, db, l).await;
-                *titles_synced = true;
             }
             l.on_event(CoreEvent::Ready);
         }
@@ -471,7 +493,7 @@ async fn handle(
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
             let sender = content.metadata.sender.service_id_string();
-            if apply_received(db, l, &ops, &sender).await {
+            if apply_received(db, l, &ops, &sender, me, progress.live).await {
                 // receipts held back while the read receipts setting was unknown; queued only
                 // now that the new setting is stored, so they can't go out under the old one
                 let _ = jobs.send(Job::Receipts);
@@ -480,14 +502,26 @@ async fn handle(
     }
 }
 
-/// Applies the ops of one received content. True if it changed the privacy settings.
-async fn apply_received(db: &ProjectionDb, l: &dyn EventListener, ops: &[Op], sender: &str) -> bool {
+/// Applies the ops of one received content and, when `live` (not catching up), announces what
+/// is worth a notification. True if it changed the privacy settings.
+async fn apply_received(
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    ops: &[Op],
+    sender: &str,
+    me: &str,
+    live: bool,
+) -> bool {
     let mut settings_changed = false;
     for op in ops {
         match db.apply(op).await {
             Ok(applied) => {
                 settings_changed |= matches!(op, Op::Settings { .. });
+                let new = if live { alert(op, &applied, me) } else { None };
                 applied.into_iter().for_each(|a| l.on_event(from_applied(a)));
+                if let Some(e) = new {
+                    l.on_event(e);
+                }
             }
             Err(e) => l.on_event(CoreEvent::Error {
                 message: format!("storing a message from {sender} failed: {e}"),
@@ -567,6 +601,60 @@ mod tests {
         fn on_event(&self, _: CoreEvent) {}
     }
 
+    struct Sink(std::sync::Mutex<Vec<CoreEvent>>);
+    impl EventListener for Sink {
+        fn on_event(&self, e: CoreEvent) {
+            self.0.lock().unwrap().push(e);
+        }
+    }
+
+    /// Each connection starts by catching up; it is live only once the server queue is drained.
+    #[test]
+    fn a_connection_is_live_only_after_draining_the_queue() {
+        let mut p = super::Progress::default();
+        p.connected();
+        assert!(!p.live);
+        assert!(p.drained(), "the first drain syncs names");
+        assert!(p.live);
+        p.connected(); // reconnect: catching up again
+        assert!(!p.live);
+        assert!(!p.drained(), "names are synced once");
+        assert!(p.live);
+    }
+
+    /// Catching up after being offline must not set off a notification per queued message.
+    #[tokio::test]
+    async fn only_live_messages_are_announced() {
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let msg = |sent_at| {
+            Op::InsertMessage(crate::projection::Message {
+                conversation_id: "c:alice".into(),
+                author: "alice".into(),
+                sent_at,
+                received_at: sent_at,
+                body: Some("hi".into()),
+                is_outgoing: false,
+                status: crate::projection::MessageStatus::Delivered,
+                edited: false,
+                deleted: false,
+                quote: None,
+            })
+        };
+        let sink = Sink(Default::default());
+        let announced = |sink: &Sink| {
+            sink.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, CoreEvent::NewMessage { .. }))
+                .count()
+        };
+        super::apply_received(&db, &sink, &[msg(1)], "alice", "me", false).await;
+        assert_eq!(announced(&sink), 0);
+        super::apply_received(&db, &sink, &[msg(2)], "alice", "me", true).await;
+        assert_eq!(announced(&sink), 1);
+    }
+
     /// The receipts flush is queued after this returns, so the new setting must already be stored.
     #[tokio::test]
     async fn a_settings_change_is_stored_before_it_is_reported() {
@@ -575,14 +663,14 @@ mod tests {
             read_receipts: Some(false),
             typing_indicators: None,
         };
-        assert!(super::apply_received(&db, &Quiet, &[off], "me").await);
+        assert!(super::apply_received(&db, &Quiet, &[off], "me", "me", true).await);
         assert_eq!(db.settings().await.unwrap().read_receipts, Some(false));
         let typing = Op::Typing {
             conversation_id: "c:a".into(),
             who: "a".into(),
             started: true,
         };
-        assert!(!super::apply_received(&db, &Quiet, &[typing], "a").await);
+        assert!(!super::apply_received(&db, &Quiet, &[typing], "a", "me", true).await);
         assert_eq!(
             db.settings().await.unwrap(),
             Settings {
