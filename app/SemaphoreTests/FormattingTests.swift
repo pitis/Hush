@@ -49,7 +49,7 @@ final class FormattingTests: XCTestCase {
     func testInitialsAndStableAvatarColor() {
         XCTAssertEqual(Formatting.initials("He Be Hatin"), "HB")
         XCTAssertEqual(Formatting.initials("bob"), "B")
-        XCTAssertEqual(Formatting.initials("8 🅰️ test"), "8")
+        XCTAssertEqual(Formatting.initials("8 🅰️ test"), "8T")  // emoji words are skipped
         XCTAssertEqual(Formatting.initials(""), "#")
         XCTAssertEqual(Formatting.avatarIndex("c:abc"), Formatting.avatarIndex("c:abc"))
         XCTAssertTrue((0..<Formatting.avatarPaletteSize).contains(Formatting.avatarIndex("c:xyz")))
