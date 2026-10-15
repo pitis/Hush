@@ -62,6 +62,8 @@ struct ChatCommands: Commands {
             Group {
                 Button("Find Chat…") { store.focusSearch() }.keyboardShortcut("k")
                 Button("Search") { store.focusSearch() }.keyboardShortcut("f")
+                Button("Search in Chat") { store.searchInChat() }.keyboardShortcut("f", modifiers: [.command, .shift])
+                    .disabled(store.selectedId == nil)
                 Divider()
                 Button("Previous Chat") { switchChat { store.selectNeighbor(step: -1, unreadOnly: false) } }
                     .keyboardShortcut(.upArrow, modifiers: .option)

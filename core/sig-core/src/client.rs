@@ -11,7 +11,7 @@ use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
     Attachment, Conversation, LinkPreview, Message, MessageKey, MessageStatus, OutgoingFile, ProjectionDb, Quote,
-    Reaction,
+    Reaction, SearchHit,
 };
 use crate::send::{self, Job, SendJob};
 
@@ -420,8 +420,19 @@ impl Client {
         Ok(self.db.messages(&conversation_id, before, limit).await?)
     }
 
-    pub async fn search(&self, query: String, limit: u32) -> Result<Vec<Message>, CoreError> {
-        Ok(self.db.search(&query, limit).await?)
+    /// Messages matching `query` (see `ProjectionDb::search`), in one conversation or all.
+    pub async fn search(
+        &self,
+        query: String,
+        conversation_id: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, CoreError> {
+        Ok(self.db.search(&query, conversation_id.as_deref(), limit).await?)
+    }
+
+    /// How many messages of a conversation are newer than `key`.
+    pub async fn count_newer(&self, conversation_id: String, key: MessageKey) -> Result<u32, CoreError> {
+        Ok(self.db.count_newer(&conversation_id, &key).await?)
     }
 
     pub async fn message(&self, key: MessageKey) -> Result<Option<Message>, CoreError> {
@@ -485,7 +496,7 @@ mod tests {
         rt.block_on(async {
             assert!(client.conversations().await.unwrap().is_empty());
             assert!(client.messages("c:x".into(), None, 10).await.unwrap().is_empty());
-            assert!(client.search("hi".into(), 10).await.unwrap().is_empty());
+            assert!(client.search("hi".into(), None, 10).await.unwrap().is_empty());
         });
         assert!(dir.0.join("presage.db").exists() && dir.0.join("projection.db").exists());
     }

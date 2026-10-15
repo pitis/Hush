@@ -155,7 +155,20 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
             return reactionAnswers[key] ?? []
         }
     }
-    func search(query: String, limit: UInt32) async throws -> [Message] { [] }
+    private(set) var searches: [(query: String, conversationId: String?)] = []
+    var searchAnswers: [String: [SearchHit]] = [:]
+    var newerCounts: [MessageKey: UInt32] = [:]
+    func search(query: String, conversationId: String?, limit: UInt32) async throws -> [SearchHit] {
+        lock.withLock {
+            searches.append((query, conversationId))
+            return (searchAnswers[query] ?? []).filter {
+                conversationId == nil || $0.message.conversationId == conversationId
+            }
+        }
+    }
+    func countNewer(conversationId: String, key: MessageKey) async throws -> UInt32 {
+        lock.withLock { newerCounts[key] ?? 0 }
+    }
 }
 
 func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {

@@ -92,6 +92,7 @@ struct TimelineList: View {
                                 senderName: store.senderName(m.author),
                                 reactions: store.reactions[key] ?? [],
                                 files: store.attachments[key] ?? [], preview: store.previews[key],
+                                highlighted: store.highlighted == key,
                                 reply: { store.replyTo = m },
                                 retry: { Task { await store.retry(key) } },
                                 download: store.download, open: open)
@@ -133,6 +134,11 @@ struct TimelineList: View {
             .onChange(of: conversation.id) { _, _ in
                 unseenNew = false
                 proxy.scrollTo("bottom", anchor: .bottom)
+            }
+            // a search result opened: to the message, in the middle
+            .onChange(of: store.scrollRequest) { _, _ in
+                guard let k = store.scrollTarget else { return }
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("\(k.author)-\(k.sentAt)", anchor: .center) }
             }
             // read once the newest message is on screen in the key window, like Desktop
             .onChange(of: atBottom) { _, _ in markReadIfSeen() }
@@ -185,6 +191,8 @@ struct MessageRow: View {
     let reactions: [Reaction]
     let files: [Attachment]
     let preview: LinkPreview?
+    /// Just opened from search: outlined for a moment.
+    var highlighted = false
     let reply: () -> Void
     let retry: () -> Void
     let download: (Int64) -> Void
@@ -262,6 +270,10 @@ struct MessageRow: View {
         .padding(.vertical, 8)
         .foregroundStyle(.white)
         .background(outgoing ? Theme.outgoing : Theme.incoming, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: Theme.bubbleRadius).stroke(.yellow, lineWidth: highlighted ? 3 : 0)
+                .animation(.easeOut(duration: 0.4), value: highlighted)
+        }
     }
 
     private var meta: some View {

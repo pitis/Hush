@@ -43,8 +43,17 @@ final class AppStore {
     private(set) var badge: String?
     /// Our own ACI once linked (Note to Self is `c:<it>`).
     private(set) var ownAci: String?
-    /// The chat list's search text; the list and keyboard navigation show only matching chats.
-    var searchQuery = ""
+    /// The chat list's search text; the list and keyboard navigation show only matching chats,
+    /// and matching messages are looked up (`searchResults`).
+    var searchQuery = "" { didSet { if searchQuery != oldValue { scheduleSearch() } } }
+    /// Search only in this chat (⇧⌘F), or everywhere.
+    private(set) var searchScope: String? { didSet { if searchScope != oldValue { scheduleSearch() } } }
+    private(set) var searchResults: [SearchHit] = []
+    private var searchTask: Task<Void, Never>?
+    /// A message found by search: highlighted for a moment, and scrolled to (`scrollRequest`).
+    private(set) var highlighted: MessageKey?
+    private(set) var scrollTarget: MessageKey?
+    private(set) var scrollRequest = 0
     /// Bumped to ask the sidebar to focus the search field.
     private(set) var searchFocusRequest = 0
     /// Set to move focus to the composer (a click on a chat, ↩ in the search, a shortcut); the
@@ -339,6 +348,11 @@ final class AppStore {
     /// ↩ in the search: opens the selected match (or the first), ends the search and moves to the
     /// composer.
     func openSearchResult() {
+        // searching a chat, or no chat matches: the newest message found
+        if searchScope != nil || visibleConversations.isEmpty {
+            if let hit = searchResults.first { Task { await open(hit) } }
+            return
+        }
         let shown = visibleConversations
         let id = shown.contains { $0.id == selectedId } ? selectedId : shown.first?.id
         guard let id else { return }
@@ -454,6 +468,75 @@ final class AppStore {
     }
 
     func focusSearch() { searchFocusRequest += 1 }
+
+    // MARK: Search
+
+    static let searchLimit: UInt32 = 50
+    /// How far back a search result can be shown: the open chat is loaded up to it.
+    static let jumpLimit: UInt32 = 10_000
+
+    /// ⇧⌘F: search the open chat only.
+    func searchInChat() {
+        guard let id = selectedId else { return }
+        searchScope = id
+        focusSearch()
+    }
+
+    func endSearch() {
+        searchQuery = ""
+        searchScope = nil
+    }
+
+    /// Looks the query up once typing pauses; a newer query cancels an older one.
+    private func scheduleSearch() {
+        searchTask?.cancel()
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let client, !query.isEmpty else {
+            searchResults = []
+            return
+        }
+        let scope = searchScope
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            do {
+                let hits = try await client.search(query: query, conversationId: scope, limit: Self.searchLimit)
+                if !Task.isCancelled { searchResults = hits }
+            } catch { append("search failed: \(error)") }
+        }
+    }
+
+    /// Opens a search result: its chat, loaded back to the message, scrolled to and highlighted.
+    func open(_ hit: SearchHit) async {
+        let key = MessageKey(author: hit.message.author, sentAt: hit.message.sentAt)
+        let conversationId = hit.message.conversationId
+        select(conversationId)
+        guard let client else { return }
+        let generation = selectionGeneration
+        do {
+            let newer = try await client.countNewer(conversationId: conversationId, key: key)
+            guard newer < Self.jumpLimit else {
+                return showError("That message is too far back to show yet.")
+            }
+            let limit = max(Self.pageSize, newer + 50)
+            let page = try await client.messages(conversationId: conversationId, before: nil, limit: limit)
+            guard generation == selectionGeneration else { return }
+            if page.count > messages.count {
+                messages = page
+                hasOlder = page.count == Int(limit)
+                await loadDetails(for: page, generation: generation)
+            }
+        } catch {
+            return showError("Couldn't open that message: \(Self.describe(error))")
+        }
+        highlighted = key
+        scrollTarget = key
+        scrollRequest += 1
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            if highlighted == key { highlighted = nil }
+        }
+    }
     func focusComposer() { composerWantsFocus = true }
     func composerTookFocus() { composerWantsFocus = false }
 
