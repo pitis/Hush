@@ -295,6 +295,28 @@ impl ProjectionDb {
                 tx.commit().await?;
                 Ok(changed(m))
             }
+            Op::Settings {
+                read_receipts,
+                typing_indicators,
+            } => {
+                let mut tx = self.pool.begin().await?;
+                for (key, value) in [
+                    ("read_receipts", read_receipts),
+                    ("typing_indicators", typing_indicators),
+                ] {
+                    if let Some(v) = value {
+                        sqlx::query(
+                            "INSERT INTO settings VALUES (?1, ?2) ON CONFLICT DO UPDATE SET value = excluded.value",
+                        )
+                        .bind(key)
+                        .bind(v)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                tx.commit().await?;
+                Ok(vec![])
+            }
             Op::SetStatus { targets, status } => {
                 let mut tx = self.pool.begin().await?;
                 let mut out = vec![];
@@ -409,6 +431,17 @@ impl ProjectionDb {
             .into_iter()
             .map(|(author, sent_at)| MessageKey { author, sent_at })
             .collect())
+    }
+
+    pub async fn settings(&self) -> Result<Settings, sqlx::Error> {
+        let rows: Vec<(String, bool)> = sqlx::query_as("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await?;
+        let get = |k: &str| rows.iter().find(|(key, _)| key == k).map(|(_, v)| *v);
+        Ok(Settings {
+            read_receipts: get("read_receipts"),
+            typing_indicators: get("typing_indicators"),
+        })
     }
 
     /// Remembers that read receipts for `targets` still have to go out.
@@ -1644,5 +1677,32 @@ mod tests {
         );
         db.receipts_sent(&[k("alice", 1), k("bob", 3)]).await.unwrap();
         assert_eq!(db.unsent_receipts().await.unwrap(), vec![k("alice", 2)]);
+    }
+
+    #[tokio::test]
+    async fn settings_are_unknown_until_the_phone_sends_them_and_merge() {
+        let db = db().await;
+        assert_eq!(db.settings().await.unwrap(), Settings::default());
+        let set = |read_receipts, typing_indicators| Op::Settings {
+            read_receipts,
+            typing_indicators,
+        };
+        assert!(db.apply(&set(Some(false), None)).await.unwrap().is_empty());
+        db.apply(&set(None, Some(true))).await.unwrap();
+        assert_eq!(
+            db.settings().await.unwrap(),
+            Settings {
+                read_receipts: Some(false),
+                typing_indicators: Some(true)
+            }
+        );
+        db.apply(&set(Some(true), Some(false))).await.unwrap();
+        assert_eq!(
+            db.settings().await.unwrap(),
+            Settings {
+                read_receipts: Some(true),
+                typing_indicators: Some(false)
+            }
+        );
     }
 }

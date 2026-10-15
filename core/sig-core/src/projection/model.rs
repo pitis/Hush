@@ -101,6 +101,13 @@ impl Message {
     }
 }
 
+/// Privacy settings synced from the phone; `None` until it has told us.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    pub read_receipts: Option<bool>,
+    pub typing_indicators: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

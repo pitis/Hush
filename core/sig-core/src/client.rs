@@ -131,7 +131,8 @@ impl Client {
 
     /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
     /// the chat). Call it on every change of the field; typing stops by itself after `TYPING_IDLE`
-    /// (10 s) without one. Nothing is sent in Note to Self.
+    /// (10 s) without one. Nothing is sent in Note to Self, or unless the account's typing indicators
+    /// setting is on.
     pub fn set_typing(&self, conversation_id: String, started: bool) -> Result<(), CoreError> {
         if !self.is_linked() {
             return Err(CoreError::NotLinked);
@@ -279,7 +280,7 @@ impl Client {
     }
 
     /// Marks the conversation's unread messages read here at once, then sends read receipts to
-    /// their senders and tells our phone. The receipts are stored first and go out as soon as
+    /// their senders (only if the account's read receipts setting is on) and tells our phone. The receipts are stored first and go out as soon as
     /// sending runs (retried until sent). Returns how many were unread.
     pub async fn mark_read(&self, conversation_id: String) -> Result<u32, CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;

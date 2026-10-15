@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::CoreError;
 use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
-use crate::projection::{project, ProjectionDb};
+use crate::projection::{project, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
 use crate::typing::{Typing, TYPING_IDLE};
 
@@ -256,6 +256,7 @@ async fn run(
                         projection.clone(),
                         listener.clone(),
                         caught_up_tx.clone(),
+                        send_tx.clone(),
                     )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
@@ -394,6 +395,7 @@ async fn receive_loop(
     db: ProjectionDb,
     l: Arc<dyn EventListener>,
     caught_up: Rc<watch::Sender<bool>>,
+    jobs: mpsc::UnboundedSender<Job>,
 ) {
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
@@ -410,7 +412,7 @@ async fn receive_loop(
                 });
                 futures::pin_mut!(stream);
                 while let Some(received) = stream.next().await {
-                    handle(received, &m, &db, &me, &mut titles_synced, l.as_ref()).await;
+                    handle(received, &m, &db, &me, &mut titles_synced, l.as_ref(), &jobs).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && titles_synced;
                         *ready |= titles_synced;
@@ -443,6 +445,7 @@ async fn handle(
     me: &str,
     titles_synced: &mut bool,
     l: &dyn EventListener,
+    jobs: &mpsc::UnboundedSender<Job>,
 ) {
     // Kinds and counts only: never message content.
     match &received {
@@ -468,6 +471,10 @@ async fn handle(
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
             for op in ops {
+                if matches!(op, Op::Settings { .. }) {
+                    // receipts held back while the read receipts setting was unknown
+                    let _ = jobs.send(Job::Receipts);
+                }
                 match db.apply(&op).await {
                     Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
                     Err(e) => l.on_event(CoreEvent::Error {

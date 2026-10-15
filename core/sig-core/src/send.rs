@@ -186,6 +186,25 @@ pub fn read_receipts(targets: &[MessageKey]) -> Vec<(String, ReceiptMessage)> {
         .collect()
 }
 
+/// The receipts to send for `targets` under the read receipts setting: none when it is off, and
+/// `None` (keep them queued) while the phone hasn't told us yet.
+pub fn receipts_allowed(setting: Option<bool>, targets: &[MessageKey]) -> Option<Vec<(String, ReceiptMessage)>> {
+    match setting? {
+        true => Some(read_receipts(targets)),
+        false => Some(vec![]),
+    }
+}
+
+/// Asks our phone for the account's settings (read receipts, typing indicators).
+pub fn configuration_request() -> SyncMessage {
+    SyncMessage {
+        content: Some(sync_message::Content::Request(sync_message::Request {
+            r#type: Some(sync_message::request::Type::Configuration as i32),
+        })),
+        ..Default::default()
+    }
+}
+
 /// Tells our other devices that we read `targets`.
 pub fn read_sync(targets: &[MessageKey]) -> SyncMessage {
     SyncMessage {
@@ -286,6 +305,15 @@ pub async fn sender(
     if caught_up.wait_for(|ready| *ready).await.is_err() {
         return;
     }
+    match db.settings().await {
+        Ok(s) if s.read_receipts.is_some() && s.typing_indicators.is_some() => {}
+        _ => {
+            let me = m.registration_data().service_ids.aci();
+            if let Err(e) = timed(Box::pin(m.send_message(me, configuration_request(), now_ms()))).await {
+                tracing::warn!(error = %e, "asking the phone for settings failed");
+            }
+        }
+    }
     // receipts left over from an earlier run or a failed send
     send_receipts(&mut m, &db, l.as_ref()).await;
     loop {
@@ -307,6 +335,10 @@ pub async fn sender(
             } => {
                 // typing that waited this long (offline, catching up) is no longer true
                 if queued.elapsed() >= TYPING_IDLE {
+                    continue;
+                }
+                // only with typing indicators known to be on (they are an account setting)
+                if !matches!(db.settings().await, Ok(s) if s.typing_indicators == Some(true)) {
                     continue;
                 }
                 let at = now_ms();
@@ -398,13 +430,14 @@ async fn record_mutation(
     }
 }
 
-/// Sends the unsent read receipts, one per sender, then the read state to our phone. Receipts
-/// stay queued until both went out, to be sent again on the next try (a repeat is harmless).
+/// Sends the unsent read receipts, one per sender, as the read receipts setting allows, then the
+/// read state to our phone. A receipt stays queued until it went out (a repeat is harmless), and
+/// while the setting is unknown.
 async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener) {
-    let targets = match db.unsent_receipts().await {
-        Ok(t) if t.is_empty() => return,
-        Ok(t) => t,
-        Err(e) => {
+    let (targets, settings) = match (db.unsent_receipts().await, db.settings().await) {
+        (Ok(t), _) if t.is_empty() => return,
+        (Ok(t), Ok(s)) => (t, s),
+        (Err(e), _) | (_, Err(e)) => {
             l.on_event(CoreEvent::Error {
                 message: format!("reading unsent read receipts failed: {e}"),
             });
@@ -412,9 +445,10 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
         }
     };
     let at = now_ms();
+    let allowed = receipts_allowed(settings.read_receipts, &targets);
     let mut done = vec![];
     let mut failed = 0;
-    for (author, receipt) in read_receipts(&targets) {
+    for (author, receipt) in allowed.clone().unwrap_or_default() {
         let sent = match Uuid::parse_str(&author) {
             Ok(u) => timed(Box::pin(m.send_message(Aci::from(u), receipt, at))).await,
             Err(e) => Err(e.to_string()),
@@ -439,6 +473,9 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
             message: format!("couldn't tell your phone what you read; it will be retried: {e}"),
         });
         return;
+    }
+    if allowed.is_some_and(|r| r.is_empty()) {
+        done = targets; // read receipts are off: nothing to send to anyone
     }
     if let Err(e) = db.receipts_sent(&done).await {
         l.on_event(CoreEvent::Error {
@@ -689,6 +726,19 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn receipts_follow_the_read_receipts_setting() {
+        let targets = [key(U, 100)];
+        assert_eq!(receipts_allowed(None, &targets), None);
+        assert_eq!(receipts_allowed(Some(false), &targets), Some(vec![]));
+        assert_eq!(receipts_allowed(Some(true), &targets), Some(read_receipts(&targets)));
+        let request = match configuration_request().content {
+            Some(sync_message::Content::Request(r)) => r.r#type,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(request, Some(sync_message::request::Type::Configuration as i32));
     }
 
     #[test]
