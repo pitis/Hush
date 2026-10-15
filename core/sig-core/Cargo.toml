@@ -8,13 +8,16 @@ license = "AGPL-3.0-only"
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
-uniffi = { workspace = true }
+uniffi = { workspace = true, features = ["tokio"] }
 presage = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
 tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
 hex = "0.4"
 chrono = "0.4"
+futures = "0.3"
+thiserror = "2"
+tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["rt", "macros"] }
+tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros"] }
