@@ -76,7 +76,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func react(target: MessageKey, emoji: String, remove: Bool) async throws {}
     func edit(key: MessageKey, newBody: String) async throws {}
     func deleteForEveryone(key: MessageKey) async throws {}
-    func markRead(conversationId: String) async throws -> UInt32 { 0 }
+    private(set) var markedRead: [String] = []
+    var markReadError: Error?
+    func markRead(conversationId: String) async throws -> UInt32 {
+        lock.withLock { markedRead.append(conversationId) }
+        if let markReadError { throw markReadError }
+        return 0
+    }
     func setTyping(conversationId: String, started: Bool) throws {}
 
     private(set) var titleCalls = 0
@@ -127,7 +133,10 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
 }
 
 func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
-    Conversation(id: id, kind: .direct, title: id, lastMessageAt: 1, lastMessagePreview: "", unreadCount: unread)
+    Conversation(
+        id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
+        unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
+        lastMessageDeleted: false)
 }
 
 final class Counter: @unchecked Sendable {

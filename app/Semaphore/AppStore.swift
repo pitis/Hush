@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import OSLog
 import Observation
 
@@ -29,7 +29,26 @@ final class AppStore {
     private(set) var screen: Screen = .starting
     private(set) var linkURL: String?
     private(set) var connection: ConnectionState = .offline
-    private(set) var conversations: [Conversation] = []
+    private(set) var conversations: [Conversation] = [] {
+        didSet {
+            badge = ChatList.badge(conversations)
+            NSApp?.dockTile.badgeLabel = badge
+        }
+    }
+    /// The dock badge: total unread.
+    private(set) var badge: String?
+    /// Our own ACI once linked (Note to Self is `c:<it>`).
+    private(set) var ownAci: String?
+    /// The chat list's search text; the list and keyboard navigation show only matching chats.
+    var searchQuery = ""
+    /// Bumped to ask the sidebar to focus the search field.
+    private(set) var searchFocusRequest = 0
+    /// Set to move focus to the composer (a click on a chat, ↩ in the search, a shortcut); the
+    /// composer clears it. Switching chats with the arrows in the list or the search leaves focus
+    /// there.
+    private(set) var composerWantsFocus = false
+    /// Chats whose mark-read call is in flight.
+    private var markingRead: Set<String> = []
     private(set) var log: [LogLine] = []
     private(set) var lastError: String?
     private(set) var selectedId: String?
@@ -88,6 +107,7 @@ final class AppStore {
             let client = try opened.get()
             self.client = client
             if client.isLinked() {
+                ownAci = client.ownAci()
                 screen = .chats
                 try client.start()
                 refreshConversations()
@@ -117,6 +137,7 @@ final class AppStore {
             screen = .link
         case .linked:
             Self.logger.notice("linked")
+            ownAci = client?.ownAci()
             linkURL = nil
             lastError = nil
             screen = .chats
@@ -209,6 +230,51 @@ final class AppStore {
         } catch { append("retry failed: \(error)") }
     }
 
+    /// Marks a chat read (here, on the phone, and with read receipts) if it has unread messages.
+    func markRead(_ conversationId: String) {
+        guard let client, !markingRead.contains(conversationId),
+            conversations.first(where: { $0.id == conversationId })?.unreadCount ?? 0 > 0
+        else { return }
+        markingRead.insert(conversationId)
+        Task {
+            defer { markingRead.remove(conversationId) }
+            do { _ = try await client.markRead(conversationId: conversationId) } catch {
+                lastError = "Couldn't mark the chat read: \(Self.describe(error))"
+                append("mark read failed: \(error)")
+            }
+        }
+    }
+
+    /// Opens the chat `step` away in the visible list (see `ChatList.neighbor`).
+    func selectNeighbor(step: Int, unreadOnly: Bool) {
+        if let id = ChatList.neighbor(in: visibleConversations, of: selectedId, step: step, unreadOnly: unreadOnly) {
+            select(id)
+        }
+    }
+
+    /// Opens the chat at 1-based position `n` of the visible list.
+    func selectChat(at n: Int) {
+        if let id = ChatList.at(n, in: visibleConversations) { select(id) }
+    }
+
+    /// ↩ in the search: opens the selected match (or the first), ends the search and moves to the
+    /// composer.
+    func openSearchResult() {
+        let shown = visibleConversations
+        let id = shown.contains { $0.id == selectedId } ? selectedId : shown.first?.id
+        guard let id else { return }
+        select(id)
+        searchQuery = ""
+        focusComposer()
+    }
+
+    func focusSearch() { searchFocusRequest += 1 }
+    func focusComposer() { composerWantsFocus = true }
+    func composerTookFocus() { composerWantsFocus = false }
+
+    /// Recomputes day separators ("Today" becomes "Yesterday" after midnight).
+    func refreshDays() { timelineItems = Timeline.items(for: messages) }
+
     func isTyping(_ conversationId: String, now: Date = .now) -> Bool {
         typingUntil[conversationId]?.values.contains { $0 > now } ?? false
     }
@@ -217,8 +283,17 @@ final class AppStore {
         selectedId.flatMap { id in conversations.first { $0.id == id } }
     }
 
-    /// A conversation's name, or a short form of its id until the name is known.
-    nonisolated static func displayTitle(_ c: Conversation) -> String {
+    /// The chats the list shows: all, or those matching the search.
+    var visibleConversations: [Conversation] {
+        conversations.filter { Formatting.matches(title($0), query: searchQuery) }
+    }
+
+    func title(_ c: Conversation) -> String { Self.displayTitle(c, ownAci: ownAci) }
+
+    /// A conversation's name ("Note to Self" for our own), or a short form of its id until the
+    /// name is known.
+    nonisolated static func displayTitle(_ c: Conversation, ownAci: String? = nil) -> String {
+        if let ownAci, c.id == "c:\(ownAci)" { return "Note to Self" }
         if !c.title.isEmpty { return c.title }
         if c.id.hasPrefix("g:") { return "Group" }
         return String(c.id.dropFirst(2).prefix(8))
@@ -311,16 +386,20 @@ final class AppStore {
                 let r = try await client.reactions(key: key)
                 if generation == selectionGeneration { reactions[key] = r.isEmpty ? nil : r }
             } catch { append("query failed: \(error)") }
-            if isGroup, !m.isOutgoing, senderNames[m.author] == nil, !unnamedAuthors.contains(m.author) {
-                do {
-                    if let name = try await client.title(conversationId: "c:\(m.author)") {
-                        senderNames[m.author] = name
-                    } else {
-                        unnamedAuthors.insert(m.author)
-                    }
-                } catch { append("query failed: \(error)") }
-            }
+            if isGroup, !m.isOutgoing { await loadName(m.author) }
         }
+    }
+
+    /// Looks up a group member's contact name once.
+    private func loadName(_ author: String) async {
+        guard let client, senderNames[author] == nil, !unnamedAuthors.contains(author) else { return }
+        do {
+            if let name = try await client.title(conversationId: "c:\(author)") {
+                senderNames[author] = name
+            } else {
+                unnamedAuthors.insert(author)
+            }
+        } catch { append("query failed: \(error)") }
     }
 
     /// One query at a time; events arriving meanwhile cause exactly one more pass, so a burst
@@ -338,6 +417,10 @@ final class AppStore {
                 do {
                     conversations = try await client.conversations()
                     Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
+                    // group rows say who wrote the last message
+                    for c in conversations where c.kind == .group && !c.lastMessageOutgoing {
+                        await loadName(c.lastMessageAuthor)
+                    }
                 } catch { append("query failed: \(error)") }
             } while refreshAgain
             refreshing = false

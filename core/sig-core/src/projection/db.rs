@@ -120,10 +120,15 @@ impl ProjectionDb {
     /// Conversations that have messages, most recent first. Contacts known only by name (synced
     /// from the phone) aren't listed until a message arrives.
     pub async fn conversations(&self) -> Result<Vec<Conversation>, sqlx::Error> {
-        let rows =
-            sqlx::query("SELECT * FROM conversations WHERE last_message_at > 0 ORDER BY last_message_at DESC, id")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT c.*, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
+               m.deleted AS last_deleted
+             FROM conversations c LEFT JOIN messages m ON m.id = (SELECT id FROM messages
+               WHERE conversation_id = c.id ORDER BY sent_at DESC, author DESC LIMIT 1)
+             WHERE c.last_message_at > 0 ORDER BY c.last_message_at DESC, c.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(row_to_conversation).collect()
     }
 
@@ -653,7 +658,14 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
     let id: String = r.try_get("id")?;
     let kind = kind_of(&id)?;
     let unread: i64 = r.try_get("unread_count")?;
+    let status: Option<i64> = r.try_get("last_status")?;
+    let status = status.unwrap_or(MessageStatus::Sent.to_i64());
     Ok(Conversation {
+        last_message_author: r.try_get::<Option<String>, _>("last_author")?.unwrap_or_default(),
+        last_message_outgoing: r.try_get::<Option<bool>, _>("last_outgoing")?.unwrap_or(false),
+        last_message_status: MessageStatus::from_i64(status)
+            .ok_or_else(|| decode_err(format!("message status {status}")))?,
+        last_message_deleted: r.try_get::<Option<bool>, _>("last_deleted")?.unwrap_or(false),
         kind,
         title: r.try_get("title")?,
         last_message_at: r.try_get("last_message_at")?,
@@ -1704,5 +1716,47 @@ mod tests {
                 typing_indicators: Some(false)
             }
         );
+    }
+
+    #[tokio::test]
+    async fn conversations_describe_their_last_message() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (
+                c.last_message_author.as_str(),
+                c.last_message_outgoing,
+                c.last_message_deleted
+            ),
+            ("alice", false, false)
+        );
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            ..msg("me", 2, "mine")
+        })
+        .await
+        .unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (
+                c.last_message_author.as_str(),
+                c.last_message_outgoing,
+                c.last_message_status
+            ),
+            ("me", true, MessageStatus::Pending)
+        );
+        db.apply(&Op::SetStatus {
+            targets: vec![k("me", 2)],
+            status: MessageStatus::Read,
+        })
+        .await
+        .unwrap();
+        assert_eq!(conv(&db, "c:alice").await.last_message_status, MessageStatus::Read);
+        db.apply(&Op::Delete { target: k("me", 2) }).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert!(c.last_message_deleted && c.last_message_outgoing);
+        assert_eq!(c.last_message_preview, "");
     }
 }

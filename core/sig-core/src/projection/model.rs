@@ -24,6 +24,12 @@ pub struct Conversation {
     pub last_message_at: i64,
     pub last_message_preview: String,
     pub unread_count: u32,
+    /// The last message's author (empty without messages).
+    pub last_message_author: String,
+    pub last_message_outgoing: bool,
+    /// Meaningful for our own last message: its ticks.
+    pub last_message_status: MessageStatus,
+    pub last_message_deleted: bool,
 }
 
 /// Delivery state of a message. The variant order matches the stored integers, and a later state

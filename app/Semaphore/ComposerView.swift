@@ -66,13 +66,17 @@ struct ComposerView: View {
         }
         .onAppear {
             text = Composer.draft(for: conversationId)
-            focused = true
+            takeFocusIfAsked()
         }
-        .onChange(of: conversationId) { _, new in
-            text = Composer.draft(for: new)
-            focused = true
-        }
+        .onChange(of: conversationId) { _, new in text = Composer.draft(for: new) }
         .onChange(of: text) { _, new in Composer.saveDraft(new, for: conversationId) }
+        .onChange(of: store.composerWantsFocus) { _, _ in takeFocusIfAsked() }
+    }
+
+    private func takeFocusIfAsked() {
+        guard store.composerWantsFocus else { return }
+        focused = true
+        store.composerTookFocus()
     }
 
     private func submit() {

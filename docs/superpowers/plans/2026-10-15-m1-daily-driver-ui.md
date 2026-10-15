@@ -41,6 +41,17 @@
 ### Task 3 (#11): Sidebar
 
 > **As built (PR #31):** the list, search (⌘F), rows, relative times, unread badges and typing are done. Keyboard navigation, the ⌘K switcher, the dock badge, sidebar ticks/deleted preview and minute-refreshing times moved to #32.
+>
+> **As built (#32), after Signal Desktop:**
+> - **Shortcuts** (Chats menu): ⌥↑/⌥↓ previous/next chat, wrapping around. ⌥⇧↑/⌥⇧↓ previous/next unread, without wrapping. ⌘1–9 jumps to a chat. ⌘F/⌘K search. ⌘⇧T focuses the composer. ⌘⇧C closes the chat.
+> - **Search:** ↑/↓ pick a chat, ↩ opens it and moves to the composer, Esc ends the search.
+> - **Rows:** groups show "Name: text" ("You: …" for our own). "You/Name deleted this message". "Draft: …" for unsent text in chats that aren't open. "Note to Self". Ticks for our own last message.
+> - **Dock badge:** total unread messages.
+> - **Read:** a chat is marked read when its newest message is visible in the key window.
+> - **Read:** the window must also be on screen, so a locked or sleeping Mac doesn't mark incoming messages read.
+> - **Focus:** chat shortcuts and clicking a chat move focus to the composer; ↑/↓ in the list or the search switch chats but keep focus there.
+> - **⌥↑/⌥↓ clash:** like Desktop, they switch chats even in the composer, overriding "move to paragraph start/end".
+> - **Not done:** ⌃Tab/⌃⇧Tab (Tab is taken by focus moves). ⌘↑/⌘↓ and ⌘J, because moving to the start or end of a long draft is used far more often than paragraph moves.
 - `NavigationSplitView` sidebar (min 300 pt): "Chats" header, search field (filters by title, ⌘F focuses), rows = avatar (initials, stable color from id) · title (bold if unread) · preview (one line, "Photo"/"Attachment" when body nil, "This message was deleted" when deleted) · relative time (Now / 11m / 14:05 / Mon / Jul 18) · unread badge (blue capsule) · ticks for own last message.
 - Keyboard: ↑/↓ moves selection, ⌘1–9 jumps, ⌘K quick switcher (fuzzy title).
 - Dock badge = total unread.
