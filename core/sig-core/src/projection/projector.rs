@@ -40,6 +40,11 @@ pub enum Op {
         who: String,
         started: bool,
     },
+    /// Privacy settings from our phone; `None` leaves a setting as it is.
+    Settings {
+        read_receipts: Option<bool>,
+        typing_indicators: Option<bool>,
+    },
 }
 
 /// The ops one received (or locally sent) `Content` produces. `me` is our own ACI as a canonical
@@ -70,6 +75,14 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
         ContentBody::SynchronizeMessage(sm) if sender == me => {
             let mut ops = match &sm.content {
                 Some(sync_message::Content::Sent(sent)) => sent_transcript(sent, me, received_at),
+                Some(sync_message::Content::Configuration(c))
+                    if c.read_receipts.is_some() || c.typing_indicators.is_some() =>
+                {
+                    vec![Op::Settings {
+                        read_receipts: c.read_receipts,
+                        typing_indicators: c.typing_indicators,
+                    }]
+                }
                 _ => vec![],
             };
             let read: Vec<_> = sm
@@ -863,5 +876,35 @@ mod tests {
             timestamp: vec![1],
         };
         assert!(project(&content(ME, 1, ContentBody::ReceiptMessage(rm)), ME).is_empty());
+    }
+
+    #[test]
+    fn privacy_settings_come_from_my_phone_only() {
+        let config = |read: Option<bool>, typing: Option<bool>| {
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::Configuration(sync_message::Configuration {
+                    read_receipts: read,
+                    typing_indicators: typing,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            project(&content(ME, 1, config(Some(false), Some(true))), ME),
+            vec![Op::Settings {
+                read_receipts: Some(false),
+                typing_indicators: Some(true)
+            }]
+        );
+        assert_eq!(
+            project(&content(ME, 2, config(Some(true), None)), ME),
+            vec![Op::Settings {
+                read_receipts: Some(true),
+                typing_indicators: None
+            }]
+        );
+        assert!(project(&content(ME, 3, config(None, None)), ME).is_empty());
+        assert!(project(&content(ALICE, 4, config(Some(true), Some(true))), ME).is_empty());
     }
 }

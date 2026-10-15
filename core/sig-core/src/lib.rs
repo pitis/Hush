@@ -7,6 +7,7 @@ mod events;
 mod logging;
 pub mod projection;
 mod send;
+mod typing;
 
 pub use client::Client;
 pub use error::CoreError;

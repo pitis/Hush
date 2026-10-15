@@ -2,7 +2,7 @@
 //! here: one OS thread with a current-thread tokio runtime and a `LocalSet`. The rest of the core
 //! talks to it through `Command`s; results flow back as `CoreEvent`s.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -28,8 +28,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::CoreError;
 use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
-use crate::projection::{project, ProjectionDb};
-use crate::send::{sender, Jobs, SendJob};
+use crate::projection::{project, Op, ProjectionDb};
+use crate::send::{sender, Job, Jobs};
+use crate::typing::{Typing, TYPING_IDLE};
 
 /// libsignal's post-quantum crypto (libcrux ML-KEM key generation, also run by presage's pre-key
 /// refresh while receiving, and session decryption) uses very large stack frames in debug builds;
@@ -49,9 +50,16 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(300);
 const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 pub enum Command {
-    Link { device_name: String },
+    Link {
+        device_name: String,
+    },
     Start,
-    Send(SendJob),
+    Send(Job),
+    /// The user is typing in a conversation (`started`), or stopped.
+    Typing {
+        conversation_id: String,
+        started: bool,
+    },
 }
 
 pub struct Handles {
@@ -182,8 +190,9 @@ async fn run(
         set_aci(m);
     }
     // Sends queue here until receiving starts and the server queue is drained.
-    let (send_tx, send_rx) = mpsc::unbounded_channel::<SendJob>();
-    let jobs: Jobs = Rc::new(std::cell::RefCell::new(send_rx));
+    let (send_tx, send_rx) = mpsc::unbounded_channel::<Job>();
+    let jobs: Jobs = Rc::new(RefCell::new(send_rx));
+    let typing = Rc::new(RefCell::new(Typing::default()));
     let mut sending = false;
     // Sends queued by a previous run died with it.
     match projection.fail_all_pending().await {
@@ -247,6 +256,7 @@ async fn run(
                         projection.clone(),
                         listener.clone(),
                         caught_up_tx.clone(),
+                        send_tx.clone(),
                     )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
@@ -268,13 +278,48 @@ async fn run(
             },
             Command::Send(job) => {
                 if let Err(mpsc::error::SendError(job)) = send_tx.send(job) {
-                    let _ = projection.set_failed(&job.key).await;
                     listener.on_event(CoreEvent::Error {
                         message: "the sender stopped".into(),
                     });
-                    listener.on_event(CoreEvent::MessageChanged {
-                        conversation_id: job.conversation_id,
-                        key: job.key,
+                    if let Job::Text(job) = job {
+                        let _ = projection.set_failed(&job.key).await;
+                        listener.on_event(CoreEvent::MessageChanged {
+                            conversation_id: job.conversation_id,
+                            key: job.key,
+                        });
+                    }
+                }
+            }
+            Command::Typing {
+                conversation_id,
+                started,
+            } => {
+                let now = std::time::Instant::now();
+                let send = if started {
+                    typing.borrow_mut().started(&conversation_id, now)
+                } else {
+                    typing.borrow_mut().stopped(&conversation_id)
+                };
+                if send {
+                    let _ = send_tx.send(Job::Typing {
+                        conversation_id,
+                        started,
+                        queued: now,
+                    });
+                }
+                if started {
+                    // typing stops on its own once no keystroke came for TYPING_IDLE
+                    let (typing, send_tx) = (typing.clone(), send_tx.clone());
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(TYPING_IDLE).await;
+                        let now = std::time::Instant::now();
+                        for conversation_id in typing.borrow_mut().expire(now) {
+                            let _ = send_tx.send(Job::Typing {
+                                conversation_id,
+                                started: false,
+                                queued: now,
+                            });
+                        }
                     });
                 }
             }
@@ -311,7 +356,8 @@ async fn link(
 }
 
 /// Runs the sender and restarts it if it panics. Jobs queued meanwhile stay queued; the one in
-/// flight is lost, so every Pending row is marked Failed (retryable).
+/// flight is lost, so every Pending row is marked Failed (retryable). Unsent read receipts are
+/// stored and go out when the sender restarts; a lost reaction, edit or delete is not retried.
 async fn supervise_sender(
     m: Manager<SqliteStore, Registered>,
     db: ProjectionDb,
@@ -349,6 +395,7 @@ async fn receive_loop(
     db: ProjectionDb,
     l: Arc<dyn EventListener>,
     caught_up: Rc<watch::Sender<bool>>,
+    jobs: mpsc::UnboundedSender<Job>,
 ) {
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
@@ -365,7 +412,7 @@ async fn receive_loop(
                 });
                 futures::pin_mut!(stream);
                 while let Some(received) = stream.next().await {
-                    handle(received, &m, &db, &me, &mut titles_synced, l.as_ref()).await;
+                    handle(received, &m, &db, &me, &mut titles_synced, l.as_ref(), &jobs).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && titles_synced;
                         *ready |= titles_synced;
@@ -398,6 +445,7 @@ async fn handle(
     me: &str,
     titles_synced: &mut bool,
     l: &dyn EventListener,
+    jobs: &mpsc::UnboundedSender<Job>,
 ) {
     // Kinds and counts only: never message content.
     match &received {
@@ -423,6 +471,10 @@ async fn handle(
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
             for op in ops {
+                if matches!(op, Op::Settings { .. }) {
+                    // receipts held back while the read receipts setting was unknown
+                    let _ = jobs.send(Job::Receipts);
+                }
                 match db.apply(&op).await {
                     Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
                     Err(e) => l.on_event(CoreEvent::Error {

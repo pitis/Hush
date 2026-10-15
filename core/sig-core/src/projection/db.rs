@@ -295,6 +295,28 @@ impl ProjectionDb {
                 tx.commit().await?;
                 Ok(changed(m))
             }
+            Op::Settings {
+                read_receipts,
+                typing_indicators,
+            } => {
+                let mut tx = self.pool.begin().await?;
+                for (key, value) in [
+                    ("read_receipts", read_receipts),
+                    ("typing_indicators", typing_indicators),
+                ] {
+                    if let Some(v) = value {
+                        sqlx::query(
+                            "INSERT INTO settings VALUES (?1, ?2) ON CONFLICT DO UPDATE SET value = excluded.value",
+                        )
+                        .bind(key)
+                        .bind(v)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                tx.commit().await?;
+                Ok(vec![])
+            }
             Op::SetStatus { targets, status } => {
                 let mut tx = self.pool.begin().await?;
                 let mut out = vec![];
@@ -392,6 +414,71 @@ impl ProjectionDb {
             .fetch_optional(&self.pool)
             .await?;
         Ok(t)
+    }
+
+    /// The incoming messages of a conversation that count as unread (as in `unread_count`), oldest
+    /// first.
+    pub async fn unread(&self, conversation_id: &str) -> Result<Vec<MessageKey>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT author, sent_at FROM messages WHERE conversation_id = ?1
+               AND is_outgoing = 0 AND deleted = 0 AND status < ?2 ORDER BY sent_at, author",
+        )
+        .bind(conversation_id)
+        .bind(MessageStatus::Read.to_i64())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(author, sent_at)| MessageKey { author, sent_at })
+            .collect())
+    }
+
+    pub async fn settings(&self) -> Result<Settings, sqlx::Error> {
+        let rows: Vec<(String, bool)> = sqlx::query_as("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await?;
+        let get = |k: &str| rows.iter().find(|(key, _)| key == k).map(|(_, v)| *v);
+        Ok(Settings {
+            read_receipts: get("read_receipts"),
+            typing_indicators: get("typing_indicators"),
+        })
+    }
+
+    /// Remembers that read receipts for `targets` still have to go out.
+    pub async fn queue_receipts(&self, targets: &[MessageKey]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for t in targets {
+            sqlx::query("INSERT OR IGNORE INTO unsent_receipts VALUES (?1, ?2)")
+                .bind(&t.author)
+                .bind(t.sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Read receipts still to send, by sender then time.
+    pub async fn unsent_receipts(&self) -> Result<Vec<MessageKey>, sqlx::Error> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT author, sent_at FROM unsent_receipts ORDER BY author, sent_at")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(author, sent_at)| MessageKey { author, sent_at })
+            .collect())
+    }
+
+    pub async fn receipts_sent(&self, targets: &[MessageKey]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for t in targets {
+            sqlx::query("DELETE FROM unsent_receipts WHERE author = ?1 AND sent_at = ?2")
+                .bind(&t.author)
+                .bind(t.sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
     }
 
     pub async fn message(&self, key: &MessageKey) -> Result<Option<Message>, sqlx::Error> {
@@ -1537,6 +1624,85 @@ mod tests {
         assert_eq!(
             db.message(&k("me", 1)).await.unwrap().unwrap().status,
             MessageStatus::Delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_lists_what_counts_as_unread_and_marking_it_read_clears_the_badge() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "old")).await.unwrap();
+        db.insert_message(&msg("alice", 2, "read on phone")).await.unwrap();
+        db.insert_message(&msg("bob", 3, "new")).await.unwrap();
+        db.insert_message(&msg("alice", 4, "gone")).await.unwrap();
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Sent,
+            ..msg("me", 5, "mine")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&in_conv("c:carol", msg("carol", 6, "elsewhere")))
+            .await
+            .unwrap();
+        db.apply(&Op::SetStatus {
+            targets: vec![k("alice", 2)],
+            status: MessageStatus::Read,
+        })
+        .await
+        .unwrap();
+        db.apply(&Op::Delete { target: k("alice", 4) }).await.unwrap();
+        let unread = db.unread("c:alice").await.unwrap();
+        assert_eq!(unread, vec![k("alice", 1), k("bob", 3)]);
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 2);
+        db.apply(&Op::SetStatus {
+            targets: unread,
+            status: MessageStatus::Read,
+        })
+        .await
+        .unwrap();
+        assert!(db.unread("c:alice").await.unwrap().is_empty());
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 0);
+        assert_eq!(db.unread("c:carol").await.unwrap(), vec![k("carol", 6)]);
+    }
+
+    #[tokio::test]
+    async fn unsent_receipts_are_kept_until_marked_sent() {
+        let db = db().await;
+        assert!(db.unsent_receipts().await.unwrap().is_empty());
+        db.queue_receipts(&[k("bob", 3), k("alice", 1)]).await.unwrap();
+        db.queue_receipts(&[k("alice", 1), k("alice", 2)]).await.unwrap();
+        assert_eq!(
+            db.unsent_receipts().await.unwrap(),
+            vec![k("alice", 1), k("alice", 2), k("bob", 3)]
+        );
+        db.receipts_sent(&[k("alice", 1), k("bob", 3)]).await.unwrap();
+        assert_eq!(db.unsent_receipts().await.unwrap(), vec![k("alice", 2)]);
+    }
+
+    #[tokio::test]
+    async fn settings_are_unknown_until_the_phone_sends_them_and_merge() {
+        let db = db().await;
+        assert_eq!(db.settings().await.unwrap(), Settings::default());
+        let set = |read_receipts, typing_indicators| Op::Settings {
+            read_receipts,
+            typing_indicators,
+        };
+        assert!(db.apply(&set(Some(false), None)).await.unwrap().is_empty());
+        db.apply(&set(None, Some(true))).await.unwrap();
+        assert_eq!(
+            db.settings().await.unwrap(),
+            Settings {
+                read_receipts: Some(false),
+                typing_indicators: Some(true)
+            }
+        );
+        db.apply(&set(Some(true), Some(false))).await.unwrap();
+        assert_eq!(
+            db.settings().await.unwrap(),
+            Settings {
+                read_receipts: Some(true),
+                typing_indicators: Some(false)
+            }
         );
     }
 }

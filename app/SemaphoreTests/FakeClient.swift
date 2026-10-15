@@ -73,6 +73,12 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return true
     }
 
+    func react(target: MessageKey, emoji: String, remove: Bool) async throws {}
+    func edit(key: MessageKey, newBody: String) async throws {}
+    func deleteForEveryone(key: MessageKey) async throws {}
+    func markRead(conversationId: String) async throws -> UInt32 { 0 }
+    func setTyping(conversationId: String, started: Bool) throws {}
+
     private(set) var titleCalls = 0
     var reactionAnswers: [MessageKey: [Reaction]] = [:]
     private(set) var reactionCalls = 0
