@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
-# Run inside a worktree: merge origin/<base> into the current branch, where <base> is the branch it
-# is stacked on (branch.<branch>.updateBase) while that branch is still open, else main.
-# On a conflict nothing is changed; the merge command to run by hand is printed.
+# Run inside a worktree: merge origin/<base> into the current branch. <base> is the branch this one
+# is stacked on (branch.<branch>.updateBase) until that branch's PR is merged or its branch is
+# gone, then main. On a conflict no merge is made; the command to run by hand is printed.
 set -euo pipefail
 branch=$(git branch --show-current)
-git fetch -q origin
-base=$(git config "branch.$branch.updateBase" || echo main)
-if [ "$base" != main ] && ! git show-ref -q "refs/remotes/origin/$base"; then
-  echo "stacked base $base is gone (merged?) → following main"
-  git config "branch.$branch.updateBase" main
-  base=main
+[ -n "$branch" ] || { echo "✗ detached HEAD: check out a branch first" >&2; exit 1; }
+git fetch -q --prune origin
+base=$(git config --default main --get "branch.$branch.updateBase")
+if [ "$base" != main ]; then
+  merged=$(gh pr list --head "$base" --state merged --json number --jq 'length')
+  if [ "$merged" != 0 ] || ! git show-ref --verify -q "refs/remotes/origin/$base"; then
+    echo "stacked base $base is merged or gone → following main"
+    git config "branch.$branch.updateBase" main
+    base=main
+  fi
 fi
-if ! git merge-tree --write-tree HEAD "origin/$base" >/dev/null 2>&1; then
-  echo "✗ conflicts with origin/$base; nothing changed. Resolve by hand: git merge origin/$base" >&2
-  exit 1
-fi
+set +e
+git merge-tree --write-tree HEAD "origin/$base" >/dev/null
+rc=$?
+set -e
+case $rc in
+  0) ;;
+  1) echo "✗ conflicts with origin/$base; no merge made. Resolve by hand: git merge origin/$base" >&2; exit 1 ;;
+  *) echo "✗ git merge-tree failed (exit $rc); see the error above" >&2; exit "$rc" ;;
+esac
 git merge -q --no-edit "origin/$base"
 echo "✓ $branch is up to date with origin/$base"

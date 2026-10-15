@@ -39,16 +39,17 @@ answer, never for mechanics.
    listing each finding and its fix; declining a finding is a stated ruling, not silence. A
    finding that needs a product decision stays unfixed and goes to the owner. Then report the
    same in chat. The PR is ready for the owner only after this step.
-8. **Merge only on the owner's go**: squash (`gh pr merge --squash`), then
+8. **Merge only on the owner's go**: squash (`gh pr merge --squash --delete-branch`), then
    `make card issue=<n> status="Done"`.
 
 ## Worktrees
 
-- `make worktree` creates `worktrees/<PR number>--<slug>` from the latest `origin/main` (or
-  `base=`). Build output lives per worktree (`core/target`, `build/`), so the first build in a
-  new worktree is slow.
-- `make update` merges `origin/main` (or the stacked base, until it is merged) into the branch;
-  on a conflict it changes nothing and prints the `git merge` to run.
+- `make worktree` creates `worktrees/<PR number>--<slug>` (the number is a guess until the PR
+  exists): a new branch starts from the latest `origin/main` (or `base=origin/<branch>`); an
+  existing branch is checked out as is. Build output lives per worktree (`core/target`,
+  `build/`), so the first build in a new worktree is slow.
+- `make update` merges `origin/main`, or the stacked base until its PR is merged, into the
+  branch; on a conflict it makes no merge and prints the `git merge` to run.
 - Remove a worktree with `git worktree remove` once its PR is merged or closed (check
   `git status` there first).
 
@@ -68,7 +69,7 @@ answer, never for mechanics.
 - presage is pinned to one git rev in `core/sig-core/Cargo.toml`; bump it only in its own PR.
   Keep the `[patch.crates-io] libsqlite3-sys` entry in `core/Cargo.toml` in sync with presage's.
 - No `cdsi` feature (BoringSSL/OpenSSL conflict with SQLCipher).
-- presage's `Manager`/store are `!Send`: call them only from the core's actor thread.
+- presage's `Manager`/store are `!Send`: call them only from one dedicated thread (the core's actor, Task 5).
 - Never log message content; ids and errors only.
 - Swift bindings and the xcframework are generated (`make core`); never edit `app/Generated/`.
 - The Xcode project is generated from `app/project.yml` (`make project`); never commit it.
@@ -76,5 +77,6 @@ answer, never for mechanics.
 
 ## Commands
 
-`make setup` · `make core` · `make app` · `make run` · `make format` · `make check` ·
+`make setup` · `make core` · `make project` · `make app` · `make run` · `make format` · `make lint` ·
+`make test` · `make check` ·
 `make worktree name=… branch=…` · `make update` · `make card issue=… status=…`

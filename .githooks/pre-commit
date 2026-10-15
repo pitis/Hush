@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Fast gate on every commit. The full gate (`make check`) runs before every push.
+# Fast checks on every commit. The full gate is `make check`; run it before every push.
+# Checks read the working tree, so with a partially staged file they see the unstaged edits too.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-staged=$(git diff --cached --name-only --diff-filter=ACM)
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
 if grep -q '^core/' <<<"$staged"; then
   (cd core && cargo fmt --check) || { echo "✗ run: make format" >&2; exit 1; }
   (cd core && cargo clippy --all-targets -q -- -D warnings)
 fi
-swift=$(grep -E '^app/.*\.swift$' <<<"$staged" | grep -v '^app/Generated/' || true)
-if [ -n "$swift" ]; then
-  xcrun swift-format lint --strict $swift || { echo "✗ run: make format" >&2; exit 1; }
+swift=()
+while IFS= read -r f; do
+  [[ $f == app/*.swift && $f != app/Generated/* && -f $f ]] && swift+=("$f")
+done <<<"$staged"
+if [ ${#swift[@]} -gt 0 ]; then
+  xcrun swift-format lint --strict "${swift[@]}" || { echo "✗ run: make format" >&2; exit 1; }
 fi
-if git diff --cached | grep -qiE '^\+.*(co-authored-by: claude|generated with \[?claude)'; then
+# No AI attribution. The diff goes through a variable rather than a pipe into `grep -q`: an early
+# grep exit would SIGPIPE `git diff` and, under pipefail, read as "no match". [[:space:]] keeps
+# this line from matching itself.
+diff=$(git diff --cached --no-color)
+if grep -qiE '^\+.*(co-authored-by:[[:space:]]*claude|generated with[[:space:]]+\[?claude)' <<<"$diff"; then
   echo "✗ no AI attribution in the repo" >&2; exit 1
 fi
