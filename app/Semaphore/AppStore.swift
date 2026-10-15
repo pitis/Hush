@@ -257,6 +257,8 @@ final class AppStore {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let files = outgoingFiles
         guard let client, let id = selectedId, !body.isEmpty || !files.isEmpty else { return false }
+        // taken out of the tray now, so a second ↩ while this one is busy can't send them again
+        outgoingFiles = []
         let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body) }
         do {
             // the core announces the new pending message itself
@@ -266,15 +268,22 @@ final class AppStore {
                 // the text goes with the files, as their caption
                 _ = try await client.sendAttachments(
                     conversationId: id, files: files, caption: body.isEmpty ? nil : body, quote: quote)
-                outgoingFiles.removeAll { f in files.contains { $0.path == f.path } }
             }
             replyTo = nil
             return true
         } catch {
+            // back in the tray, unless the chat changed meanwhile
+            if selectedId == id { outgoingFiles = files + outgoingFiles }
             lastError = Self.describe(error)
             append("send failed: \(error)")
             return false
         }
+    }
+
+    /// Something the user tried didn't work; the reason shows in the window.
+    func showError(_ message: String) {
+        Self.logger.error("\(message, privacy: .private)")
+        lastError = message
     }
 
     /// Adds files to the tray of the open chat (each once).
@@ -351,9 +360,12 @@ final class AppStore {
         do {
             guard let m = try await client.message(key: key), !m.deleted else { return }
             // a message with files reads "📷 Photo" (or "📷 caption"), as in Desktop
-            let text =
-                try await client.attachments(key: key).first.map { Files.describe(Files.summary($0), body: m.body) }
-                ?? m.body
+            var text = m.body
+            do {
+                if let first = try await client.attachments(key: key).first {
+                    text = Files.describe(Files.summary(first), body: m.body)
+                }
+            } catch { append("query failed: \(error)") }  // still announced, with its text
             let author = reaction?.reactor ?? m.author
             await loadName(author)
             let groupTitle =
@@ -555,15 +567,18 @@ final class AppStore {
         let isGroup = selectedId?.hasPrefix("g:") == true
         for m in page {
             let key = MessageKey(author: m.author, sentAt: m.sentAt)
+            // separately: one failing query doesn't take the others' details with it
             do {
                 let r = try await client.reactions(key: key)
+                if generation == selectionGeneration { reactions[key] = r.isEmpty ? nil : r }
+            } catch { append("query failed: \(error)") }
+            do {
                 let files = try await client.attachments(key: key)
+                if generation == selectionGeneration { attachments[key] = files.isEmpty ? nil : files }
+            } catch { append("query failed: \(error)") }
+            do {
                 let preview = try await client.linkPreview(key: key)
-                if generation == selectionGeneration {
-                    reactions[key] = r.isEmpty ? nil : r
-                    attachments[key] = files.isEmpty ? nil : files
-                    previews[key] = preview
-                }
+                if generation == selectionGeneration { previews[key] = preview }
             } catch { append("query failed: \(error)") }
             if isGroup, !m.isOutgoing { await loadName(m.author) }
         }

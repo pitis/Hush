@@ -11,14 +11,21 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             ConversationHeader(store: store, conversation: conversation)
             Divider().overlay(Color.black.opacity(0.4))
-            TimelineList(store: store, conversation: conversation) { a in quickLook = Files.openable(a) }
+            TimelineList(store: store, conversation: conversation) { a in
+                do { quickLook = try Files.openable(a) } catch {
+                    store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
+                }
+            }
             ComposerView(store: store, conversationId: conversation.id)
         }
         .background(Theme.window)
         .quickLookPreview($quickLook)
+        // the preview closed: its link goes
+        .onChange(of: quickLook) { old, _ in if let old { Files.close(old) } }
+        .onDisappear { if let quickLook { Files.close(quickLook) } }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
-            let files = urls.filter(\.isFileURL).map(Files.outgoing)
+            let files = Files.attachable(urls).map(Files.outgoing)
             store.addFiles(files)
             return !files.isEmpty
         } isTargeted: {

@@ -91,10 +91,16 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     var attachmentAnswers: [MessageKey: [Attachment]] = [:]
     var previewAnswers: [MessageKey: LinkPreview] = [:]
 
-    func downloadAttachment(id: Int64) throws { lock.withLock { downloads.append(id) } }
+    var downloadError: Error?
+    var sendDelay: Duration?
+    func downloadAttachment(id: Int64) throws {
+        if let downloadError { throw downloadError }
+        lock.withLock { downloads.append(id) }
+    }
     func sendAttachments(conversationId: String, files: [OutgoingFile], caption: String?, quote: Quote?) async throws
         -> MessageKey
     {
+        if let sendDelay { try? await Task.sleep(for: sendDelay) }
         if let sendError { throw sendError }
         lock.withLock { sentFiles.append((conversationId, files, caption)) }
         return MessageKey(author: aci ?? "", sentAt: Int64(sentFiles.count))

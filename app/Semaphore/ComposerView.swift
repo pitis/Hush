@@ -98,7 +98,7 @@ struct ComposerView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
-        if panel.runModal() == .OK { store.addFiles(panel.urls.map(Files.outgoing)) }
+        if panel.runModal() == .OK { store.addFiles(Files.attachable(panel.urls).map(Files.outgoing)) }
         focused = true
     }
 
@@ -108,11 +108,17 @@ struct ComposerView: View {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
                 event.charactersIgnoringModifiers == "v",
-                MainActor.assumeIsolated({ focused })
+                MainActor.assumeIsolated({ focused && event.window === NSApp.mainWindow })
             else { return event }
-            let files = Composer.pastedFiles(from: .general)
-            guard !files.isEmpty else { return event }
-            MainActor.assumeIsolated { store.addFiles(files.map(Files.outgoing)) }
+            do {
+                let files = try Composer.pastedFiles(from: .general)
+                guard !files.isEmpty else { return event }
+                MainActor.assumeIsolated { store.addFiles(files.map(Files.outgoing)) }
+            } catch {
+                MainActor.assumeIsolated {
+                    store.showError("Couldn't attach what you pasted: \(error.localizedDescription)")
+                }
+            }
             return nil
         }
     }
@@ -142,23 +148,25 @@ enum Composer {
         (NSApp.keyWindow?.firstResponder as? NSTextView)?.hasMarkedText() ?? false
     }
 
-    /// What ⌘V attaches: copied files, else a copied image (saved as a PNG). Empty for text,
-    /// which the field pastes itself.
-    static func pastedFiles(from board: NSPasteboard) -> [URL] {
+    struct PasteError: LocalizedError {
+        var errorDescription: String? { "the image couldn't be read" }
+    }
+
+    /// What ⌘V attaches: copied files, else a copied image without text (a screenshot, saved as
+    /// a PNG). Empty for text, which the field pastes itself, even when it also carries a picture
+    /// of itself (Pages, Word, Numbers do that).
+    static func pastedFiles(from board: NSPasteboard) throws -> [URL] {
         let files = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
-        if let files, !files.isEmpty { return files }
+        if let files, !files.isEmpty { return Files.attachable(files) }
+        guard board.availableType(from: [.string]) == nil, NSImage.canInit(with: board) else { return [] }
         guard let image = NSImage(pasteboard: board), let tiff = image.tiffRepresentation,
             let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
-        else { return [] }
+        else { throw PasteError() }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Semaphore-paste", isDirectory: true)
         let url = dir.appendingPathComponent("Pasted image \(UUID().uuidString.prefix(8)).png")
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try png.write(to: url)
-            return [url]
-        } catch {
-            return []
-        }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try png.write(to: url)
+        return [url]
     }
 
     static func canSend(_ text: String) -> Bool {
@@ -189,8 +197,8 @@ struct FileTray: View {
             HStack(spacing: 8) {
                 ForEach(store.outgoingFiles, id: \.path) { f in
                     HStack(spacing: 6) {
-                        if f.contentType.hasPrefix("image/"), let thumb = Thumbnails.image(f.path) {
-                            Image(nsImage: thumb).resizable().scaledToFill().frame(width: 36, height: 36)
+                        if f.contentType.hasPrefix("image/") {
+                            ThumbnailImage(path: f.path).frame(width: 36, height: 36)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                         } else {
                             Image(systemName: "doc.fill").font(.system(size: 20)).frame(width: 36, height: 36)

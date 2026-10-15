@@ -14,6 +14,7 @@ struct SemaphoreApp: App {
     init() {
         let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         let core = AppStore(notifier: isTestHost ? nil : SystemNotifier())
+        if !isTestHost { Files.clearOpened() }
         self.isTestHost = isTestHost
         _core = State(initialValue: core)
         // set before launch finishes, so a click on a notification that launched the app arrives

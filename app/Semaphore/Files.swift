@@ -56,26 +56,54 @@ enum Files {
             height: height, isVoiceNote: false)
     }
 
-    /// The downloaded file under its own name (or one with the right extension), for Quick Look,
-    /// players and "Open": stored files are named by id only. A hard link, so nothing is copied.
-    static func openable(_ a: Attachment) -> URL? {
-        guard a.state == .ready, let path = a.path else { return nil }
+    /// Where opened files are linked; swapped only by tests.
+    static let defaultOpenRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "Semaphore-open", isDirectory: true)
+    nonisolated(unsafe) static var openRoot = defaultOpenRoot
+
+    enum OpenError: LocalizedError {
+        case notDownloaded
+
+        var errorDescription: String? { "it isn't downloaded" }
+    }
+
+    /// The downloaded file under its own name (or one with the right extension), for Quick Look
+    /// and players: stored files are named by id only. A hard link (a copy across volumes),
+    /// made fresh each time; `close` removes it, so a message deleted for everyone leaves nothing
+    /// readable here.
+    static func openable(_ a: Attachment) throws -> URL {
+        guard a.state == .ready, let path = a.path else { throw OpenError.notDownloaded }
         let ext = UTType(mimeType: a.contentType)?.preferredFilenameExtension
         // only the last part of a sender-chosen name, so it stays in our folder
-        let given = a.fileName.map { URL(fileURLWithPath: $0).lastPathComponent }.flatMap { $0.isEmpty ? nil : $0 }
+        let given = a.fileName.map { URL(fileURLWithPath: $0).lastPathComponent }
+            .flatMap { ["", ".", "..", "/"].contains($0) ? nil : $0 }
         let name = given ?? (ext.map { "file.\($0)" } ?? "file")
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("Semaphore-open", isDirectory: true)
-            .appendingPathComponent(String(a.id), isDirectory: true)
+        let dir = openRoot.appendingPathComponent(String(a.id), isDirectory: true)
         let url = dir.appendingPathComponent(name)
-        if FileManager.default.fileExists(atPath: url.path) { return url }
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try FileManager.default.linkItem(at: URL(fileURLWithPath: path), to: url)
-            return url
+            try fm.linkItem(at: URL(fileURLWithPath: path), to: url)
         } catch {
-            return nil
+            try fm.copyItem(at: URL(fileURLWithPath: path), to: url)  // e.g. another volume
         }
+        return url
+    }
+
+    /// Done with an opened file: its link goes.
+    static func close(_ url: URL) {
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    /// At launch: what a previous run left open goes.
+    static func clearOpened() {
+        try? FileManager.default.removeItem(at: openRoot)
+    }
+
+    /// Of dropped or pasted items, the ones that can be sent: files (not folders) that exist.
+    static func attachable(_ urls: [URL]) -> [URL] {
+        urls.filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true }
     }
 
     static func size(_ bytes: UInt64) -> String {

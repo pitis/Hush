@@ -62,25 +62,53 @@ final class FilesTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("semaphore-open-\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
+        Files.openRoot = dir.appendingPathComponent("open")
+        defer { Files.openRoot = Files.defaultOpenRoot }
         let stored = dir.appendingPathComponent("42")
         try Data("pdf".utf8).write(to: stored)
         let a = Attachment(
             id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "application/pdf", fileName: "plan.pdf",
             size: 3, width: nil, height: nil, isVoiceNote: false, path: stored.path, state: .ready)
-        let url = try XCTUnwrap(Files.openable(a))
+        let url = try Files.openable(a)
         XCTAssertEqual(url.lastPathComponent, "plan.pdf")
         XCTAssertEqual(try Data(contentsOf: url), Data("pdf".utf8))
+        // closed, nothing of it is left outside Semaphore's folder
+        Files.close(url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        // opened again, it is made fresh from the stored file (never a stale one)
+        try Data("new".utf8).write(to: dir.appendingPathComponent("43"))
+        var other = a
+        other.path = dir.appendingPathComponent("43").path
+        XCTAssertEqual(try Data(contentsOf: try Files.openable(other)), Data("new".utf8))
         // no name: the type gives the extension
         var unnamed = a
         unnamed.fileName = nil
-        XCTAssertEqual(Files.openable(unnamed)?.pathExtension, "pdf")
-        // a name can't climb out of the folder
+        XCTAssertEqual(try Files.openable(unnamed).pathExtension, "pdf")
+        // a name can't climb out of the folder, or be the folder
         var sneaky = a
         sneaky.fileName = "../../evil.pdf"
-        XCTAssertEqual(Files.openable(sneaky)?.lastPathComponent, "evil.pdf")
+        XCTAssertEqual(try Files.openable(sneaky).lastPathComponent, "evil.pdf")
+        sneaky.fileName = ".."
+        XCTAssertEqual(try Files.openable(sneaky).lastPathComponent, "file.pdf")
+        // not downloaded, or its file gone: an error to show, not silence
         var pending = a
         pending.state = .pending
-        XCTAssertNil(Files.openable(pending))
+        XCTAssertThrowsError(try Files.openable(pending))
+        var gone = a
+        gone.path = dir.appendingPathComponent("missing").path
+        XCTAssertThrowsError(try Files.openable(gone))
+        // what a previous run left behind goes at launch
+        Files.clearOpened()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Files.openRoot.path))
+    }
+
+    func testOnlyRegularFilesCanBeAttached() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("semaphore-regular-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.txt")
+        try Data("x".utf8).write(to: file)
+        XCTAssertEqual(Files.attachable([dir, file, dir.appendingPathComponent("missing")]), [file])
     }
 }
 
@@ -144,6 +172,27 @@ final class AppStoreFilesTests: XCTestCase {
         XCTAssertNil(fake.sentFiles.last?.caption)
     }
 
+    func testPressingSendTwiceSendsTheFilesOnce() async {
+        let fake = FakeClient(linked: true)
+        fake.sendDelay = .milliseconds(50)
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        store.addFiles([file("a.png")])
+        async let first = store.send("look")
+        async let second = store.send("")
+        let results = await [first, second]
+        XCTAssertEqual(results.filter { $0 }.count, 1)
+        XCTAssertEqual(fake.sentFiles.count, 1)
+    }
+
+    func testADownloadTheCoreRefusesSaysWhy() async {
+        let fake = FakeClient(linked: true)
+        fake.downloadError = TestError(description: "not linked")
+        let store = await linkedStore(fake)
+        store.download(7)
+        XCTAssertNotNil(store.lastError)
+    }
+
     func testAFailedSendKeepsTheFilesAndSwitchingChatsClearsThem() async {
         let fake = FakeClient(linked: true)
         fake.sendError = TestError(description: "too big")
@@ -166,14 +215,19 @@ final class PasteTests: XCTestCase {
         // text: the field pastes it
         board.clearContents()
         board.setString("hello", forType: .string)
-        XCTAssertTrue(Composer.pastedFiles(from: board).isEmpty)
+        XCTAssertTrue(try Composer.pastedFiles(from: board).isEmpty)
+        // text from Pages, Word or Numbers also carries a picture of itself: still text
+        board.clearContents()
+        board.writeObjects([NSImage(size: NSSize(width: 1, height: 1))])
+        board.setString("a paragraph", forType: .string)
+        XCTAssertTrue(try Composer.pastedFiles(from: board).isEmpty)
         // files copied in Finder (they come with their names as text too)
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("paste-\(UUID()).txt")
         try Data("x".utf8).write(to: file)
         defer { try? FileManager.default.removeItem(at: file) }
         board.clearContents()
         board.writeObjects([file as NSURL])
-        XCTAssertEqual(Composer.pastedFiles(from: board).map(\.standardizedFileURL), [file.standardizedFileURL])
+        XCTAssertEqual(try Composer.pastedFiles(from: board).map(\.standardizedFileURL), [file.standardizedFileURL])
         // an image (a screenshot to the clipboard): saved as a PNG to send
         let image = NSImage(size: NSSize(width: 2, height: 2))
         image.lockFocus()
@@ -181,7 +235,7 @@ final class PasteTests: XCTestCase {
         image.unlockFocus()
         board.clearContents()
         board.writeObjects([image])
-        let pasted = Composer.pastedFiles(from: board)
+        let pasted = try Composer.pastedFiles(from: board)
         XCTAssertEqual(pasted.count, 1)
         XCTAssertEqual(pasted.first?.pathExtension, "png")
         XCTAssertNotNil(NSImage(contentsOf: try XCTUnwrap(pasted.first)))

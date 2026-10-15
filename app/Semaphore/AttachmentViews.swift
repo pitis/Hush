@@ -54,23 +54,38 @@ struct ImageAttachmentView: View {
     let attachment: Attachment
     let download: () -> Void
     let open: () -> Void
+    @State private var image: CGImage?
+    @State private var undecodable = false
 
     var body: some View {
         let size = Files.displaySize(width: attachment.width, height: attachment.height)
-        Group {
-            if attachment.state == .ready, let path = attachment.path, let image = Thumbnails.image(path) {
-                Image(nsImage: image).resizable().scaledToFill()
-                    .onTapGesture(perform: open)
-                    .accessibilityAddTraits(.isButton)
+        let path = attachment.state == .ready ? attachment.path : nil
+        if undecodable {
+            // a file that says it is an image but can't be shown: still there to open
+            FileAttachmentView(attachment: attachment, download: download, open: open)
+        } else {
+            Group {
+                if let path, let image = image ?? Thumbnails.cached(path) {
+                    Button(action: open) {
+                        Image(decorative: image, scale: 1).resizable().scaledToFill()
+                            .frame(width: size.width, height: size.height)
+                    }
+                    .buttonStyle(.plain)
                     .accessibilityLabel(attachment.fileName ?? "Photo")
-            } else {
-                Rectangle().fill(.black.opacity(0.25))
-                    .overlay { DownloadState(state: attachment.state, download: download) }
-                    .accessibilityLabel("Photo, \(Files.size(attachment.size))")
+                } else {
+                    Rectangle().fill(.black.opacity(0.25))
+                        .overlay { DownloadState(state: attachment.state, download: download) }
+                        .accessibilityLabel("Photo, \(Files.size(attachment.size))")
+                }
+            }
+            .frame(width: size.width, height: size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .task(id: path) {
+                guard let path else { return }
+                image = await Thumbnails.load(path)
+                undecodable = image == nil
             }
         }
-        .frame(width: size.width, height: size.height)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -80,21 +95,23 @@ struct FileAttachmentView: View {
     let open: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(nsImage: NSWorkspace.shared.icon(for: UTType(mimeType: attachment.contentType) ?? .data))
-                .resizable().frame(width: 32, height: 32)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(attachment.fileName ?? "File").font(.system(size: 13, weight: .medium)).lineLimit(1)
-                Text(Files.size(attachment.size)).font(.system(size: 11)).opacity(0.7)
+        Button {
+            attachment.state == .ready ? open() : download()
+        } label: {
+            HStack(spacing: 10) {
+                Image(nsImage: NSWorkspace.shared.icon(for: UTType(mimeType: attachment.contentType) ?? .data))
+                    .resizable().frame(width: 32, height: 32)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(attachment.fileName ?? "File").font(.system(size: 13, weight: .medium)).lineLimit(1)
+                    Text(Files.size(attachment.size)).font(.system(size: 11)).opacity(0.7)
+                }
+                Spacer(minLength: 8)
+                DownloadState(state: attachment.state, download: download)
             }
-            Spacer(minLength: 8)
-            DownloadState(state: attachment.state, download: download)
+            .frame(width: 260)
+            .contentShape(Rectangle())
         }
-        .frame(width: 260)
-        .contentShape(Rectangle())
-        .onTapGesture { attachment.state == .ready ? open() : download() }
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isButton)
+        .buttonStyle(.plain)
     }
 }
 
@@ -103,38 +120,42 @@ struct AudioAttachmentView: View {
     let attachment: Attachment
     let download: () -> Void
     @State private var player: AVPlayer?
+    @State private var opened: URL?
     @State private var playing = false
+    @State private var unplayable = false
     @State private var elapsed: Double = 0
     @State private var duration: Double = 0
     @State private var observer: Any?
 
     var body: some View {
         HStack(spacing: 10) {
-            if attachment.state == .ready {
-                Button(action: toggle) {
-                    Image(systemName: playing ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 28))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(playing ? "Pause" : "Play")
+            if unplayable {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                Text("This recording can't be played").font(.system(size: 12))
             } else {
-                DownloadState(state: attachment.state, download: download)
+                if attachment.state == .ready {
+                    Button(action: toggle) {
+                        Image(systemName: playing ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 28))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(playing ? "Pause" : "Play")
+                } else {
+                    DownloadState(state: attachment.state, download: download)
+                }
+                Track(fraction: duration > 0 ? elapsed / duration : 0)
+                Text(Self.clock(playing || elapsed > 0 ? elapsed : duration))
+                    .font(.system(size: 11).monospacedDigit()).opacity(0.8)
             }
-            Track(fraction: duration > 0 ? elapsed / duration : 0)
-            Text(Self.clock(playing || elapsed > 0 ? elapsed : duration)).font(.system(size: 11).monospacedDigit())
-                .opacity(0.8)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(attachment.isVoiceNote ? "Voice message" : (attachment.fileName ?? "Audio"))
         .onDisappear { stop() }
         .task(id: attachment.state) {
-            // the length shows before playing, as in Desktop
-            guard let url = Files.openable(attachment),
-                let length = try? await AVURLAsset(
-                    url: url, options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType]
-                )
-                .load(.duration).seconds, length.isFinite
-            else { return }
-            duration = length
+            // the length shows before playing, as in Desktop (read from the stored file: no link)
+            guard attachment.state == .ready, let path = attachment.path else { return }
+            let asset = AVURLAsset(
+                url: URL(fileURLWithPath: path), options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
+            if let length = try? await asset.load(.duration).seconds, length.isFinite { duration = length }
         }
     }
 
@@ -143,10 +164,23 @@ struct AudioAttachmentView: View {
         guard let player else { return }
         if playing { player.pause() } else { player.play() }
         playing.toggle()
+        guard playing else { return }
+        // a format AVFoundation can't play fails after starting: say so instead of a stuck Pause
+        Task {
+            try? await Task.sleep(for: .milliseconds(500))
+            if player.currentItem?.status == .failed {
+                stop()
+                unplayable = true
+            }
+        }
     }
 
     private func prepare() {
-        guard let url = Files.openable(attachment) else { return }
+        guard let url = try? Files.openable(attachment) else {
+            unplayable = true
+            return
+        }
+        opened = url
         let asset = AVURLAsset(url: url, options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
@@ -173,6 +207,8 @@ struct AudioAttachmentView: View {
         observer = nil
         player = nil
         playing = false
+        if let opened { Files.close(opened) }
+        opened = nil
     }
 
     static func clock(_ seconds: Double) -> String {
@@ -202,51 +238,76 @@ struct LinkPreviewCard: View {
 
     var body: some View {
         let url = URL(string: preview.url).flatMap { $0.scheme?.lowercased() == "https" ? $0 : nil }
-        HStack(spacing: 10) {
-            if let image = preview.image, image.state == .ready, let path = image.path,
-                let thumb = Thumbnails.image(path)
-            {
-                Image(nsImage: thumb).resizable().scaledToFill().frame(width: 52, height: 52)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                if let title = preview.title {
-                    Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
+        Button {
+            if let url { NSWorkspace.shared.open(url) }
+        } label: {
+            HStack(spacing: 10) {
+                if let image = preview.image, image.state == .ready, let path = image.path {
+                    ThumbnailImage(path: path).frame(width: 52, height: 52)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
-                Text(url?.host() ?? preview.url).font(.system(size: 11)).opacity(0.7).lineLimit(1)
+                VStack(alignment: .leading, spacing: 2) {
+                    if let title = preview.title {
+                        Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(url?.host() ?? preview.url).font(.system(size: 11)).opacity(0.7).lineLimit(1)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+            .frame(width: 280)
+            .padding(8)
+            .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+            .contentShape(Rectangle())
         }
-        .frame(width: 280)
-        .padding(8)
-        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
-        .contentShape(Rectangle())
-        .onTapGesture { if let url { NSWorkspace.shared.open(url) } }
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(url == nil ? [] : .isButton)
+        .buttonStyle(.plain)
+        .disabled(url == nil)
     }
 }
 
-/// Downsampled images for bubbles, kept in memory: decoding a full photo every render would
-/// stall scrolling.
+/// A small picture of an image file, decoded off the main thread.
+struct ThumbnailImage: View {
+    let path: String
+    @State private var image: CGImage?
+
+    var body: some View {
+        Group {
+            if let image = image ?? Thumbnails.cached(path) {
+                Image(decorative: image, scale: 1).resizable().scaledToFill()
+            } else {
+                Rectangle().fill(.black.opacity(0.25))
+            }
+        }
+        .task(id: path) { image = await Thumbnails.load(path) }
+    }
+}
+
+/// Downsampled images for bubbles, decoded off the main thread and kept in memory: decoding a
+/// full photo while drawing would stall scrolling.
 @MainActor
 enum Thumbnails {
-    private static let cache = NSCache<NSString, NSImage>()
-    static let maxPixels = 2 * Files.imageBox
+    private static let cache = NSCache<NSString, CGImage>()
+    /// Files that didn't decode, not tried again on every draw.
+    private static var undecodable: Set<String> = []
+    nonisolated static let maxPixels = 2 * Files.imageBox
 
-    static func image(_ path: String) -> NSImage? {
-        if let hit = cache.object(forKey: path as NSString) { return hit }
+    static func cached(_ path: String) -> CGImage? { cache.object(forKey: path as NSString) }
+
+    static func load(_ path: String) async -> CGImage? {
+        if let hit = cached(path) { return hit }
+        if undecodable.contains(path) { return nil }
+        let image = await Task.detached(priority: .userInitiated) { decode(path) }.value
+        if let image { cache.setObject(image, forKey: path as NSString) } else { undecodable.insert(path) }
+        return image
+    }
+
+    nonisolated private static func decode(_ path: String) -> CGImage? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixels,
         ]
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
-            let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return nil }
-        let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-        cache.setObject(image, forKey: path as NSString)
-        return image
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 }
