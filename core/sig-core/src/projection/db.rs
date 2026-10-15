@@ -43,6 +43,10 @@ pub struct ProjectionDb {
 /// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
 pub const MAX_ATTACHMENT: u64 = 100 * 1024 * 1024;
 
+/// The chat list's preview when the latest thing in a chat is a message that couldn't be
+/// decrypted.
+pub const UNDECRYPTABLE_PREVIEW: &str = "A message couldn't be decrypted";
+
 /// Images and voice notes up to this size download as they arrive; anything else on request.
 pub const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
@@ -71,6 +75,11 @@ impl ProjectionDb {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool, files: None })
+    }
+
+    /// Closes the database: later calls fail. Before its file is removed (unlinking).
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     /// Keeps attachment files in `dir` (created when the first one is written).
@@ -158,7 +167,8 @@ impl ProjectionDb {
         let rows = sqlx::query(
             "SELECT c.*, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
                m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
-               a.is_voice_note AS file_voice
+               a.is_voice_note AS file_voice, m.sent_at AS last_sent_at,
+               (SELECT MAX(at) FROM chat_events e WHERE e.conversation_id = c.id AND e.kind = 0) AS failed_at
              FROM conversations c LEFT JOIN messages m ON m.id = (SELECT id FROM messages
                WHERE conversation_id = c.id ORDER BY sent_at DESC, author DESC LIMIT 1)
              LEFT JOIN attachments a ON a.message_author = m.author AND a.message_sent_at = m.sent_at
@@ -328,6 +338,7 @@ impl ProjectionDb {
             .bind(author)
             .execute(&mut *tx)
             .await?;
+        refresh_summary(&mut tx, conversation_id).await?;
         tx.commit().await
     }
 
@@ -1204,16 +1215,27 @@ async fn conversation_of(
 /// Every op that changes a `messages` row calls this inside its transaction (reactions don't
 /// affect the summary).
 pub(crate) async fn refresh_summary(conn: &mut SqliteConnection, conversation_id: &str) -> Result<(), sqlx::Error> {
+    // A message that couldn't be decrypted counts as the chat's latest activity, so the chat
+    // shows (and moves up) even if it has no message yet.
     sqlx::query(
         "UPDATE conversations SET
-           last_message_at = COALESCE((SELECT MAX(sent_at) FROM messages WHERE conversation_id = ?1), 0),
-           last_message_preview = COALESCE((SELECT body FROM messages WHERE conversation_id = ?1
-                                            ORDER BY sent_at DESC, author DESC LIMIT 1), ''),
+           last_message_at = MAX(
+             COALESCE((SELECT MAX(sent_at) FROM messages WHERE conversation_id = ?1), 0),
+             COALESCE((SELECT MAX(at) FROM chat_events WHERE conversation_id = ?1 AND kind = ?2), 0)),
+           last_message_preview = CASE
+             WHEN COALESCE((SELECT MAX(at) FROM chat_events WHERE conversation_id = ?1 AND kind = ?2), 0)
+                  > COALESCE((SELECT MAX(sent_at) FROM messages WHERE conversation_id = ?1), 0)
+             THEN ?3
+             ELSE COALESCE((SELECT body FROM messages WHERE conversation_id = ?1
+                            ORDER BY sent_at DESC, author DESC LIMIT 1), '')
+           END,
            unread_count = (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1
                            AND is_outgoing = 0 AND deleted = 0 AND status < 3)
          WHERE id = ?1",
     )
     .bind(conversation_id)
+    .bind(ChatEventKind::DecryptionFailed.to_i64())
+    .bind(UNDECRYPTABLE_PREVIEW)
     .execute(conn)
     .await?;
     Ok(())
@@ -1239,15 +1261,24 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
     let id: String = r.try_get("id")?;
     let kind = kind_of(&id)?;
     let unread: i64 = r.try_get("unread_count")?;
+    // the latest thing is a message that couldn't be decrypted: the row is about that only
+    let failed_at: Option<i64> = r.try_get("failed_at")?;
+    let last_sent_at: Option<i64> = r.try_get("last_sent_at")?;
+    let undecryptable = failed_at.is_some_and(|f| last_sent_at.is_none_or(|m| f > m));
     let status: Option<i64> = r.try_get("last_status")?;
     let status = status.unwrap_or(MessageStatus::Sent.to_i64());
     Ok(Conversation {
-        last_message_author: r.try_get::<Option<String>, _>("last_author")?.unwrap_or_default(),
-        last_message_outgoing: r.try_get::<Option<bool>, _>("last_outgoing")?.unwrap_or(false),
+        last_message_undecryptable: undecryptable,
+        last_message_author: if undecryptable {
+            String::new()
+        } else {
+            r.try_get::<Option<String>, _>("last_author")?.unwrap_or_default()
+        },
+        last_message_outgoing: !undecryptable && r.try_get::<Option<bool>, _>("last_outgoing")?.unwrap_or(false),
         last_message_status: MessageStatus::from_i64(status)
             .ok_or_else(|| decode_err(format!("message status {status}")))?,
-        last_message_deleted: r.try_get::<Option<bool>, _>("last_deleted")?.unwrap_or(false),
-        last_message_file: match r.try_get::<Option<String>, _>("file_type")? {
+        last_message_deleted: !undecryptable && r.try_get::<Option<bool>, _>("last_deleted")?.unwrap_or(false),
+        last_message_file: match r.try_get::<Option<String>, _>("file_type")?.filter(|_| !undecryptable) {
             Some(content_type) => Some(FileSummary {
                 content_type,
                 file_name: r.try_get("file_name")?,
@@ -2862,5 +2893,51 @@ mod tests {
             1,
             "only since the oldest shown"
         );
+    }
+
+    #[tokio::test]
+    async fn a_chat_with_only_an_undecryptable_message_is_listed_and_moves_up() {
+        let db = db().await;
+        db.insert_message(&in_conv("c:bob", msg("bob", 50, "hi")))
+            .await
+            .unwrap();
+        db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice")
+            .await
+            .unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (c.last_message_at, c.last_message_preview.as_str()),
+            (10, UNDECRYPTABLE_PREVIEW)
+        );
+        assert!(c.last_message_undecryptable);
+        // after a message of ours (deleted): the row is about the failure only
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Read,
+            ..in_conv("c:carol", msg("me", 5, "mine"))
+        })
+        .await
+        .unwrap();
+        db.apply(&Op::Delete { target: k("me", 5) }).await.unwrap();
+        db.add_chat_event("c:carol", 9, ChatEventKind::DecryptionFailed, "carol")
+            .await
+            .unwrap();
+        let c = conv(&db, "c:carol").await;
+        assert!(c.last_message_undecryptable);
+        assert!(!c.last_message_outgoing && !c.last_message_deleted && c.last_message_file.is_none());
+        db.add_chat_event("c:bob", 60, ChatEventKind::DecryptionFailed, "bob")
+            .await
+            .unwrap();
+        assert_eq!(db.conversations().await.unwrap()[0].id, "c:bob", "moved up");
+        // a later message takes over the preview; our own session reset doesn't count
+        db.insert_message(&in_conv("c:bob", msg("bob", 70, "back")))
+            .await
+            .unwrap();
+        db.add_chat_event("c:bob", 80, ChatEventKind::SessionReset, "bob")
+            .await
+            .unwrap();
+        let c = conv(&db, "c:bob").await;
+        assert_eq!((c.last_message_at, c.last_message_preview.as_str()), (70, "back"));
+        assert!(!c.last_message_undecryptable);
     }
 }

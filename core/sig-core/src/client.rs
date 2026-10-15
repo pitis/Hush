@@ -147,9 +147,11 @@ impl Client {
     /// Starts a new secure session with the contact of a 1:1 chat (after messages from them
     /// couldn't be decrypted).
     pub fn reset_session(&self, conversation_id: String) -> Result<(), CoreError> {
-        if !matches!(send::recipient(&conversation_id), Some(send::Recipient::Direct(_))) {
+        // presage resets sessions with an ACI only
+        let aci = |id: &str| id.strip_prefix("c:").is_some_and(|rest| !rest.starts_with("PNI:"));
+        if !matches!(send::recipient(&conversation_id), Some(send::Recipient::Direct(_))) || !aci(&conversation_id) {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat: {conversation_id}"),
+                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
             });
         }
         self.send(Command::ResetSession { conversation_id })
@@ -357,10 +359,15 @@ impl Client {
         // the core thread is ending: wait for it, so nothing writes the files again
         drop(self.commands.lock().ok().and_then(|mut c| c.take()));
         if let Some(thread) = self.thread.lock().ok().and_then(|mut t| t.take()) {
-            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            if !matches!(tokio::task::spawn_blocking(move || thread.join()).await, Ok(Ok(()))) {
+                tracing::error!("the core thread ended abnormally while unlinking");
+            }
         }
+        // this handle's own connection to the projection too, before its file goes
+        self.db.close().await;
         let storage = |e: std::io::Error| CoreError::Storage { message: e.to_string() };
-        for db in ["presage.db", "projection.db"] {
+        // the projection first: a half-done wipe must not leave old messages next to a new link
+        for db in ["projection.db", "presage.db"] {
             for suffix in ["", "-wal", "-shm"] {
                 match std::fs::remove_file(self.data_dir.join(format!("{db}{suffix}"))) {
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
@@ -964,5 +971,28 @@ mod tests {
         let sink = Arc::new(Sink(Mutex::new(vec![])));
         let fresh = Client::open(dir.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
         assert!(!fresh.is_linked());
+    }
+
+    #[test]
+    fn sessions_are_reset_only_with_known_contacts() {
+        let (_dir, _sink, client, _rt) = as_me("client-reset");
+        assert!(invalid(client.reset_session(format!("c:PNI:{ALICE}"))));
+        assert!(invalid(client.reset_session(format!("g:{}", "ab".repeat(32)))));
+        client.reset_session(format!("c:{ALICE}")).unwrap();
+    }
+
+    #[test]
+    fn after_unlinking_this_handle_reads_nothing_more() {
+        let dir = temp_dir("client-unlink-closed");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            client.unlink(false).await.unwrap();
+            assert!(client.chat_events(format!("c:{ALICE}"), 0).await.is_err());
+        });
     }
 }

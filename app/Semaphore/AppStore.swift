@@ -120,6 +120,9 @@ final class AppStore {
     private let open: Opener
     private var client: (any ClientProtocol)?
     private var booted = false
+    /// Which core's events count: bumped when starting over, so a closed core's late events
+    /// (or a refresh still running against it) change nothing.
+    private(set) var listenerGeneration = 0
     private var nextLogId = 0
     private var refreshing = false
     private var refreshAgain = false
@@ -156,7 +159,7 @@ final class AppStore {
     func boot() async {
         guard !booted else { return }
         booted = true
-        let listener = Listener(bridge: self)
+        let listener = Listener(bridge: self, generation: listenerGeneration)
         let open = self.open
         let opened = await Task.detached { Result { try open(listener) } }.value
         do {
@@ -183,6 +186,12 @@ final class AppStore {
         guard let client, linkURL == nil else { return }
         lastError = nil
         do { try client.link(deviceName: Self.deviceName) } catch { lastError = Self.describe(error) }
+    }
+
+    /// An event from the core with listener generation `generation`; dropped if that core was
+    /// replaced.
+    func receive(_ event: CoreEvent, generation: Int) {
+        if generation == listenerGeneration { handle(event) }
     }
 
     func handle(_ event: CoreEvent, now: Date = .now) {
@@ -499,7 +508,11 @@ final class AppStore {
 
     /// "Retry" on the connection banner: reconnects now.
     func retryConnection() {
-        do { try client?.reconnect() } catch { showError("Couldn't reconnect: \(Self.describe(error))") }
+        do {
+            // receiving may have stopped (it is restarted only on request); starting is idempotent
+            try client?.start()
+            try client?.reconnect()
+        } catch { showError("Couldn't reconnect: \(Self.describe(error))") }
     }
 
     /// The network came back: reconnect at once rather than after the backoff.
@@ -521,15 +534,23 @@ final class AppStore {
     }
 
     /// Unlinks this Mac and removes all its data, telling the server first if `tellServer`.
-    /// Returns why it couldn't (nothing is removed then), or nil once it is done and a new
-    /// linking code is on its way.
+    /// Returns why the server couldn't be told (nothing is removed then: the caller can offer to
+    /// unlink anyway), or nil: done and a new linking code is on its way, or the core stopped but
+    /// its data couldn't all be removed (the failed screen says so).
     func unlinkThisMac(tellServer: Bool) async -> String? {
         guard let client else { return "Semaphore isn't running." }
         do {
             try await client.unlink(tellServer: tellServer)
+        } catch CoreError.Network(let message) {
+            Self.logger.error("unlink failed: \(message, privacy: .private)")
+            return Self.describe(CoreError.Network(message: message))
         } catch {
-            Self.logger.error("unlink failed: \(Self.describe(error), privacy: .private)")
-            return Self.describe(error)
+            // the core has stopped: there is no going back to the chats
+            Self.logger.error("removing the data failed: \(Self.describe(error), privacy: .private)")
+            screen = .failed(
+                "Semaphore couldn't remove its data (\(Self.describe(error))). Quit Semaphore, delete "
+                    + "~/Library/Application Support/Semaphore, and open it again.")
+            return nil
         }
         await restart()
         return nil
@@ -538,8 +559,12 @@ final class AppStore {
     /// Starts over with a fresh, unlinked core: everything shown is forgotten, and the key goes
     /// with the data it protected.
     private func restart() async {
+        listenerGeneration += 1
         client = nil
         forgetKey()
+        notifier?.removeAll()  // message previews go with the data
+        refreshing = false
+        refreshAgain = false
         conversations = []
         select(nil)
         searchQuery = ""
@@ -816,11 +841,17 @@ final class AppStore {
             return
         }
         refreshing = true
+        let generation = listenerGeneration
         Task {
+            // a refresh of a core that was replaced (starting over) leaves everything, flags too,
+            // to the new one
             repeat {
+                guard generation == listenerGeneration else { return }
                 refreshAgain = false
                 do {
-                    conversations = try await client.conversations()
+                    let found = try await client.conversations()
+                    guard generation == listenerGeneration else { return }
+                    conversations = found
                     conversationsLoaded = true
                     Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
                     // group rows say who wrote the last message
@@ -829,7 +860,7 @@ final class AppStore {
                     }
                 } catch { append("query failed: \(error)") }
             } while refreshAgain
-            refreshing = false
+            if generation == listenerGeneration { refreshing = false }
         }
     }
 
@@ -848,6 +879,8 @@ final class AppStore {
             return "Semaphore couldn't read its key from your keychain. Unlock the keychain, allow access, and reopen."
         case CoreError.Storage(let message):
             return "Semaphore couldn't open its data: \(message)"
+        case CoreError.Network(let message):
+            return "The server couldn't be reached: \(message)"
         default:
             return "\(error)"
         }
@@ -858,9 +891,9 @@ final class AppStore {
 final class Listener: EventListener {
     private let deliver: @Sendable (CoreEvent) -> Void
 
-    init(bridge: AppStore) {
+    init(bridge: AppStore, generation: Int) {
         deliver = { [weak bridge] event in
-            Task { @MainActor in bridge?.handle(event) }
+            Task { @MainActor in bridge?.receive(event, generation: generation) }
         }
     }
 

@@ -80,6 +80,7 @@ protocol Notifier: AnyObject {
     func post(_ request: NotificationRequest)
     func remove(conversationId: String)
     func remove(ids: [String])
+    func removeAll()
 }
 
 /// Notification Center. Notifications of a chat share its thread, so they group together.
@@ -128,6 +129,8 @@ final class SystemNotifier: Notifier {
     }
 
     func remove(ids: [String]) { center.removeDeliveredNotifications(withIdentifiers: ids) }
+
+    func removeAll() { center.removeAllDeliveredNotifications() }
 }
 
 /// Routes clicks and actions on notifications to the store.
