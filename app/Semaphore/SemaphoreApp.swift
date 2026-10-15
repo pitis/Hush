@@ -1,8 +1,16 @@
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
+/// Closing the window keeps Semaphore running (notifications, the menu bar item), as Signal
+/// Desktop does; ⌘Q quits.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+
 @main
 struct SemaphoreApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     /// XCTest launches the app as its test host; it must not touch real data or the network then.
     private let isTestHost: Bool
     /// One core per app (it locks the data folder), owned by the app so closing the window doesn't
@@ -12,6 +20,9 @@ struct SemaphoreApp: App {
     private let notificationDelegate: NotificationDelegate?
     /// Reconnects as soon as the network comes back.
     private let networkWatch: NetworkWatch?
+    /// The menu bar item with the unread count (an AppKit status item: a SwiftUI MenuBarExtra
+    /// can't be left out of the XCTest host, and it hangs XCTest there).
+    private let menuBar: MenuBarItem?
 
     init() {
         let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
@@ -23,6 +34,7 @@ struct SemaphoreApp: App {
         notificationDelegate = isTestHost ? nil : NotificationDelegate(store: core)
         if let notificationDelegate { UNUserNotificationCenter.current().delegate = notificationDelegate }
         networkWatch = isTestHost ? nil : NetworkWatch { core.networkReturned() }
+        menuBar = isTestHost ? nil : MenuBarItem(store: core)
     }
 
     var body: some Scene {
@@ -31,6 +43,7 @@ struct SemaphoreApp: App {
         }
         .commands { ChatCommands(store: core) }
         Window("Core Log", id: "core-log") { CoreLogView(store: core) }
+        // not in the test host: a menu bar extra keeps XCTest from attaching to it
         Settings { SettingsView(store: core) }
     }
 }
@@ -39,6 +52,9 @@ struct SemaphoreApp: App {
 struct SettingsView: View {
     let store: AppStore
     @AppStorage(NotificationContent.key) private var content = NotificationContent.nameAndMessage
+    @AppStorage(MenuBar.key) private var showInMenuBar = true
+    @State private var openAtLogin = LoginItem.isEnabled
+    @State private var loginItemError: String?
     @State private var confirmUnlink = false
     @State private var unlinkFailed: String?
     @State private var working = false
@@ -49,6 +65,17 @@ struct SettingsView: View {
                 ForEach(NotificationContent.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.radioGroup)
+            Toggle("Open at login", isOn: $openAtLogin)
+                .onChange(of: openAtLogin) { _, on in
+                    do { try LoginItem.set(on) } catch {
+                        loginItemError = error.localizedDescription
+                        openAtLogin = LoginItem.isEnabled
+                    }
+                }
+            Toggle("Show in menu bar", isOn: $showInMenuBar)
+            if let loginItemError {
+                Text("Couldn't change the login item: \(loginItemError)").font(.caption).foregroundStyle(.secondary)
+            }
             if store.screen == .chats {
                 Divider()
                 LabeledContent("Linked device") {
@@ -129,4 +156,18 @@ struct ChatCommands: Commands {
             .disabled(store.screen != .chats)
         }
     }
+}
+
+/// Opening Semaphore at login (System Settings ▸ General ▸ Login Items lists it).
+enum LoginItem {
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    static func set(_ on: Bool) throws {
+        if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+    }
+}
+
+enum MenuBar {
+    static let key = "menuBar.show"
+    static let unreadChatsShown = 5
 }

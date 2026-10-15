@@ -74,6 +74,12 @@ final class ChatListTests: XCTestCase {
         XCTAssertNil(ChatList.at(0, in: list))
     }
 
+    func testTheMenuBarListsTheChatsWithUnreadMessagesNewestFirst() {
+        let list = [conversation("c:1", unread: 2), conversation("c:2"), conversation("c:3", unread: 1)]
+        XCTAssertEqual(ChatList.unreadChats(list, limit: 5).map(\.id), ["c:1", "c:3"])
+        XCTAssertEqual(ChatList.unreadChats(list, limit: 1).map(\.id), ["c:1"])
+    }
+
     func testDockBadgeIsTheTotalUnread() {
         XCTAssertNil(ChatList.badge([conversation("c:1")]))
         XCTAssertEqual(ChatList.badge([conversation("c:1", unread: 2), conversation("c:2", unread: 5)]), "7")
