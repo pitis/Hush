@@ -104,6 +104,8 @@ final class AppStore {
     /// Files chosen, dropped or pasted for the open chat, sent with the next message.
     private(set) var outgoingFiles: [OutgoingFile] = []
     var replyTo: Message?
+    /// The message of ours being edited in the composer, if any.
+    private(set) var editing: Message?
     /// Who is typing where, until when (per sender: in groups several people can type).
     private var typingUntil: [String: [String: Date]] = [:]
     private var senderNames: [String: String] = [:]
@@ -273,6 +275,7 @@ final class AppStore {
         changedKeys = []
         hasOlder = false
         replyTo = nil
+        editing = nil
         reloadMessages()
     }
 
@@ -299,6 +302,7 @@ final class AppStore {
     @discardableResult
     func send(_ text: String) async -> Bool {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let editing { return await saveEdit(of: editing, body) }
         let files = outgoingFiles
         guard let client, let id = selectedId, !body.isEmpty || !files.isEmpty else { return false }
         // taken out of the tray now, so a second ↩ while this one is busy can't send them again
@@ -328,6 +332,54 @@ final class AppStore {
     func showError(_ message: String) {
         Self.logger.error("\(message, privacy: .private)")
         lastError = message
+    }
+
+    // MARK: Reactions, edits, deletes
+
+    /// Reacts to a message: our current reaction again takes it back, another replaces it.
+    func react(to m: Message, with emoji: String) async {
+        guard let client else { return }
+        let key = MessageKey(author: m.author, sentAt: m.sentAt)
+        let mine = MessageActions.mine(reactions[key] ?? [], me: ownAci)
+        let (emoji, remove) = MessageActions.reaction(choosing: emoji, mine: mine)
+        do { try await client.react(target: key, emoji: emoji, remove: remove) } catch {
+            showError("Couldn't react: \(Self.describe(error))")
+        }
+    }
+
+    /// Puts one of our messages in the composer to edit it.
+    func startEditing(_ m: Message) {
+        replyTo = nil
+        editing = m
+        focusComposer()
+    }
+
+    func cancelEditing() { editing = nil }
+
+    /// ↑ in an empty composer: edits our newest message that can still be edited. False if none.
+    func editLast() -> Bool {
+        guard let m = MessageActions.lastEditable(messages, me: ownAci) else { return false }
+        startEditing(m)
+        return true
+    }
+
+    private func saveEdit(of m: Message, _ body: String) async -> Bool {
+        guard let client, !body.isEmpty else { return false }
+        do {
+            try await client.edit(key: MessageKey(author: m.author, sentAt: m.sentAt), newBody: body)
+            editing = nil
+            return true
+        } catch {
+            showError("Couldn't edit the message: \(Self.describe(error))")
+            return false
+        }
+    }
+
+    func deleteForEveryone(_ m: Message) async {
+        guard let client else { return }
+        do { try await client.deleteForEveryone(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
+            showError("Couldn't delete the message: \(Self.describe(error))")
+        }
     }
 
     /// Adds files to the tray of the open chat (each once).
@@ -879,6 +931,8 @@ final class AppStore {
             return "Semaphore couldn't read its key from your keychain. Unlock the keychain, allow access, and reopen."
         case CoreError.Storage(let message):
             return "Semaphore couldn't open its data: \(message)"
+        case CoreError.InvalidInput(let message):
+            return message
         case CoreError.Network(let message):
             return "The server couldn't be reached: \(message)"
         default:

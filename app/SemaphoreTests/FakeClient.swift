@@ -75,9 +75,22 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return true
     }
 
-    func react(target: MessageKey, emoji: String, remove: Bool) async throws {}
-    func edit(key: MessageKey, newBody: String) async throws {}
-    func deleteForEveryone(key: MessageKey) async throws {}
+    private(set) var reacted: [(target: MessageKey, emoji: String, remove: Bool)] = []
+    private(set) var edited: [(key: MessageKey, body: String)] = []
+    private(set) var deletedForEveryone: [MessageKey] = []
+    var changeError: Error?
+    func react(target: MessageKey, emoji: String, remove: Bool) async throws {
+        if let changeError { throw changeError }
+        lock.withLock { reacted.append((target, emoji, remove)) }
+    }
+    func edit(key: MessageKey, newBody: String) async throws {
+        if let changeError { throw changeError }
+        lock.withLock { edited.append((key, newBody)) }
+    }
+    func deleteForEveryone(key: MessageKey) async throws {
+        if let changeError { throw changeError }
+        lock.withLock { deletedForEveryone.append(key) }
+    }
     private(set) var markedRead: [String] = []
     var markReadError: Error?
     func markRead(conversationId: String) async throws -> UInt32 {

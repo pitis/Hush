@@ -41,8 +41,9 @@ Legend: ✅ built (the PR that did it) · ◐ partly · ✗ not in M1 (where it 
 | Send text, 1:1 and groups, with pending/sent/delivered/read ticks | ✅ #29, #33 | Send both ways |
 | Failed send with Retry | ✅ #29 | Send offline |
 | Reply (quote) | ✅ #29, #31 | Context menu ▸ Reply |
-| Reactions in and out | ◐ #25, #33 → #43 | Shown and sent by the core; **no reaction picker in the app yet (#43)** |
-| Edit and delete for everyone, in and out | ◐ #25, #33 → #43 | Shown; **no Edit/Delete menu in the app yet (#43)** |
+| Reactions in and out: hover picker, menu, "More…", who reacted | ✅ #25, #33, #43 | React, change, remove; the phone shows it |
+| Edit (menu, ↑ in an empty composer) and delete for everyone, in and out | ✅ #25, #33, #43 | Edit and delete; the phone shows "edited" / deleted |
+| Delete for me | ✗ (owner's decision, #43) | Desktop syncs it to your devices |
 | Day separators, grouping, "edited", deleted | ✅ #31 | |
 | Stickers, shared contacts, payments, polls | ✗ (#24, needs decision) | They don't show at all |
 | Disappearing messages | ✗ (#24, needs decision) | Timer is ignored |
