@@ -1331,6 +1331,13 @@ Add `uniffi = { workspace = true, features = ["tokio"] }` in `sig-core/Cargo.tom
 
 ### Task 6: Spike UI — Keychain key, QR link screen, live event log (manual E2E with phone)
 
+> **As built (PR for #6):**
+> - **Signing:** with the owner's Apple Development identity (team `95KQ82C586`, `app/project.yml`). An ad-hoc signature changes on every build, and the Keychain then blocks `dbKey()` on an access prompt. That was found when the first run hung.
+> - **Opening:** `CoreBridge.boot()` opens the core off the main thread. `Keychain.read` throws on any error other than "not found" (never silently makes a new key that can't decrypt the data).
+> - **Tests:** XCTest launches the app as its host, so the app skips booting under XCTest (`XCTestConfigurationFilePath`).
+> - **Logging:** app state goes to the unified log (category `app`), with no URLs or content.
+> - **Probe:** `cargo run --example link_probe` prints core events while linking, to debug without the UI.
+
 **Files:**
 - Create: `app/Semaphore/Keychain.swift`, `app/Semaphore/CoreBridge.swift`, `app/Semaphore/LinkView.swift`, `app/Semaphore/QRCode.swift`
 - Modify: `app/Semaphore/ContentView.swift`, `app/Semaphore/SemaphoreApp.swift`

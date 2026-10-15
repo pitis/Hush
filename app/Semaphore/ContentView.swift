@@ -31,6 +31,6 @@ struct ContentView: View {
         }
         .frame(minWidth: 720, minHeight: 480)
         .navigationTitle("Semaphore — \(String(describing: core.connection))")
-        .task { core.boot() }
+        .task { await core.boot() }
     }
 }

@@ -6,6 +6,10 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     ARCHS: arm64
+    # A stable signing identity: the Keychain only trusts rebuilds signed by the same team.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Apple Development"
+    DEVELOPMENT_TEAM: 95KQ82C586
 targets:
   Semaphore:
     type: application
@@ -24,7 +28,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.semaphore
-        CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: NO
         GENERATE_INFOPLIST_FILE: YES
   SemaphoreTests:
@@ -35,7 +38,6 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        CODE_SIGN_IDENTITY: "-"
 schemes:
   Semaphore:
     build: { targets: { Semaphore: all, SemaphoreTests: [test] } }

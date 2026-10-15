@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import Observation
 
 /// App-side state fed by core events. Plan 2 grows this into the full app store.
@@ -10,6 +11,8 @@ final class CoreBridge {
     }
 
     static let logLimit = 200
+    /// App state for Console.app (subsystem dev.pitis.semaphore). Never URLs or message content.
+    private static let logger = Logger(subsystem: "dev.pitis.semaphore", category: "app")
 
     private(set) var screen: Screen = .starting
     private(set) var linkURL: String?
@@ -19,14 +22,20 @@ final class CoreBridge {
     private(set) var lastError: String?
     private var client: Client?
 
-    /// Opens the core with the Keychain key and either starts receiving or starts linking.
-    func boot() {
+    /// Opens the core (off the main thread) with the Keychain key, then either starts receiving
+    /// or starts linking.
+    func boot() async {
+        let listener = Listener(bridge: self)
+        let opened = await Task.detached { () -> Result<Client, Error> in
+            Result {
+                let dir = try FileManager.default
+                    .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                    .appendingPathComponent("Semaphore", isDirectory: true)
+                return try Client.open(dataDir: dir.path, dbKeyHex: try Keychain().dbKey(), listener: listener)
+            }
+        }.value
         do {
-            let dir = try FileManager.default
-                .url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-                .appendingPathComponent("Semaphore", isDirectory: true)
-            let client = try Client.open(
-                dataDir: dir.path, dbKeyHex: try Keychain().dbKey(), listener: Listener(bridge: self))
+            let client = try opened.get()
             self.client = client
             if client.isLinked() {
                 screen = .chats
@@ -36,6 +45,9 @@ final class CoreBridge {
                 screen = .link
                 try client.link(deviceName: "Semaphore")
             }
+        } catch CoreError.AlreadyOpen {
+            Self.logger.error("already running")
+            screen = .failed("Semaphore is already running.")
         } catch {
             screen = .failed("\(error)")
         }
@@ -50,13 +62,16 @@ final class CoreBridge {
     func handle(_ event: CoreEvent) {
         switch event {
         case .linkUrl(let url):
+            Self.logger.notice("link code ready")
             linkURL = url
             screen = .link
         case .linked:
+            Self.logger.notice("linked")
             linkURL = nil
             screen = .chats
             do { try client?.start() } catch { append("start failed: \(error)") }
         case .connection(let state):
+            Self.logger.notice("connection \(String(describing: state), privacy: .public)")
             connection = state
             if state == .unlinked {
                 linkURL = nil
@@ -72,6 +87,7 @@ final class CoreBridge {
         case .typing(let conversationId, _, let started):
             append("typing \(conversationId) \(started ? "started" : "stopped")")
         case .error(let message):
+            Self.logger.error("core error: \(message, privacy: .public)")
             lastError = message
             append("error: \(message)")
         }
