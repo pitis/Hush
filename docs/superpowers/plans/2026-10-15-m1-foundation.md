@@ -1023,6 +1023,12 @@ The `Receipt` test relies on the `messages_au` trigger only firing for `body` up
 
 ### Task 5: Actor + UniFFI `Client` — open, link, receive loop, events, queries
 
+> **As built (PR for #5):**
+> - **Swift API:** `Client.open(dataDir:dbKeyHex:listener:)`, `isLinked()`, `link(deviceName:) throws`, `start() throws`, async `conversations()`, `messages(conversationId:before: MessageKey?, limit:)`, `search(query:limit:)`, `reactions(key:)`.
+> - **Events:** `CoreEvent.messageChanged` carries a `MessageKey`; `ConnectionState` adds `unlinked`. `CoreError` is `Storage`, `Signal` or `Closed`.
+> - **Core thread:** opens both DBs and reports readiness before `open` returns. `start` is idempotent. Titles come from presage contacts (by ACI) and groups (by master key) on `Contacts`/`QueueEmpty`.
+> - **Runtimes:** queries from UniFFI's tokio runtime use the same pool as the core thread; tested.
+
 **Files:**
 - Create: `core/sig-core/src/client.rs` (UniFFI surface), `core/sig-core/src/actor.rs` (presage thread), `core/sig-core/src/events.rs`, `core/sig-core/src/error.rs`
 - Modify: `core/sig-core/src/lib.rs`
