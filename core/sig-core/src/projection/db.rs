@@ -1202,6 +1202,153 @@ impl ProjectionDb {
         sqlx::query("DELETE FROM history_import").execute(&self.pool).await?;
         Ok(())
     }
+
+    // TODO(remove when the driver lands): only tests call this until then.
+    #[allow(dead_code)]
+    /// Writes one batch of imported history in one transaction, merging into what is already
+    /// here: existing messages keep their content (only the read status can rise), existing
+    /// reactions, files and titles win, and a repeated import changes nothing. Emits no events;
+    /// the caller announces once at the end of the whole import.
+    pub(crate) async fn import_history(&self, batch: &crate::history::import::HistoryBatch) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut touched = std::collections::BTreeSet::new();
+        for c in &batch.conversations {
+            let kind = kind_of(&c.id)?;
+            sqlx::query(
+                "INSERT INTO conversations(id, kind, title, expire_timer) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                   title = CASE WHEN conversations.title = '' THEN excluded.title ELSE conversations.title END",
+            )
+            .bind(&c.id)
+            .bind(kind_to_i64(kind))
+            .bind(&c.title)
+            .bind(i64::from(c.expire_timer))
+            .execute(&mut *tx)
+            .await?;
+        }
+        for m in &batch.messages {
+            let msg = &m.message;
+            let kind = kind_of(&msg.conversation_id)?;
+            sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+                .bind(&msg.conversation_id)
+                .bind(kind_to_i64(kind))
+                .execute(&mut *tx)
+                .await?;
+            let quote = msg.quote.as_ref();
+            let (body, quote_text) = if msg.deleted {
+                (None, None)
+            } else {
+                (msg.body.as_ref(), quote.and_then(|q| q.text.as_ref()))
+            };
+            let (msg_kind, kind_text) = msg.kind.to_row();
+            sqlx::query(
+                "INSERT INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
+                   status, edited, deleted, quote_author, quote_sent_at, quote_text, kind, kind_text,
+                   expires_in, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(author, sent_at) DO UPDATE SET
+                   status = MAX(messages.status, excluded.status)",
+            )
+            .bind(&msg.conversation_id)
+            .bind(&msg.author)
+            .bind(msg.sent_at)
+            .bind(msg.received_at)
+            .bind(body)
+            .bind(msg.is_outgoing)
+            .bind(msg.status.to_i64())
+            .bind(msg.edited)
+            .bind(msg.deleted)
+            .bind(quote.map(|q| &q.author))
+            .bind(quote.map(|q| q.sent_at))
+            .bind(quote_text)
+            .bind(msg_kind)
+            .bind(kind_text)
+            .bind(i64::from(msg.expires_in))
+            .bind(msg.expires_at)
+            .execute(&mut *tx)
+            .await?;
+            for (reactor, emoji) in &m.reactions {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO reactions(target_author, target_sent_at, reactor, emoji)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(&msg.author)
+                .bind(msg.sent_at)
+                .bind(reactor)
+                .bind(emoji)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let preview_image = m.preview.as_ref().and_then(|p| p.image.as_ref());
+            for a in m.attachments.iter().chain(preview_image) {
+                let state = if a.pointer.is_some() {
+                    AttachmentState::Pending
+                } else {
+                    // no longer on the transit CDN: shown as unavailable
+                    AttachmentState::Failed
+                };
+                sqlx::query(
+                    "INSERT OR IGNORE INTO attachments(message_author, message_sent_at, position,
+                       content_type, file_name, size, width, height, is_voice_note, pointer, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .bind(&msg.author)
+                .bind(msg.sent_at)
+                .bind(a.position)
+                .bind(&a.content_type)
+                .bind(&a.file_name)
+                .bind(a.size as i64)
+                .bind(a.width.map(i64::from))
+                .bind(a.height.map(i64::from))
+                .bind(a.is_voice_note)
+                .bind(&a.pointer)
+                .bind(state.to_i64())
+                .execute(&mut *tx)
+                .await?;
+            }
+            if let Some(p) = &m.preview {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO link_previews(message_author, message_sent_at, url, title, description)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .bind(&msg.author)
+                .bind(msg.sent_at)
+                .bind(&p.url)
+                .bind(&p.title)
+                .bind(&p.description)
+                .execute(&mut *tx)
+                .await?;
+            }
+            touched.insert(msg.conversation_id.clone());
+        }
+        for e in &batch.events {
+            let kind = kind_of(&e.conversation_id)?;
+            sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+                .bind(&e.conversation_id)
+                .bind(kind_to_i64(kind))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                // a change both imported and received live is shown once
+                "INSERT INTO chat_events(conversation_id, at, kind, author, value)
+                 SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (SELECT 1 FROM chat_events
+                   WHERE conversation_id = ?1 AND at = ?2 AND kind = ?3 AND author = ?4)",
+            )
+            .bind(&e.conversation_id)
+            .bind(e.at)
+            .bind(ChatEventKind::TimerChanged.to_i64())
+            .bind(&e.author)
+            .bind(e.value)
+            .execute(&mut *tx)
+            .await?;
+            touched.insert(e.conversation_id.clone());
+        }
+        for id in &touched {
+            refresh_summary(&mut tx, id).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// After an UPDATE of one message: refresh its conversation's summary if a row changed.
@@ -1694,6 +1841,241 @@ mod tests {
         assert_eq!(db.history_state().await.unwrap(), Some(s), "updates replace the row");
         db.clear_history_state().await.unwrap();
         assert_eq!(db.history_state().await.unwrap(), None);
+    }
+
+    mod import_history {
+        use super::*;
+        use crate::history::import::{HistoryBatch, ImportAttachment, ImportConversation, ImportEvent, ImportMessage};
+
+        fn imported(conv: &str, author: &str, sent_at: i64, body: &str, status: MessageStatus) -> ImportMessage {
+            ImportMessage {
+                message: Message {
+                    status,
+                    ..in_conv(conv, msg(author, sent_at, body))
+                },
+                reactions: vec![],
+                attachments: vec![],
+                preview: None,
+            }
+        }
+
+        fn batch_with(messages: Vec<ImportMessage>) -> HistoryBatch {
+            HistoryBatch {
+                conversations: vec![],
+                messages,
+                events: vec![],
+            }
+        }
+
+        fn key(author: &str, sent_at: i64) -> MessageKey {
+            MessageKey {
+                author: author.into(),
+                sent_at,
+            }
+        }
+
+        #[tokio::test]
+        async fn an_existing_message_is_kept_but_status_rises() {
+            let db = db().await;
+            db.insert_message(&in_conv("c:alice", msg("alice", 5, "live")))
+                .await
+                .unwrap();
+            db.import_history(&batch_with(vec![imported(
+                "c:alice",
+                "alice",
+                5,
+                "archived",
+                MessageStatus::Read,
+            )]))
+            .await
+            .unwrap();
+            let m = db.message(&key("alice", 5)).await.unwrap().unwrap();
+            assert_eq!((m.body.as_deref(), m.status), (Some("live"), MessageStatus::Read));
+        }
+
+        #[tokio::test]
+        async fn a_second_import_changes_nothing() {
+            let db = db().await;
+            let batch = || {
+                let mut m = imported("c:alice", "alice", 5, "hello", MessageStatus::Read);
+                m.reactions = vec![("alice".into(), "👍".into())];
+                m.attachments = vec![ImportAttachment {
+                    position: 0,
+                    content_type: "image/png".into(),
+                    file_name: None,
+                    size: 9,
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                    pointer: Some(vec![1, 2]),
+                }];
+                HistoryBatch {
+                    conversations: vec![ImportConversation {
+                        id: "c:alice".into(),
+                        title: "Alice".into(),
+                        expire_timer: 60,
+                    }],
+                    messages: vec![m],
+                    events: vec![ImportEvent {
+                        conversation_id: "c:alice".into(),
+                        at: 4,
+                        author: "alice".into(),
+                        value: 60,
+                    }],
+                }
+            };
+            db.import_history(&batch()).await.unwrap();
+            db.import_history(&batch()).await.unwrap();
+            let c = conv(&db, "c:alice").await;
+            assert_eq!((c.title.as_str(), c.unread_count), ("Alice", 0));
+            let events = db.chat_events("c:alice", 0).await.unwrap();
+            assert_eq!(events.len(), 1, "no duplicate timer event");
+            assert_eq!(db.reactions(&key("alice", 5)).await.unwrap().len(), 1);
+            assert_eq!(db.attachments(&key("alice", 5)).await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn import_updates_summaries_and_unread() {
+            let db = db().await;
+            db.import_history(&batch_with(vec![
+                imported("c:alice", "alice", 5, "first", MessageStatus::Delivered),
+                imported("c:alice", "alice", 9, "newest", MessageStatus::Delivered),
+            ]))
+            .await
+            .unwrap();
+            let c = conv(&db, "c:alice").await;
+            assert_eq!(
+                (c.unread_count, c.last_message_preview.as_str(), c.last_message_at),
+                (2, "newest", 9)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_imported_title_never_overwrites_a_known_one() {
+            let db = db().await;
+            alice(&db).await;
+            db.import_history(&HistoryBatch {
+                conversations: vec![
+                    ImportConversation {
+                        id: "c:alice".into(),
+                        title: "Imported".into(),
+                        expire_timer: 0,
+                    },
+                    ImportConversation {
+                        id: "c:bob".into(),
+                        title: "Bob".into(),
+                        expire_timer: 30,
+                    },
+                ],
+                messages: vec![imported("c:bob", "bob", 2, "hi", MessageStatus::Read)],
+                events: vec![],
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                db.title("c:alice").await.unwrap().as_deref(),
+                Some("Alice"),
+                "known title kept"
+            );
+            let bob = conv(&db, "c:bob").await;
+            assert_eq!(
+                (bob.title.as_str(), bob.expire_timer),
+                ("Bob", 30),
+                "new chat filled in"
+            );
+        }
+
+        #[tokio::test]
+        async fn imported_reactions_do_not_clobber_live_ones() {
+            let db = db().await;
+            db.insert_message(&in_conv("c:alice", msg("alice", 5, "hi")))
+                .await
+                .unwrap();
+            db.apply(&Op::React {
+                target: key("alice", 5),
+                reactor: "bob".into(),
+                emoji: Some("❤️".into()),
+            })
+            .await
+            .unwrap();
+            let mut m = imported("c:alice", "alice", 5, "hi", MessageStatus::Read);
+            m.reactions = vec![("bob".into(), "👍".into())];
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let reactions = db.reactions(&key("alice", 5)).await.unwrap();
+            assert_eq!(reactions.len(), 1);
+            assert_eq!(reactions[0].emoji, "❤️", "the live reaction wins");
+        }
+
+        #[tokio::test]
+        async fn unavailable_files_are_failed_rows() {
+            let db = db().await;
+            let mut m = imported("c:alice", "alice", 5, "files", MessageStatus::Read);
+            m.attachments = vec![
+                ImportAttachment {
+                    position: 0,
+                    content_type: "image/png".into(),
+                    file_name: Some("a.png".into()),
+                    size: 9,
+                    width: Some(4),
+                    height: Some(4),
+                    is_voice_note: false,
+                    pointer: Some(vec![1, 2, 3]),
+                },
+                ImportAttachment {
+                    position: 1,
+                    content_type: "image/jpeg".into(),
+                    file_name: None,
+                    size: 10,
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                    pointer: None,
+                },
+            ];
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let files = db.attachments(&key("alice", 5)).await.unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].state, AttachmentState::Pending, "downloadable");
+            assert_eq!(files[1].state, AttachmentState::Failed, "no longer available");
+        }
+
+        /// 100k messages across 50 chats; run with
+        /// `cargo test -p sig-core --release -- --ignored volume` and put time and memory in the PR.
+        #[tokio::test]
+        #[ignore]
+        async fn volume_100k_messages() {
+            let db = db().await;
+            let conv_id = |n: usize| format!("c:{:08}-0000-0000-0000-000000000000", n % 50);
+            let started = std::time::Instant::now();
+            for page in 0..100usize {
+                let messages = (0..1000usize)
+                    .map(|i| {
+                        let n = page * 1000 + i;
+                        imported(
+                            &conv_id(n),
+                            "alice",
+                            n as i64 + 1,
+                            "hello world, this is a message",
+                            MessageStatus::Read,
+                        )
+                    })
+                    .collect();
+                db.import_history(&batch_with(messages)).await.unwrap();
+            }
+            eprintln!("100k messages imported in {:?}", started.elapsed());
+            assert_eq!(db.conversations().await.unwrap().len(), 50);
+        }
+
+        #[tokio::test]
+        async fn an_imported_deleted_message_stores_no_text() {
+            let db = db().await;
+            let mut m = imported("c:alice", "alice", 5, "secret", MessageStatus::Read);
+            m.message.deleted = true;
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let got = db.message(&key("alice", 5)).await.unwrap().unwrap();
+            assert!(got.deleted);
+            assert_eq!(got.body, None);
+        }
     }
 
     /// A temp file path removed on drop, even if the test panics.
