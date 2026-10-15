@@ -14,3 +14,9 @@ ALTER TABLE conversations ADD COLUMN timer_at INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE chat_events ADD COLUMN value INTEGER;
 -- when a message was read before it reached us (its disappearing timer starts then)
 ALTER TABLE pending_status ADD COLUMN read_at INTEGER;
+-- presage copies of expired messages (and their edits) still to delete there; kept until done
+CREATE TABLE presage_forget (
+    conversation_id TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
+    PRIMARY KEY (conversation_id, sent_at)
+) WITHOUT ROWID;

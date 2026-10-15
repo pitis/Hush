@@ -30,7 +30,7 @@ use crate::download::{downloader, Download, Downloads};
 use crate::error::CoreError;
 use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
-use crate::projection::{project, ChatEventKind, Expired, Op, ProjectionDb};
+use crate::projection::{project, ChatEventKind, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
 use crate::typing::{Typing, TYPING_IDLE};
 
@@ -462,30 +462,9 @@ async fn expire(mut store: SqliteStore, db: ProjectionDb, l: Arc<dyn EventListen
     // an error is reported once until a sweep works again, not every 5 s
     let mut failing = false;
     loop {
-        match db.delete_expired(chrono::Utc::now().timestamp_millis()).await {
-            Ok(gone) => {
-                failing = false;
-                if !gone.is_empty() {
-                    tracing::info!(count = gone.len(), "disappearing messages removed");
-                }
-                for e in &gone {
-                    // presage keeps its own copy of each message and edit: it goes too
-                    if let Err(err) = forget_in_presage(&mut store, e).await {
-                        l.on_event(CoreEvent::Error {
-                            message: format!("removing a disappearing message's stored copy failed: {err}"),
-                        });
-                    }
-                }
-                for e in &gone {
-                    l.on_event(CoreEvent::MessageExpired {
-                        conversation_id: e.conversation_id.clone(),
-                        key: e.key.clone(),
-                    });
-                }
-                if !gone.is_empty() {
-                    l.on_event(CoreEvent::ConversationsChanged);
-                }
-            }
+        let swept = sweep(&mut store, &db, l.as_ref()).await;
+        match swept {
+            Ok(()) => failing = false,
             Err(e) if !failing => {
                 failing = true;
                 l.on_event(CoreEvent::Error {
@@ -498,16 +477,49 @@ async fn expire(mut store: SqliteStore, db: ProjectionDb, l: Arc<dyn EventListen
     }
 }
 
-/// Removes an expired message, and its edits, from presage's store.
-async fn forget_in_presage(store: &mut SqliteStore, e: &Expired) -> Result<(), String> {
-    let thread = crate::send::thread(&e.conversation_id).ok_or("not a conversation id")?;
-    for at in std::iter::once(e.key.sent_at).chain(e.revisions.iter().copied()) {
-        store
-            .delete_message(&thread, at as u64)
-            .await
-            .map_err(|err| err.to_string())?;
+/// One expiry sweep: removes expired messages, then their copies in presage's store (queued
+/// durably, so one that fails, or is cut short by a quit, is retried by the next sweep).
+async fn sweep(store: &mut SqliteStore, db: &ProjectionDb, l: &dyn EventListener) -> Result<(), String> {
+    let gone = db
+        .delete_expired(chrono::Utc::now().timestamp_millis())
+        .await
+        .map_err(|e| e.to_string())?;
+    if !gone.is_empty() {
+        tracing::info!(count = gone.len(), "disappearing messages removed");
     }
-    Ok(())
+    for e in &gone {
+        l.on_event(CoreEvent::MessageExpired {
+            conversation_id: e.conversation_id.clone(),
+            key: e.key.clone(),
+        });
+    }
+    if !gone.is_empty() {
+        l.on_event(CoreEvent::ConversationsChanged);
+    }
+    let mut first_error = None;
+    for (conversation_id, sent_at) in db.presage_forget_queue().await.map_err(|e| e.to_string())? {
+        let done = match forget_in_presage(store, &conversation_id, sent_at).await {
+            Ok(()) => db
+                .presage_forgotten(&conversation_id, sent_at)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
+            first_error.get_or_insert(format!("deleting a stored copy: {e}"));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Removes one message (or edit) from presage's store, which keeps its own copy of each.
+async fn forget_in_presage(store: &mut SqliteStore, conversation_id: &str, sent_at: i64) -> Result<(), String> {
+    let thread = crate::send::thread(conversation_id).ok_or("not a conversation id")?;
+    store
+        .delete_message(&thread, sent_at as u64)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Keeps a chat's timer as presage has it: presage orders timer changes by version (1:1) or
@@ -1083,7 +1095,8 @@ mod tests {
         assert!(generated > 1000);
     }
 
-    /// presage keeps its own copy of every message (and edit): an expired one goes from there too.
+    /// presage keeps its own copy of every message (and edit): an expired one goes from there too,
+    /// and one that fails to go there is retried rather than forgotten.
     #[tokio::test]
     async fn an_expired_message_leaves_presages_store_too() {
         use presage::libsignal_service::content::{Content, ContentBody, Metadata};
@@ -1125,21 +1138,41 @@ mod tests {
                 ..Default::default()
             }),
         };
-        for ms in [100, 107, 200] {
+        for ms in [100, 200] {
             store.save_message(&thread, at(ms)).await.unwrap();
         }
-        let expired = super::Expired {
-            conversation_id: format!("c:{ALICE}"),
-            key: crate::projection::MessageKey {
-                author: ALICE.into(),
-                sent_at: 100,
-            },
-            revisions: vec![107],
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        let expired = |conversation_id: String, sent_at| crate::projection::Message {
+            conversation_id,
+            author: ALICE.into(),
+            sent_at,
+            received_at: sent_at,
+            body: Some("x".into()),
+            is_outgoing: false,
+            status: crate::projection::MessageStatus::Read,
+            edited: false,
+            deleted: false,
+            quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 1,
+            expires_at: Some(1),
         };
-        super::forget_in_presage(&mut store, &expired).await.unwrap();
+        db.insert_message(&expired(format!("c:{ALICE}"), 100)).await.unwrap();
+        // a copy presage can't be asked to delete (a bad id) stays queued and fails the sweep
+        db.insert_message(&expired("c:not-a-uuid".into(), 5)).await.unwrap();
+        assert!(super::sweep(&mut store, &db, &Quiet).await.is_err());
         assert!(store.message(&thread, 100).await.unwrap().is_none());
-        assert!(store.message(&thread, 107).await.unwrap().is_none(), "its edit");
         assert!(store.message(&thread, 200).await.unwrap().is_some(), "others stay");
+        let left = vec![("c:not-a-uuid".to_string(), 5)];
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            left,
+            "kept, for the next sweep"
+        );
+        assert!(super::sweep(&mut store, &db, &Quiet).await.is_err(), "retried");
+        assert_eq!(db.presage_forget_queue().await.unwrap(), left);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

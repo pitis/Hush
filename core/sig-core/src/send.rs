@@ -367,14 +367,16 @@ async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, 
     // presage sends it with the chat's timer as it keeps it (by version, which we don't see):
     // our copy disappears with the recipient's
     if let Some(thread) = thread(&job.conversation_id) {
-        let timer = m
-            .store()
-            .expire_timer(&thread)
-            .await
-            .ok()
-            .flatten()
-            .map_or(0, |(t, _)| t);
-        if let Err(e) = db.set_message_timer(&job.key, timer).await {
+        // unreadable: keep the timer the message was stored with (the chat's), not none
+        let timer = match m.store().expire_timer(&thread).await {
+            Ok(t) => Ok(t.map_or(0, |(t, _)| t)),
+            Err(e) => Err(format!("reading the chat's timer: {e}")),
+        };
+        let recorded = match timer {
+            Ok(timer) => db.set_message_timer(&job.key, timer).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = recorded {
             l.on_event(CoreEvent::Error {
                 message: format!("recording a message's timer failed: {e}"),
             });

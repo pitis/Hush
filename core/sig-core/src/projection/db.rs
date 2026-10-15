@@ -52,8 +52,6 @@ pub const MAX_ATTACHMENT: u64 = 100 * 1024 * 1024;
 pub struct Expired {
     pub conversation_id: String,
     pub key: MessageKey,
-    /// Timestamps of its edit revisions.
-    pub revisions: Vec<i64>,
 }
 
 /// The chat list's preview when the latest thing in a chat is a message that couldn't be
@@ -699,6 +697,23 @@ impl ProjectionDb {
         Ok(())
     }
 
+    /// presage copies of expired messages still to delete: (conversation, timestamp).
+    pub async fn presage_forget_queue(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as("SELECT conversation_id, sent_at FROM presage_forget")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// One queued presage copy is gone.
+    pub async fn presage_forgotten(&self, conversation_id: &str, sent_at: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM presage_forget WHERE conversation_id = ?1 AND sent_at = ?2")
+            .bind(conversation_id)
+            .bind(sent_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// The chat's disappearing-message timer (seconds, 0: off), for our own new messages.
     pub async fn expire_timer(&self, conversation_id: &str) -> Result<u32, sqlx::Error> {
         let t: Option<i64> = sqlx::query_scalar("SELECT expire_timer FROM conversations WHERE id = ?1")
@@ -709,8 +724,8 @@ impl ProjectionDb {
     }
 
     /// Removes the messages whose timer ran out by `now_ms`: rows, search index, reactions,
-    /// previews and files. Returns them, each with its edit revisions' timestamps (presage keeps
-    /// a copy of each, to remove there too).
+    /// previews and files. Returns them. presage's copies of them and their edits are queued
+    /// (`presage_forget`) in the same transaction, so none is forgotten if deleting there fails.
     pub async fn delete_expired(&self, now_ms: i64) -> Result<Vec<Expired>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let expired: Vec<(String, String, i64)> = sqlx::query_as(
@@ -729,6 +744,13 @@ impl ProjectionDb {
                     .bind(key.sent_at)
                     .fetch_all(&mut *tx)
                     .await?;
+            for at in std::iter::once(key.sent_at).chain(revisions) {
+                sqlx::query("INSERT OR IGNORE INTO presage_forget(conversation_id, sent_at) VALUES (?1, ?2)")
+                    .bind(&conversation_id)
+                    .bind(at)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             files.extend(forget_deleted_text(&mut tx, &key).await?);
             sqlx::query("DELETE FROM messages WHERE author = ?1 AND sent_at = ?2")
                 .bind(&key.author)
@@ -740,11 +762,7 @@ impl ProjectionDb {
                 .bind(key.sent_at)
                 .execute(&mut *tx)
                 .await?;
-            out.push(Expired {
-                conversation_id,
-                key,
-                revisions,
-            });
+            out.push(Expired { conversation_id, key });
         }
         let mut conversations: Vec<&String> = out.iter().map(|e| &e.conversation_id).collect();
         conversations.dedup();
@@ -3203,9 +3221,19 @@ mod tests {
             vec![Expired {
                 conversation_id: "c:alice".into(),
                 key: k("alice", 1),
-                revisions: vec![7],
-            }],
-            "with its edit, which presage keeps a copy of too"
+            }]
+        );
+        let mut queued = db.presage_forget_queue().await.unwrap();
+        queued.sort();
+        assert_eq!(
+            queued,
+            vec![("c:alice".to_string(), 1), ("c:alice".to_string(), 7)],
+            "presage's copies of it and its edit are queued for deletion there"
+        );
+        db.presage_forgotten("c:alice", 1).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 7)]
         );
         assert!(db.message(&k("alice", 1)).await.unwrap().is_none());
         assert!(
