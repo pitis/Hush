@@ -10,7 +10,7 @@ pub fn init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // sqlx statements stay off even if someone raises the level: they can carry key pragmas.
-        let filter = EnvFilter::new("warn,sqlx=off");
+        let filter = EnvFilter::new("warn,sig_core=info,sqlx=off");
         let subscriber = tracing_subscriber::registry()
             .with(filter)
             .with(tracing_oslog::OsLogger::new("dev.pitis.semaphore", "core"));

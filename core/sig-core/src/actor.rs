@@ -299,6 +299,13 @@ async fn handle(
     titles_synced: &mut bool,
     l: &dyn EventListener,
 ) {
+    // Kinds and counts only: never message content.
+    match &received {
+        Received::QueueEmpty => tracing::info!("caught up with the server queue"),
+        Received::Contacts => tracing::info!("contacts synced from the phone"),
+        Received::DecryptionError(_) => {}
+        Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
+    }
     match received {
         Received::QueueEmpty => {
             if !*titles_synced {
@@ -313,7 +320,9 @@ async fn handle(
             message: format!("a message from {} couldn't be decrypted", sender.service_id_string()),
         }),
         Received::Content(content) => {
-            for op in project(&content, me) {
+            let ops = project(&content, me);
+            tracing::info!(ops = ops.len(), "projected");
+            for op in ops {
                 match db.apply(&op).await {
                     Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
                     Err(e) => l.on_event(CoreEvent::Error {
@@ -325,6 +334,21 @@ async fn handle(
                 }
             }
         }
+    }
+}
+
+fn content_kind(body: &presage::libsignal_service::content::ContentBody) -> &'static str {
+    use presage::libsignal_service::content::ContentBody::*;
+    match body {
+        NullMessage(_) => "null",
+        DataMessage(_) => "data",
+        SynchronizeMessage(_) => "sync",
+        CallMessage(_) => "call",
+        ReceiptMessage(_) => "receipt",
+        TypingMessage(_) => "typing",
+        DecryptionErrorMessage(_) => "decryption-error",
+        StoryMessage(_) => "story",
+        EditMessage(_) => "edit",
     }
 }
 
