@@ -5,6 +5,7 @@ mod client;
 mod download;
 mod error;
 mod events;
+mod history;
 mod logging;
 pub mod projection;
 mod send;

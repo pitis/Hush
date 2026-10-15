@@ -438,7 +438,9 @@ async fn link(
         Manager::link_secondary_device(store.clone(), SignalServers::Production, device_name, url_tx),
         async move {
             if let Ok(url) = url_rx.await {
-                l.on_event(CoreEvent::LinkUrl { url: url.to_string() });
+                l.on_event(CoreEvent::LinkUrl {
+                    url: crate::history::with_backup_capability(url.as_str()),
+                });
             }
         },
     );
