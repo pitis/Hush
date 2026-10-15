@@ -16,6 +16,8 @@ enum ChatList {
         if typing { return .typing }
         if !selected, Composer.canSend(draft) { return .draft(oneLine(draft)) }
         guard c.lastMessageAt > 0 else { return .message("", tick: nil) }
+        // the core's notice; the older message's author, ticks and files don't belong to it
+        if c.lastMessageUndecryptable { return .message(c.lastMessagePreview, tick: nil) }
         let author = c.lastMessageOutgoing ? "You" : authorName
         if c.lastMessageDeleted { return .message("\(author) deleted this message", tick: nil) }
         let text =

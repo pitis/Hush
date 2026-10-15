@@ -533,7 +533,17 @@ async fn receive_loop(
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Connecting,
         });
-        match Box::pin(m.receive_messages()).await {
+        // a reconnect request also cuts short a connect that hangs (Wi-Fi without internet):
+        // nothing has been read yet, so nothing is lost
+        let connecting = tokio::select! {
+            connected = Box::pin(m.receive_messages()) => Some(connected),
+            _ = wake.notified() => None,
+        };
+        let Some(connecting) = connecting else {
+            backoff = Duration::from_secs(1);
+            continue;
+        };
+        match connecting {
             Ok(stream) => {
                 let connected = tokio::time::Instant::now();
                 l.on_event(CoreEvent::Connection {

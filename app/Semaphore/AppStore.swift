@@ -843,11 +843,14 @@ final class AppStore {
         refreshing = true
         let generation = listenerGeneration
         Task {
+            // a refresh of a core that was replaced (starting over) leaves everything, flags too,
+            // to the new one
             repeat {
+                guard generation == listenerGeneration else { return }
                 refreshAgain = false
                 do {
                     let found = try await client.conversations()
-                    guard generation == listenerGeneration else { return }  // started over meanwhile
+                    guard generation == listenerGeneration else { return }
                     conversations = found
                     conversationsLoaded = true
                     Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
@@ -857,7 +860,7 @@ final class AppStore {
                     }
                 } catch { append("query failed: \(error)") }
             } while refreshAgain
-            refreshing = false
+            if generation == listenerGeneration { refreshing = false }
         }
     }
 

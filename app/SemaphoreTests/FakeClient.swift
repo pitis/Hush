@@ -195,7 +195,7 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
     Conversation(
         id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
         unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
-        lastMessageDeleted: false, lastMessageFile: nil)
+        lastMessageDeleted: false, lastMessageFile: nil, lastMessageUndecryptable: false)
 }
 
 final class Counter: @unchecked Sendable {

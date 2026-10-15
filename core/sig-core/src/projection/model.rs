@@ -32,6 +32,9 @@ pub struct Conversation {
     pub last_message_deleted: bool,
     /// The last message's first file, so the list can say "Photo", "Voice Message"…
     pub last_message_file: Option<FileSummary>,
+    /// The latest thing in the chat is a message that couldn't be decrypted (the preview says
+    /// so; the other `last_message_*` fields are then empty).
+    pub last_message_undecryptable: bool,
 }
 
 /// What kind of file a message has (its first one).
