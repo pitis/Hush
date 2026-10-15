@@ -38,19 +38,19 @@
 ### Task 1: Scaffold — Rust core + UniFFI + XcodeGen app that calls Rust
 
 **Files:**
-- Create: `.gitignore`, `README.md`, `justfile`
+- Create: `.gitignore`, `README.md`, `Makefile`, `CLAUDE.md`, `scripts/{worktree,update,card}.sh`, `.githooks/`
 - Create: `core/Cargo.toml`, `core/sig-core/Cargo.toml`, `core/sig-core/src/lib.rs`
 - Create: `core/uniffi-bindgen/Cargo.toml`, `core/uniffi-bindgen/src/main.rs`
 - Create: `scripts/build-core.sh`
 - Create: `app/project.yml`, `app/Semaphore/SemaphoreApp.swift`, `app/Semaphore/ContentView.swift`
 
 **Interfaces:**
-- Produces: `sig_core::core_version() -> String` (UniFFI-exported → Swift `coreVersion()`); `app/Generated/SigCore.swift` + `app/Frameworks/SigCore.xcframework` produced by `scripts/build-core.sh`.
+- Produces: `sig_core::core_version() -> String` (UniFFI-exported → Swift `coreVersion()`); `app/Generated/sig_core.swift` + `app/Frameworks/SigCore.xcframework` produced by `scripts/build-core.sh`.
 
 - [ ] **Step 1: Install tools**
 
 ```bash
-brew install protobuf xcodegen just
+brew install protobuf xcodegen
 ```
 
 - [ ] **Step 2: Workspace manifests**
@@ -152,7 +152,7 @@ pub fn core_version() -> String {
 
 Run: `cd core && cargo test -p sig-core`
 
-- [ ] **Step 7: Build script** `scripts/build-core.sh` (chmod +x):
+- [ ] **Step 7: Build script** (as built, `scripts/build-core.sh` also maps `debug`→Cargo profile `dev`, which the version below misses, and asserts a single modulemap) `scripts/build-core.sh` (chmod +x):
 
 ```bash
 #!/usr/bin/env bash
@@ -176,7 +176,7 @@ echo "built SigCore.xcframework ($PROFILE)"
 Run: `rustup target add aarch64-apple-darwin && ./scripts/build-core.sh debug`
 Expected: `app/Generated/sig_core.swift` exists and contains `func coreVersion()`.
 
-- [ ] **Step 8: XcodeGen project** `app/project.yml`:
+- [ ] **Step 8: XcodeGen project** (as built, `app/project.yml` links Security/SystemConfiguration as `sdk:` dependencies, generates Info.plist and signs the test target ad hoc; the repo is authoritative) `app/project.yml`:
 
 ```yaml
 name: Semaphore
@@ -253,7 +253,7 @@ final class SmokeTests: XCTestCase {
 Run: `cd app && xcodegen && xcodebuild -project Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' test | tail -5`
 Expected: `** TEST SUCCEEDED **`. (Linker errors for missing system frameworks → add them to `OTHER_LDFLAGS`; the libsignal stack may need `-framework CoreFoundation`.)
 
-- [ ] **Step 10: justfile, .gitignore, README**
+- [ ] **Step 10: Makefile, .gitignore, README** (as built: a Makefile replaces the justfile, and `.gitignore` differs; the repo is authoritative)
 
 `justfile`:
 ```make
@@ -276,7 +276,7 @@ DerivedData/
 .DS_Store
 ```
 
-`README.md`: one paragraph (unofficial personal native macOS Signal client; Rust core on presage + SwiftUI; AGPL-3.0; `just test`, `just app`).
+`README.md`: one paragraph (unofficial personal native macOS Signal client; Rust core on presage + SwiftUI; AGPL-3.0; `make check`, `make run`).
 
 - [ ] **Step 11: Commit**
 
@@ -1478,9 +1478,9 @@ struct ContentView: View {
 }
 ```
 
-- [ ] **Step 6: Build + unit tests pass.** Run: `just test` → `TEST SUCCEEDED`.
+- [ ] **Step 6: Build + unit tests pass.** Run: `make check` → `TEST SUCCEEDED`.
 
-- [ ] **Step 7: Manual E2E (requires Pitis + phone).** Run: `just app && open app/build/Debug/Semaphore.app` (or run from Xcode).
+- [ ] **Step 7: Manual E2E (requires Pitis + phone).** Run: `make run` (or run from Xcode).
   Checklist:
   1. QR appears within ~5 s.
   2. Scan with phone → phone shows "Semaphore" in Linked devices; window switches to the split view; title shows `online`.
