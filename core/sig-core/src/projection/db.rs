@@ -58,6 +58,44 @@ pub struct Expired {
 /// decrypted.
 pub const UNDECRYPTABLE_PREVIEW: &str = "A message couldn't be decrypted";
 
+/// Where an interrupted history import picks up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryDbStage {
+    Waiting,
+    Downloading,
+    Importing,
+}
+
+impl HistoryDbStage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Downloading => "downloading",
+            Self::Importing => "importing",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        [Self::Waiting, Self::Downloading, Self::Importing]
+            .into_iter()
+            .find(|v| v.as_str() == s)
+    }
+}
+
+/// The one in-flight history import, surviving quits and crashes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryImportState {
+    pub stage: HistoryDbStage,
+    /// The 32-byte ephemeral backup key from the provisioning message.
+    pub key: Vec<u8>,
+    /// Our ACI (part of the decryption key derivation).
+    pub aci: String,
+    pub cdn: Option<u32>,
+    pub cdn_key: Option<String>,
+    pub bytes_done: u64,
+    pub total_bytes: Option<u64>,
+}
+
 /// Images and voice notes up to this size download as they arrive; anything else on request.
 pub const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
@@ -1114,6 +1152,56 @@ impl ProjectionDb {
             })
             .collect()
     }
+
+    /// The in-flight history import, if one was started and not finished or abandoned.
+    pub async fn history_state(&self) -> Result<Option<HistoryImportState>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT stage, key, aci, cdn, cdn_key, bytes_done, total_bytes FROM history_import WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            let stage: String = r.try_get("stage")?;
+            let cdn: Option<i64> = r.try_get("cdn")?;
+            let bytes_done: i64 = r.try_get("bytes_done")?;
+            let total: Option<i64> = r.try_get("total_bytes")?;
+            Ok(HistoryImportState {
+                stage: HistoryDbStage::parse(&stage).ok_or_else(|| decode_err(format!("history stage {stage:?}")))?,
+                key: r.try_get("key")?,
+                aci: r.try_get("aci")?,
+                cdn: cdn.map(|c| c as u32),
+                cdn_key: r.try_get("cdn_key")?,
+                bytes_done: bytes_done as u64,
+                total_bytes: total.map(|t| t as u64),
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn set_history_state(&self, s: &HistoryImportState) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO history_import (id, stage, key, aci, cdn, cdn_key, bytes_done, total_bytes)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET stage = ?1, key = ?2, aci = ?3, cdn = ?4, cdn_key = ?5,
+               bytes_done = ?6, total_bytes = ?7",
+        )
+        .bind(s.stage.as_str())
+        .bind(&s.key)
+        .bind(&s.aci)
+        .bind(s.cdn.map(|c| c as i64))
+        .bind(&s.cdn_key)
+        .bind(s.bytes_done as i64)
+        .bind(s.total_bytes.map(|t| t as i64))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The import finished or was abandoned: nothing resumes on the next launch.
+    pub async fn clear_history_state(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM history_import").execute(&self.pool).await?;
+        Ok(())
+    }
 }
 
 /// After an UPDATE of one message: refresh its conversation's summary if a row changed.
@@ -1580,6 +1668,32 @@ mod tests {
             .into_iter()
             .find(|c| c.id == id)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn history_state_round_trips_and_clears() {
+        let db = db().await;
+        assert_eq!(db.history_state().await.unwrap(), None);
+        let mut s = HistoryImportState {
+            stage: HistoryDbStage::Waiting,
+            key: vec![7u8; 32],
+            aci: "22222222-2222-2222-2222-222222222222".into(),
+            cdn: None,
+            cdn_key: None,
+            bytes_done: 0,
+            total_bytes: None,
+        };
+        db.set_history_state(&s).await.unwrap();
+        assert_eq!(db.history_state().await.unwrap(), Some(s.clone()));
+        s.stage = HistoryDbStage::Downloading;
+        s.cdn = Some(3);
+        s.cdn_key = Some("abc".into());
+        s.bytes_done = 1024;
+        s.total_bytes = Some(4096);
+        db.set_history_state(&s).await.unwrap();
+        assert_eq!(db.history_state().await.unwrap(), Some(s), "updates replace the row");
+        db.clear_history_state().await.unwrap();
+        assert_eq!(db.history_state().await.unwrap(), None);
     }
 
     /// A temp file path removed on drop, even if the test panics.
