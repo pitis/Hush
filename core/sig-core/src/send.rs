@@ -305,14 +305,11 @@ pub async fn sender(
     if caught_up.wait_for(|ready| *ready).await.is_err() {
         return;
     }
-    match db.settings().await {
-        Ok(s) if s.read_receipts.is_some() && s.typing_indicators.is_some() => {}
-        _ => {
-            let me = m.registration_data().service_ids.aci();
-            if let Err(e) = timed(Box::pin(m.send_message(me, configuration_request(), now_ms()))).await {
-                tracing::warn!(error = %e, "asking the phone for settings failed");
-            }
-        }
+    // Settings are asked for on every start, so a change the phone sent while we weren't
+    // listening (or that never arrived) is still picked up.
+    let me = m.registration_data().service_ids.aci();
+    if let Err(e) = timed(Box::pin(m.send_message(me, configuration_request(), now_ms()))).await {
+        tracing::warn!(error = %e, "asking the phone for settings failed");
     }
     // receipts left over from an earlier run or a failed send
     send_receipts(&mut m, &db, l.as_ref()).await;
