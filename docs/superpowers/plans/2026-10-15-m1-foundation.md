@@ -1023,11 +1023,24 @@ The `Receipt` test relies on the `messages_au` trigger only firing for `body` up
 
 ### Task 5: Actor + UniFFI `Client` — open, link, receive loop, events, queries
 
-> **As built (PR for #5):**
+> **As built (PR #26, after review):**
 > - **Swift API:** `Client.open(dataDir:dbKeyHex:listener:)`, `isLinked()`, `link(deviceName:) throws`, `start() throws`, async `conversations()`, `messages(conversationId:before: MessageKey?, limit:)`, `search(query:limit:)`, `reactions(key:)`.
-> - **Events:** `CoreEvent.messageChanged` carries a `MessageKey`; `ConnectionState` adds `unlinked`. `CoreError` is `Storage`, `Signal` or `Closed`.
-> - **Core thread:** opens both DBs and reports readiness before `open` returns. `start` is idempotent. Titles come from presage contacts (by ACI) and groups (by master key) on `Contacts`/`QueueEmpty`.
-> - **Runtimes:** queries from UniFFI's tokio runtime use the same pool as the core thread; tested.
+> - **Errors:** `CoreError` is `Storage`, `AlreadyOpen` or `Closed`.
+> - **Open:**
+>   - takes a file lock on `<dataDir>/.lock` (a second open → `AlreadyOpen`);
+>   - opens both DBs with the raw hex key, with statement logging off;
+>   - treats only presage's `NotYetRegisteredError` as unlinked; any other load error fails `open`, because linking clears the registration.
+> - **Drop:** dropping the `Client` joins the core thread.
+> - **Link:** times out after 5 min (`Error` + `Unlinked`). A failed `request_contacts` is reported as an `Error`.
+> - **Receiving:**
+>   - the receive loop is supervised (a panic → `Error` + `Offline`, and `start` works again);
+>   - backoff resets only after 30 s of stable connection;
+>   - decryption failures become `Error` events (sender id only);
+>   - titles sync on `Contacts` and the first `QueueEmpty`.
+> - **Core thread panic** → `Error` + `Offline`.
+> - **Logging:** warn+ goes to the unified log (subsystem `dev.pitis.semaphore`), with sqlx statements off.
+> - **Conversations:** `conversations()` lists only conversations with messages, so phone contacts don't flood the sidebar.
+> - **Deferred to #16:** detecting "unlinked by the phone" (websocket handshake 401/403).
 
 **Files:**
 - Create: `core/sig-core/src/client.rs` (UniFFI surface), `core/sig-core/src/actor.rs` (presage thread), `core/sig-core/src/events.rs`, `core/sig-core/src/error.rs`
