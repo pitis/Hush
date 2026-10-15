@@ -71,7 +71,7 @@ final class CoreBridge {
                 try client.link(deviceName: Self.deviceName)
             }
         } catch {
-            Self.logger.error("boot failed")
+            Self.logger.error("boot failed: \(Self.describe(error), privacy: .private)")
             screen = .failed(Self.describe(error))
         }
     }
@@ -107,6 +107,7 @@ final class CoreBridge {
                 screen = .chats
             }
         case .ready, .conversationsChanged:
+            Self.logger.notice("\(event == .ready ? "caught up" : "names synced", privacy: .public)")
             refreshConversations()
         case .messageChanged(let conversationId, let key):
             append("message \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
@@ -133,7 +134,10 @@ final class CoreBridge {
         Task {
             repeat {
                 refreshAgain = false
-                do { conversations = try await client.conversations() } catch { append("query failed: \(error)") }
+                do {
+                    conversations = try await client.conversations()
+                    Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
+                } catch { append("query failed: \(error)") }
             } while refreshAgain
             refreshing = false
         }

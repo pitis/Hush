@@ -13,6 +13,12 @@ struct ContentView: View {
                     "Semaphore couldn't start", systemImage: "exclamationmark.octagon", description: Text(message))
             case .link:
                 LinkView(url: core.linkURL, error: core.lastError, retry: core.retryLink)
+            case .chats where core.conversations.isEmpty:
+                ContentUnavailableView(
+                    core.connection == .online ? "Connected — no messages yet" : "Connecting…",
+                    systemImage: "bubble.left.and.bubble.right",
+                    description: Text(
+                        core.lastError ?? "New messages appear here as they arrive. Older history isn't synced yet."))
             case .chats:
                 HSplitView {
                     List(core.conversations, id: \.id) { conversation in
