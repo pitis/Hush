@@ -46,7 +46,7 @@ pub fn recipient(conversation_id: &str) -> Option<Recipient> {
     Some(Recipient::Group(key.try_into().ok()?))
 }
 
-/// One queued send of a message already stored as `Pending`.
+/// A text message: queued as `Job::Text` once stored as `Pending`, and the content of an edit.
 pub struct SendJob {
     pub key: MessageKey,
     pub conversation_id: String,
@@ -57,17 +57,17 @@ pub struct SendJob {
 /// Everything the sender sends, in order.
 pub enum Job {
     Text(SendJob),
-    /// A reaction, edit or delete, sent at `at`. Applied here once it has gone out, exactly as our
-    /// phone applies the sync transcript of it.
+    /// A reaction, edit or delete (built by `reaction`, `edit` or `delete`), sent at `at`. Applied
+    /// here after sending, exactly as our phone applies the sync transcript of it.
     Mutation {
         conversation_id: String,
         body: Box<ContentBody>,
         at: u64,
     },
-    /// Read receipts to each sender and the read state to our phone. Already applied here.
-    Read {
-        targets: Vec<MessageKey>,
-    },
+    /// Send the unsent read receipts (`ProjectionDb::unsent_receipts`) and the read state to our
+    /// phone. Also done whenever the sender starts.
+    Receipts,
+    /// Started or Stopped; dropped if it waited `TYPING_IDLE` (since `queued`) before going out.
     Typing {
         conversation_id: String,
         started: bool,
@@ -286,6 +286,8 @@ pub async fn sender(
     if caught_up.wait_for(|ready| *ready).await.is_err() {
         return;
     }
+    // receipts left over from an earlier run or a failed send
+    send_receipts(&mut m, &db, l.as_ref()).await;
     loop {
         // the RefCell borrow is never held across the send itself
         let next = std::future::poll_fn(|cx| jobs.borrow_mut().poll_recv(cx)).await;
@@ -297,7 +299,7 @@ pub async fn sender(
                 body,
                 at,
             } => send_mutation(&mut m, &db, l.as_ref(), &conversation_id, *body, at).await,
-            Job::Read { targets } => send_read(&mut m, l.as_ref(), &targets).await,
+            Job::Receipts => send_receipts(&mut m, &db, l.as_ref()).await,
             Job::Typing {
                 conversation_id,
                 started,
@@ -355,7 +357,7 @@ async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, 
     });
 }
 
-/// Sends a reaction, edit or delete and, once it went out, applies it here.
+/// Sends a reaction, edit or delete, then applies it here.
 async fn send_mutation(
     m: &mut Manager<SqliteStore, Registered>,
     db: &ProjectionDb,
@@ -364,14 +366,29 @@ async fn send_mutation(
     body: ContentBody,
     at: u64,
 ) {
-    if let Err(e) = send_to(m, conversation_id, body.clone(), at).await {
-        l.on_event(CoreEvent::Error {
-            message: format!("a reaction, edit or delete in {conversation_id} wasn't sent: {e}"),
-        });
-        return;
-    }
+    let sent = send_to(m, conversation_id, body.clone(), at).await;
     let me = m.registration_data().service_ids.aci.to_string();
-    for op in own_ops(&me, conversation_id, body) {
+    record_mutation(db, l, &me, conversation_id, body, sent).await;
+}
+
+/// Applies our sent reaction, edit or delete here, even if sending reported an error: presage
+/// fails a group send when one member fails, after the others (and our phone) got it, and a send
+/// can fail after it went out (timeout, saving presage's copy). Showing it is closer to what
+/// everyone else sees than hiding it.
+async fn record_mutation(
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    me: &str,
+    conversation_id: &str,
+    body: ContentBody,
+    sent: Result<(), String>,
+) {
+    if let Err(e) = sent {
+        l.on_event(CoreEvent::Error {
+            message: format!("a reaction, edit or delete in {conversation_id} may not have reached everyone: {e}"),
+        });
+    }
+    for op in own_ops(me, conversation_id, body) {
         match db.apply(&op).await {
             Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
             Err(e) => l.on_event(CoreEvent::Error {
@@ -381,29 +398,51 @@ async fn send_mutation(
     }
 }
 
-/// Read receipts to each sender, then the read state to our phone.
-async fn send_read(m: &mut Manager<SqliteStore, Registered>, l: &dyn EventListener, targets: &[MessageKey]) {
+/// Sends the unsent read receipts, one per sender, then the read state to our phone. Receipts
+/// stay queued until both went out, to be sent again on the next try (a repeat is harmless).
+async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener) {
+    let targets = match db.unsent_receipts().await {
+        Ok(t) if t.is_empty() => return,
+        Ok(t) => t,
+        Err(e) => {
+            l.on_event(CoreEvent::Error {
+                message: format!("reading unsent read receipts failed: {e}"),
+            });
+            return;
+        }
+    };
     let at = now_ms();
+    let mut done = vec![];
     let mut failed = 0;
-    for (author, receipt) in read_receipts(targets) {
+    for (author, receipt) in read_receipts(&targets) {
         let sent = match Uuid::parse_str(&author) {
             Ok(u) => timed(Box::pin(m.send_message(Aci::from(u), receipt, at))).await,
             Err(e) => Err(e.to_string()),
         };
-        if let Err(e) = sent {
-            tracing::warn!(to = %author, error = %e, "read receipt not sent");
-            failed += 1;
+        match sent {
+            Ok(()) => done.extend(targets.iter().filter(|t| t.author == author).cloned()),
+            Err(e) => {
+                tracing::warn!(to = %author, error = %e, "read receipt not sent");
+                failed += 1;
+            }
         }
     }
     if failed > 0 {
         l.on_event(CoreEvent::Error {
-            message: format!("{failed} read receipts weren't sent"),
+            message: format!("read receipts to {failed} people weren't sent; they will be retried"),
         });
     }
+    // Sent to our own account; libsignal-service delivers a sync message to self twice (harmless).
     let me = m.registration_data().service_ids.aci();
-    if let Err(e) = timed(Box::pin(m.send_message(me, read_sync(targets), at))).await {
+    if let Err(e) = timed(Box::pin(m.send_message(me, read_sync(&targets), at))).await {
         l.on_event(CoreEvent::Error {
-            message: format!("couldn't tell your phone what you read: {e}"),
+            message: format!("couldn't tell your phone what you read; it will be retried: {e}"),
+        });
+        return;
+    }
+    if let Err(e) = db.receipts_sent(&done).await {
+        l.on_event(CoreEvent::Error {
+            message: format!("recording sent read receipts failed: {e}"),
         });
     }
 }
@@ -610,6 +649,45 @@ mod tests {
                 targets: targets.clone(),
                 status: MessageStatus::Read
             }]
+        );
+    }
+
+    struct Sink(std::sync::Mutex<Vec<CoreEvent>>);
+    impl EventListener for Sink {
+        fn on_event(&self, e: CoreEvent) {
+            self.0.lock().unwrap().push(e);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_that_may_not_have_reached_everyone_still_shows_here() {
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let conv = format!("c:{U}");
+        for t in [100, 101] {
+            db.insert_message(&mine(&conv, t)).await.unwrap();
+        }
+        let sink = Sink(Default::default());
+        record_mutation(&db, &sink, ME, &conv, delete(&conv, 100, 700).into(), Ok(())).await;
+        assert!(db.message(&key(ME, 100)).await.unwrap().unwrap().deleted);
+        assert!(!sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::Error { .. })));
+        let failed = Err("one member failed".to_string());
+        record_mutation(&db, &sink, ME, &conv, delete(&conv, 101, 701).into(), failed).await;
+        assert!(db.message(&key(ME, 101)).await.unwrap().unwrap().deleted);
+        let events = sink.0.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::Error { message } if message.contains("may not have reached everyone"))));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, CoreEvent::MessageChanged { .. }))
+                .count(),
+            2
         );
     }
 

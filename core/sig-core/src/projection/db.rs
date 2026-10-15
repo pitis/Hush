@@ -411,6 +411,43 @@ impl ProjectionDb {
             .collect())
     }
 
+    /// Remembers that read receipts for `targets` still have to go out.
+    pub async fn queue_receipts(&self, targets: &[MessageKey]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for t in targets {
+            sqlx::query("INSERT OR IGNORE INTO unsent_receipts VALUES (?1, ?2)")
+                .bind(&t.author)
+                .bind(t.sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Read receipts still to send, by sender then time.
+    pub async fn unsent_receipts(&self) -> Result<Vec<MessageKey>, sqlx::Error> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT author, sent_at FROM unsent_receipts ORDER BY author, sent_at")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(author, sent_at)| MessageKey { author, sent_at })
+            .collect())
+    }
+
+    pub async fn receipts_sent(&self, targets: &[MessageKey]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for t in targets {
+            sqlx::query("DELETE FROM unsent_receipts WHERE author = ?1 AND sent_at = ?2")
+                .bind(&t.author)
+                .bind(t.sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
     pub async fn message(&self, key: &MessageKey) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query("SELECT * FROM messages WHERE author = ?1 AND sent_at = ?2")
             .bind(&key.author)
@@ -1593,5 +1630,19 @@ mod tests {
         assert!(db.unread("c:alice").await.unwrap().is_empty());
         assert_eq!(conv(&db, "c:alice").await.unread_count, 0);
         assert_eq!(db.unread("c:carol").await.unwrap(), vec![k("carol", 6)]);
+    }
+
+    #[tokio::test]
+    async fn unsent_receipts_are_kept_until_marked_sent() {
+        let db = db().await;
+        assert!(db.unsent_receipts().await.unwrap().is_empty());
+        db.queue_receipts(&[k("bob", 3), k("alice", 1)]).await.unwrap();
+        db.queue_receipts(&[k("alice", 1), k("alice", 2)]).await.unwrap();
+        assert_eq!(
+            db.unsent_receipts().await.unwrap(),
+            vec![k("alice", 1), k("alice", 2), k("bob", 3)]
+        );
+        db.receipts_sent(&[k("alice", 1), k("bob", 3)]).await.unwrap();
+        assert_eq!(db.unsent_receipts().await.unwrap(), vec![k("alice", 2)]);
     }
 }

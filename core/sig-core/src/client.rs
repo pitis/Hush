@@ -130,8 +130,8 @@ impl Client {
     }
 
     /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
-    /// the chat). Call it on every change of the field; typing stops by itself after 10 s without
-    /// one.
+    /// the chat). Call it on every change of the field; typing stops by itself after `TYPING_IDLE`
+    /// (10 s) without one. Nothing is sent in Note to Self.
     pub fn set_typing(&self, conversation_id: String, started: bool) -> Result<(), CoreError> {
         if !self.is_linked() {
             return Err(CoreError::NotLinked);
@@ -140,6 +140,9 @@ impl Client {
             return Err(CoreError::InvalidInput {
                 message: format!("not a conversation: {conversation_id}"),
             });
+        }
+        if self.own_aci().is_some_and(|me| conversation_id == format!("c:{me}")) {
+            return Ok(());
         }
         self.send(Command::Typing {
             conversation_id,
@@ -276,21 +279,23 @@ impl Client {
     }
 
     /// Marks the conversation's unread messages read here at once, then sends read receipts to
-    /// their senders and tells our phone. Returns how many were unread.
+    /// their senders and tells our phone. The receipts are stored first and go out as soon as
+    /// sending runs (retried until sent). Returns how many were unread.
     pub async fn mark_read(&self, conversation_id: String) -> Result<u32, CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
         let targets = self.db.unread(&conversation_id).await?;
         if targets.is_empty() {
             return Ok(0);
         }
+        self.db.queue_receipts(&targets).await?;
         for op in send::own_ops(&me, &conversation_id, send::read_sync(&targets).into()) {
             for applied in self.db.apply(&op).await? {
                 self.listener.on_event(from_applied(applied));
             }
         }
-        let count = targets.len() as u32;
-        self.send(Command::Send(Job::Read { targets }))?;
-        Ok(count)
+        // if the core is closing, the stored receipts go out on the next start
+        let _ = self.send(Command::Send(Job::Receipts));
+        Ok(targets.len() as u32)
     }
 
     /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).
@@ -563,7 +568,7 @@ mod tests {
             let old = key(ME, now - 25 * 3600 * 1000);
             assert!(invalid(client.edit(old.clone(), "new".into()).await));
             assert!(invalid(client.delete_for_everyone(old).await));
-            assert!(invalid(client.edit(key(ME, 1), "new".into()).await));
+            assert!(invalid(client.edit(key(ME, now - 500), "new".into()).await));
             assert!(invalid(client.edit(key(ME, now - 1000), " ".into()).await));
             // own and recent: queued (shown once sent)
             client.edit(key(ME, now - 1000), "new".into()).await.unwrap();
@@ -620,6 +625,20 @@ mod tests {
             }
             assert_eq!(client.conversations().await.unwrap()[0].unread_count, 2);
             assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 2);
+            // stored until sent, so a quit or a failed send can't lose them
+            assert_eq!(
+                client.db.unsent_receipts().await.unwrap(),
+                vec![
+                    MessageKey {
+                        author: ALICE.into(),
+                        sent_at: 1
+                    },
+                    MessageKey {
+                        author: ALICE.into(),
+                        sent_at: 3
+                    }
+                ]
+            );
             assert_eq!(client.conversations().await.unwrap()[0].unread_count, 0);
             for t in [1, 3] {
                 let key = MessageKey {

@@ -355,7 +355,8 @@ async fn link(
 }
 
 /// Runs the sender and restarts it if it panics. Jobs queued meanwhile stay queued; the one in
-/// flight is lost, so every Pending row is marked Failed (retryable).
+/// flight is lost, so every Pending row is marked Failed (retryable). Unsent read receipts are
+/// stored and go out when the sender restarts; a lost reaction, edit or delete is not retried.
 async fn supervise_sender(
     m: Manager<SqliteStore, Registered>,
     db: ProjectionDb,
