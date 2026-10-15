@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-15-m1-daily-driver-design.md`
 
-**Plan 2** (features + real UI: sending, reactions/edits/deletes, attachments, timeline, composer, notifications, search, packaging) is written after this plan lands, against the real APIs discovered here. All M1 work is tracked as GitHub issues in `pitis/sigmac`.
+**Plan 2** (features + real UI: sending, reactions/edits/deletes, attachments, timeline, composer, notifications, search, packaging) is written after this plan lands, against the real APIs discovered here. All M1 work is tracked as GitHub issues in `pitis/semaphore`.
 
 ## Global Constraints
 
@@ -19,10 +19,10 @@
 - No `cdsi` feature (avoids BoringSSL/OpenSSL conflict).
 - Must replicate presage's `[patch.crates-io]` for `libsqlite3-sys` (whisperfish fork, rev `2a42b3354c9194700d08aa070f70a131a470e7dc`).
 - Never call presage from outside the actor thread.
-- DB key: 32 random bytes hex-encoded, stored in macOS Keychain (service `dev.pitis.sigmac`, account `db-key`); same key for presage store and projection DB.
-- Data dir: `~/Library/Application Support/SigMac/` (`presage.db`, `projection.db`, `attachments/`).
-- Device name shown on phone: `SigMac`.
-- No "Signal" branding in app name/icon. App name: SigMac. Bundle id `dev.pitis.sigmac`.
+- DB key: 32 random bytes hex-encoded, stored in macOS Keychain (service `dev.pitis.semaphore`, account `db-key`); same key for presage store and projection DB.
+- Data dir: `~/Library/Application Support/Semaphore/` (`presage.db`, `projection.db`, `attachments/`).
+- Device name shown on phone: `Semaphore`.
+- No "Signal" branding in app name/icon. App name: Semaphore. Bundle id `dev.pitis.semaphore`.
 - Conversation ids: `c:<aci-uuid>` for 1:1, `g:<hex master key>` for groups. Message identity = `(author_aci, sent_at_ms)`.
 
 ## Review Focus
@@ -42,7 +42,7 @@
 - Create: `core/Cargo.toml`, `core/sig-core/Cargo.toml`, `core/sig-core/src/lib.rs`
 - Create: `core/uniffi-bindgen/Cargo.toml`, `core/uniffi-bindgen/src/main.rs`
 - Create: `scripts/build-core.sh`
-- Create: `app/project.yml`, `app/SigMac/SigMacApp.swift`, `app/SigMac/ContentView.swift`
+- Create: `app/project.yml`, `app/Semaphore/SemaphoreApp.swift`, `app/Semaphore/ContentView.swift`
 
 **Interfaces:**
 - Produces: `sig_core::core_version() -> String` (UniFFI-exported → Swift `coreVersion()`); `app/Generated/SigCore.swift` + `app/Frameworks/SigCore.xcframework` produced by `scripts/build-core.sh`.
@@ -179,7 +179,7 @@ Expected: `app/Generated/sig_core.swift` exists and contains `func coreVersion()
 - [ ] **Step 8: XcodeGen project** `app/project.yml`:
 
 ```yaml
-name: SigMac
+name: Semaphore
 options:
   bundleIdPrefix: dev.pitis
   deploymentTarget: { macOS: "15.0" }
@@ -189,57 +189,57 @@ settings:
     ARCHS: arm64
     OTHER_LDFLAGS: ["-framework", "Security", "-framework", "SystemConfiguration"]
 targets:
-  SigMac:
+  Semaphore:
     type: application
     platform: macOS
-    sources: [SigMac, Generated]
+    sources: [Semaphore, Generated]
     dependencies:
       - framework: Frameworks/SigCore.xcframework
         embed: false
     info:
-      path: SigMac/Info.plist
+      path: Semaphore/Info.plist
       properties:
-        CFBundleDisplayName: SigMac
+        CFBundleDisplayName: Semaphore
         LSMinimumSystemVersion: "15.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.sigmac
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.semaphore
         CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: NO
-  SigMacTests:
+  SemaphoreTests:
     type: bundle.unit-test
     platform: macOS
-    sources: [SigMacTests]
-    dependencies: [{ target: SigMac }]
+    sources: [SemaphoreTests]
+    dependencies: [{ target: Semaphore }]
 ```
 
-`app/SigMac/SigMacApp.swift`:
+`app/Semaphore/SemaphoreApp.swift`:
 ```swift
 import SwiftUI
 
 @main
-struct SigMacApp: App {
+struct SemaphoreApp: App {
     var body: some Scene {
         WindowGroup { ContentView() }
     }
 }
 ```
 
-`app/SigMac/ContentView.swift`:
+`app/Semaphore/ContentView.swift`:
 ```swift
 import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        Text("SigMac — core \(coreVersion())").padding()
+        Text("Semaphore — core \(coreVersion())").padding()
     }
 }
 ```
 
-Create `app/SigMacTests/SmokeTests.swift`:
+Create `app/SemaphoreTests/SmokeTests.swift`:
 ```swift
 import XCTest
-@testable import SigMac
+@testable import Semaphore
 
 final class SmokeTests: XCTestCase {
     func testCoreVersionIsNotEmpty() {
@@ -250,7 +250,7 @@ final class SmokeTests: XCTestCase {
 
 - [ ] **Step 9: Build + test the app**
 
-Run: `cd app && xcodegen && xcodebuild -project SigMac.xcodeproj -scheme SigMac -destination 'platform=macOS,arch=arm64' test | tail -5`
+Run: `cd app && xcodegen && xcodebuild -project Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' test | tail -5`
 Expected: `** TEST SUCCEEDED **`. (Linker errors for missing system frameworks → add them to `OTHER_LDFLAGS`; the libsignal stack may need `-framework CoreFoundation`.)
 
 - [ ] **Step 10: justfile, .gitignore, README**
@@ -260,10 +260,10 @@ Expected: `** TEST SUCCEEDED **`. (Linker errors for missing system frameworks �
 core:
     ./scripts/build-core.sh debug
 app: core
-    cd app && xcodegen && xcodebuild -project SigMac.xcodeproj -scheme SigMac -configuration Debug -destination 'platform=macOS,arch=arm64' build
+    cd app && xcodegen && xcodebuild -project Semaphore.xcodeproj -scheme Semaphore -configuration Debug -destination 'platform=macOS,arch=arm64' build
 test:
     cd core && cargo test
-    cd app && xcodegen && xcodebuild -project SigMac.xcodeproj -scheme SigMac -destination 'platform=macOS,arch=arm64' test
+    cd app && xcodegen && xcodebuild -project Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' test
 ```
 
 `.gitignore`:
@@ -271,7 +271,7 @@ test:
 core/target/
 app/Generated/
 app/Frameworks/
-app/SigMac.xcodeproj/
+app/Semaphore.xcodeproj/
 DerivedData/
 .DS_Store
 ```
@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn fresh_dir_is_not_linked_and_queries_work() {
-        let dir = std::env::temp_dir().join(format!("sigmac-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("semaphore-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sink = Arc::new(Sink(Mutex::new(vec![])));
         let key = "ab".repeat(32);
@@ -1295,9 +1295,9 @@ Add `uniffi = { workspace = true, features = ["tokio"] }` in `sig-core/Cargo.tom
 ### Task 6: Spike UI — Keychain key, QR link screen, live event log (manual E2E with phone)
 
 **Files:**
-- Create: `app/SigMac/Keychain.swift`, `app/SigMac/CoreBridge.swift`, `app/SigMac/LinkView.swift`, `app/SigMac/QRCode.swift`
-- Modify: `app/SigMac/ContentView.swift`, `app/SigMac/SigMacApp.swift`
-- Test: `app/SigMacTests/KeychainTests.swift`
+- Create: `app/Semaphore/Keychain.swift`, `app/Semaphore/CoreBridge.swift`, `app/Semaphore/LinkView.swift`, `app/Semaphore/QRCode.swift`
+- Modify: `app/Semaphore/ContentView.swift`, `app/Semaphore/SemaphoreApp.swift`
+- Test: `app/SemaphoreTests/KeychainTests.swift`
 
 **Interfaces:**
 - Consumes: Swift `Client.open(dataDir:dbKeyHex:listener:)`, `isLinked()`, `link(deviceName:)`, `start()`, `conversations()`, protocol `EventListener`, enum `CoreEvent` (generated by Task 5).
@@ -1307,11 +1307,11 @@ Add `uniffi = { workspace = true, features = ["tokio"] }` in `sig-core/Cargo.tom
 
 ```swift
 import XCTest
-@testable import SigMac
+@testable import Semaphore
 
 final class KeychainTests: XCTestCase {
     func testKeyIsStableAnd64Hex() throws {
-        let k = Keychain(service: "dev.pitis.sigmac.tests", account: "db-key-\(UUID())")
+        let k = Keychain(service: "dev.pitis.semaphore.tests", account: "db-key-\(UUID())")
         defer { k.delete() }
         let a = try k.dbKey(), b = try k.dbKey()
         XCTAssertEqual(a, b)
@@ -1321,7 +1321,7 @@ final class KeychainTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** Run: `cd app && xcodegen && xcodebuild -project SigMac.xcodeproj -scheme SigMac -destination 'platform=macOS,arch=arm64' test 2>&1 | tail -5`
+- [ ] **Step 2: Run, expect FAIL.** Run: `cd app && xcodegen && xcodebuild -project Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' test 2>&1 | tail -5`
 
 - [ ] **Step 3: Implement `Keychain.swift`**
 
@@ -1330,7 +1330,7 @@ import Foundation
 import Security
 
 struct Keychain {
-    var service = "dev.pitis.sigmac"
+    var service = "dev.pitis.semaphore"
     var account = "db-key"
 
     func dbKey() throws -> String {
@@ -1401,11 +1401,11 @@ final class CoreBridge {
     func boot() {
         do {
             let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("SigMac", isDirectory: true)
+                .appendingPathComponent("Semaphore", isDirectory: true)
             let client = try Client.open(dataDir: dir.path, dbKeyHex: try Keychain().dbKey(), listener: Listener(bridge: self))
             self.client = client
             linked = client.isLinked()
-            if linked { client.start() } else { client.link(deviceName: "SigMac") }
+            if linked { client.start() } else { client.link(deviceName: "Semaphore") }
         } catch { log.append("boot failed: \(error)") }
     }
 
@@ -1439,7 +1439,7 @@ struct LinkView: View {
     let url: String?
     var body: some View {
         VStack(spacing: 16) {
-            Text("Link SigMac").font(.title2.bold())
+            Text("Link Semaphore").font(.title2.bold())
             Text("On your phone: Signal → Settings → Linked devices → Link new device")
                 .foregroundStyle(.secondary)
             if let url, let img = QRCode.image(for: url) {
@@ -1472,7 +1472,7 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 700, minHeight: 450)
-        .navigationTitle("SigMac — \(String(describing: core.connection))")
+        .navigationTitle("Semaphore — \(String(describing: core.connection))")
         .task { core.boot() }
     }
 }
@@ -1480,16 +1480,16 @@ struct ContentView: View {
 
 - [ ] **Step 6: Build + unit tests pass.** Run: `just test` → `TEST SUCCEEDED`.
 
-- [ ] **Step 7: Manual E2E (requires Pitis + phone).** Run: `just app && open app/build/Debug/SigMac.app` (or run from Xcode).
+- [ ] **Step 7: Manual E2E (requires Pitis + phone).** Run: `just app && open app/build/Debug/Semaphore.app` (or run from Xcode).
   Checklist:
   1. QR appears within ~5 s.
-  2. Scan with phone → phone shows "SigMac" in Linked devices; window switches to the split view; title shows `online`.
+  2. Scan with phone → phone shows "Semaphore" in Linked devices; window switches to the split view; title shows `online`.
   3. Contacts/groups appear with names within ~30 s (after `Contacts` event).
   4. Send a message to yourself/another device from someone → log line `msg c:… @…` appears, conversation jumps to top with preview + unread badge.
   5. Send from **your phone** to someone → appears in that person's conversation (outgoing).
   6. React/edit/delete from phone → `msg` log line for the target.
   7. Quit and relaunch → no QR, goes straight to online, previous conversations still listed.
-  8. Activity Monitor: note SigMac memory after 5 min idle (target < 100 MB).
+  8. Activity Monitor: note Semaphore memory after 5 min idle (target < 100 MB).
   Record results in the issue for this task.
 
 - [ ] **Step 8: Commit** — `git add -A && git commit -m "feat(app): QR linking, Keychain DB key and live event log spike"`
