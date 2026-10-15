@@ -17,6 +17,7 @@ use presage::libsignal_service::sender::AttachmentSpec;
 use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 use presage::manager::Registered;
 use presage::proto::{data_message, receipt_message, typing_message, AttachmentPointer};
+use presage::store::{ContentsStore, Thread};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::{mpsc, watch};
@@ -45,6 +46,14 @@ pub fn recipient(conversation_id: &str) -> Option<Recipient> {
     }
     let key = hex::decode(conversation_id.strip_prefix("g:")?).ok()?;
     Some(Recipient::Group(key.try_into().ok()?))
+}
+
+/// presage's thread for a conversation id: where it keeps the chat's messages and timer.
+pub fn thread(conversation_id: &str) -> Option<Thread> {
+    Some(match recipient(conversation_id)? {
+        Recipient::Direct(sid) => Thread::Contact(sid),
+        Recipient::Group(key) => Thread::Group(key),
+    })
 }
 
 /// A message: queued as `Job::Text` once stored as `Pending`, and the content of an edit.
@@ -355,6 +364,24 @@ pub async fn sender(
 }
 
 async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener, job: SendJob) {
+    // presage sends it with the chat's timer as it keeps it (by version, which we don't see):
+    // our copy disappears with the recipient's
+    if let Some(thread) = thread(&job.conversation_id) {
+        // unreadable: keep the timer the message was stored with (the chat's), not none
+        let timer = match m.store().expire_timer(&thread).await {
+            Ok(t) => Ok(t.map_or(0, |(t, _)| t)),
+            Err(e) => Err(format!("reading the chat's timer: {e}")),
+        };
+        let recorded = match timer {
+            Ok(timer) => db.set_message_timer(&job.key, timer).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = recorded {
+            l.on_event(CoreEvent::Error {
+                message: format!("recording a message's timer failed: {e}"),
+            });
+        }
+    }
     let result = match upload(m, db, &job.attachments).await {
         Ok(pointers) => {
             send_to(
@@ -698,6 +725,9 @@ mod tests {
                 sent_at: 5,
                 text: Some("q".into()),
             }),
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         }
     }
 
@@ -764,12 +794,10 @@ mod tests {
     #[test]
     fn own_read_applies_like_the_phone_reading() {
         let targets = vec![key(U, 100), key(ME, 1), key(U, 101)];
-        assert_eq!(
-            own_ops(ME, &format!("c:{U}"), read_sync(&targets).into()),
-            vec![Op::SetStatus {
-                targets: targets.clone(),
-                status: MessageStatus::Read
-            }]
+        let ops = own_ops(ME, &format!("c:{U}"), read_sync(&targets).into());
+        assert!(
+            matches!(&ops[..], [Op::Read { targets: t, .. }] if *t == targets),
+            "{ops:?}"
         );
     }
 

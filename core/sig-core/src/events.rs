@@ -25,6 +25,11 @@ pub enum CoreEvent {
         conversation_id: String,
         key: MessageKey,
     },
+    /// A disappearing message's timer ran out: it is gone, with its notifications.
+    MessageExpired {
+        conversation_id: String,
+        key: MessageKey,
+    },
     Typing {
         conversation_id: String,
         who: String,
@@ -87,6 +92,7 @@ pub fn from_applied(a: Applied) -> CoreEvent {
             message,
             id,
         },
+        Applied::ChatEvent { conversation_id } => CoreEvent::ChatEventAdded { conversation_id },
     }
 }
 
@@ -95,7 +101,7 @@ pub fn from_applied(a: Applied) -> CoreEvent {
 pub fn alert(op: &Op, applied: &[Applied], me: &str) -> Option<CoreEvent> {
     let conversation_id = applied.iter().find_map(|a| match a {
         Applied::MessageChanged { conversation_id, .. } => Some(conversation_id.clone()),
-        Applied::Typing { .. } | Applied::AttachmentChanged { .. } => None,
+        Applied::Typing { .. } | Applied::AttachmentChanged { .. } | Applied::ChatEvent { .. } => None,
     })?;
     match op {
         Op::InsertMessage(m) if !m.is_outgoing && m.author != me => Some(CoreEvent::NewMessage {
@@ -148,6 +154,9 @@ mod tests {
             edited: false,
             deleted: false,
             quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         })
     }
 

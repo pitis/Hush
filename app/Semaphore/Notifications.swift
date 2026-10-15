@@ -43,6 +43,16 @@ enum Notifications {
     static let replyAction = "reply"
     static let markReadAction = "mark-read"
 
+    /// The id of a notification about a message: the message itself (`reactor` nil) or a reaction
+    /// to it. All of a message's notifications share `idPrefix`, to remove them together.
+    static func id(_ conversationId: String, _ key: MessageKey, reactor: String?, emoji: String?) -> String {
+        idPrefix(conversationId, key) + (reactor.map { "\($0)|\(emoji ?? "")" } ?? "")
+    }
+
+    static func idPrefix(_ conversationId: String, _ key: MessageKey) -> String {
+        "\(conversationId)|\(key.author)|\(key.sentAt)|"
+    }
+
     /// The notification for a message (or a reaction to ours, `reaction` = its emoji) worded like
     /// Signal Desktop's, or nil when notifications are off.
     static func request(
@@ -80,6 +90,9 @@ protocol Notifier: AnyObject {
     func post(_ request: NotificationRequest)
     func remove(conversationId: String)
     func remove(ids: [String])
+    /// Removes the delivered notifications whose ids start with `idPrefix`, including ones shown
+    /// before the app last started.
+    func remove(idPrefix: String)
     func removeAll()
 }
 
@@ -129,6 +142,13 @@ final class SystemNotifier: Notifier {
     }
 
     func remove(ids: [String]) { center.removeDeliveredNotifications(withIdentifiers: ids) }
+
+    func remove(idPrefix: String) {
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.map(\.request.identifier).filter { $0.hasPrefix(idPrefix) }
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ids)
+        }
+    }
 
     func removeAll() { center.removeAllDeliveredNotifications() }
 }

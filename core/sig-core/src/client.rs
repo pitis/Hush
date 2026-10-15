@@ -10,8 +10,8 @@ use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
-    Attachment, ChatEvent, Conversation, LinkPreview, Message, MessageKey, MessageStatus, OutgoingFile, ProjectionDb,
-    Quote, Reaction, SearchHit,
+    Attachment, ChatEvent, Conversation, LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile,
+    ProjectionDb, Quote, Reaction, SearchHit,
 };
 use crate::send::{self, Job, SendJob};
 
@@ -210,6 +210,8 @@ impl Client {
             });
         }
         let author = self.own_aci().ok_or(CoreError::NotLinked)?;
+        // the chat's timer; ours start disappearing when sent
+        let expires_in = self.db.expire_timer(&conversation_id).await?;
         let mut message = Message {
             conversation_id: conversation_id.clone(),
             author,
@@ -221,11 +223,15 @@ impl Client {
             edited: false,
             deleted: false,
             quote: quote.clone(),
+            kind: MessageKind::Normal,
+            expires_in,
+            expires_at: None,
         };
         // (author, sent_at) is the identity: on a collision (a phone-sent message in the same ms,
         // a clock that went back) take the next timestamp rather than dropping the message.
         for _ in 0..1000 {
             message.received_at = message.sent_at;
+            message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
             if self.db.insert_message(&message).await? {
                 break;
             }
@@ -304,6 +310,8 @@ impl Client {
             return Err(invalid(format!("not a conversation: {conversation_id}")));
         }
         let author = self.own_aci().ok_or(CoreError::NotLinked)?;
+        // the chat's timer; ours start disappearing when sent
+        let expires_in = self.db.expire_timer(&conversation_id).await?;
         let body = caption.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
         let mut message = Message {
             conversation_id: conversation_id.clone(),
@@ -316,10 +324,14 @@ impl Client {
             edited: false,
             deleted: false,
             quote: quote.clone(),
+            kind: MessageKind::Normal,
+            expires_in,
+            expires_at: None,
         };
         // as in send_text: a timestamp collision takes the next one
         for _ in 0..1000 {
             message.received_at = message.sent_at;
+            message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
             if self.db.insert_outgoing(&message, &files).await? {
                 break;
             }
@@ -689,6 +701,9 @@ mod tests {
             edited: false,
             deleted: false,
             quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         }
     }
 
@@ -993,6 +1008,27 @@ mod tests {
         rt.block_on(async {
             client.unlink(false).await.unwrap();
             assert!(client.chat_events(format!("c:{ALICE}"), 0).await.is_err());
+        });
+    }
+
+    #[test]
+    fn our_messages_take_the_chats_timer_and_start_it_at_once() {
+        let (_dir, _sink, client, rt) = as_me("client-timer");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            client
+                .db
+                .apply(&crate::projection::Op::SetTimer {
+                    conversation_id: conv.clone(),
+                    author: ALICE.into(),
+                    seconds: 60,
+                    at: 1,
+                })
+                .await
+                .unwrap();
+            let key = client.send_text(conv, "brb".into(), None).await.unwrap();
+            let m = client.message(key.clone()).await.unwrap().unwrap();
+            assert_eq!((m.expires_in, m.expires_at), (60, Some(key.sent_at + 60_000)));
         });
     }
 }

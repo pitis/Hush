@@ -236,6 +236,16 @@ final class AppStore {
                 reloadMessages()
             }
             if notifiedMessages[key] != nil { Task { await removeIfDeleted(key) } }
+        case .messageExpired(let conversationId, let key):
+            // its disappearing timer ran out: nothing of it may stay on screen
+            append("expired \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
+            refreshConversations()
+            if conversationId == selectedId {
+                messages.removeAll { $0.author == key.author && $0.sentAt == key.sentAt }
+            }
+            searchResults.removeAll { $0.message.author == key.author && $0.message.sentAt == key.sentAt }
+            notifiedMessages[key] = nil
+            notifier?.remove(idPrefix: Notifications.idPrefix(conversationId, key))
         case .newMessage(let conversationId, let key):
             Task { await notify(conversationId, about: key, reaction: nil) }
         case .attachmentChanged(let conversationId, let message, _):
@@ -481,7 +491,7 @@ final class AppStore {
         do {
             guard let m = try await client.message(key: key), !m.deleted else { return }
             // a message with files reads "📷 Photo" (or "📷 caption"), as in Desktop
-            var text = m.body
+            var text = Placeholder.text(m.kind) ?? m.body
             do {
                 if let first = try await client.attachments(key: key).first {
                     text = Files.describe(Files.summary(first), body: m.body)
@@ -494,7 +504,7 @@ final class AppStore {
             guard
                 let request = Notifications.request(
                     setting: setting, conversationId: conversationId,
-                    id: "\(conversationId)|\(author)|\(key.sentAt)|\(reaction?.emoji ?? "")",
+                    id: Notifications.id(conversationId, key, reactor: reaction?.reactor, emoji: reaction?.emoji),
                     sender: senderName(author), groupTitle: groupTitle, text: text, reaction: reaction?.emoji)
             else { return }
             notifier.post(request)
@@ -832,11 +842,12 @@ final class AppStore {
                     // older loaded messages that changed are fetched one by one
                     let pageKeys = Set(page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
                     for key in changed.subtracting(pageKeys) {
-                        if let fresh = try await client.message(key: key), generation == selectionGeneration,
+                        let fresh = try await client.message(key: key)
+                        guard generation == selectionGeneration,
                             let i = messages.firstIndex(where: { $0.author == key.author && $0.sentAt == key.sentAt })
-                        {
-                            messages[i] = fresh
-                        }
+                        else { continue }
+                        // gone: its disappearing timer ran out
+                        if let fresh { messages[i] = fresh } else { messages.remove(at: i) }
                     }
                     // details only for messages that are new or changed
                     let needDetails = messages.filter { m in

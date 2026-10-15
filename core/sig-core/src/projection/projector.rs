@@ -36,6 +36,12 @@ pub enum Op {
         targets: Vec<MessageKey>,
         status: MessageStatus,
     },
+    /// We read the targets, on another device (or here) at `at` (ms): their disappearing timers
+    /// start then.
+    Read {
+        targets: Vec<MessageKey>,
+        at: i64,
+    },
     Typing {
         conversation_id: String,
         who: String,
@@ -46,6 +52,13 @@ pub enum Op {
         message: MessageKey,
         attachments: Vec<NewAttachment>,
         preview: Option<NewPreview>,
+    },
+    /// `author` set the chat's disappearing-message timer (seconds, 0: off) at `at`.
+    SetTimer {
+        conversation_id: String,
+        author: String,
+        seconds: u32,
+        at: i64,
     },
     /// Privacy settings from our phone; `None` leaves a setting as it is.
     Settings {
@@ -103,9 +116,9 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
                 })
                 .collect();
             if !read.is_empty() {
-                ops.push(Op::SetStatus {
+                ops.push(Op::Read {
                     targets: read,
-                    status: MessageStatus::Read,
+                    at: received_at,
                 });
             }
             ops
@@ -222,9 +235,34 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
             })
             .unwrap_or_default();
     }
-    if dm.body.is_none() && dm.attachments.is_empty() {
+    if dm.flags.unwrap_or(0) & presage::proto::data_message::Flags::ExpirationTimerUpdate as u32 != 0 {
+        return vec![Op::SetTimer {
+            conversation_id: conv.to_string(),
+            author: author.to_string(),
+            seconds: dm.expire_timer.unwrap_or(0),
+            at: sent_at,
+        }];
+    }
+    // what we can't show yet becomes a placeholder rather than vanishing
+    let kind = if let Some(s) = &dm.sticker {
+        MessageKind::Sticker { emoji: s.emoji.clone() }
+    } else if let Some(c) = dm.contact.first() {
+        MessageKind::Contact { name: contact_name(c) }
+    } else if dm.payment.is_some() {
+        MessageKind::Payment
+    } else if let Some(p) = &dm.poll_create {
+        MessageKind::Poll {
+            question: p.question.clone(),
+        }
+    } else if dm.gift_badge.is_some() {
+        MessageKind::GiftBadge
+    } else {
+        MessageKind::Normal
+    };
+    if dm.body.is_none() && dm.attachments.is_empty() && kind == MessageKind::Normal {
         return vec![];
     }
+    let expires_in = dm.expire_timer.unwrap_or(0);
     let quote = dm.quote.as_ref().and_then(|q| {
         Some(Quote {
             author: aci(q.author_aci.as_deref(), q.author_aci_binary.as_deref())?,
@@ -247,6 +285,10 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         edited: false,
         deleted: false,
         quote,
+        kind,
+        expires_in,
+        // ours start disappearing when sent; others' once read
+        expires_at: (outgoing && expires_in > 0).then(|| sent_at + i64::from(expires_in) * 1000),
     };
     let attachments: Vec<_> = dm.attachments.iter().map(new_attachment).collect();
     let preview = dm.preview.first().and_then(|p| {
@@ -267,6 +309,25 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     }
     ops.insert(0, Op::InsertMessage(message));
     ops
+}
+
+/// A shared contact's name as it reads: the nickname, else given and family name, else the
+/// organization.
+fn contact_name(c: &presage::proto::data_message::Contact) -> Option<String> {
+    let name = c.name.as_ref();
+    let full = name
+        .map(|n| {
+            [n.given_name.as_deref(), n.family_name.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty());
+    name.and_then(|n| n.nickname.clone())
+        .filter(|s| !s.is_empty())
+        .or(full)
+        .or_else(|| c.organization.clone())
 }
 
 fn new_attachment(p: &AttachmentPointer) -> NewAttachment {
@@ -553,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    /// (Timer changes and stickers aren't skipped any more: see the placeholder and timer tests.)
     fn content_without_visible_text_or_attachments_is_skipped() {
         let reaction = DataMessage {
             timestamp: Some(502),
@@ -570,18 +632,6 @@ mod tests {
             KEY.to_vec(),
         );
         group_update.group_v2.as_mut().unwrap().group_change = Some(vec![1]);
-        let timer = DataMessage {
-            timestamp: Some(505),
-            flags: Some(2),
-            expire_timer: Some(60),
-            ..Default::default()
-        };
-        // pinned M1 behaviour until decided: stickers have no body or attachments and are skipped
-        let sticker = DataMessage {
-            timestamp: Some(506),
-            sticker: Some(Default::default()),
-            ..Default::default()
-        };
         let skipped = [
             ContentBody::NullMessage(NullMessage::default()),
             ContentBody::DataMessage(DataMessage {
@@ -594,8 +644,6 @@ mod tests {
             }),
             ContentBody::DataMessage(reaction),
             ContentBody::DataMessage(group_update),
-            ContentBody::DataMessage(timer),
-            ContentBody::DataMessage(sticker),
             ContentBody::SynchronizeMessage(SyncMessage::default()),
             sync(sync_message::Sent {
                 destination_service_id: Some(ALICE.into()),
@@ -811,10 +859,11 @@ mod tests {
         let ops = project(&content(ME, 950, ContentBody::SynchronizeMessage(sm.clone())), ME);
         assert_eq!(
             ops,
-            vec![Op::SetStatus {
+            vec![Op::Read {
                 targets: vec![key(ALICE, 100), key(BOB, 101)],
-                status: MessageStatus::Read
-            }]
+                at: 950,
+            }],
+            "read when the phone said so (disappearing timers start then)"
         );
         // only our own devices may tell us what we read
         assert!(project(&content(ALICE, 951, ContentBody::SynchronizeMessage(sm)), ME).is_empty());
@@ -1036,5 +1085,103 @@ mod tests {
         let mut dm = text(101, "hi");
         dm.preview = vec![Preview::default()];
         assert_eq!(project(&content(ALICE, 151, ContentBody::DataMessage(dm)), ME).len(), 1);
+    }
+
+    fn placeholder(dm: DataMessage) -> MessageKind {
+        let ops = project(&content(ALICE, 150, ContentBody::DataMessage(dm)), ME);
+        match ops.as_slice() {
+            [Op::InsertMessage(m)] => m.kind.clone(),
+            _ => panic!("{ops:?}"),
+        }
+    }
+
+    #[test]
+    fn what_we_cant_show_yet_becomes_a_placeholder_not_nothing() {
+        let base = || DataMessage {
+            timestamp: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            placeholder(DataMessage {
+                sticker: Some(data_message::Sticker {
+                    emoji: Some("🙂".into()),
+                    ..Default::default()
+                }),
+                ..base()
+            }),
+            MessageKind::Sticker {
+                emoji: Some("🙂".into())
+            }
+        );
+        let contact = data_message::Contact {
+            name: Some(data_message::contact::Name {
+                given_name: Some("Ada".into()),
+                family_name: Some("Lovelace".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            placeholder(DataMessage {
+                contact: vec![contact],
+                ..base()
+            }),
+            MessageKind::Contact {
+                name: Some("Ada Lovelace".into())
+            }
+        );
+        assert_eq!(
+            placeholder(DataMessage {
+                payment: Some(Default::default()),
+                ..base()
+            }),
+            MessageKind::Payment
+        );
+        assert_eq!(
+            placeholder(DataMessage {
+                poll_create: Some(data_message::PollCreate {
+                    question: Some("Pizza?".into()),
+                    ..Default::default()
+                }),
+                ..base()
+            }),
+            MessageKind::Poll {
+                question: Some("Pizza?".into())
+            }
+        );
+        assert_eq!(
+            placeholder(DataMessage {
+                gift_badge: Some(Default::default()),
+                ..base()
+            }),
+            MessageKind::GiftBadge
+        );
+        // text stays normal
+        assert_eq!(placeholder(text(100, "hi")), MessageKind::Normal);
+    }
+
+    #[test]
+    fn disappearing_timers_come_with_messages_and_timer_changes() {
+        let mut dm = text(100, "secret");
+        dm.expire_timer = Some(3600);
+        let m = one(project(&content(ALICE, 150, ContentBody::DataMessage(dm.clone())), ME));
+        assert_eq!((m.expires_in, m.expires_at), (3600, None), "theirs start when read");
+        let mine = one(project(&content(ME, 150, sent_sync(ALICE, dm)), ME));
+        assert_eq!(mine.expires_at, Some(100 + 3_600_000), "ours start when sent");
+        let update = DataMessage {
+            timestamp: Some(200),
+            flags: Some(data_message::Flags::ExpirationTimerUpdate as u32),
+            expire_timer: Some(604_800),
+            ..Default::default()
+        };
+        assert_eq!(
+            project(&content(ALICE, 250, ContentBody::DataMessage(update)), ME),
+            vec![Op::SetTimer {
+                conversation_id: format!("c:{ALICE}"),
+                author: ALICE.into(),
+                seconds: 604_800,
+                at: 200
+            }]
+        );
     }
 }

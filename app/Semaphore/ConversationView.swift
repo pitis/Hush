@@ -51,6 +51,12 @@ struct ConversationHeader: View {
             Avatar(id: conversation.id, name: title, size: 36)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                if conversation.expireTimer > 0 {
+                    Label(Placeholder.duration(Int64(conversation.expireTimer)), systemImage: "hourglass")
+                        .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+                        .accessibilityLabel(
+                            "Disappearing messages: \(Placeholder.duration(Int64(conversation.expireTimer)))")
+                }
                 if store.isTyping(conversation.id) {
                     Text("typing…").font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
                 } else if store.connection != .online {
@@ -87,7 +93,7 @@ struct TimelineList: View {
                                 .padding(.vertical, 10)
                         case .event(let e):
                             ChatEventRow(
-                                event: e, name: store.senderName(e.author),
+                                event: e, name: store.senderName(e.author), me: store.ownAci,
                                 reset: { store.resetSession(e.conversationId) })
                         case .message(let m, let first, let last):
                             let key = MessageKey(author: m.author, sentAt: m.sentAt)
@@ -330,6 +336,9 @@ struct MessageRow: View {
                 Group {
                     if message.deleted {
                         Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
+                    } else if let placeholder = Placeholder.text(message.kind) {
+                        // something we can't show yet (sticker, contact, payment, poll, gift badge)
+                        Text(placeholder).italic()
                     } else if let body = message.body, !body.isEmpty {
                         Text(body).textSelection(.enabled)
                     } else if files.isEmpty {
@@ -353,6 +362,9 @@ struct MessageRow: View {
     private var meta: some View {
         HStack(spacing: 3) {
             if message.edited && !message.deleted { Text("edited") }
+            if message.expiresIn > 0 {
+                Image(systemName: "hourglass").accessibilityLabel("Disappears")
+            }
             Text(Formatting().bubbleTime(message.sentAt))
             if outgoing {
                 tick.accessibilityLabel(Timeline.accessibilityLabel(for: Timeline.tick(for: message.status)))
@@ -442,6 +454,8 @@ struct TickIcon: View {
 struct ChatEventRow: View {
     let event: ChatEvent
     let name: String
+    /// Our ACI, to word our own changes ("You set…").
+    var me: String?
     let reset: () -> Void
 
     var body: some View {
@@ -455,6 +469,12 @@ struct ChatEventRow: View {
                 if event.conversationId.hasPrefix("c:") && !event.conversationId.hasPrefix("c:PNI:") {
                     Button("Reset Secure Session", action: reset).controlSize(.small)
                 }
+            case .timerChanged:
+                Label(
+                    Placeholder.timerChange(event, who: event.author == me ? nil : name), systemImage: "hourglass"
+                )
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondaryText)
             case .sessionReset:
                 Label("You reset the secure session with \(name)", systemImage: "lock.rotation")
                     .font(.system(size: 12))

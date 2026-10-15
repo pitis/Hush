@@ -45,8 +45,8 @@ Legend: ✅ built (the PR that did it) · ◐ partly · ✗ not in M1 (where it 
 | Edit (menu, ↑ in an empty composer) and delete for everyone, in and out | ✅ #25, #33, #43 | Edit and delete; the phone shows "edited" / deleted |
 | Delete for me | ✗ (owner's decision, #43) | Desktop syncs it to your devices |
 | Day separators, grouping, "edited", deleted | ✅ #31 | |
-| Stickers, shared contacts, payments, polls | ✗ (#24, needs decision) | They don't show at all |
-| Disappearing messages | ✗ (#24, needs decision) | Timer is ignored |
+| Stickers, shared contacts, payments, polls, gift badges | ◐ #24 | Placeholder rows ("🙂 Sticker message", "📊 Poll: …"), counted as unread; the content itself is M4 |
+| Disappearing messages | ✅ #24 | Set a timer on the phone: the header shows it, messages go when it runs out (incoming: after being read) |
 | View-once media, stories | ✗ M4 (#20) | |
 
 ## Attachments

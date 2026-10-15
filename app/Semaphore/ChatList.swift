@@ -21,7 +21,9 @@ enum ChatList {
         let author = c.lastMessageOutgoing ? "You" : authorName
         if c.lastMessageDeleted { return .message("\(author) deleted this message", tick: nil) }
         let text =
-            if let file = c.lastMessageFile {
+            if let placeholder = Placeholder.text(c.lastMessageKind) {
+                placeholder
+            } else if let file = c.lastMessageFile {
                 oneLine(Files.describe(file, body: c.lastMessagePreview))
             } else {
                 c.lastMessagePreview.isEmpty ? "Attachment" : oneLine(c.lastMessagePreview)

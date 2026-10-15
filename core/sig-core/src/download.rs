@@ -190,6 +190,9 @@ mod tests {
             edited: false,
             deleted: false,
             quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -256,6 +259,9 @@ mod tests {
             edited: false,
             deleted: false,
             quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
         })
         .await
         .unwrap();
