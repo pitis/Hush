@@ -1,6 +1,15 @@
 uniffi::setup_scaffolding!();
 
+mod actor;
+mod client;
+mod error;
+mod events;
+mod logging;
 pub mod projection;
+
+pub use client::Client;
+pub use error::CoreError;
+pub use events::{ConnectionState, CoreEvent, EventListener};
 
 /// Version of the Rust core, shown in the app's About panel.
 #[uniffi::export]

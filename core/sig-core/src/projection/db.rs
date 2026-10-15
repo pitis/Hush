@@ -117,11 +117,13 @@ impl ProjectionDb {
         Ok(inserted)
     }
 
-    /// All conversations, most recent first.
+    /// Conversations that have messages, most recent first. Contacts known only by name (synced
+    /// from the phone) aren't listed until a message arrives.
     pub async fn conversations(&self) -> Result<Vec<Conversation>, sqlx::Error> {
-        let rows = sqlx::query("SELECT * FROM conversations ORDER BY last_message_at DESC, id")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT * FROM conversations WHERE last_message_at > 0 ORDER BY last_message_at DESC, id")
+                .fetch_all(&self.pool)
+                .await?;
         rows.iter().map(row_to_conversation).collect()
     }
 
@@ -801,7 +803,8 @@ mod tests {
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
         let ids: Vec<_> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
-        assert_eq!(ids, vec!["c:bob", "c:alice", "c:carol"]);
+        // carol has a name but no messages: not listed
+        assert_eq!(ids, vec!["c:bob", "c:alice"]);
     }
 
     #[tokio::test]
@@ -816,6 +819,7 @@ mod tests {
     async fn titles_update_but_empty_never_overwrites() {
         let db = db().await;
         alice(&db).await;
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
         db.upsert_conversation_title("c:alice", "Alice Smith").await.unwrap();
         db.upsert_conversation_title("c:alice", "").await.unwrap();
         assert_eq!(conv(&db, "c:alice").await.title, "Alice Smith");
@@ -910,7 +914,7 @@ mod tests {
         let key = "ab".repeat(32);
         {
             let db = ProjectionDb::open(&f.url(), Some(&key)).await.unwrap();
-            alice(&db).await;
+            db.insert_message(&msg("alice", 1, "kept")).await.unwrap();
         }
         assert!(!std::fs::read(&f.0).unwrap().starts_with(b"SQLite format 3\0"));
         let db = ProjectionDb::open(&f.url(), Some(&key)).await.unwrap();
