@@ -394,6 +394,23 @@ impl ProjectionDb {
         Ok(t)
     }
 
+    /// The incoming messages of a conversation that count as unread (as in `unread_count`), oldest
+    /// first.
+    pub async fn unread(&self, conversation_id: &str) -> Result<Vec<MessageKey>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT author, sent_at FROM messages WHERE conversation_id = ?1
+               AND is_outgoing = 0 AND deleted = 0 AND status < ?2 ORDER BY sent_at, author",
+        )
+        .bind(conversation_id)
+        .bind(MessageStatus::Read.to_i64())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(author, sent_at)| MessageKey { author, sent_at })
+            .collect())
+    }
+
     pub async fn message(&self, key: &MessageKey) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query("SELECT * FROM messages WHERE author = ?1 AND sent_at = ?2")
             .bind(&key.author)
@@ -1538,5 +1555,43 @@ mod tests {
             db.message(&k("me", 1)).await.unwrap().unwrap().status,
             MessageStatus::Delivered
         );
+    }
+
+    #[tokio::test]
+    async fn unread_lists_what_counts_as_unread_and_marking_it_read_clears_the_badge() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "old")).await.unwrap();
+        db.insert_message(&msg("alice", 2, "read on phone")).await.unwrap();
+        db.insert_message(&msg("bob", 3, "new")).await.unwrap();
+        db.insert_message(&msg("alice", 4, "gone")).await.unwrap();
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Sent,
+            ..msg("me", 5, "mine")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&in_conv("c:carol", msg("carol", 6, "elsewhere")))
+            .await
+            .unwrap();
+        db.apply(&Op::SetStatus {
+            targets: vec![k("alice", 2)],
+            status: MessageStatus::Read,
+        })
+        .await
+        .unwrap();
+        db.apply(&Op::Delete { target: k("alice", 4) }).await.unwrap();
+        let unread = db.unread("c:alice").await.unwrap();
+        assert_eq!(unread, vec![k("alice", 1), k("bob", 3)]);
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 2);
+        db.apply(&Op::SetStatus {
+            targets: unread,
+            status: MessageStatus::Read,
+        })
+        .await
+        .unwrap();
+        assert!(db.unread("c:alice").await.unwrap().is_empty());
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 0);
+        assert_eq!(db.unread("c:carol").await.unwrap(), vec![k("carol", 6)]);
     }
 }

@@ -2,7 +2,7 @@
 //! here: one OS thread with a current-thread tokio runtime and a `LocalSet`. The rest of the core
 //! talks to it through `Command`s; results flow back as `CoreEvent`s.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -29,7 +29,8 @@ use crate::error::CoreError;
 use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, ProjectionDb};
-use crate::send::{sender, Jobs, SendJob};
+use crate::send::{sender, Job, Jobs};
+use crate::typing::{Typing, TYPING_IDLE};
 
 /// libsignal's post-quantum crypto (libcrux ML-KEM key generation, also run by presage's pre-key
 /// refresh while receiving, and session decryption) uses very large stack frames in debug builds;
@@ -49,9 +50,16 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(300);
 const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 pub enum Command {
-    Link { device_name: String },
+    Link {
+        device_name: String,
+    },
     Start,
-    Send(SendJob),
+    Send(Job),
+    /// The user is typing in a conversation (`started`), or stopped.
+    Typing {
+        conversation_id: String,
+        started: bool,
+    },
 }
 
 pub struct Handles {
@@ -182,8 +190,9 @@ async fn run(
         set_aci(m);
     }
     // Sends queue here until receiving starts and the server queue is drained.
-    let (send_tx, send_rx) = mpsc::unbounded_channel::<SendJob>();
-    let jobs: Jobs = Rc::new(std::cell::RefCell::new(send_rx));
+    let (send_tx, send_rx) = mpsc::unbounded_channel::<Job>();
+    let jobs: Jobs = Rc::new(RefCell::new(send_rx));
+    let typing = Rc::new(RefCell::new(Typing::default()));
     let mut sending = false;
     // Sends queued by a previous run died with it.
     match projection.fail_all_pending().await {
@@ -268,13 +277,48 @@ async fn run(
             },
             Command::Send(job) => {
                 if let Err(mpsc::error::SendError(job)) = send_tx.send(job) {
-                    let _ = projection.set_failed(&job.key).await;
                     listener.on_event(CoreEvent::Error {
                         message: "the sender stopped".into(),
                     });
-                    listener.on_event(CoreEvent::MessageChanged {
-                        conversation_id: job.conversation_id,
-                        key: job.key,
+                    if let Job::Text(job) = job {
+                        let _ = projection.set_failed(&job.key).await;
+                        listener.on_event(CoreEvent::MessageChanged {
+                            conversation_id: job.conversation_id,
+                            key: job.key,
+                        });
+                    }
+                }
+            }
+            Command::Typing {
+                conversation_id,
+                started,
+            } => {
+                let now = std::time::Instant::now();
+                let send = if started {
+                    typing.borrow_mut().started(&conversation_id, now)
+                } else {
+                    typing.borrow_mut().stopped(&conversation_id)
+                };
+                if send {
+                    let _ = send_tx.send(Job::Typing {
+                        conversation_id,
+                        started,
+                        queued: now,
+                    });
+                }
+                if started {
+                    // typing stops on its own once no keystroke came for TYPING_IDLE
+                    let (typing, send_tx) = (typing.clone(), send_tx.clone());
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(TYPING_IDLE).await;
+                        let now = std::time::Instant::now();
+                        for conversation_id in typing.borrow_mut().expire(now) {
+                            let _ = send_tx.send(Job::Typing {
+                                conversation_id,
+                                started: false,
+                                queued: now,
+                            });
+                        }
                     });
                 }
             }
