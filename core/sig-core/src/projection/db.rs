@@ -4,6 +4,21 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoo
 use sqlx::{ConnectOptions, Row};
 
 use super::model::*;
+use super::projector::Op;
+
+/// What applying an `Op` changed, for the UI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Applied {
+    MessageChanged {
+        conversation_id: String,
+        key: MessageKey,
+    },
+    Typing {
+        conversation_id: String,
+        who: String,
+        started: bool,
+    },
+}
 
 /// Encrypted SQLite store the UI reads from. Separate from presage's database because both use
 /// `sqlx::migrate!`, which would collide on `_sqlx_migrations`.
@@ -162,6 +177,178 @@ impl ProjectionDb {
         .await?;
         rows.iter().map(row_to_message).collect()
     }
+    /// Applies one projection op atomically. Ops whose target message isn't stored (yet) change
+    /// nothing visible; reactions are kept anyway so they show once the message arrives.
+    pub async fn apply(&self, op: &Op) -> Result<Vec<Applied>, sqlx::Error> {
+        let changed = |m: Option<(String, MessageKey)>| {
+            m.map(|(conversation_id, key)| Applied::MessageChanged { conversation_id, key })
+                .into_iter()
+                .collect()
+        };
+        match op {
+            Op::InsertMessage(m) => Ok(if self.insert_message(m).await? {
+                vec![Applied::MessageChanged {
+                    conversation_id: m.conversation_id.clone(),
+                    key: m.key(),
+                }]
+            } else {
+                vec![]
+            }),
+            Op::Typing {
+                conversation_id,
+                who,
+                started,
+            } => Ok(vec![Applied::Typing {
+                conversation_id: conversation_id.clone(),
+                who: who.clone(),
+                started: *started,
+            }]),
+            Op::React { target, reactor, emoji } => {
+                let mut tx = self.pool.begin().await?;
+                match emoji {
+                    Some(e) => sqlx::query(
+                        "INSERT INTO reactions(target_author, target_sent_at, reactor, emoji) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT DO UPDATE SET emoji = excluded.emoji",
+                    )
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .bind(reactor)
+                    .bind(e),
+                    None => sqlx::query(
+                        "DELETE FROM reactions WHERE target_author = ?1 AND target_sent_at = ?2 AND reactor = ?3",
+                    )
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .bind(reactor),
+                }
+                .execute(&mut *tx)
+                .await?;
+                let m = conversation_of(&mut tx, target).await?;
+                tx.commit().await?;
+                Ok(changed(m))
+            }
+            Op::Edit {
+                target,
+                new_body,
+                edited_at,
+            } => {
+                let mut tx = self.pool.begin().await?;
+                let res = sqlx::query(
+                    "UPDATE messages SET body = ?3, edited = 1, edited_at = ?4
+                     WHERE author = ?1 AND sent_at = ?2 AND deleted = 0 AND edited_at < ?4",
+                )
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .bind(new_body)
+                .bind(edited_at)
+                .execute(&mut *tx)
+                .await?;
+                let m = self.finish_update(&mut tx, target, res.rows_affected()).await?;
+                tx.commit().await?;
+                Ok(changed(m))
+            }
+            Op::Delete { target } => {
+                let mut tx = self.pool.begin().await?;
+                let res = sqlx::query(
+                    "UPDATE messages SET body = NULL, quote_text = NULL, deleted = 1
+                     WHERE author = ?1 AND sent_at = ?2 AND deleted = 0",
+                )
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM reactions WHERE target_author = ?1 AND target_sent_at = ?2")
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .execute(&mut *tx)
+                    .await?;
+                let m = self.finish_update(&mut tx, target, res.rows_affected()).await?;
+                tx.commit().await?;
+                Ok(changed(m))
+            }
+            Op::SetStatus { targets, status } => {
+                let mut tx = self.pool.begin().await?;
+                let mut out = vec![];
+                for target in targets {
+                    let res = sqlx::query(
+                        "UPDATE messages SET status = ?3 WHERE author = ?1 AND sent_at = ?2 AND status < ?3",
+                    )
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .bind(status.to_i64())
+                    .execute(&mut *tx)
+                    .await?;
+                    if let Some(m) = self.finish_update(&mut tx, target, res.rows_affected()).await? {
+                        out.push(Applied::MessageChanged {
+                            conversation_id: m.0,
+                            key: m.1,
+                        });
+                    }
+                }
+                tx.commit().await?;
+                Ok(out)
+            }
+        }
+    }
+
+    /// After an UPDATE of one message: refresh its conversation's summary if a row changed.
+    async fn finish_update(
+        &self,
+        conn: &mut SqliteConnection,
+        target: &MessageKey,
+        rows: u64,
+    ) -> Result<Option<(String, MessageKey)>, sqlx::Error> {
+        if rows == 0 {
+            return Ok(None);
+        }
+        let m = conversation_of(conn, target).await?;
+        if let Some((conv, _)) = &m {
+            refresh_summary(conn, conv).await?;
+        }
+        Ok(m)
+    }
+
+    pub async fn message(&self, key: &MessageKey) -> Result<Option<Message>, sqlx::Error> {
+        let row = sqlx::query("SELECT * FROM messages WHERE author = ?1 AND sent_at = ?2")
+            .bind(&key.author)
+            .bind(key.sent_at)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_message).transpose()
+    }
+
+    /// Reactions on a message, one per reactor, ordered by reactor.
+    pub async fn reactions(&self, key: &MessageKey) -> Result<Vec<Reaction>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT reactor, emoji FROM reactions WHERE target_author = ?1 AND target_sent_at = ?2 ORDER BY reactor",
+        )
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(Reaction {
+                    reactor: r.try_get("reactor")?,
+                    emoji: r.try_get("emoji")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The conversation a stored message belongs to, if it is stored.
+async fn conversation_of(
+    conn: &mut SqliteConnection,
+    key: &MessageKey,
+) -> Result<Option<(String, MessageKey)>, sqlx::Error> {
+    let conv: Option<String> =
+        sqlx::query_scalar("SELECT conversation_id FROM messages WHERE author = ?1 AND sent_at = ?2")
+            .bind(&key.author)
+            .bind(key.sent_at)
+            .fetch_optional(conn)
+            .await?;
+    Ok(conv.map(|c| (c, key.clone())))
 }
 
 /// Recomputes a conversation's last message time, preview and unread count from its messages.
@@ -638,5 +825,208 @@ mod tests {
             assert!(matches!(err, sqlx::Error::Configuration(_)), "{bad:?}: {err}");
         }
         assert!(!f.0.exists());
+    }
+
+    fn k(author: &str, sent_at: i64) -> MessageKey {
+        MessageKey {
+            author: author.into(),
+            sent_at,
+        }
+    }
+
+    fn changed(conv: &str, author: &str, sent_at: i64) -> Vec<Applied> {
+        vec![Applied::MessageChanged {
+            conversation_id: conv.into(),
+            key: k(author, sent_at),
+        }]
+    }
+
+    #[tokio::test]
+    async fn apply_insert_reports_new_messages_only() {
+        let db = db().await;
+        let m = msg("alice", 1, "hi");
+        assert_eq!(
+            db.apply(&Op::InsertMessage(m.clone())).await.unwrap(),
+            changed("c:alice", "alice", 1)
+        );
+        assert!(db.apply(&Op::InsertMessage(m)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactions_add_replace_remove() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        let react = |who: &str, e: Option<&str>| Op::React {
+            target: k("alice", 1),
+            reactor: who.into(),
+            emoji: e.map(Into::into),
+        };
+        assert_eq!(
+            db.apply(&react("me", Some("👍"))).await.unwrap(),
+            changed("c:alice", "alice", 1)
+        );
+        db.apply(&react("bob", Some("😂"))).await.unwrap();
+        db.apply(&react("me", Some("❤️"))).await.unwrap(); // one reaction per reactor
+        let r = db.reactions(&k("alice", 1)).await.unwrap();
+        assert_eq!(
+            r,
+            vec![
+                Reaction {
+                    reactor: "bob".into(),
+                    emoji: "😂".into()
+                },
+                Reaction {
+                    reactor: "me".into(),
+                    emoji: "❤️".into()
+                }
+            ]
+        );
+        db.apply(&react("me", None)).await.unwrap();
+        assert_eq!(db.reactions(&k("alice", 1)).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reaction_arriving_before_its_message_shows_once_it_arrives() {
+        let db = db().await;
+        let op = Op::React {
+            target: k("alice", 1),
+            reactor: "bob".into(),
+            emoji: Some("👍".into()),
+        };
+        assert!(db.apply(&op).await.unwrap().is_empty());
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        assert_eq!(db.reactions(&k("alice", 1)).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_body_keeps_latest_and_updates_search_and_preview() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "orignal typo")).await.unwrap();
+        let edit = |body: &str, at| Op::Edit {
+            target: k("alice", 1),
+            new_body: Some(body.into()),
+            edited_at: at,
+        };
+        assert_eq!(
+            db.apply(&edit("second", 20)).await.unwrap(),
+            changed("c:alice", "alice", 1)
+        );
+        assert!(db.apply(&edit("first", 10)).await.unwrap().is_empty()); // older edit arriving late
+        let m = db.message(&k("alice", 1)).await.unwrap().unwrap();
+        assert_eq!((m.body.as_deref(), m.edited), (Some("second"), true));
+        assert_eq!(db.search("second", 5).await.unwrap().len(), 1);
+        assert!(db.search("typo", 5).await.unwrap().is_empty());
+        assert_eq!(conv(&db, "c:alice").await.last_message_preview, "second");
+    }
+
+    #[tokio::test]
+    async fn only_the_author_can_edit_or_delete() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "mine")).await.unwrap();
+        // an op from bob targets (bob, 1), which is not alice's message
+        let edit = Op::Edit {
+            target: k("bob", 1),
+            new_body: Some("hacked".into()),
+            edited_at: 5,
+        };
+        assert!(db.apply(&edit).await.unwrap().is_empty());
+        assert!(db.apply(&Op::Delete { target: k("bob", 1) }).await.unwrap().is_empty());
+        assert_eq!(
+            db.message(&k("alice", 1)).await.unwrap().unwrap().body.as_deref(),
+            Some("mine")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_tombstones_clears_text_reactions_search_and_preview_and_blocks_edits() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "older")).await.unwrap();
+        db.insert_message(&Message {
+            quote: Some(Quote {
+                author: "me".into(),
+                sent_at: 0,
+                text: Some("quoted".into()),
+            }),
+            ..msg("alice", 2, "secret")
+        })
+        .await
+        .unwrap();
+        db.apply(&Op::React {
+            target: k("alice", 2),
+            reactor: "me".into(),
+            emoji: Some("👍".into()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.apply(&Op::Delete { target: k("alice", 2) }).await.unwrap(),
+            changed("c:alice", "alice", 2)
+        );
+        let m = db.message(&k("alice", 2)).await.unwrap().unwrap();
+        assert!(m.deleted && m.body.is_none() && m.quote.unwrap().text.is_none());
+        assert!(db.reactions(&k("alice", 2)).await.unwrap().is_empty());
+        assert!(db.search("secret", 5).await.unwrap().is_empty());
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.last_message_preview.as_str(), c.unread_count), ("", 1));
+        let edit = Op::Edit {
+            target: k("alice", 2),
+            new_body: Some("back".into()),
+            edited_at: 9,
+        };
+        assert!(db.apply(&edit).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_only_moves_up_and_read_clears_unread() {
+        let db = db().await;
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Sent,
+            ..msg("me", 1, "out")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&msg("alice", 2, "in")).await.unwrap();
+        db.insert_message(&msg("alice", 3, "in")).await.unwrap();
+        let set = |targets, status| Op::SetStatus { targets, status };
+        db.apply(&set(vec![k("me", 1)], MessageStatus::Read)).await.unwrap();
+        assert!(db
+            .apply(&set(vec![k("me", 1)], MessageStatus::Delivered))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.message(&k("me", 1)).await.unwrap().unwrap().status,
+            MessageStatus::Read
+        );
+
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 2);
+        let got = db
+            .apply(&set(
+                vec![k("alice", 2), k("alice", 3), k("nobody", 9)],
+                MessageStatus::Read,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(conv(&db, "c:alice").await.unread_count, 0);
+    }
+
+    #[tokio::test]
+    async fn typing_passes_through() {
+        let db = db().await;
+        let op = Op::Typing {
+            conversation_id: "c:alice".into(),
+            who: "alice".into(),
+            started: true,
+        };
+        assert_eq!(
+            db.apply(&op).await.unwrap(),
+            vec![Applied::Typing {
+                conversation_id: "c:alice".into(),
+                who: "alice".into(),
+                started: true
+            }]
+        );
     }
 }

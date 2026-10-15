@@ -757,6 +757,15 @@ Note: for a 1:1 *incoming* message, `Thread::try_from` returns `Contact(sender)`
 
 ### Task 4: Projector + DB — reactions, edits, deletes, receipts, typing, and `apply`
 
+> **As built (PR for #4):**
+> - **Ops:** `React { target: MessageKey, reactor, emoji: Option }`, `Edit { target, new_body, edited_at }`, `Delete { target }`, `SetStatus { targets: Vec<MessageKey>, status }` (receipts, plus the phone's read sync `SyncMessage.read`, which clears unread here too), and `Typing`.
+> - **Apply:** `ProjectionDb::apply(&Op) -> Vec<Applied>` with `Applied::{MessageChanged { conversation_id, key }, Typing { .. }}`. Each op is one transaction and calls `refresh_summary`.
+> - **Edits:** ordered by `edited_at` (migration 0002), so an older edit arriving late is ignored.
+> - **Reactions:** stored even before their message arrives.
+> - **Deletes:** clear the body, quote text and reactions.
+> - **Ignored:** story reactions, and typing in groups.
+> - **Read paths:** `message(&MessageKey)` and `reactions(&MessageKey)`.
+
 **Files:**
 - Modify: `core/sig-core/src/projection/projector.rs` (extend `project`)
 - Modify: `core/sig-core/src/projection/db.rs` (add `apply`, `reactions_for`)
