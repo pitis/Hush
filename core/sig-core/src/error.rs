@@ -8,6 +8,11 @@ pub enum CoreError {
     AlreadyOpen,
     #[error("the core has stopped")]
     Closed,
+    /// The action needs a linked device.
+    #[error("not linked to a phone")]
+    NotLinked,
+    #[error("{message}")]
+    InvalidInput { message: String },
 }
 
 impl From<sqlx::Error> for CoreError {

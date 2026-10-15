@@ -55,7 +55,29 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return try answer.get()
     }
 
-    func messages(conversationId: String, before: MessageKey?, limit: UInt32) async throws -> [Message] { [] }
+    var aci: String? = "me-aci"
+    private(set) var sent: [(conversationId: String, body: String, quote: Quote?)] = []
+    private(set) var retried: [MessageKey] = []
+    var titles: [String: String] = [:]
+    var messageAnswers: [String: [Message]] = [:]
+
+    func ownAci() -> String? { aci }
+
+    func sendText(conversationId: String, body: String, quote: Quote?) async throws -> MessageKey {
+        lock.withLock { sent.append((conversationId, body, quote)) }
+        return MessageKey(author: aci ?? "", sentAt: Int64(sent.count))
+    }
+
+    func retry(key: MessageKey) async throws -> Bool {
+        lock.withLock { retried.append(key) }
+        return true
+    }
+
+    func title(conversationId: String) async throws -> String? { titles[conversationId] }
+
+    func messages(conversationId: String, before: MessageKey?, limit: UInt32) async throws -> [Message] {
+        messageAnswers[conversationId] ?? []
+    }
     func reactions(key: MessageKey) async throws -> [Reaction] { [] }
     func search(query: String, limit: UInt32) async throws -> [Message] { [] }
 }

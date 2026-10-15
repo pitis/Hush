@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use crate::actor::{self, Command};
 use crate::error::CoreError;
 use crate::events::EventListener;
-use crate::projection::{Conversation, Message, MessageKey, ProjectionDb, Reaction};
+use crate::projection::{Conversation, Message, MessageKey, MessageStatus, ProjectionDb, Quote, Reaction};
+use crate::send::SendJob;
 
 /// The app's handle on the core. Cheap to call from any thread; Signal work happens on the core
 /// thread and reports back through the `EventListener`.
@@ -20,6 +21,9 @@ pub struct Client {
     thread: Mutex<Option<JoinHandle<()>>>,
     db: ProjectionDb,
     linked: Arc<AtomicBool>,
+    own_aci: Arc<Mutex<Option<String>>>,
+    /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
+    last_sent_at: Mutex<i64>,
 }
 
 impl Drop for Client {
@@ -33,6 +37,16 @@ impl Drop for Client {
 }
 
 impl Client {
+    fn next_sent_at(&self) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut last = self.last_sent_at.lock().unwrap_or_else(|e| e.into_inner());
+        *last = now.max(*last + 1);
+        *last
+    }
+
     fn send(&self, cmd: Command) -> Result<(), CoreError> {
         let commands = self.commands.lock().map_err(|_| CoreError::Closed)?;
         commands
@@ -54,13 +68,27 @@ impl Client {
     ) -> Result<Arc<Self>, CoreError> {
         crate::logging::init();
         let linked = Arc::new(AtomicBool::new(false));
-        let h = actor::spawn(PathBuf::from(data_dir), db_key_hex, listener, linked.clone())?;
+        let own_aci = Arc::new(Mutex::new(None));
+        let h = actor::spawn(
+            PathBuf::from(data_dir),
+            db_key_hex,
+            listener,
+            linked.clone(),
+            own_aci.clone(),
+        )?;
         Ok(Arc::new(Self {
             commands: Mutex::new(Some(h.commands)),
             thread: Mutex::new(Some(h.thread)),
             db: h.projection,
             linked,
+            own_aci,
+            last_sent_at: Mutex::new(0),
         }))
+    }
+
+    /// Our own ACI once linked; own messages carry it as their author.
+    pub fn own_aci(&self) -> Option<String> {
+        self.own_aci.lock().ok().and_then(|a| a.clone())
     }
 
     pub fn is_linked(&self) -> bool {
@@ -81,6 +109,72 @@ impl Client {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
+    /// Shows `body` at once as a pending message and queues it for sending (it moves to Sent or
+    /// Failed, reported through `MessageChanged`). Returns the new message's key.
+    pub async fn send_text(
+        &self,
+        conversation_id: String,
+        body: String,
+        quote: Option<Quote>,
+    ) -> Result<MessageKey, CoreError> {
+        if body.trim().is_empty() {
+            return Err(CoreError::InvalidInput {
+                message: "empty message".into(),
+            });
+        }
+        if crate::send::recipient(&conversation_id).is_none() {
+            return Err(CoreError::InvalidInput {
+                message: format!("not a conversation: {conversation_id}"),
+            });
+        }
+        let author = self.own_aci().ok_or(CoreError::NotLinked)?;
+        let sent_at = self.next_sent_at();
+        let message = Message {
+            conversation_id: conversation_id.clone(),
+            author,
+            sent_at,
+            received_at: sent_at,
+            body: Some(body.clone()),
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            edited: false,
+            deleted: false,
+            quote: quote.clone(),
+        };
+        self.db.insert_message(&message).await?;
+        let key = message.key();
+        self.send(Command::Send(SendJob {
+            key: key.clone(),
+            conversation_id,
+            body,
+            quote,
+        }))?;
+        Ok(key)
+    }
+
+    /// Re-queues a Failed message. Returns false if it isn't Failed.
+    pub async fn retry(&self, key: MessageKey) -> Result<bool, CoreError> {
+        if !self.db.set_pending(&key).await? {
+            return Ok(false);
+        }
+        let m = self.db.message(&key).await?.ok_or(CoreError::InvalidInput {
+            message: "unknown message".into(),
+        })?;
+        let body = m.body.unwrap_or_default();
+        self.send(Command::Send(SendJob {
+            key,
+            conversation_id: m.conversation_id,
+            body,
+            quote: m.quote,
+        }))?;
+        Ok(true)
+    }
+
+    /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).
+    pub async fn title(&self, conversation_id: String) -> Result<Option<String>, CoreError> {
+        Ok(self.db.title(&conversation_id).await?)
+    }
+
     pub async fn conversations(&self) -> Result<Vec<Conversation>, CoreError> {
         Ok(self.db.conversations().await?)
     }
@@ -215,5 +309,41 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(matches!(err, CoreError::Storage { .. }), "{err}");
+    }
+
+    #[test]
+    fn sending_needs_a_link_and_valid_input() {
+        let dir = temp_dir("client-send");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let to = "c:22222222-2222-2222-2222-222222222222".to_string();
+            assert!(matches!(
+                client.send_text(to.clone(), "  ".into(), None).await,
+                Err(CoreError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                client.send_text("c:nope".into(), "hi".into(), None).await,
+                Err(CoreError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                client.send_text(to, "hi".into(), None).await,
+                Err(CoreError::NotLinked)
+            ));
+        });
+        assert_eq!(client.own_aci(), None);
+    }
+
+    #[test]
+    fn own_message_timestamps_are_unique_and_increasing() {
+        let dir = temp_dir("client-ts");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        let stamps: Vec<i64> = (0..100).map(|_| client.next_sent_at()).collect();
+        assert!(stamps.windows(2).all(|w| w[1] > w[0]));
     }
 }
