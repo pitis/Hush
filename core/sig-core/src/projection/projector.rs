@@ -4,6 +4,7 @@
 use presage::libsignal_service::content::{
     sync_message, Content, ContentBody, DataMessage, EditMessage, ReceiptMessage, TypingMessage,
 };
+use presage::libsignal_service::protocol::ServiceId;
 use presage::proto::{receipt_message, typing_message};
 
 use super::ids::{aci, direct_id, group_id};
@@ -63,7 +64,7 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
         }
         ContentBody::EditMessage(em) => edit(em, &sender).into_iter().collect(),
         ContentBody::ReceiptMessage(rm) if sender != me => receipt(rm, me).into_iter().collect(),
-        ContentBody::TypingMessage(tm) if sender != me => typing(tm, &sender).into_iter().collect(),
+        ContentBody::TypingMessage(tm) if sender != me => typing(tm, &content.metadata.sender).into_iter().collect(),
         // libsignal-service already drops sync messages that aren't from our account; checked
         // again here because accepting one would put words in our mouth.
         ContentBody::SynchronizeMessage(sm) if sender == me => {
@@ -139,14 +140,14 @@ fn receipt(rm: &ReceiptMessage, me: &str) -> Option<Op> {
 }
 
 /// Typing in a 1:1 chat. Group typing carries a group id we can't map to a conversation yet.
-fn typing(tm: &TypingMessage, sender: &str) -> Option<Op> {
+fn typing(tm: &TypingMessage, sender: &ServiceId) -> Option<Op> {
     if tm.group_id.is_some() {
         return None;
     }
     let started = typing_message::Action::try_from(tm.action?).ok()? == typing_message::Action::Started;
     Some(Op::Typing {
-        conversation_id: format!("c:{sender}"),
-        who: sender.to_string(),
+        conversation_id: direct_id(sender),
+        who: sender.raw_uuid().to_string(),
         started,
     })
 }
@@ -806,5 +807,61 @@ mod tests {
         // my own typing on another device is not shown
         let mine = tm(typing_message::Action::Started, None);
         assert!(project(&content(ME, 1003, ContentBody::TypingMessage(mine)), ME).is_empty());
+    }
+
+    #[test]
+    fn malformed_mutations_are_dropped() {
+        let no_emoji = DataMessage {
+            timestamp: Some(1),
+            reaction: Some(data_message::Reaction {
+                remove: Some(false),
+                target_author_aci: Some(ME.into()),
+                target_sent_timestamp: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bad_target = reaction("👍", false, "not-a-uuid", 1);
+        let delete_no_target = DataMessage {
+            timestamp: Some(1),
+            delete: Some(data_message::Delete {
+                target_sent_timestamp: None,
+            }),
+            ..Default::default()
+        };
+        let bodies = [
+            ContentBody::DataMessage(no_emoji),
+            ContentBody::DataMessage(bad_target),
+            ContentBody::DataMessage(delete_no_target),
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: Some(1),
+                data_message: None,
+            }),
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: None,
+                data_message: Some(text(2, "x")),
+            }),
+            ContentBody::ReceiptMessage(ReceiptMessage {
+                r#type: Some(99),
+                timestamp: vec![1],
+            }),
+            ContentBody::TypingMessage(TypingMessage {
+                timestamp: Some(1),
+                action: None,
+                group_id: None,
+            }),
+        ];
+        for body in bodies {
+            assert!(project(&content(ALICE, 1, body.clone()), ME).is_empty(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn my_own_receipts_from_another_device_are_ignored() {
+        let rm = ReceiptMessage {
+            r#type: Some(receipt_message::Type::Read as i32),
+            timestamp: vec![1],
+        };
+        assert!(project(&content(ME, 1, ContentBody::ReceiptMessage(rm)), ME).is_empty());
     }
 }
