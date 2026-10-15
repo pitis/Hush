@@ -63,6 +63,12 @@ pub struct Quote {
     pub text: Option<String>,
 }
 
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    pub reactor: String,
+    pub emoji: String,
+}
+
 /// Identity of a message, and the paging cursor for `messages`.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct MessageKey {

@@ -1,7 +1,11 @@
 //! Pure translation of presage `Content` into projection operations. No I/O: the actor applies
 //! the returned ops to the database.
 
-use presage::libsignal_service::content::{sync_message, Content, ContentBody, DataMessage};
+use presage::libsignal_service::content::{
+    sync_message, Content, ContentBody, DataMessage, EditMessage, ReceiptMessage, TypingMessage,
+};
+use presage::libsignal_service::protocol::ServiceId;
+use presage::proto::{receipt_message, typing_message};
 
 use super::ids::{aci, direct_id, group_id};
 use super::model::*;
@@ -9,6 +13,33 @@ use super::model::*;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     InsertMessage(Message),
+    /// `emoji: None` removes the reactor's reaction.
+    React {
+        target: MessageKey,
+        reactor: String,
+        emoji: Option<String>,
+    },
+    /// Replaces the body of `target` (always the editor's own message); `edited_at` orders edits.
+    Edit {
+        target: MessageKey,
+        new_body: Option<String>,
+        edited_at: i64,
+    },
+    /// Delete for everyone (always the deleter's own message).
+    Delete {
+        target: MessageKey,
+    },
+    /// Raises the status of the targets: delivery/read receipts for our messages, or the phone
+    /// telling us it read incoming ones. Never lowers it.
+    SetStatus {
+        targets: Vec<MessageKey>,
+        status: MessageStatus,
+    },
+    Typing {
+        conversation_id: String,
+        who: String,
+        started: bool,
+    },
 }
 
 /// The ops one received (or locally sent) `Content` produces. `me` is our own ACI as a canonical
@@ -31,22 +62,94 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
             };
             data_message(dm, &conv, &sender, received_at, outgoing)
         }
+        ContentBody::EditMessage(em) => edit(em, &sender).into_iter().collect(),
+        ContentBody::ReceiptMessage(rm) if sender != me => receipt(rm, me).into_iter().collect(),
+        ContentBody::TypingMessage(tm) if sender != me => typing(tm, &content.metadata.sender).into_iter().collect(),
         // libsignal-service already drops sync messages that aren't from our account; checked
         // again here because accepting one would put words in our mouth.
-        ContentBody::SynchronizeMessage(sm) if sender == me => match &sm.content {
-            Some(sync_message::Content::Sent(sent)) => {
-                let Some(dm) = &sent.message else { return vec![] };
-                let conv = match group_of(dm) {
-                    Some(group) => group,
-                    None => sent.parse_destination_service_id().map(|d| direct_id(&d)),
-                };
-                let Some(conv) = conv else { return vec![] };
-                data_message(dm, &conv, me, received_at, true)
+        ContentBody::SynchronizeMessage(sm) if sender == me => {
+            let mut ops = match &sm.content {
+                Some(sync_message::Content::Sent(sent)) => sent_transcript(sent, me, received_at),
+                _ => vec![],
+            };
+            let read: Vec<_> = sm
+                .read
+                .iter()
+                .filter_map(|r| {
+                    Some(MessageKey {
+                        author: aci(r.sender_aci.as_deref(), r.sender_aci_binary.as_deref())?,
+                        sent_at: i64::try_from(r.timestamp?).ok()?,
+                    })
+                })
+                .collect();
+            if !read.is_empty() {
+                ops.push(Op::SetStatus {
+                    targets: read,
+                    status: MessageStatus::Read,
+                });
             }
-            _ => vec![],
-        },
+            ops
+        }
         _ => vec![],
     }
+}
+
+fn sent_transcript(sent: &sync_message::Sent, me: &str, received_at: i64) -> Vec<Op> {
+    if let Some(em) = &sent.edit_message {
+        return edit(em, me).into_iter().collect();
+    }
+    let Some(dm) = &sent.message else { return vec![] };
+    let conv = match group_of(dm) {
+        Some(group) => group,
+        None => sent.parse_destination_service_id().map(|d| direct_id(&d)),
+    };
+    let Some(conv) = conv else { return vec![] };
+    data_message(dm, &conv, me, received_at, true)
+}
+
+fn edit(em: &EditMessage, author: &str) -> Option<Op> {
+    let dm = em.data_message.as_ref()?;
+    Some(Op::Edit {
+        target: MessageKey {
+            author: author.to_string(),
+            sent_at: i64::try_from(em.target_sent_timestamp?).ok()?,
+        },
+        new_body: dm.body.clone(),
+        edited_at: i64::try_from(dm.timestamp?).ok()?,
+    })
+}
+
+/// A receipt from a recipient about messages we sent.
+fn receipt(rm: &ReceiptMessage, me: &str) -> Option<Op> {
+    use receipt_message::Type;
+    let status = match Type::try_from(rm.r#type?).ok()? {
+        Type::Delivery => MessageStatus::Delivered,
+        Type::Read | Type::Viewed => MessageStatus::Read,
+    };
+    let targets: Vec<_> = rm
+        .timestamp
+        .iter()
+        .filter_map(|t| {
+            Some(MessageKey {
+                author: me.to_string(),
+                sent_at: i64::try_from(*t).ok()?,
+            })
+        })
+        .collect();
+    (!targets.is_empty()).then_some(Op::SetStatus { targets, status })
+}
+
+/// Typing in a 1:1 chat. Group typing carries a group id we can't map to a conversation yet.
+fn typing(tm: &TypingMessage, sender: &ServiceId) -> Option<Op> {
+    if tm.group_id.is_some() {
+        return None;
+    }
+    let started = typing_message::Action::try_from(tm.action?).ok()? == typing_message::Action::Started;
+    Some(Op::Typing {
+        conversation_id: direct_id(sender),
+        who: sender.raw_uuid().to_string(),
+        started,
+    })
 }
 
 /// `Some(conversation)` if the message is a group message: `Some(None)` when its group context is
@@ -65,6 +168,39 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     // "Needs decision" card).
     if dm.story_context.is_some() || dm.is_view_once == Some(true) {
         return vec![];
+    }
+    if let Some(r) = &dm.reaction {
+        let target = (|| {
+            Some(MessageKey {
+                author: aci(r.target_author_aci.as_deref(), r.target_author_aci_binary.as_deref())?,
+                sent_at: i64::try_from(r.target_sent_timestamp?).ok()?,
+            })
+        })();
+        let emoji = if r.remove == Some(true) { None } else { r.emoji.clone() };
+        return match target {
+            Some(target) if r.remove == Some(true) || emoji.is_some() => {
+                vec![Op::React {
+                    target,
+                    reactor: author.to_string(),
+                    emoji,
+                }]
+            }
+            _ => vec![],
+        };
+    }
+    if let Some(d) = &dm.delete {
+        return d
+            .target_sent_timestamp
+            .and_then(|t| i64::try_from(t).ok())
+            .map(|sent_at| {
+                vec![Op::Delete {
+                    target: MessageKey {
+                        author: author.to_string(),
+                        sent_at,
+                    },
+                }]
+            })
+            .unwrap_or_default();
     }
     if dm.body.is_none() && dm.attachments.is_empty() {
         return vec![];
@@ -98,11 +234,13 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
 mod tests {
     use super::*;
     use presage::libsignal_service::content::{
-        sync_message, Content, ContentBody, DataMessage, GroupContextV2, Metadata, NullMessage, SyncMessage,
+        sync_message, Content, ContentBody, DataMessage, EditMessage, GroupContextV2, Metadata, NullMessage,
+        ReceiptMessage, SyncMessage, TypingMessage,
     };
     use presage::libsignal_service::prelude::Uuid;
     use presage::libsignal_service::protocol::{Aci, DeviceId, ServiceId};
     use presage::proto::data_message::{self, StoryContext};
+    use presage::proto::{receipt_message, typing_message};
 
     const ME: &str = "11111111-1111-1111-1111-111111111111";
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
@@ -367,13 +505,6 @@ mod tests {
             }),
             ..Default::default()
         };
-        let delete = DataMessage {
-            timestamp: Some(503),
-            delete: Some(data_message::Delete {
-                target_sent_timestamp: Some(1),
-            }),
-            ..Default::default()
-        };
         let mut group_update = in_group(
             DataMessage {
                 timestamp: Some(504),
@@ -405,7 +536,6 @@ mod tests {
                 ..Default::default()
             }),
             ContentBody::DataMessage(reaction),
-            ContentBody::DataMessage(delete),
             ContentBody::DataMessage(group_update),
             ContentBody::DataMessage(timer),
             ContentBody::DataMessage(sticker),
@@ -419,5 +549,319 @@ mod tests {
             let ops = project(&content(ALICE, 500, body.clone()), ME);
             assert!(ops.is_empty(), "{body:?} gave {ops:?}");
         }
+    }
+
+    fn key(author: &str, sent_at: i64) -> MessageKey {
+        MessageKey {
+            author: author.into(),
+            sent_at,
+        }
+    }
+
+    fn reaction(emoji: &str, remove: bool, target_author: &str, target: u64) -> DataMessage {
+        DataMessage {
+            timestamp: Some(600),
+            reaction: Some(data_message::Reaction {
+                emoji: Some(emoji.into()),
+                remove: Some(remove),
+                target_author_aci: Some(target_author.into()),
+                target_sent_timestamp: Some(target),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reaction_add_and_remove() {
+        let ops = project(
+            &content(ALICE, 600, ContentBody::DataMessage(reaction("👍", false, ME, 100))),
+            ME,
+        );
+        assert_eq!(
+            ops,
+            vec![Op::React {
+                target: key(ME, 100),
+                reactor: ALICE.into(),
+                emoji: Some("👍".into())
+            }]
+        );
+        let ops = project(
+            &content(ALICE, 601, ContentBody::DataMessage(reaction("👍", true, ME, 100))),
+            ME,
+        );
+        assert_eq!(
+            ops,
+            vec![Op::React {
+                target: key(ME, 100),
+                reactor: ALICE.into(),
+                emoji: None
+            }]
+        );
+    }
+
+    #[test]
+    fn reaction_target_from_binary_author_and_in_groups() {
+        let mut dm = in_group(reaction("❤️", false, BOB, 100), KEY.to_vec());
+        let r = dm.reaction.as_mut().unwrap();
+        r.target_author_aci = None;
+        r.target_author_aci_binary = Some(uuid(BOB).as_bytes().to_vec());
+        let ops = project(&content(ALICE, 602, ContentBody::DataMessage(dm)), ME);
+        assert_eq!(
+            ops,
+            vec![Op::React {
+                target: key(BOB, 100),
+                reactor: ALICE.into(),
+                emoji: Some("❤️".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn my_reaction_from_phone() {
+        let ops = project(
+            &content(ME, 603, sent_sync(ALICE, reaction("😂", false, ALICE, 50))),
+            ME,
+        );
+        assert_eq!(
+            ops,
+            vec![Op::React {
+                target: key(ALICE, 50),
+                reactor: ME.into(),
+                emoji: Some("😂".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn story_reaction_is_ignored() {
+        let mut dm = reaction("🔥", false, ME, 100);
+        dm.story_context = Some(StoryContext::default());
+        assert!(project(&content(ALICE, 604, ContentBody::DataMessage(dm)), ME).is_empty());
+    }
+
+    #[test]
+    fn delete_for_everyone_targets_the_senders_own_message() {
+        let dm = DataMessage {
+            timestamp: Some(700),
+            delete: Some(data_message::Delete {
+                target_sent_timestamp: Some(100),
+            }),
+            ..Default::default()
+        };
+        let ops = project(&content(ALICE, 700, ContentBody::DataMessage(dm.clone())), ME);
+        assert_eq!(
+            ops,
+            vec![Op::Delete {
+                target: key(ALICE, 100)
+            }]
+        );
+        let ops = project(&content(ME, 701, sent_sync(ALICE, dm)), ME);
+        assert_eq!(ops, vec![Op::Delete { target: key(ME, 100) }]);
+    }
+
+    #[test]
+    fn edit_message_incoming_and_from_phone() {
+        let em = EditMessage {
+            target_sent_timestamp: Some(100),
+            data_message: Some(text(800, "fixed")),
+        };
+        let ops = project(&content(ALICE, 810, ContentBody::EditMessage(em.clone())), ME);
+        assert_eq!(
+            ops,
+            vec![Op::Edit {
+                target: key(ALICE, 100),
+                new_body: Some("fixed".into()),
+                edited_at: 800
+            }]
+        );
+        let sent = sync_message::Sent {
+            destination_service_id: Some(ALICE.into()),
+            edit_message: Some(em),
+            ..Default::default()
+        };
+        let ops = project(&content(ME, 820, sync(sent)), ME);
+        assert_eq!(
+            ops,
+            vec![Op::Edit {
+                target: key(ME, 100),
+                new_body: Some("fixed".into()),
+                edited_at: 800
+            }]
+        );
+    }
+
+    #[test]
+    fn receipts_target_my_messages() {
+        let rm = |t: receipt_message::Type| ReceiptMessage {
+            r#type: Some(t as i32),
+            timestamp: vec![100, 101],
+        };
+        let targets = vec![key(ME, 100), key(ME, 101)];
+        let ops = project(
+            &content(
+                ALICE,
+                900,
+                ContentBody::ReceiptMessage(rm(receipt_message::Type::Delivery)),
+            ),
+            ME,
+        );
+        assert_eq!(
+            ops,
+            vec![Op::SetStatus {
+                targets: targets.clone(),
+                status: MessageStatus::Delivered
+            }]
+        );
+        for t in [receipt_message::Type::Read, receipt_message::Type::Viewed] {
+            let ops = project(&content(ALICE, 901, ContentBody::ReceiptMessage(rm(t))), ME);
+            assert_eq!(
+                ops,
+                vec![Op::SetStatus {
+                    targets: targets.clone(),
+                    status: MessageStatus::Read
+                }]
+            );
+        }
+        let empty = ReceiptMessage {
+            r#type: Some(1),
+            timestamp: vec![],
+        };
+        assert!(project(&content(ALICE, 902, ContentBody::ReceiptMessage(empty)), ME).is_empty());
+    }
+
+    #[test]
+    fn read_on_my_phone_marks_incoming_messages_read() {
+        let sm = SyncMessage {
+            read: vec![
+                sync_message::Read {
+                    sender_aci: Some(ALICE.into()),
+                    timestamp: Some(100),
+                    ..Default::default()
+                },
+                sync_message::Read {
+                    sender_aci_binary: Some(uuid(BOB).as_bytes().to_vec()),
+                    timestamp: Some(101),
+                    ..Default::default()
+                },
+                sync_message::Read {
+                    timestamp: Some(102),
+                    ..Default::default()
+                }, // no sender: skipped
+            ],
+            ..Default::default()
+        };
+        let ops = project(&content(ME, 950, ContentBody::SynchronizeMessage(sm.clone())), ME);
+        assert_eq!(
+            ops,
+            vec![Op::SetStatus {
+                targets: vec![key(ALICE, 100), key(BOB, 101)],
+                status: MessageStatus::Read
+            }]
+        );
+        // only our own devices may tell us what we read
+        assert!(project(&content(ALICE, 951, ContentBody::SynchronizeMessage(sm)), ME).is_empty());
+    }
+
+    #[test]
+    fn typing_in_direct_chats_only() {
+        let tm = |action: typing_message::Action, group: Option<Vec<u8>>| TypingMessage {
+            timestamp: Some(1000),
+            action: Some(action as i32),
+            group_id: group,
+        };
+        let ops = project(
+            &content(
+                ALICE,
+                1000,
+                ContentBody::TypingMessage(tm(typing_message::Action::Started, None)),
+            ),
+            ME,
+        );
+        assert_eq!(
+            ops,
+            vec![Op::Typing {
+                conversation_id: format!("c:{ALICE}"),
+                who: ALICE.into(),
+                started: true
+            }]
+        );
+        let ops = project(
+            &content(
+                ALICE,
+                1001,
+                ContentBody::TypingMessage(tm(typing_message::Action::Stopped, None)),
+            ),
+            ME,
+        );
+        assert_eq!(
+            ops,
+            vec![Op::Typing {
+                conversation_id: format!("c:{ALICE}"),
+                who: ALICE.into(),
+                started: false
+            }]
+        );
+        let group = tm(typing_message::Action::Started, Some(vec![1; 32]));
+        assert!(project(&content(ALICE, 1002, ContentBody::TypingMessage(group)), ME).is_empty());
+        // my own typing on another device is not shown
+        let mine = tm(typing_message::Action::Started, None);
+        assert!(project(&content(ME, 1003, ContentBody::TypingMessage(mine)), ME).is_empty());
+    }
+
+    #[test]
+    fn malformed_mutations_are_dropped() {
+        let no_emoji = DataMessage {
+            timestamp: Some(1),
+            reaction: Some(data_message::Reaction {
+                remove: Some(false),
+                target_author_aci: Some(ME.into()),
+                target_sent_timestamp: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bad_target = reaction("👍", false, "not-a-uuid", 1);
+        let delete_no_target = DataMessage {
+            timestamp: Some(1),
+            delete: Some(data_message::Delete {
+                target_sent_timestamp: None,
+            }),
+            ..Default::default()
+        };
+        let bodies = [
+            ContentBody::DataMessage(no_emoji),
+            ContentBody::DataMessage(bad_target),
+            ContentBody::DataMessage(delete_no_target),
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: Some(1),
+                data_message: None,
+            }),
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: None,
+                data_message: Some(text(2, "x")),
+            }),
+            ContentBody::ReceiptMessage(ReceiptMessage {
+                r#type: Some(99),
+                timestamp: vec![1],
+            }),
+            ContentBody::TypingMessage(TypingMessage {
+                timestamp: Some(1),
+                action: None,
+                group_id: None,
+            }),
+        ];
+        for body in bodies {
+            assert!(project(&content(ALICE, 1, body.clone()), ME).is_empty(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn my_own_receipts_from_another_device_are_ignored() {
+        let rm = ReceiptMessage {
+            r#type: Some(receipt_message::Type::Read as i32),
+            timestamp: vec![1],
+        };
+        assert!(project(&content(ME, 1, ContentBody::ReceiptMessage(rm)), ME).is_empty());
     }
 }
