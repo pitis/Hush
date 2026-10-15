@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     let core: AppStore
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -45,6 +46,7 @@ struct ContentView: View {
         .background(Theme.window)
         .preferredColorScheme(.dark)
         .task { await core.boot() }
+        .onAppear { WindowOpener.open = openWindow }
         .task {
             // "Today" separators become "Yesterday" at midnight
             var day = Calendar.current.startOfDay(for: .now)

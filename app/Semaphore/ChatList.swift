@@ -59,6 +59,11 @@ enum ChatList {
         return total > 0 ? "\(total)" : nil
     }
 
+    /// The chats with unread messages, in list order (newest first), for the menu bar.
+    static func unreadChats(_ list: [Conversation], limit: Int) -> [Conversation] {
+        Array(list.filter { $0.unreadCount > 0 }.prefix(limit))
+    }
+
     /// The open chat is read once its newest message is on screen in the key window, and the
     /// window is actually visible (not while the screen is locked or asleep).
     static func shouldMarkRead(atBottom: Bool, windowKey: Bool, windowVisible: Bool, unread: UInt32) -> Bool {

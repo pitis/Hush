@@ -4,7 +4,7 @@ XCB := xcodebuild -project app/Semaphore.xcodeproj -scheme Semaphore -destinatio
 # the test host app prints harmless linkd/XPC noise on stderr; keep only what matters
 XCB_FILTER := { grep -vE 'com\.apple\.linkd|synchronousRemoteObjectProxy|Process Instance Registry|IDETestOperationsObserverDebug' || true; }
 
-.PHONY: help setup core project app run test check format lint worktree update card
+.PHONY: help setup core project app run release perf test check format lint worktree update card
 
 help: ## List available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -27,6 +27,18 @@ app: core project ## Build the Debug app into build/
 
 run: app ## Build and launch the Debug app
 	open build/Build/Products/Debug/Semaphore.app
+
+release: ## Build the Release app (release core: thin LTO, stripped) and install it in /Applications
+	scripts/build-core.sh release
+	cd app && xcodegen -q
+	$(XCB) -configuration Release build -quiet 2>&1 | $(XCB_FILTER)
+	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; sleep 1
+	rm -rf /Applications/Semaphore.app
+	ditto build/Build/Products/Release/Semaphore.app /Applications/Semaphore.app
+	@echo "✓ /Applications/Semaphore.app"
+
+perf: ## Measure the installed app against the M1 budget (size, cold launch, idle RAM and CPU)
+	scripts/perf.sh
 
 ## ── Gate ─────────────────────────────────────────────────────────────
 
