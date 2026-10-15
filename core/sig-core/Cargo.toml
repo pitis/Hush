@@ -22,4 +22,5 @@ tracing-oslog = "0.3"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 [dev-dependencies]
+rand = "0.9"
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros"] }

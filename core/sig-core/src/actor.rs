@@ -30,6 +30,17 @@ use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, ProjectionDb};
 
+/// libsignal's post-quantum key generation (libcrux ML-KEM) uses very large stack frames,
+/// especially in debug builds; the default 2 MB thread stack overflows while finishing a link.
+const CORE_THREAD_STACK: usize = 64 * 1024 * 1024;
+
+/// The builder for the core thread (shared with tests so they exercise the same stack size).
+pub(crate) fn core_thread() -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name("sig-core".into())
+        .stack_size(CORE_THREAD_STACK)
+}
+
 /// How long a linking QR code stays valid before the app has to ask for a new one.
 const LINK_TIMEOUT: Duration = Duration::from_secs(300);
 /// A connection must stay up this long before the reconnect backoff resets.
@@ -60,8 +71,7 @@ pub fn spawn(
     lock.try_lock().map_err(|_| CoreError::AlreadyOpen)?;
     let (commands, rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
-    let thread = std::thread::Builder::new()
-        .name("sig-core".into())
+    let thread = core_thread()
         .spawn(move || {
             let _lock = lock; // held for the thread's lifetime
             let _guard = PanicReporter(listener.clone());
@@ -72,7 +82,7 @@ pub fn spawn(
                     return;
                 }
             };
-            tokio::task::LocalSet::new().block_on(&rt, run(data_dir, key, listener, linked, rx, ready_tx));
+            tokio::task::LocalSet::new().block_on(&rt, Box::pin(run(data_dir, key, listener, linked, rx, ready_tx)));
         })
         .map_err(|e| CoreError::Storage { message: e.to_string() })?;
     match ready_rx.blocking_recv() {
@@ -169,7 +179,8 @@ async fn run(
                     });
                     continue;
                 }
-                match link(&store, device_name, listener.as_ref()).await {
+                // boxed: presage's provisioning future is large, keep it off the thread stack
+                match Box::pin(link(&store, device_name, listener.as_ref())).await {
                     Ok(m) => {
                         manager = Some(m);
                         linked.store(true, Ordering::SeqCst);
@@ -187,7 +198,11 @@ async fn run(
                 Some(_) if receiving.get() => {}
                 Some(m) => {
                     receiving.set(true);
-                    let task = tokio::task::spawn_local(receive_loop(m.clone(), projection.clone(), listener.clone()));
+                    let task = tokio::task::spawn_local(Box::pin(receive_loop(
+                        m.clone(),
+                        projection.clone(),
+                        listener.clone(),
+                    )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
                     tokio::task::spawn_local(async move {
@@ -247,7 +262,7 @@ async fn receive_loop(mut m: Manager<SqliteStore, Registered>, db: ProjectionDb,
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Connecting,
         });
-        match m.receive_messages().await {
+        match Box::pin(m.receive_messages()).await {
             Ok(stream) => {
                 let connected = tokio::time::Instant::now();
                 l.on_event(CoreEvent::Connection {
@@ -354,4 +369,27 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
         });
     }
     l.on_event(CoreEvent::ConversationsChanged);
+}
+
+#[cfg(test)]
+mod tests {
+    use presage::libsignal_service::protocol::kem::{KeyPair, KeyType};
+
+    /// Linking generates Kyber keys on the core thread (on top of presage's linking future); the
+    /// default 2 MB stack overflowed there in debug builds.
+    #[test]
+    fn core_thread_has_room_for_kyber_key_generation() {
+        let generated = super::core_thread()
+            .spawn(|| {
+                let mut rng = rand::rng();
+                KeyPair::generate(KeyType::Kyber1024, &mut rng)
+                    .public_key
+                    .serialize()
+                    .len()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(generated > 1000);
+    }
 }

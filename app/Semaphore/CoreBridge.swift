@@ -71,7 +71,7 @@ final class CoreBridge {
                 try client.link(deviceName: Self.deviceName)
             }
         } catch {
-            Self.logger.error("boot failed")
+            Self.logger.error("boot failed: \(Self.describe(error), privacy: .public)")
             screen = .failed(Self.describe(error))
         }
     }
