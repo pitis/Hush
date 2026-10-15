@@ -137,3 +137,23 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(AppStore.displayTitle(g), "Group")
     }
 }
+
+final class ScrollDecisionTests: XCTestCase {
+    func testFollowsNewMessagesOnlyAtTheBottomOrForOwnMessages() {
+        XCTAssertEqual(Timeline.onNewLastMessage(atBottom: true, isOwn: false), .scrollToBottom)
+        XCTAssertEqual(Timeline.onNewLastMessage(atBottom: false, isOwn: true), .scrollToBottom)
+        XCTAssertEqual(Timeline.onNewLastMessage(atBottom: false, isOwn: false), .showPill)
+    }
+
+    func testEdges() {
+        XCTAssertTrue(Timeline.isAtBottom(offsetY: 920, visibleHeight: 600, contentHeight: 1600))
+        XCTAssertFalse(Timeline.isAtBottom(offsetY: 500, visibleHeight: 600, contentHeight: 1600))
+        XCTAssertTrue(Timeline.isNearTop(offsetY: 40))
+        XCTAssertFalse(Timeline.isNearTop(offsetY: 400))
+    }
+
+    func testTicksHaveSpokenLabels() {
+        XCTAssertEqual(Timeline.accessibilityLabel(for: .double), "Delivered")
+        XCTAssertEqual(Timeline.accessibilityLabel(for: .failed), "Not sent")
+    }
+}

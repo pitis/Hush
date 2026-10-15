@@ -34,7 +34,11 @@ final class AppStore {
     private(set) var lastError: String?
     private(set) var selectedId: String?
     /// The open conversation's loaded messages, oldest first.
-    private(set) var messages: [Message] = []
+    private(set) var messages: [Message] = [] {
+        didSet { timelineItems = Timeline.items(for: messages) }
+    }
+    /// Rows for the timeline, recomputed only when `messages` change.
+    private(set) var timelineItems: [Timeline.Item] = []
     private(set) var hasOlder = false
     private(set) var reactions: [MessageKey: [Reaction]] = [:]
     var replyTo: Message?
@@ -179,17 +183,22 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
-    func send(_ text: String) async {
+    /// Sends `text` to the open conversation. Returns false if it couldn't be handed to the core
+    /// (the caller keeps the text).
+    @discardableResult
+    func send(_ text: String) async -> Bool {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let client, let id = selectedId, !body.isEmpty else { return }
+        guard let client, let id = selectedId, !body.isEmpty else { return false }
         let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body) }
         do {
             // the core announces the new pending message itself
             _ = try await client.sendText(conversationId: id, body: body, quote: quote)
             replyTo = nil
+            return true
         } catch {
             lastError = Self.describe(error)
             append("send failed: \(error)")
+            return false
         }
     }
 

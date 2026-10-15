@@ -15,7 +15,7 @@ struct ContentView: View {
                 LinkView(url: core.linkURL, error: core.lastError, retry: core.retryLink)
             case .chats:
                 NavigationSplitView {
-                    SidebarView(store: core).navigationSplitViewColumnWidth(min: 280, ideal: 340, max: 460)
+                    SidebarView(store: core).navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
                 } detail: {
                     if let c = core.selectedConversation {
                         ConversationView(store: core, conversation: c)

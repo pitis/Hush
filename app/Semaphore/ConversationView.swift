@@ -3,30 +3,34 @@ import SwiftUI
 struct ConversationView: View {
     let store: AppStore
     let conversation: Conversation
-    @State private var atBottom = true
-    @State private var unseenNew = false
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            ConversationHeader(store: store, conversation: conversation)
             Divider().overlay(Color.black.opacity(0.4))
-            timeline
+            TimelineList(store: store, conversation: conversation)
             ComposerView(store: store, conversationId: conversation.id)
         }
         .background(Theme.window)
     }
+}
 
-    private var header: some View {
+/// Header in its own view so typing/connection changes don't re-render the timeline.
+struct ConversationHeader: View {
+    let store: AppStore
+    let conversation: Conversation
+
+    var body: some View {
         let title = AppStore.displayTitle(conversation)
-        return HStack(spacing: 12) {
+        HStack(spacing: 12) {
             Avatar(id: conversation.id, name: title, size: 36)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
                 if store.isTyping(conversation.id) {
                     Text("typing…").font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
                 } else if store.connection != .online {
-                    Text(String(describing: store.connection)).font(.system(size: 12)).foregroundStyle(
-                        Theme.secondaryText)
+                    Text(String(describing: store.connection)).font(.system(size: 12))
+                        .foregroundStyle(Theme.secondaryText)
                 }
             }
             Spacer()
@@ -34,50 +38,73 @@ struct ConversationView: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
     }
+}
 
-    private var timeline: some View {
+struct TimelineList: View {
+    let store: AppStore
+    let conversation: Conversation
+    @State private var atBottom = true
+    @State private var nearTop = false
+    @State private var unseenNew = false
+
+    var body: some View {
         let isGroup = conversation.kind == .group
-        return ScrollViewReader { proxy in
+        ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    if store.hasOlder {
-                        ProgressView().controlSize(.small).padding(8)
-                            .onAppear { Task { await store.loadOlder() } }
-                    }
-                    ForEach(Timeline.items(for: store.messages)) { item in
+                    if store.hasOlder { ProgressView().controlSize(.small).padding(8) }
+                    ForEach(store.timelineItems) { item in
                         switch item {
                         case .day(let title, _):
                             Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.secondaryText)
                                 .padding(.vertical, 10)
                         case .message(let m, let first, let last):
+                            let key = MessageKey(author: m.author, sentAt: m.sentAt)
                             MessageRow(
                                 message: m, first: first, last: last, isGroup: isGroup,
                                 senderName: store.senderName(m.author),
-                                reactions: store.reactions[MessageKey(author: m.author, sentAt: m.sentAt)] ?? [],
+                                reactions: store.reactions[key] ?? [],
                                 reply: { store.replyTo = m },
-                                retry: { Task { await store.retry(MessageKey(author: m.author, sentAt: m.sentAt)) } })
+                                retry: { Task { await store.retry(key) } })
                         }
                     }
                     Color.clear.frame(height: 1).id("bottom")
-                        .onAppear {
-                            atBottom = true
-                            unseenNew = false
-                        }
-                        .onDisappear { atBottom = false }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
             }
             .defaultScrollAnchor(.bottom)
+            .onScrollGeometryChange(for: [Bool].self) { g in
+                [
+                    Timeline.isAtBottom(
+                        offsetY: g.contentOffset.y, visibleHeight: g.containerSize.height,
+                        contentHeight: g.contentSize.height),
+                    Timeline.isNearTop(offsetY: g.contentOffset.y),
+                ]
+            } action: { _, edges in
+                atBottom = edges[0]
+                if atBottom { unseenNew = false }
+                nearTop = edges[1]
+            }
+            .onChange(of: nearTop) { _, near in if near { loadOlder() } }
+            .onChange(of: store.messages.first?.sentAt) { _, _ in
+                // still at the top after a page arrived (short messages): keep paging
+                if nearTop { loadOlder() }
+            }
             .onChange(of: store.messages.last?.sentAt) { _, _ in
-                // follow new messages only when the user is already at the bottom
-                if atBottom {
+                let own = store.messages.last?.isOutgoing ?? false
+                switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
+                case .scrollToBottom:
                     withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
-                } else {
-                    unseenNew = true
+                    unseenNew = false
+                case .showPill: unseenNew = true
+                case .nothing: break
                 }
             }
-            .onChange(of: conversation.id) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
+            .onChange(of: conversation.id) { _, _ in
+                unseenNew = false
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
             .overlay(alignment: .bottomTrailing) {
                 if unseenNew {
                     Button {
@@ -93,6 +120,11 @@ struct ConversationView: View {
                 }
             }
         }
+    }
+
+    private func loadOlder() {
+        guard store.hasOlder else { return }
+        Task { await store.loadOlder() }
     }
 }
 
@@ -132,7 +164,7 @@ struct MessageRow: View {
         }
         .padding(.top, first ? 8 : 2)
         .contextMenu {
-            Button("Reply", action: reply)
+            if !message.deleted { Button("Reply", action: reply) }
             if let body = message.body, !message.deleted {
                 Button("Copy") {
                     NSPasteboard.general.clearContents()
@@ -170,14 +202,15 @@ struct MessageRow: View {
         .padding(.vertical, 8)
         .foregroundStyle(.white)
         .background(outgoing ? Theme.outgoing : Theme.incoming, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
-        .onTapGesture(count: 1) { if message.status == .failed { retry() } }
     }
 
     private var meta: some View {
         HStack(spacing: 3) {
             if message.edited && !message.deleted { Text("edited") }
             Text(Formatting().bubbleTime(message.sentAt))
-            if outgoing { tick }
+            if outgoing {
+                tick.accessibilityLabel(Timeline.accessibilityLabel(for: Timeline.tick(for: message.status)))
+            }
         }
         .font(.system(size: 10))
         .foregroundStyle(.white.opacity(0.7))
@@ -191,8 +224,12 @@ struct MessageRow: View {
         case .double: Image(systemName: "checkmark.circle")
         case .doubleFilled: Image(systemName: "checkmark.circle.fill")
         case .failed:
-            Label("Retry", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
-                .labelStyle(.titleAndIcon)
+            Button(action: retry) {
+                Label("Retry", systemImage: "exclamationmark.triangle.fill").labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.yellow)
+            .accessibilityLabel("Not sent. Retry")
         }
     }
 

@@ -22,9 +22,16 @@ struct Formatting {
         return format(date, "M/d/yy")
     }
 
-    /// Bubble time: "09:05".
+    /// Bubble time in the user's 12/24-hour style ("09:05" or "9:05 AM").
     func bubbleTime(_ ms: Int64) -> String {
-        format(Date(timeIntervalSince1970: Double(ms) / 1000), "HH:mm")
+        Formatting.cached(key: "time-\(calendar.timeZone.identifier)") {
+            let f = DateFormatter()
+            f.calendar = calendar
+            f.timeZone = calendar.timeZone
+            f.timeStyle = .short
+            f.dateStyle = .none
+            return f
+        }.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
 
     /// Timeline separator: "Today", "Yesterday", "Mon, Oct 12", or with the year if not this year.
@@ -43,12 +50,23 @@ struct Formatting {
     }
 
     private func format(_ date: Date, _ pattern: String) -> String {
-        let f = DateFormatter()
-        f.calendar = calendar
-        f.timeZone = calendar.timeZone
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = pattern
-        return f.string(from: date)
+        Formatting.cached(key: "\(pattern)-\(calendar.timeZone.identifier)") {
+            let f = DateFormatter()
+            f.calendar = calendar
+            f.timeZone = calendar.timeZone
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = pattern
+            return f
+        }.string(from: date)
+    }
+
+    /// Formatters are expensive to create; the UI asks for the same few over and over.
+    nonisolated(unsafe) private static var formatters: [String: DateFormatter] = [:]  // main thread only
+    private static func cached(key: String, make: () -> DateFormatter) -> DateFormatter {
+        if let f = formatters[key] { return f }
+        let f = make()
+        formatters[key] = f
+        return f
     }
 
     /// The sidebar's second line.

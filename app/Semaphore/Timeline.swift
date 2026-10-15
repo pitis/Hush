@@ -37,6 +37,33 @@ enum Timeline {
         return items
     }
 
+    /// What the timeline does when its last message changes: follow it when the reader is at the
+    /// bottom or it is their own message, otherwise show the "New messages" pill.
+    enum NewMessageAction: Equatable { case scrollToBottom, showPill, nothing }
+
+    static func onNewLastMessage(atBottom: Bool, isOwn: Bool) -> NewMessageAction {
+        atBottom || isOwn ? .scrollToBottom : .showPill
+    }
+
+    /// Within this many points of the edge counts as being there.
+    static let edgeThreshold: CGFloat = 80
+
+    static func isAtBottom(offsetY: CGFloat, visibleHeight: CGFloat, contentHeight: CGFloat) -> Bool {
+        offsetY + visibleHeight >= contentHeight - edgeThreshold
+    }
+
+    static func isNearTop(offsetY: CGFloat) -> Bool { offsetY <= edgeThreshold }
+
+    static func accessibilityLabel(for tick: Tick) -> String {
+        switch tick {
+        case .clock: "Sending"
+        case .single: "Sent"
+        case .double: "Delivered"
+        case .doubleFilled: "Read"
+        case .failed: "Not sent"
+        }
+    }
+
     static func tick(for status: MessageStatus) -> Tick {
         switch status {
         case .pending: .clock
