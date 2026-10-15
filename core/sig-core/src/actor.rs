@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -23,12 +23,13 @@ use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::ConnectOptions;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::CoreError;
 use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, ProjectionDb};
+use crate::send::{sender, Jobs, SendJob};
 
 /// libsignal's post-quantum crypto (libcrux ML-KEM key generation, also run by presage's pre-key
 /// refresh while receiving, and session decryption) uses very large stack frames in debug builds;
@@ -50,6 +51,7 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 pub enum Command {
     Link { device_name: String },
     Start,
+    Send(SendJob),
 }
 
 pub struct Handles {
@@ -65,6 +67,7 @@ pub fn spawn(
     key: String,
     listener: Arc<dyn EventListener>,
     linked: Arc<AtomicBool>,
+    own_aci: Arc<Mutex<Option<String>>>,
 ) -> Result<Handles, CoreError> {
     std::fs::create_dir_all(&data_dir).map_err(|e| CoreError::Storage { message: e.to_string() })?;
     // Two cores on one presage store would fight over the websocket and corrupt sessions.
@@ -83,7 +86,10 @@ pub fn spawn(
                     return;
                 }
             };
-            tokio::task::LocalSet::new().block_on(&rt, Box::pin(run(data_dir, key, listener, linked, rx, ready_tx)));
+            tokio::task::LocalSet::new().block_on(
+                &rt,
+                Box::pin(run(data_dir, key, listener, linked, own_aci, rx, ready_tx)),
+            );
         })
         .map_err(|e| CoreError::Storage { message: e.to_string() })?;
     match ready_rx.blocking_recv() {
@@ -134,6 +140,7 @@ async fn run(
     key: String,
     listener: Arc<dyn EventListener>,
     linked: Arc<AtomicBool>,
+    own_aci: Arc<Mutex<Option<String>>>,
     mut rx: mpsc::UnboundedReceiver<Command>,
     ready: oneshot::Sender<Result<ProjectionDb, CoreError>>,
 ) {
@@ -166,6 +173,31 @@ async fn run(
         }
     };
     linked.store(manager.is_some(), Ordering::SeqCst);
+    let set_aci = |m: &Manager<SqliteStore, Registered>| {
+        if let Ok(mut aci) = own_aci.lock() {
+            *aci = Some(m.registration_data().service_ids.aci.to_string());
+        }
+    };
+    if let Some(m) = &manager {
+        set_aci(m);
+    }
+    // Sends queue here until receiving starts and the server queue is drained.
+    let (send_tx, send_rx) = mpsc::unbounded_channel::<SendJob>();
+    let jobs: Jobs = Rc::new(std::cell::RefCell::new(send_rx));
+    let mut sending = false;
+    // Sends queued by a previous run died with it.
+    match projection.fail_all_pending().await {
+        Ok(failed) => {
+            for (conversation_id, key) in failed {
+                listener.on_event(CoreEvent::MessageChanged { conversation_id, key });
+            }
+        }
+        Err(e) => listener.on_event(CoreEvent::Error {
+            message: format!("checking unsent messages failed: {e}"),
+        }),
+    }
+    let (caught_up_tx, caught_up_rx) = watch::channel(false);
+    let caught_up_tx = Rc::new(caught_up_tx);
     if ready.send(Ok(projection.clone())).is_err() {
         return;
     }
@@ -183,6 +215,7 @@ async fn run(
                 // boxed to keep the large provisioning future off the stack (the stack size is the real fix)
                 match Box::pin(link(&store, device_name, listener.as_ref())).await {
                     Ok(m) => {
+                        set_aci(&m);
                         manager = Some(m);
                         linked.store(true, Ordering::SeqCst);
                         listener.on_event(CoreEvent::Linked);
@@ -199,10 +232,21 @@ async fn run(
                 Some(_) if receiving.get() => {}
                 Some(m) => {
                     receiving.set(true);
+                    if !sending {
+                        sending = true;
+                        tokio::task::spawn_local(supervise_sender(
+                            m.clone(),
+                            projection.clone(),
+                            listener.clone(),
+                            jobs.clone(),
+                            caught_up_rx.clone(),
+                        ));
+                    }
                     let task = tokio::task::spawn_local(Box::pin(receive_loop(
                         m.clone(),
                         projection.clone(),
                         listener.clone(),
+                        caught_up_tx.clone(),
                     )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
@@ -222,6 +266,18 @@ async fn run(
                     state: ConnectionState::Unlinked,
                 }),
             },
+            Command::Send(job) => {
+                if let Err(mpsc::error::SendError(job)) = send_tx.send(job) {
+                    let _ = projection.set_failed(&job.key).await;
+                    listener.on_event(CoreEvent::Error {
+                        message: "the sender stopped".into(),
+                    });
+                    listener.on_event(CoreEvent::MessageChanged {
+                        conversation_id: job.conversation_id,
+                        key: job.key,
+                    });
+                }
+            }
         }
     }
 }
@@ -254,8 +310,46 @@ async fn link(
     Ok(m)
 }
 
+/// Runs the sender and restarts it if it panics. Jobs queued meanwhile stay queued; the one in
+/// flight is lost, so every Pending row is marked Failed (retryable).
+async fn supervise_sender(
+    m: Manager<SqliteStore, Registered>,
+    db: ProjectionDb,
+    l: Arc<dyn EventListener>,
+    jobs: Jobs,
+    caught_up: watch::Receiver<bool>,
+) {
+    loop {
+        let task = tokio::task::spawn_local(Box::pin(sender(
+            m.clone(),
+            db.clone(),
+            l.clone(),
+            jobs.clone(),
+            caught_up.clone(),
+        )));
+        match task.await {
+            Ok(()) => return,
+            Err(e) => {
+                l.on_event(CoreEvent::Error {
+                    message: format!("sending stopped unexpectedly: {e}"),
+                });
+                if let Ok(failed) = db.fail_all_pending().await {
+                    for (conversation_id, key) in failed {
+                        l.on_event(CoreEvent::MessageChanged { conversation_id, key });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Receives forever, reconnecting with exponential backoff (1 s → 60 s).
-async fn receive_loop(mut m: Manager<SqliteStore, Registered>, db: ProjectionDb, l: Arc<dyn EventListener>) {
+async fn receive_loop(
+    mut m: Manager<SqliteStore, Registered>,
+    db: ProjectionDb,
+    l: Arc<dyn EventListener>,
+    caught_up: Rc<watch::Sender<bool>>,
+) {
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
     let mut titles_synced = false;
@@ -272,6 +366,11 @@ async fn receive_loop(mut m: Manager<SqliteStore, Registered>, db: ProjectionDb,
                 futures::pin_mut!(stream);
                 while let Some(received) = stream.next().await {
                     handle(received, &m, &db, &me, &mut titles_synced, l.as_ref()).await;
+                    caught_up.send_if_modified(|ready| {
+                        let first = !*ready && titles_synced;
+                        *ready |= titles_synced;
+                        first
+                    });
                 }
                 if connected.elapsed() >= STABLE_CONNECTION {
                     backoff = Duration::from_secs(1);

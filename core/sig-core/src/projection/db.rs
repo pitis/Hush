@@ -329,6 +329,71 @@ impl ProjectionDb {
         }
     }
 
+    /// Pending → Failed (a send that didn't go out). No other transition.
+    pub async fn set_failed(&self, key: &MessageKey) -> Result<(), sqlx::Error> {
+        self.transition(key, MessageStatus::Pending, MessageStatus::Failed)
+            .await
+    }
+
+    /// Marks every outgoing Pending message Failed (e.g. at startup: its queued send died with the
+    /// previous run). Failed rather than re-sent, because the send may already have gone out; a
+    /// later receipt still raises it. Returns the affected keys.
+    pub async fn fail_all_pending(&self) -> Result<Vec<(String, MessageKey)>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "UPDATE messages SET status = ?1 WHERE is_outgoing = 1 AND status = ?2
+             RETURNING conversation_id, author, sent_at",
+        )
+        .bind(MessageStatus::Failed.to_i64())
+        .bind(MessageStatus::Pending.to_i64())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|(c, author, sent_at)| (c, MessageKey { author, sent_at }))
+            .collect())
+    }
+
+    /// Failed → Pending (retry). No other transition.
+    pub async fn set_pending(&self, key: &MessageKey) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query("UPDATE messages SET status = ?3 WHERE author = ?1 AND sent_at = ?2 AND status = ?4")
+            .bind(&key.author)
+            .bind(key.sent_at)
+            .bind(MessageStatus::Pending.to_i64())
+            .bind(MessageStatus::Failed.to_i64())
+            .execute(&mut *tx)
+            .await?;
+        finish_update(&mut tx, key, res.rows_affected()).await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn transition(&self, key: &MessageKey, from: MessageStatus, to: MessageStatus) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query("UPDATE messages SET status = ?3 WHERE author = ?1 AND sent_at = ?2 AND status = ?4")
+            .bind(&key.author)
+            .bind(key.sent_at)
+            .bind(to.to_i64())
+            .bind(from.to_i64())
+            .execute(&mut *tx)
+            .await?;
+        finish_update(&mut tx, key, res.rows_affected()).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The stored title of any conversation (also contacts not shown in the list), e.g. to name
+    /// group senders.
+    pub async fn title(&self, id: &str) -> Result<Option<String>, sqlx::Error> {
+        let t: Option<String> = sqlx::query_scalar("SELECT title FROM conversations WHERE id = ?1 AND title != ''")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(t)
+    }
+
     pub async fn message(&self, key: &MessageKey) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query("SELECT * FROM messages WHERE author = ?1 AND sent_at = ?2")
             .bind(&key.author)
@@ -1390,6 +1455,85 @@ mod tests {
             .unwrap(),
             changed("c:alice", "me", 1)
         );
+        assert_eq!(
+            db.message(&k("me", 1)).await.unwrap().unwrap().status,
+            MessageStatus::Delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn outgoing_pending_message_then_failed_then_retried() {
+        let db = db().await;
+        let m = Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            ..msg("me", 5, "out")
+        };
+        db.insert_message(&m).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.last_message_preview.as_str(), c.unread_count), ("out", 0));
+        db.set_failed(&k("me", 5)).await.unwrap();
+        assert_eq!(
+            db.message(&k("me", 5)).await.unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+        assert!(db.set_pending(&k("me", 5)).await.unwrap());
+        assert!(!db.set_pending(&k("me", 5)).await.unwrap()); // only from Failed
+        db.apply(&Op::SetStatus {
+            targets: vec![k("me", 5)],
+            status: MessageStatus::Sent,
+        })
+        .await
+        .unwrap();
+        db.set_failed(&k("me", 5)).await.unwrap(); // a sent message never becomes failed
+        assert_eq!(
+            db.message(&k("me", 5)).await.unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
+    }
+
+    #[tokio::test]
+    async fn title_reads_hidden_contact_names() {
+        let db = db().await;
+        db.upsert_conversation_title("c:bob", "Bob").await.unwrap();
+        assert_eq!(db.title("c:bob").await.unwrap().as_deref(), Some("Bob"));
+        assert_eq!(db.title("c:nobody").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stale_pending_messages_fail_and_receipts_can_still_lift_them() {
+        let db = db().await;
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            ..msg("me", 1, "a")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Sent,
+            ..msg("me", 2, "b")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&msg("alice", 3, "in")).await.unwrap();
+        let failed = db.fail_all_pending().await.unwrap();
+        assert_eq!(failed, vec![("c:alice".to_string(), k("me", 1))]);
+        assert_eq!(
+            db.message(&k("me", 1)).await.unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+        assert_eq!(
+            db.message(&k("me", 2)).await.unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
+        db.apply(&Op::SetStatus {
+            targets: vec![k("me", 1)],
+            status: MessageStatus::Delivered,
+        })
+        .await
+        .unwrap();
         assert_eq!(
             db.message(&k("me", 1)).await.unwrap().unwrap().status,
             MessageStatus::Delivered
