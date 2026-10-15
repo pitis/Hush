@@ -4,9 +4,25 @@
 // TODO(remove when the driver lands): drop this allow.
 #![allow(dead_code)]
 
+pub(crate) mod fetch;
 pub(crate) mod read;
 #[cfg(test)]
 pub(crate) mod test_archive;
+
+/// What the app shows while history arrives.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryStage {
+    /// Waiting for the phone to upload the archive.
+    Waiting,
+    Downloading,
+    Importing,
+    /// The history is in; the chat list is fresh.
+    Done,
+    /// There is no history to import (declined, cancelled, or the phone gave up).
+    NoHistory,
+    /// The transfer failed; Retry and Continue Without History are the ways out.
+    Failed,
+}
 
 /// Why a history import stopped.
 #[derive(Debug, thiserror::Error)]

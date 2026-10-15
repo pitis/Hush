@@ -3592,6 +3592,7 @@ dependencies = [
  "presage-store-sqlite",
  "protobuf",
  "rand 0.9.5",
+ "reqwest",
  "reqwest-websocket",
  "serde_json",
  "sqlx",

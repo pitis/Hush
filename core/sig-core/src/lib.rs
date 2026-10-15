@@ -14,6 +14,7 @@ mod typing;
 pub use client::Client;
 pub use error::CoreError;
 pub use events::{ConnectionState, CoreEvent, EventListener};
+pub use history::HistoryStage;
 
 /// Version of the Rust core, shown in the app's About panel.
 #[uniffi::export]

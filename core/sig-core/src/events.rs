@@ -52,6 +52,13 @@ pub enum CoreEvent {
     ChatEventAdded {
         conversation_id: String,
     },
+    /// How the history import is doing. `done`/`total` are bytes while `Downloading` (total 0
+    /// until known), imported items while `Importing` (total 0: unknown).
+    HistoryProgress {
+        stage: crate::history::HistoryStage,
+        done: u64,
+        total: u64,
+    },
     /// A message's file was added or changed state (downloading, ready, failed).
     AttachmentChanged {
         conversation_id: String,
