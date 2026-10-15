@@ -54,6 +54,8 @@ final class FakeNotifier: Notifier, @unchecked Sendable {
     func post(_ request: NotificationRequest) { posted.append(request) }
     func remove(conversationId: String) { removed.append(conversationId) }
     func remove(ids: [String]) { removedIds += ids }
+    private(set) var removedPrefixes: [String] = []
+    func remove(idPrefix: String) { removedPrefixes.append(idPrefix) }
     private(set) var removedAll = 0
     func removeAll() { removedAll += 1 }
 }

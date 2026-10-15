@@ -47,6 +47,15 @@ pub struct ProjectionDb {
 /// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
 pub const MAX_ATTACHMENT: u64 = 100 * 1024 * 1024;
 
+/// A message whose disappearing timer ran out (see `delete_expired`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expired {
+    pub conversation_id: String,
+    pub key: MessageKey,
+    /// Timestamps of its edit revisions.
+    pub revisions: Vec<i64>,
+}
+
 /// The chat list's preview when the latest thing in a chat is a message that couldn't be
 /// decrypted.
 pub const UNDECRYPTABLE_PREVIEW: &str = "A message couldn't be decrypted";
@@ -576,40 +585,8 @@ impl ProjectionDb {
                 tx.commit().await?;
                 Ok(vec![])
             }
-            Op::SetStatus { targets, status } => {
-                let mut tx = self.pool.begin().await?;
-                let mut out = vec![];
-                for target in targets {
-                    let target = &resolve(&mut tx, target).await?;
-                    if conversation_of(&mut tx, target).await?.is_none() {
-                        // e.g. read on the phone before the message reached us
-                        sqlx::query(
-                            "INSERT INTO pending_status VALUES (?1, ?2, ?3)
-                             ON CONFLICT DO UPDATE SET status = MAX(status, excluded.status)",
-                        )
-                        .bind(&target.author)
-                        .bind(target.sent_at)
-                        .bind(status.to_i64())
-                        .execute(&mut *tx)
-                        .await?;
-                        continue;
-                    }
-                    let res = sqlx::query(
-                        "UPDATE messages SET status = ?3 WHERE author = ?1 AND sent_at = ?2 AND status < ?3",
-                    )
-                    .bind(&target.author)
-                    .bind(target.sent_at)
-                    .bind(status.to_i64())
-                    .execute(&mut *tx)
-                    .await?;
-                    if *status == MessageStatus::Read {
-                        start_timer(&mut tx, target).await?;
-                    }
-                    out.extend(changed(finish_update(&mut tx, target, res.rows_affected()).await?));
-                }
-                tx.commit().await?;
-                Ok(out)
-            }
+            Op::SetStatus { targets, status } => self.set_status(targets, *status, None).await,
+            Op::Read { targets, at } => self.set_status(targets, MessageStatus::Read, Some(*at)).await,
             Op::SetTimer {
                 conversation_id,
                 author,
@@ -632,7 +609,10 @@ impl ProjectionDb {
                 .execute(&mut *tx)
                 .await?;
                 sqlx::query(
-                    "INSERT INTO chat_events(conversation_id, at, kind, author, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    // a redelivered change is shown once
+                    "INSERT INTO chat_events(conversation_id, at, kind, author, value)
+                     SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (SELECT 1 FROM chat_events
+                       WHERE conversation_id = ?1 AND at = ?2 AND kind = ?3 AND author = ?4)",
                 )
                 .bind(conversation_id)
                 .bind(at)
@@ -649,6 +629,76 @@ impl ProjectionDb {
         }
     }
 
+    /// Raises the status of `targets`; reads start disappearing timers (from `read_at` if known,
+    /// never later than now).
+    async fn set_status(
+        &self,
+        targets: &[MessageKey],
+        status: MessageStatus,
+        read_at: Option<i64>,
+    ) -> Result<Vec<Applied>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut out = vec![];
+        for target in targets {
+            let target = &resolve(&mut tx, target).await?;
+            if conversation_of(&mut tx, target).await?.is_none() {
+                // e.g. read on the phone before the message reached us
+                sqlx::query(
+                    "INSERT INTO pending_status(author, sent_at, status, read_at) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT DO UPDATE SET status = MAX(status, excluded.status),
+                       read_at = COALESCE(read_at, excluded.read_at)",
+                )
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .bind(status.to_i64())
+                .bind(read_at)
+                .execute(&mut *tx)
+                .await?;
+                continue;
+            }
+            let res = sqlx::query("UPDATE messages SET status = ?3 WHERE author = ?1 AND sent_at = ?2 AND status < ?3")
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .bind(status.to_i64())
+                .execute(&mut *tx)
+                .await?;
+            if status == MessageStatus::Read {
+                start_timer(&mut tx, target, read_at).await?;
+            }
+            if let Some((conversation_id, key)) = finish_update(&mut tx, target, res.rows_affected()).await? {
+                out.push(Applied::MessageChanged { conversation_id, key });
+            }
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Sets a chat's timer as it really is (presage keeps it), without a chat event.
+    pub async fn set_chat_timer(&self, conversation_id: &str, seconds: u32) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE conversations SET expire_timer = ?2 WHERE id = ?1 AND expire_timer != ?2")
+            .bind(conversation_id)
+            .bind(i64::from(seconds))
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Sets the timer one of our sent messages went out with (presage chose it); it started when
+    /// the message was sent.
+    pub async fn set_message_timer(&self, key: &MessageKey, seconds: u32) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE messages SET expires_in = ?3,
+               expires_at = CASE WHEN ?3 > 0 THEN sent_at + ?3 * 1000 ELSE NULL END
+             WHERE author = ?1 AND sent_at = ?2",
+        )
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .bind(i64::from(seconds))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// The chat's disappearing-message timer (seconds, 0: off), for our own new messages.
     pub async fn expire_timer(&self, conversation_id: &str) -> Result<u32, sqlx::Error> {
         let t: Option<i64> = sqlx::query_scalar("SELECT expire_timer FROM conversations WHERE id = ?1")
@@ -659,8 +709,9 @@ impl ProjectionDb {
     }
 
     /// Removes the messages whose timer ran out by `now_ms`: rows, search index, reactions,
-    /// previews and files. Returns them.
-    pub async fn delete_expired(&self, now_ms: i64) -> Result<Vec<(String, MessageKey)>, sqlx::Error> {
+    /// previews and files. Returns them, each with its edit revisions' timestamps (presage keeps
+    /// a copy of each, to remove there too).
+    pub async fn delete_expired(&self, now_ms: i64) -> Result<Vec<Expired>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let expired: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT conversation_id, author, sent_at FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
@@ -672,6 +723,12 @@ impl ProjectionDb {
         let mut out = vec![];
         for (conversation_id, author, sent_at) in expired {
             let key = MessageKey { author, sent_at };
+            let revisions: Vec<i64> =
+                sqlx::query_scalar("SELECT sent_at FROM message_revisions WHERE author = ?1 AND original_sent_at = ?2")
+                    .bind(&key.author)
+                    .bind(key.sent_at)
+                    .fetch_all(&mut *tx)
+                    .await?;
             files.extend(forget_deleted_text(&mut tx, &key).await?);
             sqlx::query("DELETE FROM messages WHERE author = ?1 AND sent_at = ?2")
                 .bind(&key.author)
@@ -683,9 +740,13 @@ impl ProjectionDb {
                 .bind(key.sent_at)
                 .execute(&mut *tx)
                 .await?;
-            out.push((conversation_id, key));
+            out.push(Expired {
+                conversation_id,
+                key,
+                revisions,
+            });
         }
-        let mut conversations: Vec<&String> = out.iter().map(|(c, _)| c).collect();
+        let mut conversations: Vec<&String> = out.iter().map(|e| &e.conversation_id).collect();
         conversations.dedup();
         for c in conversations {
             refresh_summary(&mut tx, c).await?;
@@ -1201,13 +1262,7 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     .await?;
     let inserted = res.rows_affected() == 1;
     if inserted {
-        // every message carries its chat's current timer: the newest one says what it is now
-        sqlx::query("UPDATE conversations SET expire_timer = ?2, timer_at = ?3 WHERE id = ?1 AND timer_at <= ?3")
-            .bind(&m.conversation_id)
-            .bind(i64::from(m.expires_in))
-            .bind(m.sent_at)
-            .execute(&mut *conn)
-            .await?;
+        // (the chat's timer comes from presage, which orders changes by version: see the actor)
         apply_pending(conn, &m.key()).await?;
         refresh_summary(conn, &m.conversation_id).await?;
     }
@@ -1264,15 +1319,17 @@ async fn add_outgoing_file(
     .await
 }
 
-/// Starts a read message's disappearing timer (once).
-async fn start_timer(conn: &mut SqliteConnection, key: &MessageKey) -> Result<(), sqlx::Error> {
+/// Starts a read message's disappearing timer (once), from when it was read (`read_at`, never
+/// later than now): a read on the phone that reaches us late must not keep it longer here.
+async fn start_timer(conn: &mut SqliteConnection, key: &MessageKey, read_at: Option<i64>) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().timestamp_millis();
     sqlx::query(
         "UPDATE messages SET expires_at = ?3 + expires_in * 1000
          WHERE author = ?1 AND sent_at = ?2 AND expires_in > 0 AND expires_at IS NULL",
     )
     .bind(&key.author)
     .bind(key.sent_at)
-    .bind(chrono::Utc::now().timestamp_millis())
+    .bind(read_at.map_or(now, |at| at.min(now)))
     .execute(conn)
     .await?;
     Ok(())
@@ -1298,13 +1355,13 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
         // nothing is attached yet: attachments are added after the message
         forget_deleted_text(conn, key).await?;
     }
-    let status: Option<i64> =
-        sqlx::query_scalar("DELETE FROM pending_status WHERE author = ?1 AND sent_at = ?2 RETURNING status")
+    let pending: Option<(i64, Option<i64>)> =
+        sqlx::query_as("DELETE FROM pending_status WHERE author = ?1 AND sent_at = ?2 RETURNING status, read_at")
             .bind(&key.author)
             .bind(key.sent_at)
             .fetch_optional(&mut *conn)
             .await?;
-    if let Some(status) = status {
+    if let Some((status, read_at)) = pending {
         sqlx::query("UPDATE messages SET status = MAX(status, ?3) WHERE author = ?1 AND sent_at = ?2")
             .bind(&key.author)
             .bind(key.sent_at)
@@ -1312,7 +1369,7 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
             .execute(&mut *conn)
             .await?;
         if status >= MessageStatus::Read.to_i64() {
-            start_timer(conn, key).await?;
+            start_timer(conn, key, read_at).await?;
         }
     }
     Ok(())
@@ -3115,6 +3172,13 @@ mod tests {
         db.start_download(id).await.unwrap();
         db.finish_download(id, Ok(b"jpg".to_vec())).await.unwrap();
         let path = db.attachment(id).await.unwrap().unwrap().path.unwrap();
+        db.apply(&Op::Edit {
+            target: k("alice", 1),
+            new_body: Some("secret plan v2".into()),
+            edited_at: 7,
+        })
+        .await
+        .unwrap();
         let far_future = i64::MAX / 2;
         assert!(
             db.delete_expired(far_future).await.unwrap().is_empty(),
@@ -3136,7 +3200,12 @@ mod tests {
         assert!(db.delete_expired(at - 1).await.unwrap().is_empty(), "not yet");
         assert_eq!(
             db.delete_expired(at).await.unwrap(),
-            vec![("c:alice".to_string(), k("alice", 1))]
+            vec![Expired {
+                conversation_id: "c:alice".into(),
+                key: k("alice", 1),
+                revisions: vec![7],
+            }],
+            "with its edit, which presage keeps a copy of too"
         );
         assert!(db.message(&k("alice", 1)).await.unwrap().is_none());
         assert!(
@@ -3170,15 +3239,92 @@ mod tests {
         assert_eq!(conv(&db, "c:alice").await.expire_timer, 604_800);
         let event = &db.chat_events("c:alice", 0).await.unwrap()[0];
         assert_eq!((event.kind, event.value), (ChatEventKind::TimerChanged, Some(604_800)));
-        // an older message doesn't undo it; a newer one carries the chat's current timer
-        db.insert_message(&msg("alice", 3, "old")).await.unwrap();
-        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 604_800);
+        // messages don't change it (presage's view, by version, is synced in by the actor)
         db.insert_message(&Message {
             expires_in: 3600,
             ..msg("alice", 9, "new")
         })
         .await
         .unwrap();
-        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 3600);
+        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 604_800);
+    }
+
+    #[tokio::test]
+    async fn a_read_on_the_phone_starts_the_timer_when_it_was_read_not_when_we_hear_of_it() {
+        let db = db().await;
+        let timed = |sent_at| Message {
+            expires_in: 3600,
+            ..msg("alice", sent_at, "x")
+        };
+        db.insert_message(&timed(1)).await.unwrap();
+        db.apply(&Op::Read {
+            targets: vec![k("alice", 1), k("alice", 2)],
+            at: 1_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.message(&k("alice", 1)).await.unwrap().unwrap().expires_at,
+            Some(1_000 + 3_600_000)
+        );
+        // read before it reached us: its timer starts from that read too
+        db.insert_message(&timed(2)).await.unwrap();
+        assert_eq!(
+            db.message(&k("alice", 2)).await.unwrap().unwrap().expires_at,
+            Some(1_000 + 3_600_000)
+        );
+        // a read "in the future" (a phone's clock ahead) starts no later than now
+        db.insert_message(&timed(3)).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.apply(&Op::Read {
+            targets: vec![k("alice", 3)],
+            at: i64::MAX / 4,
+        })
+        .await
+        .unwrap();
+        let at = db.message(&k("alice", 3)).await.unwrap().unwrap().expires_at.unwrap();
+        assert!(at <= chrono::Utc::now().timestamp_millis() + 3_600_000 && at >= now + 3_600_000);
+    }
+
+    #[tokio::test]
+    async fn the_timer_presage_sends_with_is_the_one_kept() {
+        let db = db().await;
+        db.insert_message(&Message {
+            is_outgoing: true,
+            ..msg("me", 10, "brb")
+        })
+        .await
+        .unwrap();
+        db.set_message_timer(&k("me", 10), 60).await.unwrap();
+        let m = db.message(&k("me", 10)).await.unwrap().unwrap();
+        assert_eq!(
+            (m.expires_in, m.expires_at),
+            (60, Some(10 + 60_000)),
+            "started when sent"
+        );
+        db.set_message_timer(&k("me", 10), 0).await.unwrap();
+        let m = db.message(&k("me", 10)).await.unwrap().unwrap();
+        assert_eq!((m.expires_in, m.expires_at), (0, None));
+        assert!(db.set_chat_timer("c:alice", 86_400).await.unwrap(), "changed");
+        assert!(!db.set_chat_timer("c:alice", 86_400).await.unwrap(), "unchanged");
+        assert_eq!(db.expire_timer("c:alice").await.unwrap(), 86_400);
+        assert!(
+            db.chat_events("c:alice", 0).await.unwrap().is_empty(),
+            "not a change anyone made"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_timer_change_shows_once() {
+        let db = db().await;
+        let op = Op::SetTimer {
+            conversation_id: "c:alice".into(),
+            author: "alice".into(),
+            seconds: 60,
+            at: 5,
+        };
+        db.apply(&op).await.unwrap();
+        db.apply(&op).await.unwrap();
+        assert_eq!(db.chat_events("c:alice", 0).await.unwrap().len(), 1);
     }
 }

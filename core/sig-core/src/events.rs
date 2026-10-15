@@ -25,6 +25,11 @@ pub enum CoreEvent {
         conversation_id: String,
         key: MessageKey,
     },
+    /// A disappearing message's timer ran out: it is gone, with its notifications.
+    MessageExpired {
+        conversation_id: String,
+        key: MessageKey,
+    },
     Typing {
         conversation_id: String,
         who: String,

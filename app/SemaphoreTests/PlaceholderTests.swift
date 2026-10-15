@@ -63,4 +63,25 @@ final class AppStoreExpiryTests: XCTestCase {
         store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "a", sentAt: 10)))
         await eventually { !store.messages.contains { $0.sentAt == 10 } }
     }
+
+    func testAnExpiredMessageLeavesTheChatSearchAndNotificationCenter() async {
+        let fake = FakeClient(linked: true)
+        let notifier = FakeNotifier()
+        fake.messageAnswers["c:a"] = [message("c:a", "a", 1), message("c:a", "a", 2)]
+        let store = AppStore(open: { _ in fake }, notifier: notifier)
+        await store.boot()
+        store.select("c:a")
+        await eventually { store.messages.count == 2 }
+        let key = MessageKey(author: "a", sentAt: 1)
+        store.handle(.messageExpired(conversationId: "c:a", key: key))
+        XCTAssertEqual(store.messages.map(\.sentAt), [2])
+        // one prefix covers the message's notification and those of reactions to it, even ones
+        // shown before the app started
+        XCTAssertEqual(notifier.removedPrefixes, ["c:a|a|1|"])
+        XCTAssertTrue(Notifications.id("c:a", key, reactor: nil, emoji: nil).hasPrefix("c:a|a|1|"))
+        XCTAssertTrue(Notifications.id("c:a", key, reactor: "b", emoji: "👍").hasPrefix("c:a|a|1|"))
+        XCTAssertNotEqual(
+            Notifications.id("c:a", key, reactor: "b", emoji: "👍"),
+            Notifications.id("c:a", key, reactor: nil, emoji: nil))
+    }
 }

@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use futures::{channel::oneshot as fut_oneshot, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
+use presage::libsignal_service::content::Content;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
-use presage::store::ContentsStore;
+use presage::store::{ContentsStore, Thread};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -29,7 +30,7 @@ use crate::download::{downloader, Download, Downloads};
 use crate::error::CoreError;
 use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
-use crate::projection::{project, ChatEventKind, Op, ProjectionDb};
+use crate::projection::{project, ChatEventKind, Expired, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
 use crate::typing::{Typing, TYPING_IDLE};
 
@@ -244,7 +245,7 @@ async fn run(
     }
 
     // Disappearing messages go once their timer runs out, connected or not.
-    tokio::task::spawn_local(expire(projection.clone(), listener.clone()));
+    tokio::task::spawn_local(expire(store.clone(), projection.clone(), listener.clone()));
     let receiving = Rc::new(Cell::new(false));
     let wake = Rc::new(tokio::sync::Notify::new());
     while let Some(cmd) = rx.recv().await {
@@ -457,22 +458,81 @@ async fn link(
 const EXPIRY_SWEEP: Duration = Duration::from_secs(5);
 
 /// Removes disappearing messages as their timers run out, for as long as the core runs.
-async fn expire(db: ProjectionDb, l: Arc<dyn EventListener>) {
+async fn expire(mut store: SqliteStore, db: ProjectionDb, l: Arc<dyn EventListener>) {
+    // an error is reported once until a sweep works again, not every 5 s
+    let mut failing = false;
     loop {
         match db.delete_expired(chrono::Utc::now().timestamp_millis()).await {
-            Ok(gone) if gone.is_empty() => {}
             Ok(gone) => {
-                tracing::info!(count = gone.len(), "disappearing messages removed");
-                for (conversation_id, key) in gone {
-                    l.on_event(CoreEvent::MessageChanged { conversation_id, key });
+                failing = false;
+                if !gone.is_empty() {
+                    tracing::info!(count = gone.len(), "disappearing messages removed");
                 }
-                l.on_event(CoreEvent::ConversationsChanged);
+                for e in &gone {
+                    // presage keeps its own copy of each message and edit: it goes too
+                    if let Err(err) = forget_in_presage(&mut store, e).await {
+                        l.on_event(CoreEvent::Error {
+                            message: format!("removing a disappearing message's stored copy failed: {err}"),
+                        });
+                    }
+                }
+                for e in &gone {
+                    l.on_event(CoreEvent::MessageExpired {
+                        conversation_id: e.conversation_id.clone(),
+                        key: e.key.clone(),
+                    });
+                }
+                if !gone.is_empty() {
+                    l.on_event(CoreEvent::ConversationsChanged);
+                }
             }
-            Err(e) => l.on_event(CoreEvent::Error {
-                message: format!("removing disappearing messages failed: {e}"),
-            }),
+            Err(e) if !failing => {
+                failing = true;
+                l.on_event(CoreEvent::Error {
+                    message: format!("removing disappearing messages failed: {e}"),
+                });
+            }
+            Err(_) => {}
         }
         tokio::time::sleep(EXPIRY_SWEEP).await;
+    }
+}
+
+/// Removes an expired message, and its edits, from presage's store.
+async fn forget_in_presage(store: &mut SqliteStore, e: &Expired) -> Result<(), String> {
+    let thread = crate::send::thread(&e.conversation_id).ok_or("not a conversation id")?;
+    for at in std::iter::once(e.key.sent_at).chain(e.revisions.iter().copied()) {
+        store
+            .delete_message(&thread, at as u64)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+/// Keeps a chat's timer as presage has it: presage orders timer changes by version (1:1) or
+/// group state, which the projection doesn't see.
+async fn sync_timer(store: &SqliteStore, db: &ProjectionDb, l: &dyn EventListener, content: &Content) {
+    let Ok(thread) = Thread::try_from(content) else { return };
+    let conversation_id = match &thread {
+        Thread::Contact(sid) => direct_id(sid),
+        Thread::Group(key) => group_id(key),
+    };
+    let timer = match store.expire_timer(&thread).await {
+        Ok(t) => t.map_or(0, |(t, _)| t),
+        Err(e) => {
+            l.on_event(CoreEvent::Error {
+                message: format!("reading a chat's timer failed: {e}"),
+            });
+            return;
+        }
+    };
+    match db.set_chat_timer(&conversation_id, timer).await {
+        Ok(true) => l.on_event(CoreEvent::ConversationsChanged),
+        Ok(false) => {}
+        Err(e) => l.on_event(CoreEvent::Error {
+            message: format!("storing a chat's timer failed: {e}"),
+        }),
     }
 }
 
@@ -731,6 +791,7 @@ async fn handle(
             tracing::info!(ops = ops.len(), "projected");
             let sender = content.metadata.sender.service_id_string();
             let outcome = apply_received(db, l, &ops, &sender, me, progress.live).await;
+            sync_timer(m.store(), db, l, &content).await;
             if outcome.settings_changed {
                 // receipts held back while the read receipts setting was unknown; queued only
                 // now that the new setting is stored, so they can't go out under the old one
@@ -809,11 +870,16 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
         Ok(contacts) => {
             for contact in contacts {
                 match contact {
-                    Ok(c) if c.name.is_empty() => {}
                     Ok(c) => {
                         let id = direct_id(&Aci::from(c.uuid).into());
-                        if let Err(e) = db.upsert_conversation_title(&id, &c.name).await {
-                            problems.push(format!("storing a contact name: {e}"));
+                        if !c.name.is_empty() {
+                            if let Err(e) = db.upsert_conversation_title(&id, &c.name).await {
+                                problems.push(format!("storing a contact name: {e}"));
+                            }
+                        }
+                        // chats that disappeared before we knew of timers, or changed while away
+                        if let Err(e) = db.set_chat_timer(&id, c.expire_timer).await {
+                            problems.push(format!("storing a chat's timer: {e}"));
                         }
                     }
                     Err(e) => problems.push(format!("reading a contact: {e}")),
@@ -829,6 +895,10 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
                     Ok((key, g)) => {
                         if let Err(e) = db.upsert_conversation_title(&group_id(&key), &g.title).await {
                             problems.push(format!("storing a group title: {e}"));
+                        }
+                        let timer = g.disappearing_messages_timer.map_or(0, |t| t.duration);
+                        if let Err(e) = db.set_chat_timer(&group_id(&key), timer).await {
+                            problems.push(format!("storing a chat's timer: {e}"));
                         }
                     }
                     Err(e) => problems.push(format!("reading a group: {e}")),
@@ -1011,5 +1081,65 @@ mod tests {
             .join()
             .unwrap();
         assert!(generated > 1000);
+    }
+
+    /// presage keeps its own copy of every message (and edit): an expired one goes from there too.
+    #[tokio::test]
+    async fn an_expired_message_leaves_presages_store_too() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::libsignal_service::protocol::{Aci, DeviceId, ServiceId};
+        use presage::model::identity::OnNewIdentity;
+        use presage::proto::DataMessage;
+        use presage::store::{ContentsStore, Thread};
+        use presage_store_sqlite::SqliteStore;
+
+        const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+        let dir = std::env::temp_dir().join(format!("sig-core-expire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "00".repeat(32);
+        let mut store = SqliteStore::open_with_options(
+            super::sqlite_options(&dir.join("presage.db"), &key).unwrap(),
+            OnNewIdentity::Trust,
+        )
+        .await
+        .unwrap();
+        let alice = ServiceId::from(Aci::from(
+            presage::libsignal_service::prelude::Uuid::parse_str(ALICE).unwrap(),
+        ));
+        let thread = Thread::Contact(alice);
+        let at = |ms: u64| Content {
+            metadata: Metadata {
+                sender: alice,
+                destination: alice,
+                sender_device: DeviceId::new(1).unwrap(),
+                pni_verified: None,
+                client_timestamp: chrono::DateTime::from_timestamp_millis(ms as i64).unwrap(),
+                server_timestamp: chrono::DateTime::from_timestamp_millis(ms as i64).unwrap(),
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+            body: ContentBody::DataMessage(DataMessage {
+                timestamp: Some(ms),
+                ..Default::default()
+            }),
+        };
+        for ms in [100, 107, 200] {
+            store.save_message(&thread, at(ms)).await.unwrap();
+        }
+        let expired = super::Expired {
+            conversation_id: format!("c:{ALICE}"),
+            key: crate::projection::MessageKey {
+                author: ALICE.into(),
+                sent_at: 100,
+            },
+            revisions: vec![107],
+        };
+        super::forget_in_presage(&mut store, &expired).await.unwrap();
+        assert!(store.message(&thread, 100).await.unwrap().is_none());
+        assert!(store.message(&thread, 107).await.unwrap().is_none(), "its edit");
+        assert!(store.message(&thread, 200).await.unwrap().is_some(), "others stay");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

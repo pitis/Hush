@@ -12,3 +12,5 @@ ALTER TABLE conversations ADD COLUMN expire_timer INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE conversations ADD COLUMN timer_at INTEGER NOT NULL DEFAULT 0;
 -- e.g. the new timer of a TimerChanged event
 ALTER TABLE chat_events ADD COLUMN value INTEGER;
+-- when a message was read before it reached us (its disappearing timer starts then)
+ALTER TABLE pending_status ADD COLUMN read_at INTEGER;

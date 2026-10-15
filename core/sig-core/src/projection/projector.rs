@@ -36,6 +36,12 @@ pub enum Op {
         targets: Vec<MessageKey>,
         status: MessageStatus,
     },
+    /// We read the targets, on another device (or here) at `at` (ms): their disappearing timers
+    /// start then.
+    Read {
+        targets: Vec<MessageKey>,
+        at: i64,
+    },
     Typing {
         conversation_id: String,
         who: String,
@@ -110,9 +116,9 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
                 })
                 .collect();
             if !read.is_empty() {
-                ops.push(Op::SetStatus {
+                ops.push(Op::Read {
                     targets: read,
-                    status: MessageStatus::Read,
+                    at: received_at,
                 });
             }
             ops
@@ -853,10 +859,11 @@ mod tests {
         let ops = project(&content(ME, 950, ContentBody::SynchronizeMessage(sm.clone())), ME);
         assert_eq!(
             ops,
-            vec![Op::SetStatus {
+            vec![Op::Read {
                 targets: vec![key(ALICE, 100), key(BOB, 101)],
-                status: MessageStatus::Read
-            }]
+                at: 950,
+            }],
+            "read when the phone said so (disappearing timers start then)"
         );
         // only our own devices may tell us what we read
         assert!(project(&content(ALICE, 951, ContentBody::SynchronizeMessage(sm)), ME).is_empty());

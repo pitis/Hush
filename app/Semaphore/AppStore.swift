@@ -236,6 +236,16 @@ final class AppStore {
                 reloadMessages()
             }
             if notifiedMessages[key] != nil { Task { await removeIfDeleted(key) } }
+        case .messageExpired(let conversationId, let key):
+            // its disappearing timer ran out: nothing of it may stay on screen
+            append("expired \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
+            refreshConversations()
+            if conversationId == selectedId {
+                messages.removeAll { $0.author == key.author && $0.sentAt == key.sentAt }
+            }
+            searchResults.removeAll { $0.message.author == key.author && $0.message.sentAt == key.sentAt }
+            notifiedMessages[key] = nil
+            notifier?.remove(idPrefix: Notifications.idPrefix(conversationId, key))
         case .newMessage(let conversationId, let key):
             Task { await notify(conversationId, about: key, reaction: nil) }
         case .attachmentChanged(let conversationId, let message, _):
@@ -494,7 +504,7 @@ final class AppStore {
             guard
                 let request = Notifications.request(
                     setting: setting, conversationId: conversationId,
-                    id: "\(conversationId)|\(author)|\(key.sentAt)|\(reaction?.emoji ?? "")",
+                    id: Notifications.id(conversationId, key, reactor: reaction?.reactor, emoji: reaction?.emoji),
                     sender: senderName(author), groupTitle: groupTitle, text: text, reaction: reaction?.emoji)
             else { return }
             notifier.post(request)
