@@ -2,7 +2,11 @@
 //! its own encrypted SQLite file and fed from presage content.
 
 pub mod db;
+pub mod ids;
 pub mod model;
+pub mod projector;
 
 pub use db::ProjectionDb;
+pub use ids::conversation_id;
 pub use model::*;
+pub use projector::{project, Op};
