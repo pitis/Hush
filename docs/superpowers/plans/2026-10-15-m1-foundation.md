@@ -1331,6 +1331,21 @@ Add `uniffi = { workspace = true, features = ["tokio"] }` in `sig-core/Cargo.tom
 
 ### Task 6: Spike UI — Keychain key, QR link screen, live event log (manual E2E with phone)
 
+> **As built (PR #27, after review):**
+> - **Signing:** with the owner's Apple Development identity (team `95KQ82C586`, `app/project.yml`). An ad-hoc signature changes every build, and the Keychain then blocks `dbKey()` on an access prompt. This was found when the first run hung.
+> - **Window:** a single `Window` scene owns one `CoreBridge` at app level. A second window would hit the data-dir lock, and a window close would block on joining the core thread.
+> - **CoreBridge:**
+>   - takes an injectable opener (`any ClientProtocol`), and tests use `FakeClient`;
+>   - `boot()` runs once, off the main thread;
+>   - conversation refreshes are coalesced (one in flight; the newest result wins);
+>   - only a linked core moves the UI to the chats;
+>   - a fresh link code clears the old error, and "Try again" shows only when no code is showing.
+> - **Keychain:** throws on any error other than "not found", and on a creation race returns the stored key.
+> - **Tests:** the app skips booting under XCTest (`XCTestConfigurationFilePath`).
+> - **Logging:** state goes to the unified log (category `app`); core error text is logged `.private`.
+> - **Build:** `build-core.sh` sets `MACOSX_DEPLOYMENT_TARGET=15.0`.
+> - **Probe:** `cargo run --example link_probe` prints core events while linking.
+
 **Files:**
 - Create: `app/Semaphore/Keychain.swift`, `app/Semaphore/CoreBridge.swift`, `app/Semaphore/LinkView.swift`, `app/Semaphore/QRCode.swift`
 - Modify: `app/Semaphore/ContentView.swift`, `app/Semaphore/SemaphoreApp.swift`
