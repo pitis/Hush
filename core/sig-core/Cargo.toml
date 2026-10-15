@@ -1,0 +1,13 @@
+[package]
+name = "sig-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+uniffi = { workspace = true }
+presage = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }

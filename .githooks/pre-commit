@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Fast gate on every commit. The full gate (`make check`) runs before every push.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+if grep -q '^core/' <<<"$staged"; then
+  (cd core && cargo fmt --check) || { echo "✗ run: make format" >&2; exit 1; }
+  (cd core && cargo clippy --all-targets -q -- -D warnings)
+fi
+swift=$(grep -E '^app/.*\.swift$' <<<"$staged" | grep -v '^app/Generated/' || true)
+if [ -n "$swift" ]; then
+  xcrun swift-format lint --strict $swift || { echo "✗ run: make format" >&2; exit 1; }
+fi
+if git diff --cached | grep -qiE '^\+.*(co-authored-by: claude|generated with \[?claude)'; then
+  echo "✗ no AI attribution in the repo" >&2; exit 1
+fi

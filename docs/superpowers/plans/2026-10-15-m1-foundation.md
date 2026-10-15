@@ -38,7 +38,7 @@
 ### Task 1: Scaffold — Rust core + UniFFI + XcodeGen app that calls Rust
 
 **Files:**
-- Create: `.gitignore`, `README.md`, `justfile`
+- Create: `.gitignore`, `README.md`, `Makefile`, `CLAUDE.md`, `scripts/{worktree,update,card}.sh`, `.githooks/`
 - Create: `core/Cargo.toml`, `core/sig-core/Cargo.toml`, `core/sig-core/src/lib.rs`
 - Create: `core/uniffi-bindgen/Cargo.toml`, `core/uniffi-bindgen/src/main.rs`
 - Create: `scripts/build-core.sh`
@@ -50,7 +50,7 @@
 - [ ] **Step 1: Install tools**
 
 ```bash
-brew install protobuf xcodegen just
+brew install protobuf xcodegen
 ```
 
 - [ ] **Step 2: Workspace manifests**
@@ -253,7 +253,7 @@ final class SmokeTests: XCTestCase {
 Run: `cd app && xcodegen && xcodebuild -project Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' test | tail -5`
 Expected: `** TEST SUCCEEDED **`. (Linker errors for missing system frameworks → add them to `OTHER_LDFLAGS`; the libsignal stack may need `-framework CoreFoundation`.)
 
-- [ ] **Step 10: justfile, .gitignore, README**
+- [ ] **Step 10: Makefile, .gitignore, README** (as built: see the repo; the justfile below was replaced by a Makefile with the same targets plus the PR workflow targets)
 
 `justfile`:
 ```make
@@ -276,7 +276,7 @@ DerivedData/
 .DS_Store
 ```
 
-`README.md`: one paragraph (unofficial personal native macOS Signal client; Rust core on presage + SwiftUI; AGPL-3.0; `just test`, `just app`).
+`README.md`: one paragraph (unofficial personal native macOS Signal client; Rust core on presage + SwiftUI; AGPL-3.0; `make check`, `just app`).
 
 - [ ] **Step 11: Commit**
 
@@ -1478,9 +1478,9 @@ struct ContentView: View {
 }
 ```
 
-- [ ] **Step 6: Build + unit tests pass.** Run: `just test` → `TEST SUCCEEDED`.
+- [ ] **Step 6: Build + unit tests pass.** Run: `make check` → `TEST SUCCEEDED`.
 
-- [ ] **Step 7: Manual E2E (requires Pitis + phone).** Run: `just app && open app/build/Debug/Semaphore.app` (or run from Xcode).
+- [ ] **Step 7: Manual E2E (requires Pitis + phone).** Run: `make run` (or run from Xcode).
   Checklist:
   1. QR appears within ~5 s.
   2. Scan with phone → phone shows "Semaphore" in Linked devices; window switches to the split view; title shows `online`.

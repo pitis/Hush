@@ -1,0 +1,8 @@
+core/target/
+app/Generated/
+app/Frameworks/
+app/Semaphore.xcodeproj/
+app/Semaphore/Info.plist
+build/
+worktrees/
+.DS_Store

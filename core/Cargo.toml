@@ -1,0 +1,13 @@
+[workspace]
+members = ["sig-core", "uniffi-bindgen"]
+resolver = "2"
+
+[workspace.dependencies]
+uniffi = "0.32"
+
+[patch.crates-io]
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,42 @@
+name: Semaphore
+options:
+  bundleIdPrefix: dev.pitis
+  deploymentTarget: { macOS: "15.0" }
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    ARCHS: arm64
+targets:
+  Semaphore:
+    type: application
+    platform: macOS
+    sources: [Semaphore, Generated]
+    dependencies:
+      - framework: Frameworks/SigCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+    info:
+      path: Semaphore/Info.plist
+      properties:
+        CFBundleDisplayName: Semaphore
+        LSMinimumSystemVersion: "15.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.semaphore
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: YES
+  SemaphoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [SemaphoreTests]
+    dependencies: [{ target: Semaphore }]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+schemes:
+  Semaphore:
+    build: { targets: { Semaphore: all, SemaphoreTests: [test] } }
+    test: { targets: [SemaphoreTests] }
