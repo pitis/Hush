@@ -29,7 +29,7 @@ use crate::error::CoreError;
 use crate::events::{from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, ProjectionDb};
-use crate::send::{sender, SendJob};
+use crate::send::{sender, Jobs, SendJob};
 
 /// libsignal's post-quantum crypto (libcrux ML-KEM key generation, also run by presage's pre-key
 /// refresh while receiving, and session decryption) uses very large stack frames in debug builds;
@@ -183,7 +183,19 @@ async fn run(
     }
     // Sends queue here until receiving starts and the server queue is drained.
     let (send_tx, send_rx) = mpsc::unbounded_channel::<SendJob>();
-    let mut send_rx = Some(send_rx);
+    let jobs: Jobs = Rc::new(std::cell::RefCell::new(send_rx));
+    let mut sending = false;
+    // Sends queued by a previous run died with it.
+    match projection.fail_all_pending().await {
+        Ok(failed) => {
+            for (conversation_id, key) in failed {
+                listener.on_event(CoreEvent::MessageChanged { conversation_id, key });
+            }
+        }
+        Err(e) => listener.on_event(CoreEvent::Error {
+            message: format!("checking unsent messages failed: {e}"),
+        }),
+    }
     let (caught_up_tx, caught_up_rx) = watch::channel(false);
     let caught_up_tx = Rc::new(caught_up_tx);
     if ready.send(Ok(projection.clone())).is_err() {
@@ -220,14 +232,15 @@ async fn run(
                 Some(_) if receiving.get() => {}
                 Some(m) => {
                     receiving.set(true);
-                    if let Some(jobs) = send_rx.take() {
-                        tokio::task::spawn_local(Box::pin(sender(
+                    if !sending {
+                        sending = true;
+                        tokio::task::spawn_local(supervise_sender(
                             m.clone(),
                             projection.clone(),
                             listener.clone(),
-                            jobs,
+                            jobs.clone(),
                             caught_up_rx.clone(),
-                        )));
+                        ));
                     }
                     let task = tokio::task::spawn_local(Box::pin(receive_loop(
                         m.clone(),
@@ -254,9 +267,14 @@ async fn run(
                 }),
             },
             Command::Send(job) => {
-                if send_tx.send(job).is_err() {
+                if let Err(mpsc::error::SendError(job)) = send_tx.send(job) {
+                    let _ = projection.set_failed(&job.key).await;
                     listener.on_event(CoreEvent::Error {
                         message: "the sender stopped".into(),
+                    });
+                    listener.on_event(CoreEvent::MessageChanged {
+                        conversation_id: job.conversation_id,
+                        key: job.key,
                     });
                 }
             }
@@ -290,6 +308,39 @@ async fn link(
         });
     }
     Ok(m)
+}
+
+/// Runs the sender and restarts it if it panics. Jobs queued meanwhile stay queued; the one in
+/// flight is lost, so every Pending row is marked Failed (retryable).
+async fn supervise_sender(
+    m: Manager<SqliteStore, Registered>,
+    db: ProjectionDb,
+    l: Arc<dyn EventListener>,
+    jobs: Jobs,
+    caught_up: watch::Receiver<bool>,
+) {
+    loop {
+        let task = tokio::task::spawn_local(Box::pin(sender(
+            m.clone(),
+            db.clone(),
+            l.clone(),
+            jobs.clone(),
+            caught_up.clone(),
+        )));
+        match task.await {
+            Ok(()) => return,
+            Err(e) => {
+                l.on_event(CoreEvent::Error {
+                    message: format!("sending stopped unexpectedly: {e}"),
+                });
+                if let Ok(failed) = db.fail_all_pending().await {
+                    for (conversation_id, key) in failed {
+                        l.on_event(CoreEvent::MessageChanged { conversation_id, key });
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Receives forever, reconnecting with exponential backoff (1 s → 60 s).

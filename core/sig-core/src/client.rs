@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::actor::{self, Command};
 use crate::error::CoreError;
-use crate::events::EventListener;
+use crate::events::{CoreEvent, EventListener};
 use crate::projection::{Conversation, Message, MessageKey, MessageStatus, ProjectionDb, Quote, Reaction};
 use crate::send::SendJob;
 
@@ -22,6 +22,7 @@ pub struct Client {
     db: ProjectionDb,
     linked: Arc<AtomicBool>,
     own_aci: Arc<Mutex<Option<String>>>,
+    listener: Arc<dyn EventListener>,
     /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
     last_sent_at: Mutex<i64>,
 }
@@ -72,7 +73,7 @@ impl Client {
         let h = actor::spawn(
             PathBuf::from(data_dir),
             db_key_hex,
-            listener,
+            listener.clone(),
             linked.clone(),
             own_aci.clone(),
         )?;
@@ -82,6 +83,7 @@ impl Client {
             db: h.projection,
             linked,
             own_aci,
+            listener,
             last_sent_at: Mutex::new(0),
         }))
     }
@@ -128,12 +130,11 @@ impl Client {
             });
         }
         let author = self.own_aci().ok_or(CoreError::NotLinked)?;
-        let sent_at = self.next_sent_at();
-        let message = Message {
+        let mut message = Message {
             conversation_id: conversation_id.clone(),
             author,
-            sent_at,
-            received_at: sent_at,
+            sent_at: self.next_sent_at(),
+            received_at: 0,
             body: Some(body.clone()),
             is_outgoing: true,
             status: MessageStatus::Pending,
@@ -141,14 +142,30 @@ impl Client {
             deleted: false,
             quote: quote.clone(),
         };
-        self.db.insert_message(&message).await?;
+        // (author, sent_at) is the identity: on a collision (a phone-sent message in the same ms,
+        // a clock that went back) take the next timestamp rather than dropping the message.
+        for _ in 0..1000 {
+            message.received_at = message.sent_at;
+            if self.db.insert_message(&message).await? {
+                break;
+            }
+            message.sent_at = self.next_sent_at();
+        }
         let key = message.key();
-        self.send(Command::Send(SendJob {
+        self.listener.on_event(CoreEvent::MessageChanged {
+            conversation_id: conversation_id.clone(),
+            key: key.clone(),
+        });
+        let queued = self.send(Command::Send(SendJob {
             key: key.clone(),
             conversation_id,
             body,
             quote,
-        }))?;
+        }));
+        if let Err(e) = queued {
+            self.db.set_failed(&key).await?;
+            return Err(e);
+        }
         Ok(key)
     }
 

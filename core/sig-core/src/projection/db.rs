@@ -335,6 +335,26 @@ impl ProjectionDb {
             .await
     }
 
+    /// Marks every outgoing Pending message Failed (e.g. at startup: its queued send died with the
+    /// previous run). Failed rather than re-sent, because the send may already have gone out; a
+    /// later receipt still raises it. Returns the affected keys.
+    pub async fn fail_all_pending(&self) -> Result<Vec<(String, MessageKey)>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "UPDATE messages SET status = ?1 WHERE is_outgoing = 1 AND status = ?2
+             RETURNING conversation_id, author, sent_at",
+        )
+        .bind(MessageStatus::Failed.to_i64())
+        .bind(MessageStatus::Pending.to_i64())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|(c, author, sent_at)| (c, MessageKey { author, sent_at }))
+            .collect())
+    }
+
     /// Failed → Pending (retry). No other transition.
     pub async fn set_pending(&self, key: &MessageKey) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -1478,5 +1498,45 @@ mod tests {
         db.upsert_conversation_title("c:bob", "Bob").await.unwrap();
         assert_eq!(db.title("c:bob").await.unwrap().as_deref(), Some("Bob"));
         assert_eq!(db.title("c:nobody").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stale_pending_messages_fail_and_receipts_can_still_lift_them() {
+        let db = db().await;
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            ..msg("me", 1, "a")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&Message {
+            is_outgoing: true,
+            status: MessageStatus::Sent,
+            ..msg("me", 2, "b")
+        })
+        .await
+        .unwrap();
+        db.insert_message(&msg("alice", 3, "in")).await.unwrap();
+        let failed = db.fail_all_pending().await.unwrap();
+        assert_eq!(failed, vec![("c:alice".to_string(), k("me", 1))]);
+        assert_eq!(
+            db.message(&k("me", 1)).await.unwrap().unwrap().status,
+            MessageStatus::Failed
+        );
+        assert_eq!(
+            db.message(&k("me", 2)).await.unwrap().unwrap().status,
+            MessageStatus::Sent
+        );
+        db.apply(&Op::SetStatus {
+            targets: vec![k("me", 1)],
+            status: MessageStatus::Delivered,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.message(&k("me", 1)).await.unwrap().unwrap().status,
+            MessageStatus::Delivered
+        );
     }
 }
