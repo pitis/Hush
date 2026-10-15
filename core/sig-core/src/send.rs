@@ -65,7 +65,7 @@ pub enum Job {
         at: u64,
     },
     /// Send the unsent read receipts (`ProjectionDb::unsent_receipts`) and the read state to our
-    /// phone. Also done whenever the sender starts.
+    /// phone. Queued by mark-read and when the phone's settings arrive.
     Receipts,
     /// Started or Stopped; dropped if it waited `TYPING_IDLE` (since `queued`) before going out.
     Typing {
@@ -305,17 +305,13 @@ pub async fn sender(
     if caught_up.wait_for(|ready| *ready).await.is_err() {
         return;
     }
-    match db.settings().await {
-        Ok(s) if s.read_receipts.is_some() && s.typing_indicators.is_some() => {}
-        _ => {
-            let me = m.registration_data().service_ids.aci();
-            if let Err(e) = timed(Box::pin(m.send_message(me, configuration_request(), now_ms()))).await {
-                tracing::warn!(error = %e, "asking the phone for settings failed");
-            }
-        }
+    // Settings are asked for on every start, so a change we missed is picked up. Receipts left
+    // over from an earlier run wait for the answer (storing it queues a flush) or for the next
+    // mark-read, so they don't go out under a setting the phone may have changed meanwhile.
+    let me = m.registration_data().service_ids.aci();
+    if let Err(e) = timed(Box::pin(m.send_message(me, configuration_request(), now_ms()))).await {
+        tracing::warn!(error = %e, "asking the phone for settings failed");
     }
-    // receipts left over from an earlier run or a failed send
-    send_receipts(&mut m, &db, l.as_ref()).await;
     loop {
         // the RefCell borrow is never held across the send itself
         let next = std::future::poll_fn(|cx| jobs.borrow_mut().poll_recv(cx)).await;
@@ -449,6 +445,10 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
     let mut done = vec![];
     let mut failed = 0;
     for (author, receipt) in allowed.clone().unwrap_or_default() {
+        // the setting may have been turned off while earlier receipts were going out
+        if !matches!(db.settings().await, Ok(s) if s.read_receipts == Some(true)) {
+            break;
+        }
         let sent = match Uuid::parse_str(&author) {
             Ok(u) => timed(Box::pin(m.send_message(Aci::from(u), receipt, at))).await,
             Err(e) => Err(e.to_string()),

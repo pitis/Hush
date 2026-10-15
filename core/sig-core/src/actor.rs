@@ -357,7 +357,7 @@ async fn link(
 
 /// Runs the sender and restarts it if it panics. Jobs queued meanwhile stay queued; the one in
 /// flight is lost, so every Pending row is marked Failed (retryable). Unsent read receipts are
-/// stored and go out when the sender restarts; a lost reaction, edit or delete is not retried.
+/// stored and go out with the next flush; a lost reaction, edit or delete is not retried.
 async fn supervise_sender(
     m: Manager<SqliteStore, Registered>,
     db: ProjectionDb,
@@ -470,23 +470,31 @@ async fn handle(
         Received::Content(content) => {
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
-            for op in ops {
-                if matches!(op, Op::Settings { .. }) {
-                    // receipts held back while the read receipts setting was unknown
-                    let _ = jobs.send(Job::Receipts);
-                }
-                match db.apply(&op).await {
-                    Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
-                    Err(e) => l.on_event(CoreEvent::Error {
-                        message: format!(
-                            "storing a message from {} failed: {e}",
-                            content.metadata.sender.service_id_string()
-                        ),
-                    }),
-                }
+            let sender = content.metadata.sender.service_id_string();
+            if apply_received(db, l, &ops, &sender).await {
+                // receipts held back while the read receipts setting was unknown; queued only
+                // now that the new setting is stored, so they can't go out under the old one
+                let _ = jobs.send(Job::Receipts);
             }
         }
     }
+}
+
+/// Applies the ops of one received content. True if it changed the privacy settings.
+async fn apply_received(db: &ProjectionDb, l: &dyn EventListener, ops: &[Op], sender: &str) -> bool {
+    let mut settings_changed = false;
+    for op in ops {
+        match db.apply(op).await {
+            Ok(applied) => {
+                settings_changed |= matches!(op, Op::Settings { .. });
+                applied.into_iter().for_each(|a| l.on_event(from_applied(a)));
+            }
+            Err(e) => l.on_event(CoreEvent::Error {
+                message: format!("storing a message from {sender} failed: {e}"),
+            }),
+        }
+    }
+    settings_changed
 }
 
 fn content_kind(body: &presage::libsignal_service::content::ContentBody) -> &'static str {
@@ -550,6 +558,39 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
 #[cfg(test)]
 mod tests {
     use presage::libsignal_service::protocol::kem::{KeyPair, KeyType};
+
+    use crate::events::{CoreEvent, EventListener};
+    use crate::projection::{Op, ProjectionDb, Settings};
+
+    struct Quiet;
+    impl EventListener for Quiet {
+        fn on_event(&self, _: CoreEvent) {}
+    }
+
+    /// The receipts flush is queued after this returns, so the new setting must already be stored.
+    #[tokio::test]
+    async fn a_settings_change_is_stored_before_it_is_reported() {
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let off = Op::Settings {
+            read_receipts: Some(false),
+            typing_indicators: None,
+        };
+        assert!(super::apply_received(&db, &Quiet, &[off], "me").await);
+        assert_eq!(db.settings().await.unwrap().read_receipts, Some(false));
+        let typing = Op::Typing {
+            conversation_id: "c:a".into(),
+            who: "a".into(),
+            started: true,
+        };
+        assert!(!super::apply_received(&db, &Quiet, &[typing], "a").await);
+        assert_eq!(
+            db.settings().await.unwrap(),
+            Settings {
+                read_receipts: Some(false),
+                typing_indicators: None
+            }
+        );
+    }
 
     /// Linking generates Kyber keys on the core thread (on top of presage's linking future); the
     /// default 2 MB stack overflowed there in debug builds.
