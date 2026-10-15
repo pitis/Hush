@@ -97,9 +97,17 @@ struct TimelineList: View {
                                 reactions: store.reactions[key] ?? [],
                                 files: store.attachments[key] ?? [], preview: store.previews[key],
                                 highlighted: store.highlighted == key,
-                                reply: { store.replyTo = m },
+                                reply: { store.reply(to: m) },
                                 retry: { Task { await store.retry(key) } },
-                                download: store.download, open: open)
+                                download: store.download, open: open,
+                                actions: MessageRow.Actions(
+                                    me: store.ownAci, mine: store.myReaction(to: m),
+                                    canEdit: MessageActions.canEdit(m, me: store.ownAci),
+                                    canDelete: MessageActions.canDelete(m, me: store.ownAci),
+                                    react: { emoji in Task { await store.react(to: m, with: emoji) } },
+                                    edit: { store.startEditing(m) },
+                                    delete: { Task { await store.deleteForEveryone(m) } },
+                                    name: store.senderName))
                         }
                     }
                     Color.clear.frame(height: 1).id("bottom")
@@ -201,8 +209,28 @@ struct MessageRow: View {
     let retry: () -> Void
     let download: (Int64) -> Void
     let open: (Attachment) -> Void
+    var actions = Actions()
+    @State private var hovering = false
+    @State private var picking = false
+    @State private var showingReactors = false
+    @State private var confirmingDelete = false
+
+    /// React, edit, delete (after Signal Desktop).
+    struct Actions {
+        var me: String?
+        /// Our reaction, counting one just sent.
+        var mine: String?
+        var canEdit = false
+        var canDelete = false
+        var react: (String) -> Void = { _ in }
+        var edit: () -> Void = {}
+        var delete: () -> Void = {}
+        /// A reactor's display name.
+        var name: (String) -> String = { $0 }
+    }
 
     private var outgoing: Bool { message.isOutgoing }
+    private var mine: String? { actions.mine }
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -220,15 +248,28 @@ struct MessageRow: View {
                         .foregroundStyle(Theme.avatars[Formatting.avatarIndex("c:\(message.author)")])
                         .padding(.horizontal, 12)
                 }
-                bubble
+                HStack(alignment: .center, spacing: 6) {
+                    if outgoing { reactButton }
+                    bubble
+                    if !outgoing { reactButton }
+                }
                 if !reactions.isEmpty { reactionPill }
             }
             .frame(maxWidth: 560, alignment: outgoing ? .trailing : .leading)
             if !outgoing { Spacer(minLength: 80) }
         }
         .padding(.top, first ? 8 : 2)
+        .onHover { hovering = $0 }
         .contextMenu {
-            if !message.deleted { Button("Reply", action: reply) }
+            if !message.deleted {
+                Menu("React") {
+                    ForEach(MessageActions.quickReactions, id: \.self) { emoji in
+                        Button(emoji == mine ? "\(emoji) ✓" : emoji) { actions.react(emoji) }
+                    }
+                }
+                Button("Reply", action: reply)
+            }
+            if actions.canEdit { Button("Edit", action: actions.edit) }
             if let body = message.body, !message.deleted {
                 Button("Copy") {
                     NSPasteboard.general.clearContents()
@@ -236,6 +277,35 @@ struct MessageRow: View {
                 }
             }
             if message.status == .failed { Button("Retry", action: retry) }
+            if actions.canDelete {
+                Divider()
+                Button("Delete for Everyone…", role: .destructive) { confirmingDelete = true }
+            }
+        }
+        .confirmationDialog("Delete this message for everyone?", isPresented: $confirmingDelete) {
+            Button("Delete for Everyone", role: .destructive, action: actions.delete)
+        } message: {
+            Text("Everyone in this chat sees that you deleted it.")
+        }
+    }
+
+    /// Shown on hover, like Desktop's: Signal's reactions and any other emoji.
+    @ViewBuilder private var reactButton: some View {
+        if !message.deleted {
+            Button {
+                picking = true
+            } label: {
+                Image(systemName: "face.smiling").font(.system(size: 15)).foregroundStyle(Theme.secondaryText)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("React")
+            .opacity(hovering || picking ? 1 : 0)
+            .popover(isPresented: $picking) {
+                ReactionPicker(mine: mine) { emoji in
+                    picking = false
+                    actions.react(emoji)
+                }
+            }
         }
     }
 
@@ -306,18 +376,47 @@ struct MessageRow: View {
         }
     }
 
+    /// Each emoji with how many; ours tinted. A click shows who reacted.
     private var reactionPill: some View {
-        let counts = Dictionary(grouping: reactions, by: \.emoji).map { ($0.key, $0.value.count) }
-            .sorted { $0.1 > $1.1 }
-        return HStack(spacing: 4) {
-            ForEach(counts, id: \.0) { emoji, count in
-                Text(count > 1 ? "\(emoji) \(count)" : emoji).font(.system(size: 12))
+        Button {
+            showingReactors = true
+        } label: {
+            HStack(spacing: 4) {
+                ForEach(MessageActions.pill(reactions, me: actions.me), id: \.emoji) { entry in
+                    Text(entry.count > 1 ? "\(entry.emoji) \(entry.count)" : entry.emoji).font(.system(size: 12))
+                        .padding(.horizontal, entry.mine ? 4 : 0)
+                        .background(entry.mine ? Theme.outgoing.opacity(0.45) : .clear, in: Capsule())
+                }
             }
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Theme.field, in: Capsule())
+            .overlay(Capsule().stroke(Theme.window, lineWidth: 2))
         }
-        .padding(.horizontal, 8).padding(.vertical, 3)
-        .background(Theme.field, in: Capsule())
-        .overlay(Capsule().stroke(Theme.window, lineWidth: 2))
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            MessageActions.pill(reactions, me: actions.me).map { "\($0.emoji) \($0.count)" }.joined(separator: ", ")
+        )
         .offset(y: -6)
+        .popover(isPresented: $showingReactors) {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(reactions, id: \.reactor) { r in
+                    HStack {
+                        Text(r.emoji)
+                        Text(r.reactor == actions.me ? "You" : actions.name(r.reactor))
+                        Spacer(minLength: 16)
+                        if r.reactor == actions.me {
+                            Button("Remove") {
+                                showingReactors = false
+                                actions.react(r.emoji)
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(minWidth: 200)
+        }
     }
 }
 
@@ -364,5 +463,43 @@ struct ChatEventRow: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
+    }
+}
+
+/// Signal's reactions, and any emoji from the character palette ("More…").
+struct ReactionPicker: View {
+    let mine: String?
+    let choose: (String) -> Void
+    @State private var other = ""
+    @FocusState private var otherFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(MessageActions.quickReactions, id: \.self) { emoji in
+                Button {
+                    choose(emoji)
+                } label: {
+                    Text(emoji).font(.system(size: 22)).padding(4)
+                        .background(emoji == mine ? Theme.outgoing.opacity(0.5) : .clear, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(emoji == mine ? "\(emoji), yours: remove" : emoji)
+            }
+            Button {
+                otherFocused = true  // the palette types into the focused field
+                NSApp.orderFrontCharacterPalette(nil)
+            } label: {
+                Image(systemName: "plus.circle").font(.system(size: 20))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More reactions")
+            // receives the emoji picked in the palette
+            TextField("", text: $other).focused($otherFocused).frame(width: 1).opacity(0.01)
+                .onChange(of: other) { _, new in
+                    if let first = new.first, MessageActions.isReaction(String(first)) { choose(String(first)) }
+                    other = ""
+                }
+        }
+        .padding(8)
     }
 }

@@ -104,6 +104,11 @@ final class AppStore {
     /// Files chosen, dropped or pasted for the open chat, sent with the next message.
     private(set) var outgoingFiles: [OutgoingFile] = []
     var replyTo: Message?
+    /// The message of ours being edited in the composer, if any.
+    private(set) var editing: Message?
+    /// Our reactions sent but not back from the core yet (nil: taken back), so a second click
+    /// acts on what we just did.
+    private var pendingReactions: [MessageKey: String?] = [:]
     /// Who is typing where, until when (per sender: in groups several people can type).
     private var typingUntil: [String: [String: Date]] = [:]
     private var senderNames: [String: String] = [:]
@@ -266,6 +271,7 @@ final class AppStore {
         selectionGeneration += 1
         messages = []
         reactions = [:]
+        pendingReactions = [:]
         events = []
         attachments = [:]
         previews = [:]
@@ -273,6 +279,7 @@ final class AppStore {
         changedKeys = []
         hasOlder = false
         replyTo = nil
+        editing = nil
         reloadMessages()
     }
 
@@ -299,6 +306,7 @@ final class AppStore {
     @discardableResult
     func send(_ text: String) async -> Bool {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let editing { return await saveEdit(of: editing, body) }
         let files = outgoingFiles
         guard let client, let id = selectedId, !body.isEmpty || !files.isEmpty else { return false }
         // taken out of the tray now, so a second ↩ while this one is busy can't send them again
@@ -330,9 +338,73 @@ final class AppStore {
         lastError = message
     }
 
+    // MARK: Reactions, edits, deletes
+
+    /// Reacts to a message: our current reaction again takes it back, another replaces it.
+    func react(to m: Message, with emoji: String) async {
+        guard let client else { return }
+        let key = MessageKey(author: m.author, sentAt: m.sentAt)
+        let (emoji, remove) = MessageActions.reaction(choosing: emoji, mine: myReaction(to: m))
+        do {
+            try await client.react(target: key, emoji: emoji, remove: remove)
+            pendingReactions[key] = .some(remove ? nil : emoji)
+        } catch {
+            showError("Couldn't react: \(Self.describe(error))")
+        }
+    }
+
+    /// Our reaction to a message, counting one just sent.
+    func myReaction(to m: Message) -> String? {
+        let key = MessageKey(author: m.author, sentAt: m.sentAt)
+        if let pending = pendingReactions[key] { return pending }
+        return MessageActions.mine(reactions[key] ?? [], me: ownAci)
+    }
+
+    /// Replies to a message (ends editing: the two don't mix).
+    func reply(to m: Message) {
+        editing = nil
+        replyTo = m
+    }
+
+    /// Puts one of our messages in the composer to edit it.
+    func startEditing(_ m: Message) {
+        replyTo = nil
+        editing = m
+        focusComposer()
+    }
+
+    func cancelEditing() { editing = nil }
+
+    /// ↑ in an empty composer: edits our newest message that can still be edited. False if none.
+    func editLast() -> Bool {
+        guard let m = MessageActions.lastEditable(messages, me: ownAci) else { return false }
+        startEditing(m)
+        return true
+    }
+
+    private func saveEdit(of m: Message, _ body: String) async -> Bool {
+        guard let client, !body.isEmpty else { return false }
+        do {
+            try await client.edit(key: MessageKey(author: m.author, sentAt: m.sentAt), newBody: body)
+            editing = nil
+            return true
+        } catch {
+            showError("Couldn't edit the message: \(Self.describe(error))")
+            return false
+        }
+    }
+
+    func deleteForEveryone(_ m: Message) async {
+        guard let client else { return }
+        do { try await client.deleteForEveryone(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
+            showError("Couldn't delete the message: \(Self.describe(error))")
+        }
+    }
+
     /// Adds files to the tray of the open chat (each once).
     func addFiles(_ files: [OutgoingFile]) {
-        guard selectedId != nil else { return }
+        // an edit changes the text only (as in Desktop)
+        guard selectedId != nil, editing == nil else { return }
         for f in files where !outgoingFiles.contains(where: { $0.path == f.path }) { outgoingFiles.append(f) }
     }
 
@@ -773,6 +845,12 @@ final class AppStore {
                     }
                     await loadDetails(for: needDetails, generation: generation)
                 } catch { append("query failed: \(error)") }
+                // the message being edited was deleted (here or on the phone): nothing left to edit
+                if let e = editing,
+                    messages.contains(where: { $0.author == e.author && $0.sentAt == e.sentAt && $0.deleted })
+                {
+                    editing = nil
+                }
             } while reloadMessagesAgain && generation == selectionGeneration
             if generation == selectionGeneration { reloadEvents() }
             if loadingGeneration == generation { loadingGeneration = nil }
@@ -806,7 +884,10 @@ final class AppStore {
             // separately: one failing query doesn't take the others' details with it
             do {
                 let r = try await client.reactions(key: key)
-                if generation == selectionGeneration { reactions[key] = r.isEmpty ? nil : r }
+                if generation == selectionGeneration {
+                    reactions[key] = r.isEmpty ? nil : r
+                    pendingReactions[key] = nil  // the core's word now
+                }
             } catch { append("query failed: \(error)") }
             do {
                 let files = try await client.attachments(key: key)
@@ -879,6 +960,8 @@ final class AppStore {
             return "Semaphore couldn't read its key from your keychain. Unlock the keychain, allow access, and reopen."
         case CoreError.Storage(let message):
             return "Semaphore couldn't open its data: \(message)"
+        case CoreError.InvalidInput(let message):
+            return message
         case CoreError.Network(let message):
             return "The server couldn't be reached: \(message)"
         default:

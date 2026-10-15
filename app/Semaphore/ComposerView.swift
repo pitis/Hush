@@ -6,6 +6,8 @@ struct ComposerView: View {
     let conversationId: String
     @State private var text = ""
     @FocusState private var focused: Bool
+    /// What was typed before editing started; back once the edit is saved or cancelled.
+    @State private var draftBeforeEdit: String?
     /// ⌘V of files or images while the field is focused (the field itself only pastes text).
     @State private var pasteMonitor: Any?
 
@@ -34,12 +36,30 @@ struct ComposerView: View {
                 .frame(height: 34)
                 .padding(.horizontal, 12)
             }
+            if let editing = store.editing {
+                HStack {
+                    Rectangle().fill(Theme.outgoing).frame(width: 3)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Editing message").font(.system(size: 11, weight: .semibold))
+                        Text(editing.body ?? "").font(.system(size: 12)).lineLimit(1)
+                            .foregroundStyle(Theme.secondaryText)
+                    }
+                    Spacer()
+                    Button(action: store.cancelEditing) { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityLabel("Cancel editing")
+                }
+                .frame(height: 34)
+                .padding(.horizontal, 12)
+            }
             if !store.outgoingFiles.isEmpty { FileTray(store: store) }
             HStack(alignment: .bottom, spacing: 10) {
                 Button(action: chooseFiles) {
                     Image(systemName: "paperclip").font(.system(size: 18))
                 }
                 .accessibilityLabel("Attach files")
+                .disabled(store.editing != nil)
                 .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
                 .padding(.bottom, 9)
                 Button {
@@ -59,6 +79,10 @@ struct ComposerView: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
                     .background(Theme.field, in: RoundedRectangle(cornerRadius: 18))
+                    // ↑ in an empty field edits your last message, as in Desktop
+                    .onKeyPress(.upArrow) {
+                        text.isEmpty && store.editing == nil && store.editLast() ? .handled : .ignored
+                    }
                     .onKeyPress(.return, phases: .down) { press in
                         switch Composer.action(for: press.modifiers) {
                         case .send:
@@ -78,8 +102,23 @@ struct ComposerView: View {
             text = Composer.draft(for: conversationId)
             takeFocusIfAsked()
         }
-        .onChange(of: conversationId) { _, new in text = Composer.draft(for: new) }
-        .onChange(of: text) { _, new in Composer.saveDraft(new, for: conversationId) }
+        .onChange(of: conversationId) { _, new in
+            // an edit doesn't follow to another chat, nor does the draft it put aside
+            draftBeforeEdit = nil
+            text = Composer.draft(for: new)
+        }
+        .onChange(of: text) { _, new in
+            if store.editing == nil { Composer.saveDraft(new, for: conversationId) }
+        }
+        .onChange(of: store.editing?.sentAt) { _, _ in
+            if let editing = store.editing {
+                if draftBeforeEdit == nil { draftBeforeEdit = text }
+                text = editing.body ?? ""
+            } else if let draft = draftBeforeEdit {
+                text = draft
+                draftBeforeEdit = nil
+            }
+        }
         .onAppear { pasteMonitor = installPasteMonitor() }
         .onDisappear {
             if let pasteMonitor { NSEvent.removeMonitor(pasteMonitor) }
