@@ -32,6 +32,9 @@ pub struct Conversation {
     pub last_message_deleted: bool,
     /// The last message's first file, so the list can say "Photo", "Voice Message"…
     pub last_message_file: Option<FileSummary>,
+    /// The latest thing in the chat is a message that couldn't be decrypted (the preview says
+    /// so; the other `last_message_*` fields are then empty).
+    pub last_message_undecryptable: bool,
 }
 
 /// What kind of file a message has (its first one).
@@ -120,19 +123,25 @@ impl Message {
 /// Something that happened in a chat that isn't a message.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatEventKind {
-    /// A message from `author` arrived but couldn't be decrypted (a broken session).
+    /// A message between us and `author` couldn't be decrypted, by us or by them (presage
+    /// doesn't tell which): a broken session.
     DecryptionFailed,
+    /// We started a new secure session with `author`.
+    SessionReset,
 }
 
 impl ChatEventKind {
     pub fn to_i64(self) -> i64 {
         match self {
             Self::DecryptionFailed => 0,
+            Self::SessionReset => 1,
         }
     }
 
     pub fn from_i64(v: i64) -> Option<Self> {
-        (v == 0).then_some(Self::DecryptionFailed)
+        [Self::DecryptionFailed, Self::SessionReset]
+            .into_iter()
+            .find(|k| k.to_i64() == v)
     }
 }
 

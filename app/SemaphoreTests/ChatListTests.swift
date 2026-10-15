@@ -40,6 +40,13 @@ final class ChatListTests: XCTestCase {
             .message("You deleted this message", tick: nil))
     }
 
+    func testAnUndecryptableMessageRowSaysOnlyThat() {
+        var c = last("g:00", preview: "A message couldn't be decrypted", outgoing: true, status: .read, deleted: true)
+        c.lastMessageFile = FileSummary(contentType: "image/png", fileName: nil, isVoiceNote: false)
+        c.lastMessageUndecryptable = true
+        XCTAssertEqual(line(c), .message("A message couldn't be decrypted", tick: nil))
+    }
+
     func testTypingThenDraftWinOverTheLastMessage() {
         XCTAssertEqual(line(last("c:a"), typing: true, draft: "unsent"), .typing)
         XCTAssertEqual(line(last("c:a"), draft: "unsent\nmore"), .draft("unsent more"))

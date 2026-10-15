@@ -349,10 +349,17 @@ struct ChatEventRow: View {
         VStack(spacing: 6) {
             switch event.kind {
             case .decryptionFailed:
-                Label("A message from \(name) couldn't be decrypted", systemImage: "exclamationmark.lock")
+                // presage doesn't say whose side failed: worded for both
+                Label("A message between you and \(name) couldn't be decrypted", systemImage: "exclamationmark.lock")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.secondaryText)
-                Button("Reset Secure Session", action: reset).controlSize(.small)
+                if event.conversationId.hasPrefix("c:") && !event.conversationId.hasPrefix("c:PNI:") {
+                    Button("Reset Secure Session", action: reset).controlSize(.small)
+                }
+            case .sessionReset:
+                Label("You reset the secure session with \(name)", systemImage: "lock.rotation")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondaryText)
             }
         }
         .frame(maxWidth: .infinity)

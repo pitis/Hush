@@ -109,4 +109,45 @@ final class AppStoreResilienceTests: XCTestCase {
         store.resetSession("c:a")
         XCTAssertEqual(fake.sessionResets, ["c:a"])
     }
+
+    func testAWipeThatFailsAfterTheCoreStoppedSaysSoInsteadOfHanging() async {
+        let fake = FakeClient(linked: true)
+        fake.unlinkError = CoreError.Storage(message: "permission denied")
+        let store = await store(fake)
+        let failed = await store.unlinkThisMac(tellServer: true)
+        XCTAssertNil(failed, "not a network problem: no \"server couldn't be reached\" alert")
+        guard case .failed(let reason) = store.screen else { return XCTFail("\(store.screen)") }
+        XCTAssertTrue(reason.contains("permission denied"))
+    }
+
+    func testAnUnreachableServerIsWordedForPeople() async {
+        let fake = FakeClient(linked: true)
+        fake.unlinkError = CoreError.Network(message: "timed out")
+        let store = await store(fake)
+        let failed = await store.unlinkThisMac(tellServer: true)
+        XCTAssertEqual(failed, "The server couldn't be reached: timed out")
+    }
+
+    func testTheOldCoreIsIgnoredAfterStartingOver() async {
+        let fake = FakeClient(linked: true)
+        let notifier = FakeNotifier()
+        let store = AppStore(open: { _ in fake }, notifier: notifier, forgetKey: {})
+        await store.boot()
+        let old = store.listenerGeneration
+        await store.unlinkThisMac(tellServer: false).map { XCTFail($0) }
+        XCTAssertEqual(notifier.removedAll, 1, "message previews go with the data")
+        store.receive(.error(message: "the connection to the server closed"), generation: old)
+        XCTAssertNil(store.lastError, "a late event of the old core changes nothing")
+        store.receive(.error(message: "now"), generation: store.listenerGeneration)
+        XCTAssertEqual(store.lastError, "now")
+    }
+
+    func testRetryRestartsReceivingIfItStopped() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        let starts = fake.startCalls
+        store.retryConnection()
+        XCTAssertEqual(fake.startCalls, starts + 1)
+        XCTAssertEqual(fake.reconnects, 1)
+    }
 }
