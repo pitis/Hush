@@ -86,13 +86,30 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return 0
     }
     func setTyping(conversationId: String, started: Bool) throws {}
-    func downloadAttachment(id: Int64) throws {}
+    private(set) var downloads: [Int64] = []
+    private(set) var sentFiles: [(conversationId: String, files: [OutgoingFile], caption: String?)] = []
+    var attachmentAnswers: [MessageKey: [Attachment]] = [:]
+    var previewAnswers: [MessageKey: LinkPreview] = [:]
+
+    var downloadError: Error?
+    var sendDelay: Duration?
+    func downloadAttachment(id: Int64) throws {
+        if let downloadError { throw downloadError }
+        lock.withLock { downloads.append(id) }
+    }
     func sendAttachments(conversationId: String, files: [OutgoingFile], caption: String?, quote: Quote?) async throws
         -> MessageKey
-    { MessageKey(author: aci ?? "", sentAt: 0) }
-    func attachments(key: MessageKey) async throws -> [Attachment] { [] }
-    func attachment(id: Int64) async throws -> Attachment? { nil }
-    func linkPreview(key: MessageKey) async throws -> LinkPreview? { nil }
+    {
+        if let sendDelay { try? await Task.sleep(for: sendDelay) }
+        if let sendError { throw sendError }
+        lock.withLock { sentFiles.append((conversationId, files, caption)) }
+        return MessageKey(author: aci ?? "", sentAt: Int64(sentFiles.count))
+    }
+    func attachments(key: MessageKey) async throws -> [Attachment] { lock.withLock { attachmentAnswers[key] ?? [] } }
+    func attachment(id: Int64) async throws -> Attachment? {
+        lock.withLock { attachmentAnswers.values.flatMap { $0 }.first { $0.id == id } }
+    }
+    func linkPreview(key: MessageKey) async throws -> LinkPreview? { lock.withLock { previewAnswers[key] } }
 
     private(set) var titleCalls = 0
     var reactionAnswers: [MessageKey: [Reaction]] = [:]
@@ -145,7 +162,7 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
     Conversation(
         id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
         unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
-        lastMessageDeleted: false)
+        lastMessageDeleted: false, lastMessageFile: nil)
 }
 
 final class Counter: @unchecked Sendable {

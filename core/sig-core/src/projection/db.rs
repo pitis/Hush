@@ -157,9 +157,12 @@ impl ProjectionDb {
     pub async fn conversations(&self) -> Result<Vec<Conversation>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT c.*, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
-               m.deleted AS last_deleted
+               m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
+               a.is_voice_note AS file_voice
              FROM conversations c LEFT JOIN messages m ON m.id = (SELECT id FROM messages
                WHERE conversation_id = c.id ORDER BY sent_at DESC, author DESC LIMIT 1)
+             LEFT JOIN attachments a ON a.message_author = m.author AND a.message_sent_at = m.sent_at
+               AND a.position = 0
              WHERE c.last_message_at > 0 ORDER BY c.last_message_at DESC, c.id",
         )
         .fetch_all(&self.pool)
@@ -1042,6 +1045,14 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         last_message_status: MessageStatus::from_i64(status)
             .ok_or_else(|| decode_err(format!("message status {status}")))?,
         last_message_deleted: r.try_get::<Option<bool>, _>("last_deleted")?.unwrap_or(false),
+        last_message_file: match r.try_get::<Option<String>, _>("file_type")? {
+            Some(content_type) => Some(FileSummary {
+                content_type,
+                file_name: r.try_get("file_name")?,
+                is_voice_note: r.try_get::<Option<bool>, _>("file_voice")?.unwrap_or(false),
+            }),
+            None => None,
+        },
         kind,
         title: r.try_get("title")?,
         last_message_at: r.try_get("last_message_at")?,
@@ -2385,5 +2396,36 @@ mod tests {
         let stored = db.attachments(&k("me", 5)).await.unwrap();
         assert_eq!((stored.len(), stored[0].size), (1, 1));
         assert_eq!(std::fs::read(stored[0].path.as_ref().unwrap()).unwrap(), b"1");
+    }
+
+    #[tokio::test]
+    async fn conversations_say_what_kind_of_file_the_last_message_has() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        assert_eq!(conv(&db, "c:alice").await.last_message_file, None);
+        db.insert_message(&Message {
+            body: None,
+            ..msg("alice", 2, "")
+        })
+        .await
+        .unwrap();
+        db.apply(&add(
+            k("alice", 2),
+            vec![
+                new_attachment("audio/aac", 5, true),
+                new_attachment("image/png", 5, false),
+            ],
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            conv(&db, "c:alice").await.last_message_file,
+            Some(FileSummary {
+                content_type: "audio/aac".into(),
+                file_name: Some("a.bin".into()),
+                is_voice_note: true
+            })
+        );
     }
 }

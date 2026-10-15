@@ -30,6 +30,16 @@ pub struct Conversation {
     /// Meaningful for our own last message: its ticks.
     pub last_message_status: MessageStatus,
     pub last_message_deleted: bool,
+    /// The last message's first file, so the list can say "Photo", "Voice Message"…
+    pub last_message_file: Option<FileSummary>,
+}
+
+/// What kind of file a message has (its first one).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FileSummary {
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub is_voice_note: bool,
 }
 
 /// Delivery state of a message. The variant order matches the stored integers, and a later state

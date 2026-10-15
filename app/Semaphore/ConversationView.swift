@@ -1,17 +1,42 @@
+import QuickLook
 import SwiftUI
 
 struct ConversationView: View {
     let store: AppStore
     let conversation: Conversation
+    @State private var quickLook: URL?
+    @State private var dropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
             ConversationHeader(store: store, conversation: conversation)
             Divider().overlay(Color.black.opacity(0.4))
-            TimelineList(store: store, conversation: conversation)
+            TimelineList(store: store, conversation: conversation) { a in
+                do { quickLook = try Files.openable(a) } catch {
+                    store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
+                }
+            }
             ComposerView(store: store, conversationId: conversation.id)
         }
         .background(Theme.window)
+        .quickLookPreview($quickLook)
+        // the preview closed: its link goes
+        .onChange(of: quickLook) { old, _ in if let old { Files.close(old) } }
+        .onDisappear { if let quickLook { Files.close(quickLook) } }
+        // files dropped anywhere on the chat wait in the composer's tray
+        .dropDestination(for: URL.self) { urls, _ in
+            let files = Files.attachable(urls).map(Files.outgoing)
+            store.addFiles(files)
+            return !files.isEmpty
+        } isTargeted: {
+            dropTargeted = $0
+        }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 12).stroke(Theme.outgoing, lineWidth: 3).padding(4)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 }
 
@@ -43,6 +68,7 @@ struct ConversationHeader: View {
 struct TimelineList: View {
     let store: AppStore
     let conversation: Conversation
+    let open: (Attachment) -> Void
     @State private var atBottom = true
     @State private var nearTop = false
     @State private var unseenNew = false
@@ -65,8 +91,10 @@ struct TimelineList: View {
                                 message: m, first: first, last: last, isGroup: isGroup,
                                 senderName: store.senderName(m.author),
                                 reactions: store.reactions[key] ?? [],
+                                files: store.attachments[key] ?? [], preview: store.previews[key],
                                 reply: { store.replyTo = m },
-                                retry: { Task { await store.retry(key) } })
+                                retry: { Task { await store.retry(key) } },
+                                download: store.download, open: open)
                         }
                     }
                     Color.clear.frame(height: 1).id("bottom")
@@ -155,8 +183,12 @@ struct MessageRow: View {
     let isGroup: Bool
     let senderName: String
     let reactions: [Reaction]
+    let files: [Attachment]
+    let preview: LinkPreview?
     let reply: () -> Void
     let retry: () -> Void
+    let download: (Int64) -> Void
+    let open: (Attachment) -> Void
 
     private var outgoing: Bool { message.isOutgoing }
 
@@ -196,7 +228,9 @@ struct MessageRow: View {
     }
 
     private var bubble: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        // files without a caption: the time sits under them on the right, the bubble as wide as they are
+        let filesOnly = !files.isEmpty && (message.body ?? "").isEmpty && !message.deleted
+        return VStack(alignment: filesOnly ? .trailing : .leading, spacing: 4) {
             if let q = message.quote, !message.deleted {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(q.author == message.author ? "Reply" : "Quoted").font(.system(size: 11, weight: .semibold))
@@ -206,12 +240,18 @@ struct MessageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
+            if !message.deleted {
+                AttachmentList(files: files, download: download, open: open)
+                if let preview { LinkPreviewCard(preview: preview) }
+            }
             HStack(alignment: .lastTextBaseline, spacing: 8) {
                 Group {
                     if message.deleted {
                         Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
-                    } else {
-                        Text(message.body ?? "Attachment").textSelection(.enabled)
+                    } else if let body = message.body, !body.isEmpty {
+                        Text(body).textSelection(.enabled)
+                    } else if files.isEmpty {
+                        Text("Attachment")
                     }
                 }
                 .font(.system(size: 14))

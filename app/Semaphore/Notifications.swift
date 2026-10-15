@@ -120,11 +120,10 @@ final class SystemNotifier: Notifier {
     }
 
     func remove(conversationId: String) {
-        let center = self.center
         center.getDeliveredNotifications { delivered in
             let ids = delivered.filter { $0.request.content.threadIdentifier == conversationId }
                 .map(\.request.identifier)
-            center.removeDeliveredNotifications(withIdentifiers: ids)
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ids)
         }
     }
 

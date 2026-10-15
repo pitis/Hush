@@ -111,6 +111,21 @@ final class AppStoreNotificationTests: XCTestCase {
         XCTAssertEqual(notifier.posted.count, 1)
     }
 
+    func testAPhotoIsAnnouncedLikeDesktop() async {
+        let fake = FakeClient(linked: true)
+        fake.titles["c:alice"] = "Alice"
+        let key = MessageKey(author: "alice", sentAt: 1)
+        var photo = message("c:alice", "alice", 1)
+        photo.body = nil
+        fake.messageAnswers["c:alice"] = [photo]
+        fake.attachmentAnswers[key] = [attachment(3, key, state: .pending)]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        store.handle(newMessage("c:alice", "alice", 1))
+        await eventually { notifier.posted.count == 1 }
+        XCTAssertEqual(notifier.posted.first?.body, "📷 Photo")
+    }
+
     func testDeletedMessagesDontNotifyButReactionsToMineDo() async {
         let fake = FakeClient(linked: true)
         fake.titles["c:alice"] = "Alice"

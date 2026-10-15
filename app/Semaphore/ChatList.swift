@@ -18,7 +18,12 @@ enum ChatList {
         guard c.lastMessageAt > 0 else { return .message("", tick: nil) }
         let author = c.lastMessageOutgoing ? "You" : authorName
         if c.lastMessageDeleted { return .message("\(author) deleted this message", tick: nil) }
-        let text = c.lastMessagePreview.isEmpty ? "Attachment" : oneLine(c.lastMessagePreview)
+        let text =
+            if let file = c.lastMessageFile {
+                oneLine(Files.describe(file, body: c.lastMessagePreview))
+            } else {
+                c.lastMessagePreview.isEmpty ? "Attachment" : oneLine(c.lastMessagePreview)
+            }
         let tick = c.lastMessageOutgoing ? Timeline.tick(for: c.lastMessageStatus) : nil
         return .message(c.kind == .group ? "\(author): \(text)" : text, tick: tick)
     }
