@@ -49,9 +49,11 @@ final class FakeNotifier: Notifier, @unchecked Sendable {
     private(set) var authorized = 0
     private(set) var posted: [NotificationRequest] = []
     private(set) var removed: [String] = []
+    private(set) var removedIds: [String] = []
     func authorize() { authorized += 1 }
     func post(_ request: NotificationRequest) { posted.append(request) }
     func remove(conversationId: String) { removed.append(conversationId) }
+    func remove(ids: [String]) { removedIds += ids }
 }
 
 @MainActor
@@ -126,6 +128,23 @@ final class AppStoreNotificationTests: XCTestCase {
         XCTAssertEqual(notifier.posted.first?.body, "Alice reacted 👍 to: dinner?")
     }
 
+    func testAMessageDeletedForEveryoneTakesItsNotificationWithIt() async {
+        let fake = FakeClient(linked: true)
+        fake.messageAnswers["c:a"] = [message("c:a", "a", 1, "oops"), message("c:a", "a", 2)]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        store.handle(newMessage("c:a", "a", 1))
+        await eventually { notifier.posted.count == 1 }
+        // another message changing doesn't touch it
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "a", sentAt: 2)))
+        var gone = message("c:a", "a", 1)
+        gone.deleted = true
+        gone.body = nil
+        fake.messageAnswers["c:a"] = [gone, message("c:a", "a", 2)]
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "a", sentAt: 1)))
+        await eventually { notifier.removedIds == [notifier.posted[0].id] }
+    }
+
     func testNotificationsGoAwayOnceTheChatIsReadOrOpened() async {
         let fake = FakeClient(linked: true)
         fake.messageAnswers["c:a"] = [message("c:a", "a", 1)]
@@ -155,6 +174,48 @@ final class AppStoreNotificationTests: XCTestCase {
         await eventually { fake.markedRead == ["c:a"] }
         await store.markReadFromNotification(conversationId: "c:a")
         XCTAssertTrue(notifier.removed.contains("c:a"))
+    }
+
+    func testMarkAsReadWorksWhenTheClickLaunchedTheApp() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a", unread: 1)])]
+        fake.holdCall = 1  // the chat list is still loading when the action arrives
+        let store = await store(fake, FakeNotifier())
+        let action = Task { await store.markReadFromNotification(conversationId: "c:a") }
+        await eventually { fake.isHolding }
+        fake.release()
+        await action.value
+        await eventually { fake.markedRead == ["c:a"] }
+    }
+
+    func testAReplyThatCantBeSentSaysSo() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a", unread: 1)])]
+        fake.sendError = TestError(description: "closed")
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        await store.replyFromNotification(conversationId: "c:a", text: "hi")
+        XCTAssertNotNil(store.lastError)
+        XCTAssertEqual(notifier.posted.map(\.title), ["Reply not sent"])
+        XCTAssertEqual(fake.markedRead, [])
+    }
+
+    func testReactionNotificationsStayWhenTheChatIsReadElsewhere() async {
+        let fake = FakeClient(linked: true)
+        fake.titles["c:alice"] = "Alice"
+        fake.messageAnswers["c:alice"] = [message("c:alice", "me-aci", 1, "dinner?", outgoing: true)]
+        fake.conversationAnswers = [.success([conversation("c:alice")])]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        await eventually { store.conversations.count == 1 }
+        store.handle(
+            .newReaction(
+                conversationId: "c:alice", target: MessageKey(author: "me-aci", sentAt: 1), reactor: "alice",
+                emoji: "👍"))
+        await eventually { notifier.posted.count == 1 }
+        store.handle(.conversationsChanged)
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(notifier.removed, [])
     }
 
     func testOpeningANotificationOpensItsChat() async {

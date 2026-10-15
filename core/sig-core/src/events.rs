@@ -87,13 +87,26 @@ pub fn alert(op: &Op, applied: &[Applied], me: &str) -> Option<CoreEvent> {
             target,
             reactor,
             emoji: Some(emoji),
-        } if target.author == me && reactor != me => Some(CoreEvent::NewReaction {
-            conversation_id,
-            target: target.clone(),
-            reactor: reactor.clone(),
-            emoji: emoji.clone(),
-        }),
+        } if target.author == me && reactor != me && may_react_in(&conversation_id, reactor) => {
+            Some(CoreEvent::NewReaction {
+                conversation_id,
+                target: target.clone(),
+                reactor: reactor.clone(),
+                emoji: emoji.clone(),
+            })
+        }
         _ => None,
+    }
+}
+
+/// A reaction names its target only by author and time, so it could point at our message in a
+/// chat with someone else; a notification would then show those words. In a 1:1 chat only its
+/// contact may react. (Group membership isn't known here; reacting in a group takes one of its
+/// message timestamps, which only members receive.)
+fn may_react_in(conversation_id: &str, reactor: &str) -> bool {
+    match conversation_id.strip_prefix("c:") {
+        Some(contact) => contact == reactor,
+        None => true,
     }
 }
 
@@ -169,6 +182,15 @@ mod tests {
             })
         );
         assert_eq!(alert(&react(ME, "alice", None), &changed(1, ME), ME), None);
+        // a reaction can't reach into a chat with someone else to show our words there
+        let elsewhere = vec![Applied::MessageChanged {
+            conversation_id: "c:bob".into(),
+            key: MessageKey {
+                author: ME.into(),
+                sent_at: 1,
+            },
+        }];
+        assert_eq!(alert(&react(ME, "alice", Some("👍")), &elsewhere, ME), None);
         assert_eq!(alert(&react("bob", "alice", Some("👍")), &changed(1, "bob"), ME), None);
         assert_eq!(alert(&react(ME, ME, Some("👍")), &changed(1, ME), ME), None);
         assert_eq!(alert(&react(ME, "alice", Some("👍")), &[], ME), None);

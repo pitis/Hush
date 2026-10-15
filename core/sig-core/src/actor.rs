@@ -411,8 +411,7 @@ async fn receive_loop(
                     state: ConnectionState::Online,
                 });
                 futures::pin_mut!(stream);
-                // what the server queued while we were away is history, not news
-                progress.live = false;
+                progress.connected();
                 while let Some(received) = stream.next().await {
                     handle(received, &m, &db, &me, &mut progress, l.as_ref(), &jobs).await;
                     caught_up.send_if_modified(|ready| {
@@ -449,6 +448,19 @@ struct Progress {
     live: bool,
 }
 
+impl Progress {
+    /// A new connection: what the server queued while we were away is history, not news.
+    fn connected(&mut self) {
+        self.live = false;
+    }
+
+    /// The server queue is drained. True the first time ever: names need syncing then.
+    fn drained(&mut self) -> bool {
+        self.live = true;
+        !std::mem::replace(&mut self.titles_synced, true)
+    }
+}
+
 async fn handle(
     received: Received,
     m: &Manager<SqliteStore, Registered>,
@@ -467,10 +479,8 @@ async fn handle(
     }
     match received {
         Received::QueueEmpty => {
-            progress.live = true;
-            if !progress.titles_synced {
+            if progress.drained() {
                 sync_titles(m, db, l).await;
-                progress.titles_synced = true;
             }
             l.on_event(CoreEvent::Ready);
         }
@@ -596,6 +606,20 @@ mod tests {
         fn on_event(&self, e: CoreEvent) {
             self.0.lock().unwrap().push(e);
         }
+    }
+
+    /// Each connection starts by catching up; it is live only once the server queue is drained.
+    #[test]
+    fn a_connection_is_live_only_after_draining_the_queue() {
+        let mut p = super::Progress::default();
+        p.connected();
+        assert!(!p.live);
+        assert!(p.drained(), "the first drain syncs names");
+        assert!(p.live);
+        p.connected(); // reconnect: catching up again
+        assert!(!p.live);
+        assert!(!p.drained(), "names are synced once");
+        assert!(p.live);
     }
 
     /// Catching up after being offline must not set off a notification per queued message.

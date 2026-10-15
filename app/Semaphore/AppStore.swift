@@ -56,6 +56,10 @@ final class AppStore {
     /// Chats with notifications showing; true if any is for a message (reactions don't count as
     /// unread, so those go away when the chat is opened).
     private var notified: [String: Bool] = [:]
+    /// The notification showing for each message, so a deletion can take it away.
+    private var notifiedMessages: [MessageKey: String] = [:]
+    /// The chat list has loaded once (actions from notifications need its unread counts).
+    private var conversationsLoaded = false
     private let notifier: Notifier?
     private let isAppActive: @MainActor () -> Bool
     private(set) var log: [LogLine] = []
@@ -184,6 +188,7 @@ final class AppStore {
                 changedKeys.insert(key)
                 reloadMessages()
             }
+            if notifiedMessages[key] != nil { Task { await removeIfDeleted(key) } }
         case .newMessage(let conversationId, let key):
             Task { await notify(conversationId, about: key, reaction: nil) }
         case .newReaction(let conversationId, let target, let reactor, let emoji):
@@ -319,7 +324,21 @@ final class AppStore {
             else { return }
             notifier.post(request)
             notified[conversationId] = notified[conversationId] == true || reaction == nil
-        } catch { append("notification failed: \(error)") }
+            notifiedMessages[key] = request.id
+        } catch {
+            Self.logger.error("notification failed: \(error, privacy: .private)")
+            append("notification failed: \(error)")
+        }
+    }
+
+    /// A message deleted for everyone must not stay readable in Notification Center.
+    private func removeIfDeleted(_ key: MessageKey) async {
+        guard let client, let id = notifiedMessages[key] else { return }
+        do {
+            guard try await client.message(key: key)?.deleted ?? true else { return }
+            notifiedMessages[key] = nil
+            notifier?.remove(ids: [id])
+        } catch { append("query failed: \(error)") }
     }
 
     private func removeNotifications(_ conversationId: String) {
@@ -329,7 +348,9 @@ final class AppStore {
 
     /// A click on a notification: brings up its chat, ready to type.
     func openFromNotification(conversationId: String) async {
-        guard await ready() else { return }
+        guard await ready() else {
+            return Self.logger.error("opening a chat from a notification failed: Semaphore wasn't ready")
+        }
         select(conversationId)
         focusComposer()
         NSApp?.activate()
@@ -338,27 +359,41 @@ final class AppStore {
     /// Reply typed into a notification: sends it and marks the chat read (the reply shows it was).
     func replyFromNotification(conversationId: String, text: String) async {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty, await ready(), let client else { return }
+        guard !body.isEmpty else { return }
+        guard await ready(), let client else {
+            return replyFailed(conversationId, because: "Semaphore wasn't ready")
+        }
         do {
             _ = try await client.sendText(conversationId: conversationId, body: body, quote: nil)
             markRead(conversationId)
         } catch {
-            lastError = "Your reply couldn't be sent: \(Self.describe(error))"
-            append("reply failed: \(error)")
+            replyFailed(conversationId, because: Self.describe(error))
         }
     }
 
+    /// The app is in the background when a reply comes from a notification: say so the same way.
+    private func replyFailed(_ conversationId: String, because reason: String) {
+        Self.logger.error("reply from a notification failed: \(reason, privacy: .private)")
+        lastError = "Your reply couldn't be sent: \(reason)"
+        notifier?.post(
+            NotificationRequest(
+                id: "reply-failed-\(conversationId)", conversationId: conversationId, title: "Reply not sent",
+                body: "Open the chat to send it again.", hasActions: false))
+    }
+
     func markReadFromNotification(conversationId: String) async {
-        guard await ready() else { return }
+        guard await ready() else {
+            return Self.logger.error("mark read from a notification dropped: Semaphore wasn't ready")
+        }
         markRead(conversationId)
         removeNotifications(conversationId)
     }
 
-    /// Waits (up to 10 s) for the core to be open and linked: a click on a notification can
-    /// launch the app.
+    /// Waits (up to 10 s) for the core to be open and linked and the chat list loaded: a click
+    /// on a notification can launch the app.
     private func ready() async -> Bool {
         for _ in 0..<100 {
-            if client != nil, screen == .chats { return true }
+            if client != nil, screen == .chats, conversationsLoaded { return true }
             try? await Task.sleep(for: .milliseconds(100))
         }
         return false
@@ -512,6 +547,7 @@ final class AppStore {
                 refreshAgain = false
                 do {
                     conversations = try await client.conversations()
+                    conversationsLoaded = true
                     Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
                     // group rows say who wrote the last message
                     for c in conversations where c.kind == .group && !c.lastMessageOutgoing {

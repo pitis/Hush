@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import UserNotifications
 
 /// What notifications show: Signal Desktop's "Notification content" setting (same stored values).
@@ -78,11 +79,14 @@ protocol Notifier: AnyObject {
     func authorize()
     func post(_ request: NotificationRequest)
     func remove(conversationId: String)
+    func remove(ids: [String])
 }
 
 /// Notification Center. Notifications of a chat share its thread, so they group together.
 final class SystemNotifier: Notifier {
     private var center: UNUserNotificationCenter { .current() }
+    /// Ids and errors only, never what a notification says.
+    private static let logger = Logger(subsystem: "dev.pitis.semaphore", category: "notifications")
 
     func authorize() {
         let reply = UNTextInputNotificationAction(
@@ -93,7 +97,13 @@ final class SystemNotifier: Notifier {
             UNNotificationCategory(
                 identifier: Notifications.category, actions: [reply, markRead], intentIdentifiers: [])
         ])
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error {
+                Self.logger.error("notification permission failed: \(error, privacy: .public)")
+            } else if !granted {
+                Self.logger.notice("notifications are turned off for Semaphore in System Settings")
+            }
+        }
     }
 
     func post(_ request: NotificationRequest) {
@@ -104,7 +114,9 @@ final class SystemNotifier: Notifier {
         content.threadIdentifier = request.conversationId
         content.userInfo = ["conversationId": request.conversationId]
         if request.hasActions { content.categoryIdentifier = Notifications.category }
-        center.add(UNNotificationRequest(identifier: request.id, content: content, trigger: nil))
+        center.add(UNNotificationRequest(identifier: request.id, content: content, trigger: nil)) { error in
+            if let error { Self.logger.error("showing a notification failed: \(error, privacy: .public)") }
+        }
     }
 
     func remove(conversationId: String) {
@@ -115,6 +127,8 @@ final class SystemNotifier: Notifier {
             center.removeDeliveredNotifications(withIdentifiers: ids)
         }
     }
+
+    func remove(ids: [String]) { center.removeDeliveredNotifications(withIdentifiers: ids) }
 }
 
 /// Routes clicks and actions on notifications to the store.
@@ -136,8 +150,9 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// The app only posts while in the background; if one arrives in front anyway, show nothing.
+    /// The app decides when to post (not while its window is in front); what it posts is shown,
+    /// also while the app is active with its window closed or minimized.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async
         -> UNNotificationPresentationOptions
-    { [] }
+    { [.banner, .list, .sound] }
 }
