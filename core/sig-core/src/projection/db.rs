@@ -1295,13 +1295,18 @@ impl ProjectionDb {
                 let mut tx = self.pool.begin().await?;
                 let options = serde_json::to_string(options).expect("strings serialize");
                 // the same poll again (a resend under its timestamp) never changes what was voted on
+                // and only a poll message here (not a text one sent under the same timestamp)
+                let (poll_kind, _) = MessageKind::Poll { question: None }.to_row();
                 let res = sqlx::query(
-                    "INSERT OR IGNORE INTO polls(author, sent_at, options, allow_multiple) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO polls(author, sent_at, options, allow_multiple)
+                     SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM messages
+                       WHERE author = ?1 AND sent_at = ?2 AND kind = ?5 AND deleted = 0)",
                 )
                 .bind(&message.author)
                 .bind(message.sent_at)
                 .bind(options)
                 .bind(allow_multiple)
+                .bind(poll_kind)
                 .execute(&mut *tx)
                 .await?;
                 let m = finish_poll(&mut tx, message, res.rows_affected()).await?;
@@ -4470,6 +4475,15 @@ mod tests {
         db.apply(&created(vec!["A".into(), "B".into()])).await.unwrap();
         // the same poll again, with other options: the first stands
         assert!(db.apply(&created(vec!["Rigged".into()])).await.unwrap().is_empty());
+        // a text message doesn't become one by a poll sent under its timestamp
+        db.insert_message(&msg("alice", 2, "plain text")).await.unwrap();
+        let onto_text = Op::PollCreated {
+            message: k("alice", 2),
+            options: vec!["A".into()],
+            allow_multiple: false,
+        };
+        assert!(db.apply(&onto_text).await.unwrap().is_empty());
+        assert_eq!(db.poll(&k("alice", 2)).await.unwrap(), None);
         let vote = |voter: &str| Op::PollVote {
             conversation_id: "c:alice".into(),
             target: k("alice", 1),
