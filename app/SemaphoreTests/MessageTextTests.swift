@@ -143,4 +143,23 @@ final class MessageTextTests: XCTestCase {
         XCTAssertEqual(
             String(MessageText.attributed("hi \u{FFFC}", ranges: hostile, name: name).characters), "hi \u{FFFC}")
     }
+
+    /// A range edge inside an emoji (between the halves of a UTF-16 surrogate pair) is ignored:
+    /// replacing text there traps.
+    func testRangesSplittingAnEmojiAreIgnored() {
+        for body in ["👍", "👍👍 hi", "🇷🇴🇩🇪", "👨‍👩‍👧 z", "a👍b"] {
+            for start: UInt32 in 0...4 {
+                for length: UInt32 in 1...3 {
+                    let ranges = [range(start, length, .mention(aci: "bob")), range(start, length, .spoiler)]
+                    _ = MessageText.attributed(body, ranges: ranges, name: name)
+                    _ = MessageText.attributed(body, ranges: [range(start, length, .mention(aci: "bob"))], name: name)
+                    _ = MessageText.plain(body, ranges: ranges, name: name)
+                }
+            }
+        }
+        XCTAssertEqual(
+            String(MessageText.attributed("👍", ranges: [range(1, 1, .mention(aci: "bob"))], name: name).characters), "👍"
+        )
+        XCTAssertEqual(MessageText.plain("👍", ranges: [range(1, 1, .mention(aci: "bob"))], name: name), "👍")
+    }
 }

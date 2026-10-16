@@ -71,10 +71,11 @@ enum MessageText {
             return !spoilers.contains { overlap($0, r) }
         }
         // last first; a range overlapping one already replaced is skipped
+        let units = Array(body.utf16)
         for r in (spoilers + mentions).sorted(by: { $0.start > $1.start }) {
             let start = Int(r.start)
             let length = Int(r.length)
-            guard start + length <= end, length > 0 else { continue }
+            guard start + length <= end, length > 0, fits(r, units) else { continue }
             let with =
                 switch r.style {
                 case .mention(let aci): "@\(name(aci))"
@@ -107,6 +108,16 @@ enum MessageText {
         .sorted { $0.start > $1.start }
     }
 
+    /// Whether `r` lies in text of these UTF-16 `units` with neither edge between the halves of a
+    /// surrogate pair (an emoji): an index there falls inside a character, where replacing text
+    /// traps or leaves half an emoji.
+    private static func fits(_ r: BodyRange, _ units: [UInt16]) -> Bool {
+        let start = Int(r.start)
+        let end = start + Int(r.length)
+        guard end <= units.count else { return false }
+        return [start, end].allSatisfy { $0 == units.count || !UTF16.isTrailSurrogate(units[$0]) }
+    }
+
     /// `r` cut to a text `length` long; nil if it starts past the end.
     private static func clamped(_ r: BodyRange, to length: Int) -> BodyRange? {
         guard Int(r.start) < length else { return nil }
@@ -121,6 +132,8 @@ enum MessageText {
 
     private static func span(_ r: BodyRange?, in text: AttributedString) -> Range<AttributedString.Index>? {
         guard let r, r.length > 0 else { return nil }
+        let units = Array(String(text.characters).utf16)
+        guard fits(r, units) else { return nil }
         return Range(NSRange(location: Int(r.start), length: Int(r.length)), in: text)
     }
 
