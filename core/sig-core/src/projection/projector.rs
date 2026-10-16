@@ -40,13 +40,16 @@ pub enum Op {
     /// `voter`'s vote on a poll (indexes into its options; none: taken back); the highest
     /// `vote_count` per voter wins.
     PollVote {
+        /// The chat it came in: it only counts on a poll there.
+        conversation_id: String,
         target: MessageKey,
         voter: String,
         vote_count: u32,
         options: Vec<u32>,
     },
-    /// A poll was ended (always by its author).
+    /// A poll was ended (always by its author, in the chat it came in).
     PollEnded {
+        conversation_id: String,
         target: MessageKey,
     },
     /// View-once media was opened (here or on another of our devices): it's gone.
@@ -340,6 +343,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     if let Some(v) = &dm.poll_vote {
         return (|| {
             Some(Op::PollVote {
+                conversation_id: conv.to_string(),
                 target: MessageKey {
                     author: aci(None, v.target_author_aci_binary.as_deref())?,
                     sent_at: i64::try_from(v.target_sent_timestamp?).ok()?,
@@ -358,6 +362,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
             .and_then(|t| i64::try_from(t).ok())
             .map(|sent_at| {
                 vec![Op::PollEnded {
+                    conversation_id: conv.to_string(),
                     target: MessageKey {
                         author: author.to_string(),
                         sent_at,
@@ -869,6 +874,7 @@ mod tests {
                 ME
             ),
             vec![Op::PollVote {
+                conversation_id: format!("g:{}", hex::encode(KEY)),
                 target: key(ALICE, 600),
                 voter: BOB.into(),
                 vote_count: 2,
@@ -893,7 +899,10 @@ mod tests {
                 &content(BOB, 660, ContentBody::DataMessage(in_group(end, KEY.to_vec()))),
                 ME
             ),
-            vec![Op::PollEnded { target: key(BOB, 600) }]
+            vec![Op::PollEnded {
+                conversation_id: format!("g:{}", hex::encode(KEY)),
+                target: key(BOB, 600)
+            }]
         );
     }
 

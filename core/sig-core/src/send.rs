@@ -1242,6 +1242,7 @@ mod tests {
         assert_eq!(
             own_ops(ME, &conv, dm.into()),
             vec![Op::PollVote {
+                conversation_id: conv.clone(),
                 target: key(U, 600),
                 voter: ME.into(),
                 vote_count: 4,
@@ -1250,7 +1251,10 @@ mod tests {
         );
         assert_eq!(
             own_ops(ME, &conv, poll_end(&conv, 600, 710).into()),
-            vec![Op::PollEnded { target: key(ME, 600) }]
+            vec![Op::PollEnded {
+                conversation_id: conv.clone(),
+                target: key(ME, 600)
+            }]
         );
         assert!(poll_vote(&conv, &key("not-an-aci", 1), vec![0], 1, 1).is_none());
     }

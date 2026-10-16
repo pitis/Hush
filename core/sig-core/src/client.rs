@@ -33,6 +33,10 @@ pub struct Client {
     data_dir: PathBuf,
     /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
     last_sent_at: Mutex<i64>,
+    /// The highest vote count handed out per poll (author, sent_at): our vote is stored only once
+    /// sent, so a second quick vote must not reuse the first one's count (others keep only a
+    /// higher one).
+    vote_counts: Mutex<std::collections::HashMap<(String, i64), u32>>,
     /// How many storage syncs were asked for (tests can't see the core's commands).
     #[cfg(test)]
     storage_sync_requests: std::sync::atomic::AtomicUsize,
@@ -63,6 +67,17 @@ impl Client {
     }
 
     /// A stored message, or why there is none.
+    /// Our next vote count on the poll `key`: above both what's stored and what was handed out.
+    async fn next_vote_count(&self, key: &MessageKey, me: &str) -> Result<u32, CoreError> {
+        let stored = self.db.my_poll_vote_count(key, me).await?;
+        let mut handed = self.vote_counts.lock().map_err(|_| CoreError::InvalidInput {
+            message: "vote counts unavailable".into(),
+        })?;
+        let slot = handed.entry((key.author.clone(), key.sent_at)).or_insert(0);
+        *slot = (*slot).max(stored) + 1;
+        Ok(*slot)
+    }
+
     async fn stored(&self, key: &MessageKey) -> Result<Message, CoreError> {
         self.db.message(key).await?.ok_or(CoreError::InvalidInput {
             message: "unknown message".into(),
@@ -183,6 +198,7 @@ impl Client {
             listener,
             data_dir,
             last_sent_at: Mutex::new(0),
+            vote_counts: Default::default(),
             #[cfg(test)]
             storage_sync_requests: Default::default(),
             #[cfg(test)]
@@ -708,7 +724,7 @@ impl Client {
         if !poll.allow_multiple && options.len() > 1 {
             return Err(invalid("this poll takes one choice"));
         }
-        let count = self.db.my_poll_vote_count(&key, &me).await? + 1;
+        let count = self.next_vote_count(&key, &me).await?;
         let at = self.next_sent_at() as u64;
         let body = send::poll_vote(&m.conversation_id, &key, options, count, at)
             .ok_or_else(|| invalid("the poll's author isn't known"))?;
@@ -1329,7 +1345,9 @@ mod tests {
                 .unwrap();
             client.vote(poll_key(ALICE), vec![1]).await.unwrap();
             client.vote(poll_key(ALICE), vec![]).await.unwrap(); // taken back
-                                                                 // not one of its options; two picks on a single-choice poll; not a poll
+                                                                 // both went out before either was stored here: each still got its own count
+            assert_eq!(client.next_vote_count(&poll_key(ALICE), ME).await.unwrap(), 3);
+            // not one of its options; two picks on a single-choice poll; not a poll
             assert!(invalid(client.vote(poll_key(ALICE), vec![2]).await));
             assert!(invalid(client.vote(poll_key(ALICE), vec![0, 1]).await));
             client.db.insert_message(&stored(ALICE, 6)).await.unwrap();
@@ -1343,6 +1361,7 @@ mod tests {
             client
                 .db
                 .apply(&crate::projection::Op::PollEnded {
+                    conversation_id: g.clone(),
                     target: poll_key(ALICE),
                 })
                 .await

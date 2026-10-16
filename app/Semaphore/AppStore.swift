@@ -347,6 +347,7 @@ final class AppStore {
         events = []
         attachments = [:]
         previews = [:]
+        polls = [:]
         outgoingFiles = []
         changedKeys = []
         hasOlder = false

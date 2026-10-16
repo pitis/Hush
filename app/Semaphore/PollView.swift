@@ -60,7 +60,9 @@ struct PollCard: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(poll.ended || me == nil)
-                .accessibilityLabel("\(option.text), \(option.voters.count) votes\(chosen ? ", your choice" : "")")
+                .accessibilityLabel(
+                    "\(option.text), \(option.voters.count == 1 ? "1 vote" : "\(option.voters.count) votes")\(chosen ? ", your choice" : "")"
+                )
             }
             HStack {
                 Text(PollChoice.summary(poll)).font(.system(size: 11)).foregroundStyle(.white.opacity(0.7))

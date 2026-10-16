@@ -21,11 +21,14 @@ votes and `hasEnded`.
 - Migration 0015: `polls(author, sent_at, options JSON, allow_multiple, ended)` and
   `poll_votes(target, voter, vote_count, options JSON)`. Ops `PollCreated` (with the poll's
   `InsertMessage`), `PollVote` (kept only if its count is higher), `PollEnded` (the sender's own
-  poll; an end before the poll stays). Delete for everyone drops both.
+  poll). A vote or end counts only on a poll that is here, in the chat it came in, not deleted
+  (it names its poll by author and time only); one that arrives before its poll is dropped.
+  Delete for everyone, expiry and deleting the chat drop both tables' rows.
 - `ProjectionDb::poll` reads the standing: a single-choice poll counts each voter's first pick;
   picks it doesn't have don't count.
 - `Client.vote(key, options)` (checked against the poll: open, its options, one choice unless
-  several) sends our next `voteCount`; `Client.end_poll(key)` (ours, open); both apply here once
+  several) sends our next `voteCount` (above what's stored and what was already handed out: our
+  vote is stored only once sent); `Client.end_poll(key)` (ours, open); both apply here once
   sent, like a reaction. `Client.poll(key)` for the app.
 - App: `PollCard` in the bubble; `PollChoice` decides what a click votes.
 
