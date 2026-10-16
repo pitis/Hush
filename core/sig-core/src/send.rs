@@ -76,6 +76,14 @@ pub enum Job {
         body: Box<ContentBody>,
         at: u64,
     },
+    /// A call signaling envelope, sent at `at`; the outcome goes back through `done` (RingRTC
+    /// retries or fails the call on it).
+    Call {
+        conversation_id: String,
+        body: Box<ContentBody>,
+        at: u64,
+        done: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Send the unsent read receipts (`ProjectionDb::unsent_receipts`) and the read state to our
     /// phone. Queued by mark-read and when the phone's settings arrive.
     Receipts,
@@ -337,6 +345,19 @@ pub async fn sender(
                 body,
                 at,
             } => send_mutation(&mut m, &db, l.as_ref(), &conversation_id, *body, at).await,
+            Job::Call {
+                conversation_id,
+                body,
+                at,
+                done,
+            } => {
+                let sent = send_to(&mut m, &conversation_id, *body, at).await;
+                if let Err(e) = &sent {
+                    // ids only; the call engine shows the user a failed call
+                    tracing::warn!(conversation = %conversation_id, error = %e, "a call message wasn't sent");
+                }
+                let _ = done.send(sent.is_ok());
+            }
             Job::Receipts => send_receipts(&mut m, &db, l.as_ref()).await,
             Job::Typing {
                 conversation_id,

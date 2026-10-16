@@ -13,7 +13,7 @@ pub mod projection;
 mod send;
 mod typing;
 
-pub use calls::CallPhase;
+pub use calls::{AudioDevice, AudioDevices, CallPhase};
 pub use client::Client;
 pub use error::CoreError;
 pub use events::{ConnectionState, CoreEvent, EventListener};

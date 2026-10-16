@@ -157,6 +157,50 @@ impl Client {
         self.send(Command::ResetSession { conversation_id })
     }
 
+    /// Starts a voice call in a 1:1 chat (`CallChanged` events follow; the call window opens
+    /// on `Outgoing`).
+    pub fn start_call(&self, conversation_id: String) -> Result<(), CoreError> {
+        if !self.is_linked() {
+            return Err(CoreError::NotLinked);
+        }
+        let aci = conversation_id
+            .strip_prefix("c:")
+            .filter(|rest| !rest.starts_with("PNI:") && !rest.is_empty());
+        let Some(peer_aci) = aci else {
+            return Err(CoreError::InvalidInput {
+                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+            });
+        };
+        self.send(Command::Call(crate::calls::actor::CallCommand::Start {
+            peer_aci: peer_aci.to_owned(),
+        }))
+    }
+
+    /// Accepts the ringing incoming call.
+    pub fn accept_call(&self) -> Result<(), CoreError> {
+        self.send(Command::Call(crate::calls::actor::CallCommand::Accept))
+    }
+
+    /// Hangs up the active call (or declines the ringing one).
+    pub fn hangup_call(&self) -> Result<(), CoreError> {
+        self.send(Command::Call(crate::calls::actor::CallCommand::Hangup))
+    }
+
+    /// Mutes or unmutes our microphone in the active call.
+    pub fn set_call_muted(&self, muted: bool) -> Result<(), CoreError> {
+        self.send(Command::Call(crate::calls::actor::CallCommand::SetMuted(muted)))
+    }
+
+    /// Switches the call microphone (an id from `call_audio_devices`).
+    pub fn set_call_audio_input(&self, id: String) -> Result<(), CoreError> {
+        self.send(Command::Call(crate::calls::actor::CallCommand::SetAudioInput(id)))
+    }
+
+    /// Switches the call speaker (an id from `call_audio_devices`).
+    pub fn set_call_audio_output(&self, id: String) -> Result<(), CoreError> {
+        self.send(Command::Call(crate::calls::actor::CallCommand::SetAudioOutput(id)))
+    }
+
     /// "Continue without history": stops the history import (or clears a failed one), deletes
     /// the archive and its state, and starts receiving.
     pub fn cancel_history(&self) -> Result<(), CoreError> {
@@ -402,6 +446,18 @@ impl Client {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(e)),
             _ => Ok(()),
         }
+    }
+
+    /// The microphones and speakers a call can use. Starts the audio engine if needed.
+    pub async fn call_audio_devices(&self) -> Result<crate::calls::AudioDevices, CoreError> {
+        if !self.is_linked() {
+            return Err(CoreError::NotLinked);
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send(Command::Call(crate::calls::actor::CallCommand::ListAudioDevices {
+            reply,
+        }))?;
+        rx.await.map_err(|_| CoreError::Closed)
     }
 
     /// A history import is waiting, downloading or importing: set right after linking when the
@@ -691,6 +747,38 @@ mod tests {
             }
             assert!(!client.history_pending().await.unwrap(), "cancel clears it");
         });
+    }
+
+    /// Calls need a link and a real 1:1 chat; the engine (and the audio stack) never starts
+    /// for an invalid ask.
+    #[test]
+    fn calls_need_a_link_and_a_direct_chat() {
+        let dir = temp_dir("client-calls");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        assert!(matches!(client.start_call("c:alice".into()), Err(CoreError::NotLinked)));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(matches!(client.call_audio_devices().await, Err(CoreError::NotLinked)));
+        });
+    }
+
+    #[test]
+    fn start_call_rejects_groups_and_pni_chats() {
+        let dir = temp_dir("client-call-ids");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        // linked-only guard comes first, so force the id checks by faking the link bit
+        client.linked.store(true, std::sync::atomic::Ordering::SeqCst);
+        for bad in ["g:0011", "c:PNI:22222222-2222-2222-2222-222222222222", "c:", "alice"] {
+            assert!(
+                matches!(client.start_call(bad.into()), Err(CoreError::InvalidInput { .. })),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

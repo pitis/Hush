@@ -62,7 +62,6 @@ pub(crate) enum CallOutput {
         peer_aci: String,
         call_id_u64: u64,
         proto: presage::proto::CallMessage,
-        urgent: bool,
     },
     /// Fetch relays and answer with `CallCommand::Relays`.
     NeedRelays,
@@ -230,7 +229,10 @@ fn run(
                 let active = shared.lock().unwrap().active.clone();
                 let Some(active) = active else { continue };
                 let context = NativeCallContext::new(
-                    false, // hide_ip: "always relay calls" is a later setting
+                    // hide_ip=false is Signal's own default: a 1:1 call may connect peer-to-peer,
+                    // which shows your IP to your contact. The "Always relay calls" privacy
+                    // setting (which sets this true and forces TURN) is planned M4 settings work.
+                    false,
                     ice_servers,
                     engine.audio_track.clone(),
                     engine.video_track.clone(),
@@ -354,13 +356,11 @@ impl SignalingSender for Bridge {
         receiver_device_id: Option<ringrtc::common::DeviceId>,
         message: signaling::Message,
     ) -> ringrtc::common::Result<()> {
-        let urgent = !matches!(message, signaling::Message::Ice(_));
         let proto = wire::to_proto(call_id, receiver_device_id, &message);
         let _ = self.out_tx.send(CallOutput::Send {
             peer_aci: recipient_id.to_owned(),
             call_id_u64: call_id.as_u64(),
             proto,
-            urgent,
         });
         Ok(())
     }

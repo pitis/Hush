@@ -1,11 +1,27 @@
 //! 1:1 voice calls on RingRTC: signaling translation, relays, and the call engine's thread.
 
-// The pieces land one by one and are wired together by the call actor; until then they are
-// unused. TODO(remove when the call actor lands): drop this allow.
-#![allow(dead_code)]
-
 pub(crate) mod actor;
 pub(crate) mod relays;
+
+use presage::libsignal_service::protocol::ServiceId;
+
+pub use actor::{AudioDevice, AudioDevices};
+
+/// A received `CallMessage`, as the receive loop hands it to the call router.
+pub(crate) struct IncomingEnvelope {
+    pub sender: ServiceId,
+    pub sender_device: u32,
+    pub server_timestamp_ms: i64,
+    pub message: presage::proto::CallMessage,
+}
+
+/// Only an ACI may ring us: its bare uuid string (RingRTC's peer id and our `c:<aci>`).
+pub(crate) fn call_sender_aci(sender: &ServiceId) -> Option<String> {
+    match sender {
+        ServiceId::Aci(aci) => Some(presage::libsignal_service::prelude::Uuid::from(*aci).to_string()),
+        ServiceId::Pni(_) => None,
+    }
+}
 pub(crate) mod state;
 pub(crate) mod wire;
 
@@ -27,6 +43,14 @@ pub enum CallPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_aci_senders_may_ring() {
+        use presage::libsignal_service::protocol::{Aci, Pni};
+        let u = presage::libsignal_service::prelude::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(call_sender_aci(&ServiceId::from(Aci::from(u))), Some(u.to_string()));
+        assert_eq!(call_sender_aci(&ServiceId::from(Pni::from(u))), None);
+    }
 
     #[test]
     fn phases_are_distinct_and_ended_is_terminal() {
