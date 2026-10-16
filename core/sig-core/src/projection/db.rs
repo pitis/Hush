@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{ConnectOptions, Row};
@@ -42,6 +43,9 @@ pub enum Applied {
 pub struct ProjectionDb {
     pool: SqlitePool,
     files: Option<PathBuf>,
+    /// Counts pin changes (`set_account_dirty(true)`), so the sync clears the account's mark
+    /// only if nothing changed while it wrote; the lock makes the count and the mark move together.
+    account_changes: Arc<tokio::sync::Mutex<u64>>,
 }
 
 /// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
@@ -138,7 +142,11 @@ impl ProjectionDb {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool, files: None })
+        Ok(Self {
+            pool,
+            files: None,
+            account_changes: Default::default(),
+        })
     }
 
     /// Closes the database: later calls fail. Before its file is removed (unlinking).
@@ -173,15 +181,22 @@ impl ProjectionDb {
     /// Archiving also unpins (as Desktop): an archived chat holds no pin slot and comes back
     /// unpinned.
     pub async fn set_archived(&self, id: &str, archived: bool) -> Result<(), sqlx::Error> {
+        let pinned: Option<Option<i64>> = sqlx::query_scalar("SELECT pinned_order FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         sqlx::query(
             "UPDATE conversations SET archived = ?2,
-               pinned_order = CASE WHEN ?2 THEN NULL ELSE pinned_order END
+               pinned_order = CASE WHEN ?2 THEN NULL ELSE pinned_order END, storage_dirty = 1
              WHERE id = ?1",
         )
         .bind(id)
         .bind(archived)
         .execute(&self.pool)
         .await?;
+        if archived && matches!(pinned, Some(Some(_))) {
+            self.set_account_dirty(true).await?; // the pin went with it
+        }
         Ok(())
     }
 
@@ -193,10 +208,12 @@ impl ProjectionDb {
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
+            self.set_account_dirty(true).await?;
             return Ok(true);
         }
+        // (archived may flip too, so the chat's own record is dirty as well)
         let res = sqlx::query(
-            "UPDATE conversations SET archived = 0,
+            "UPDATE conversations SET archived = 0, storage_dirty = 1,
                pinned_order = COALESCE(pinned_order,
                  (SELECT COALESCE(MAX(pinned_order), 0) + 1 FROM conversations))
              WHERE id = ?1 AND (pinned_order IS NOT NULL
@@ -206,12 +223,16 @@ impl ProjectionDb {
         .bind(i64::from(Self::MAX_PINNED))
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected() == 1)
+        let done = res.rows_affected() == 1;
+        if done {
+            self.set_account_dirty(true).await?;
+        }
+        Ok(done)
     }
 
     /// `until`: ms since the epoch; 0 unmutes; `i64::MAX` mutes for good.
     pub async fn set_mute_until(&self, id: &str, until: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE conversations SET mute_until = ?2 WHERE id = ?1")
+        sqlx::query("UPDATE conversations SET mute_until = ?2, storage_dirty = 1 WHERE id = ?1")
             .bind(id)
             .bind(until)
             .execute(&self.pool)
@@ -220,7 +241,7 @@ impl ProjectionDb {
     }
 
     pub async fn set_marked_unread(&self, id: &str, marked: bool) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE conversations SET marked_unread = ?2 WHERE id = ?1")
+        sqlx::query("UPDATE conversations SET marked_unread = ?2, storage_dirty = 1 WHERE id = ?1")
             .bind(id)
             .bind(marked)
             .execute(&self.pool)
@@ -246,13 +267,306 @@ impl ProjectionDb {
         Ok(muted.unwrap_or(false))
     }
 
-    /// The chat was read: "marked unread" goes away. True if it was set.
+    /// The chat was read: "marked unread" goes away (and the phone should learn it). True if it
+    /// was set.
     pub async fn clear_marked_unread(&self, id: &str) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("UPDATE conversations SET marked_unread = 0 WHERE id = ?1 AND marked_unread = 1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let res = sqlx::query(
+            "UPDATE conversations SET marked_unread = 0, storage_dirty = 1 WHERE id = ?1 AND marked_unread = 1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() == 1)
+    }
+
+    // ---- Storage Service sync state (see `crate::storage`) ----
+
+    pub async fn storage_state(&self) -> Result<Option<StorageState>, sqlx::Error> {
+        let row: Option<StorageSyncRow> = sqlx::query_as(
+            "SELECT version, record_ikm, key_fingerprint, account_dirty, unmappable_pins FROM storage_sync WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(version, record_ikm, key_fingerprint, account_dirty, pins)| StorageState {
+                version: u64::try_from(version).unwrap_or(0),
+                record_ikm,
+                key_fingerprint,
+                account_dirty,
+                unmappable_pins: unpack_blobs(&pins),
+            },
+        ))
+    }
+
+    /// `account_dirty` is taken only when there is no state yet: afterwards it moves only through
+    /// `set_account_dirty` and `clear_account_dirty`, so a sync can't put back a stale value.
+    pub async fn set_storage_state(&self, s: &StorageState) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO storage_sync(id, version, record_ikm, key_fingerprint, account_dirty, unmappable_pins)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET version = excluded.version, record_ikm = excluded.record_ikm,
+               key_fingerprint = excluded.key_fingerprint, unmappable_pins = excluded.unmappable_pins",
+        )
+        .bind(i64::try_from(s.version).unwrap_or(i64::MAX))
+        .bind(&s.record_ikm)
+        .bind(&s.key_fingerprint)
+        .bind(s.account_dirty)
+        .bind(pack_blobs(&s.unmappable_pins))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forgets the applied manifest and its items (a new storage key): the next pull starts
+    /// from nothing. Dirty marks stay, the account's too.
+    pub async fn reset_storage_state(&self) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM storage_items").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM storage_sync WHERE account_dirty = 0")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE storage_sync SET version = 0, record_ikm = X'', key_fingerprint = X'', unmappable_pins = X''",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    pub async fn storage_items(&self) -> Result<Vec<StorageItemRow>, sqlx::Error> {
+        let rows: Vec<(Vec<u8>, i64, Option<String>)> =
+            sqlx::query_as("SELECT key, kind, conversation_id FROM storage_items ORDER BY rowid")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, kind, conversation_id)| StorageItemRow {
+                key,
+                kind: i32::try_from(kind).unwrap_or(0),
+                conversation_id,
+            })
+            .collect())
+    }
+
+    /// The applied manifest's identifiers, replaced as a whole.
+    pub async fn replace_storage_items(&self, rows: &[StorageItemRow]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM storage_items").execute(&mut *tx).await?;
+        for r in rows {
+            sqlx::query("INSERT INTO storage_items(key, kind, conversation_id) VALUES (?1, ?2, ?3)")
+                .bind(&r.key)
+                .bind(i64::from(r.kind))
+                .bind(&r.conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// The phone's values for a chat (created if we don't have it: it is listed once a message
+    /// arrives). Remote wins; the chat's dirty mark goes. True if anything changed.
+    pub async fn apply_remote_chat(&self, id: &str, f: &ChatFlags) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(id)
+            .bind(kind_to_i64(kind))
+            .execute(&mut *tx)
+            .await?;
+        let res = sqlx::query(
+            "UPDATE conversations SET archived = ?2, marked_unread = ?3, mute_until = ?4, blocked = ?5,
+               whitelisted = ?6, storage_dirty = 0,
+               pinned_order = CASE WHEN ?2 THEN NULL ELSE pinned_order END
+             WHERE id = ?1 AND (archived != ?2 OR marked_unread != ?3 OR mute_until != ?4 OR blocked != ?5
+               OR whitelisted != ?6 OR storage_dirty != 0)",
+        )
+        .bind(id)
+        .bind(f.archived)
+        .bind(f.marked_unread)
+        .bind(f.mute_until)
+        .bind(f.blocked)
+        .bind(f.whitelisted)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// The phone's pinned list replaces ours: `ids` in pin order (chats we don't have are
+    /// created; a pinned chat is not archived). True if the list changed.
+    pub async fn apply_remote_pins(&self, ids: &[String]) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let before: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM conversations WHERE pinned_order IS NOT NULL ORDER BY pinned_order")
+                .fetch_all(&mut *tx)
+                .await?;
+        sqlx::query("UPDATE conversations SET pinned_order = NULL WHERE pinned_order IS NOT NULL")
+            .execute(&mut *tx)
+            .await?;
+        for (i, id) in ids.iter().enumerate() {
+            let kind = kind_of(id)?;
+            sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+                .bind(id)
+                .bind(kind_to_i64(kind))
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE conversations SET pinned_order = ?2, archived = 0 WHERE id = ?1")
+                .bind(id)
+                .bind(i64::try_from(i + 1).unwrap_or(i64::MAX))
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(before != ids)
+    }
+
+    /// Note to Self's archived / marked unread from the account record (its other flags have no
+    /// field there). Remote wins; true if either changed.
+    pub async fn apply_remote_note_to_self(
+        &self,
+        id: &str,
+        archived: bool,
+        marked_unread: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(id)
+            .bind(kind_to_i64(kind))
+            .execute(&mut *tx)
+            .await?;
+        let res = sqlx::query(
+            "UPDATE conversations SET archived = ?2, marked_unread = ?3, storage_dirty = 0,
+               pinned_order = CASE WHEN ?2 THEN NULL ELSE pinned_order END
+             WHERE id = ?1 AND (archived != ?2 OR marked_unread != ?3)",
+        )
+        .bind(id)
+        .bind(archived)
+        .bind(marked_unread)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// The pinned chats in pin order, listed or not.
+    pub async fn pinned_chat_ids(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM conversations WHERE pinned_order IS NOT NULL ORDER BY pinned_order, id")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// A chat's flags, listed or not; None for a chat we don't have.
+    pub async fn chat_flags(&self, id: &str) -> Result<Option<ChatFlags>, sqlx::Error> {
+        let row: Option<(bool, bool, i64, bool, bool)> = sqlx::query_as(
+            "SELECT archived, marked_unread, mute_until, blocked, whitelisted FROM conversations WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(archived, marked_unread, mute_until, blocked, whitelisted)| ChatFlags {
+                archived,
+                marked_unread,
+                mute_until,
+                blocked,
+                whitelisted,
+            },
+        ))
+    }
+
+    /// Chats whose flags changed here and haven't reached the phone, by id.
+    pub async fn dirty_chats(&self) -> Result<Vec<(String, ChatFlags)>, sqlx::Error> {
+        let rows: Vec<(String, bool, bool, i64, bool, bool)> = sqlx::query_as(
+            "SELECT id, archived, marked_unread, mute_until, blocked, whitelisted FROM conversations
+             WHERE storage_dirty = 1 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, archived, marked_unread, mute_until, blocked, whitelisted)| {
+                (
+                    id,
+                    ChatFlags {
+                        archived,
+                        marked_unread,
+                        mute_until,
+                        blocked,
+                        whitelisted,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Clears the marks of chats written with these flags; a chat whose flags changed since
+    /// (while the write was in flight) stays dirty for the next push.
+    pub async fn clear_dirty(&self, written: &[(String, ChatFlags)]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for (id, f) in written {
+            sqlx::query(
+                "UPDATE conversations SET storage_dirty = 0
+                 WHERE id = ?1 AND archived = ?2 AND marked_unread = ?3 AND mute_until = ?4",
+            )
+            .bind(id)
+            .bind(f.archived)
+            .bind(f.marked_unread)
+            .bind(f.mute_until)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// A pin change is (or is no longer) waiting to be written.
+    pub async fn set_account_dirty(&self, dirty: bool) -> Result<(), sqlx::Error> {
+        let mut changes = self.account_changes.lock().await;
+        if dirty {
+            *changes += 1;
+        }
+        sqlx::query(
+            "INSERT INTO storage_sync(id, account_dirty) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET account_dirty = excluded.account_dirty",
+        )
+        .bind(dirty)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How many pin changes there have been: read before reading the pins to write.
+    pub async fn account_changes(&self) -> u64 {
+        *self.account_changes.lock().await
+    }
+
+    /// Clears the account's mark, unless a pin changed after `account_changes` returned `seen`.
+    pub async fn clear_account_dirty(&self, seen: u64) -> Result<(), sqlx::Error> {
+        let changes = self.account_changes.lock().await;
+        if *changes == seen {
+            sqlx::query("UPDATE storage_sync SET account_dirty = 0")
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether local chat settings are written to the phone's account (on unless turned off).
+    pub async fn storage_writes(&self) -> Result<bool, sqlx::Error> {
+        let on: Option<bool> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'storage_writes'")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(on.unwrap_or(true))
+    }
+
+    pub async fn set_storage_writes(&self, on: bool) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO settings VALUES ('storage_writes', ?1) ON CONFLICT DO UPDATE SET value = excluded.value",
+        )
+        .bind(on)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Inserts a message and refreshes its conversation's summary. Returns false (and changes
@@ -1766,6 +2080,30 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
     Ok(())
 }
 
+/// `storage_sync`'s columns as sqlx reads them: version, record_ikm, key_fingerprint, account_dirty, unmappable_pins.
+type StorageSyncRow = (i64, Vec<u8>, Vec<u8>, bool, Vec<u8>);
+
+/// `u32 LE length || bytes` per entry (the `unmappable_pins` column).
+fn pack_blobs(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(items.iter().map(|b| b.len() + 4).sum());
+    for b in items {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+fn unpack_blobs(mut b: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = vec![];
+    while b.len() >= 4 {
+        let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        let Some(item) = b.get(4..4 + len) else { break };
+        out.push(item.to_vec());
+        b = &b[4 + len..];
+    }
+    out
+}
+
 /// The conversation a stored message belongs to, if it is stored.
 async fn conversation_of(
     conn: &mut SqliteConnection,
@@ -1872,6 +2210,8 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
             .transpose()?,
         mute_until: r.try_get("mute_until")?,
         marked_unread: r.try_get("marked_unread")?,
+        blocked: r.try_get("blocked")?,
+        whitelisted: r.try_get("whitelisted")?,
         id,
     })
 }
@@ -2827,6 +3167,184 @@ mod tests {
         db.set_mute_until("c:alice", i64::MAX).await.unwrap();
         assert!(db.is_muted("c:alice", i64::MAX - 1).await.unwrap());
         assert!(!db.is_muted("c:nobody", 0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn storage_state_round_trips_and_resets() {
+        let db = db().await;
+        assert_eq!(db.storage_state().await.unwrap(), None);
+        let s = StorageState {
+            version: 7,
+            record_ikm: vec![1; 32],
+            key_fingerprint: vec![2; 32],
+            account_dirty: true,
+            unmappable_pins: vec![vec![9, 9], vec![]],
+        };
+        db.set_storage_state(&s).await.unwrap();
+        assert_eq!(db.storage_state().await.unwrap(), Some(s.clone()));
+        db.replace_storage_items(&[StorageItemRow {
+            key: vec![1; 16],
+            kind: 4,
+            conversation_id: None,
+        }])
+        .await
+        .unwrap();
+        // the pending pin change is ours, not the old manifest's: it survives
+        db.reset_storage_state().await.unwrap();
+        let reset = db.storage_state().await.unwrap().unwrap();
+        assert_eq!(
+            (reset.version, reset.account_dirty, reset.key_fingerprint.len()),
+            (0, true, 0)
+        );
+        assert!(db.storage_items().await.unwrap().is_empty());
+        db.set_account_dirty(false).await.unwrap();
+        db.reset_storage_state().await.unwrap();
+        assert_eq!(db.storage_state().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn storage_items_are_replaced_as_a_set() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        let row = |k: u8, kind, conv: Option<&str>| StorageItemRow {
+            key: vec![k; 16],
+            kind,
+            conversation_id: conv.map(String::from),
+        };
+        db.replace_storage_items(&[row(1, 1, Some("c:alice")), row(2, 4, None)])
+            .await
+            .unwrap();
+        let rows = db.storage_items().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].conversation_id.as_deref(), Some("c:alice"));
+        db.replace_storage_items(&[row(3, 3, None)]).await.unwrap();
+        let keys: Vec<u8> = db.storage_items().await.unwrap().iter().map(|r| r.key[0]).collect();
+        assert_eq!(keys, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn remote_flags_apply_to_a_chat_and_create_it_if_needed() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.set_archived("c:alice", true).await.unwrap(); // dirty now
+        let flags = ChatFlags {
+            archived: false,
+            marked_unread: true,
+            mute_until: 5,
+            blocked: true,
+            whitelisted: true,
+        };
+        assert!(db.apply_remote_chat("c:alice", &flags).await.unwrap());
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (c.archived, c.marked_unread, c.mute_until, c.blocked, c.whitelisted),
+            (false, true, 5, true, true)
+        );
+        assert!(
+            db.dirty_chats().await.unwrap().is_empty(),
+            "remote wins and clears the mark"
+        );
+        assert!(
+            !db.apply_remote_chat("c:alice", &flags).await.unwrap(),
+            "nothing changed the second time"
+        );
+        // a chat we have no messages with: created, not listed
+        let archived = ChatFlags {
+            archived: true,
+            ..Default::default()
+        };
+        db.apply_remote_chat("c:bob", &archived).await.unwrap();
+        assert!(db.has_conversation("c:bob").await.unwrap());
+        assert!(db.conversations().await.unwrap().iter().all(|c| c.id != "c:bob"));
+        // a remote archive unpins
+        db.set_pinned("c:alice", true).await.unwrap();
+        db.apply_remote_chat("c:alice", &archived).await.unwrap();
+        assert_eq!(conv(&db, "c:alice").await.pinned_order, None);
+    }
+
+    #[tokio::test]
+    async fn remote_pins_replace_local_ones_in_order() {
+        let db = db().await;
+        for (c, a, t) in [("c:alice", "alice", 1), ("c:bob", "bob", 2), ("c:carol", "carol", 3)] {
+            db.insert_message(&in_conv(c, msg(a, t, "x"))).await.unwrap();
+        }
+        db.set_pinned("c:alice", true).await.unwrap();
+        db.set_archived("c:carol", true).await.unwrap();
+        db.apply_remote_pins(&["c:carol".into(), "c:bob".into(), "g:ff".into()])
+            .await
+            .unwrap();
+        assert_eq!(conv(&db, "c:alice").await.pinned_order, None);
+        let carol = conv(&db, "c:carol").await;
+        assert_eq!(
+            (carol.pinned_order, carol.archived),
+            (Some(1), false),
+            "a remote pin unarchives"
+        );
+        assert_eq!(conv(&db, "c:bob").await.pinned_order, Some(2));
+        assert!(
+            db.has_conversation("g:ff").await.unwrap(),
+            "an unknown pinned group is created"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_flag_changes_mark_the_chat_or_the_account_dirty() {
+        let db = db().await;
+        // as a push does: clears what it wrote, as it is now
+        async fn clear(db: &ProjectionDb) {
+            let flags = db.chat_flags("c:alice").await.unwrap().unwrap();
+            db.clear_dirty(&[("c:alice".into(), flags)]).await.unwrap();
+        }
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        assert!(db.dirty_chats().await.unwrap().is_empty());
+        db.set_mute_until("c:alice", 9).await.unwrap();
+        let dirty = db.dirty_chats().await.unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!((dirty[0].0.as_str(), dirty[0].1.mute_until), ("c:alice", 9));
+        clear(&db).await;
+        assert!(db.dirty_chats().await.unwrap().is_empty());
+        assert_eq!(db.storage_state().await.unwrap(), None);
+        db.set_pinned("c:alice", true).await.unwrap();
+        assert!(db.storage_state().await.unwrap().unwrap().account_dirty);
+        db.set_account_dirty(false).await.unwrap();
+        assert!(!db.storage_state().await.unwrap().unwrap().account_dirty);
+        db.set_archived("c:alice", true).await.unwrap(); // archiving unpins: the account changes too
+        assert!(db.storage_state().await.unwrap().unwrap().account_dirty);
+        // opening a chat marked unread is a change the phone should learn about
+        clear(&db).await;
+        db.set_marked_unread("c:alice", true).await.unwrap();
+        clear(&db).await;
+        assert!(db.clear_marked_unread("c:alice").await.unwrap());
+        assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn a_mark_is_cleared_only_while_the_flags_are_as_written() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.set_mute_until("c:alice", 9).await.unwrap();
+        let written = db.dirty_chats().await.unwrap();
+        db.set_archived("c:alice", true).await.unwrap(); // while the write is in flight
+        db.clear_dirty(&written).await.unwrap();
+        assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+        // the account: a pin change after the count was read keeps the mark
+        db.set_pinned("c:alice", true).await.unwrap();
+        let seen = db.account_changes().await;
+        db.set_pinned("c:alice", false).await.unwrap();
+        db.clear_account_dirty(seen).await.unwrap();
+        assert!(db.storage_state().await.unwrap().unwrap().account_dirty);
+        let seen = db.account_changes().await;
+        db.clear_account_dirty(seen).await.unwrap();
+        assert!(!db.storage_state().await.unwrap().unwrap().account_dirty);
+    }
+
+    #[tokio::test]
+    async fn storage_writes_are_on_unless_turned_off() {
+        let db = db().await;
+        assert!(db.storage_writes().await.unwrap());
+        db.set_storage_writes(false).await.unwrap();
+        assert!(!db.storage_writes().await.unwrap());
+        db.set_storage_writes(true).await.unwrap();
+        assert!(db.storage_writes().await.unwrap());
     }
 
     #[tokio::test]

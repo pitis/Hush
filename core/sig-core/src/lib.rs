@@ -11,6 +11,7 @@ mod logging;
 mod net;
 pub mod projection;
 mod send;
+mod storage;
 mod typing;
 
 pub use calls::{AudioDevice, AudioDevices, CallPhase};

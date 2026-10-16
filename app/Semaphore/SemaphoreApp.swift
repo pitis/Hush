@@ -88,6 +88,9 @@ struct SettingsView: View {
                 LabeledContent("Message history") {
                     Button("Transfer Message History…") { confirmRelink = true }.disabled(working)
                 }
+                Toggle(
+                    "Sync chat settings to your phone",
+                    isOn: Binding(get: { store.storageWrites }, set: { store.setStorageWrites($0) }))
                 LabeledContent("Linked device") {
                     Button("Unlink This Mac…", role: .destructive) { confirmUnlink = true }.disabled(working)
                 }

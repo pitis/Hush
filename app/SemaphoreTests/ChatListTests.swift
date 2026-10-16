@@ -306,6 +306,22 @@ final class AppStoreChatListTests: XCTestCase {
         await eventually { store.lastError == nil }
     }
 
+    func testTheStorageWritesSwitchReadsAndWritesTheCore() async {
+        let fake = FakeClient(linked: true)
+        fake.storageWritesAnswer = false
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.storageWrites == false }
+        store.setStorageWrites(true)
+        XCTAssertTrue(store.storageWrites)
+        await eventually { fake.storageWritesSet == [true] }
+        // a refusal puts the switch back and says why
+        fake.changeError = TestError(description: "disk full")
+        store.setStorageWrites(false)
+        await eventually { store.lastError != nil }
+        XCTAssertTrue(store.storageWrites)
+    }
+
     func testFlagChangesRunInTheOrderTheyWereMade() async {
         let fake = FakeClient(linked: true)
         fake.conversationAnswers = [.success([conversation("c:a")])]

@@ -116,6 +116,8 @@ final class AppStore {
     private let forgetKey: () -> Void
     private(set) var log: [LogLine] = []
     private(set) var lastError: String?
+    /// Chat settings changed here are written to the phone's account (the Storage Service).
+    private(set) var storageWrites = true
     /// The core's recent errors, for the Core Log window (ids and reasons, never message text).
     private(set) var errors: [LogLine] = []
     private(set) var selectedId: String?
@@ -212,6 +214,9 @@ final class AppStore {
                 let pending = (try? await client.historyPending()) == true
                 try client.start()
                 refreshConversations()
+                do { storageWrites = try await client.storageWrites() } catch {
+                    append("couldn't read the chat settings sync switch: \(error)")
+                }
                 if pending, history == nil {
                     // resuming an interrupted transfer: show it before its first event arrives
                     history = HistoryProgress(stage: .waiting, done: 0, total: 0)
@@ -560,6 +565,19 @@ final class AppStore {
                 changeFailure = "Couldn't \(action): \(Self.describe(error))"
                 lastError = changeFailure
                 append("couldn't \(action) \(conversationId): \(error)")
+            }
+        }
+    }
+
+    /// Turns writing chat settings to the phone's account on or off; a refusal puts it back.
+    func setStorageWrites(_ on: Bool) {
+        guard let client, on != storageWrites else { return }
+        storageWrites = on
+        Task {
+            do { try await client.setStorageWrites(on: on) } catch {
+                storageWrites = !on
+                lastError = "Couldn't change chat settings sync: \(Self.describe(error))"
+                append("couldn't turn chat settings sync \(on ? "on" : "off"): \(error)")
             }
         }
     }
