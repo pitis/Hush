@@ -1212,6 +1212,10 @@ impl ProjectionDb {
                 .bind(target.sent_at)
                 .execute(&mut *tx)
                 .await?;
+                if res.rows_affected() == 1 {
+                    // presage keeps the whole message (text, file keys): it goes too
+                    forget_in_presage(&mut tx, target).await?;
+                }
                 let files = forget_deleted_text(&mut tx, target).await?;
                 let m = finish_update(&mut tx, target, res.rows_affected()).await?;
                 tx.commit().await?;
@@ -2445,6 +2449,7 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
         .rows_affected()
         == 1;
     if deleted {
+        forget_in_presage(&mut *conn, key).await?;
         sqlx::query(
             "UPDATE messages SET body = NULL, quote_text = NULL, body_ranges = NULL, quote_ranges = NULL, deleted = 1 WHERE author = ?1 AND sent_at = ?2",
         )
@@ -4186,6 +4191,24 @@ mod tests {
             edited_at: 9,
         };
         assert!(db.apply(&edit).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_message_leaves_presages_store_too_whichever_came_first() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "secret")).await.unwrap();
+        db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 1)]
+        );
+        // the delete before the message
+        db.apply(&Op::Delete { target: k("alice", 2) }).await.unwrap();
+        db.insert_message(&msg("alice", 2, "secret too")).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 1), ("c:alice".to_string(), 2)]
+        );
     }
 
     #[tokio::test]
