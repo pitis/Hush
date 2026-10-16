@@ -4,7 +4,9 @@
 // unused. TODO(remove when the call actor lands): drop this allow.
 #![allow(dead_code)]
 
+pub(crate) mod actor;
 pub(crate) mod relays;
+pub(crate) mod state;
 pub(crate) mod wire;
 
 /// Where a call is, as the app shows it.
