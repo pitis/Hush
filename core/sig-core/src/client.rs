@@ -115,8 +115,8 @@ impl Client {
         let _ = self.send(Command::StorageSync);
     }
 
-    /// Queues a block or request job; if the core is closing it is dropped (the storage record
-    /// still carries the change at the next start).
+    /// Queues a block or request job. If the core is closing it is lost: the storage record
+    /// still carries a block or accept at the next start, but not a deletion or our profile key.
     fn queue(&self, job: Job) {
         #[cfg(test)]
         self.sent_jobs.lock().unwrap().push(match &job {
@@ -126,7 +126,9 @@ impl Client {
             Job::Receipts => "Receipts".into(),
             _ => "other".into(),
         });
-        let _ = self.send(Command::Send(job));
+        if let Err(e) = self.send(Command::Send(job)) {
+            tracing::warn!(error = %e, "a block or request job was dropped");
+        }
     }
 
     /// A chat that can be blocked or deleted: known, and not Note to Self.

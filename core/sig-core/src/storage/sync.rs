@@ -83,7 +83,8 @@ pub(crate) async fn pull(
                 phone_contact,
             }) => {
                 changed |= db.apply_remote_chat(conversation_id, flags).await?;
-                db.set_phone_contact(conversation_id, *phone_contact).await?;
+                // it can turn a chat into a request or out of one
+                changed |= db.set_phone_contact(conversation_id, *phone_contact).await?;
                 Some(conversation_id.clone())
             }
             Some(Remote::Account { pins, note_to_self }) => {

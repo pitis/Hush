@@ -452,7 +452,8 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
-                    report(l.as_ref(), "telling the phone about the message request", &e);
+                    let what = format!("telling the phone about the request from {conversation_id}");
+                    report(l.as_ref(), &what, &e);
                 }
             }
             Job::BlockedList => match db.blocked_chats().await {
@@ -465,8 +466,10 @@ pub async fn sender(
             },
             Job::ProfileKey { conversation_id } => {
                 let at = now_ms();
+                // not retried: every message we send carries the key too
                 if let Err(e) = send_to(&mut m, &conversation_id, profile_key_update(at).into(), at).await {
-                    report(l.as_ref(), "sharing our profile with the contact", &e);
+                    let what = format!("sharing your profile with {conversation_id} (it goes with your next message)");
+                    report(l.as_ref(), &what, &e);
                 }
             }
             Job::Typing {

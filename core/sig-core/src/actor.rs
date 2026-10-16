@@ -989,7 +989,8 @@ async fn sweep(store: &mut SqliteStore, db: &ProjectionDb, l: &dyn EventListener
     for conversation_id in db.presage_forget_threads().await.map_err(|e| e.to_string())? {
         let done = match crate::send::thread(&conversation_id) {
             Some(thread) => store.clear_thread(&thread).await.map_err(|e| e.to_string()),
-            None => Err("not a conversation id".to_string()),
+            // can never be cleared: dropped, or every sweep would fail on it
+            None => Ok(()),
         };
         let done = match done {
             Ok(()) => db
@@ -1369,10 +1370,18 @@ async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<
             None => false,
         };
     if blocked && matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
-        if let Ok(thread) = Thread::try_from(content) {
-            let at = content.metadata.client_timestamp.timestamp_millis();
-            db.queue_presage_forget(&crate::projection::conversation_id(&thread), at)
-                .await?;
+        // still dropped if this fails: the copy only stays in presage's store
+        let queued = match Thread::try_from(content) {
+            Ok(thread) => {
+                let at = content.metadata.client_timestamp.timestamp_millis();
+                db.queue_presage_forget(&crate::projection::conversation_id(&thread), at)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = queued {
+            tracing::warn!(error = %e, "a blocked sender's stored copy wasn't queued for deletion");
         }
     }
     Ok(blocked)
@@ -1816,6 +1825,15 @@ mod tests {
         assert!(dropped(content_from(ALICE, 2, typing(None))).await);
         assert!(dropped(content_from(ALICE, 3, ContentBody::CallMessage(CallMessage::default()))).await);
         assert!(dropped(content_from(BOB, 200, text(200, Some(key.to_vec())))).await);
+        let edit = |ms: u64, group: Option<Vec<u8>>| match text(ms, group) {
+            ContentBody::DataMessage(dm) => ContentBody::EditMessage(presage::proto::EditMessage {
+                target_sent_timestamp: Some(1),
+                data_message: Some(dm),
+            }),
+            _ => unreachable!(),
+        };
+        assert!(dropped(content_from(ALICE, 101, edit(101, None))).await);
+        assert!(dropped(content_from(BOB, 201, edit(201, Some(key.to_vec())))).await);
         let identifier = crate::projection::ids::group_identifier(&group);
         assert!(dropped(content_from(BOB, 4, typing(identifier))).await);
         assert!(
@@ -1835,7 +1853,12 @@ mod tests {
         queued.sort();
         assert_eq!(
             queued,
-            vec![(format!("c:{ALICE}"), 100), (group, 200)],
+            vec![
+                (format!("c:{ALICE}"), 100),
+                (format!("c:{ALICE}"), 101),
+                (group.clone(), 200),
+                (group, 201)
+            ],
             "presage's copies of the dropped messages go too"
         );
     }

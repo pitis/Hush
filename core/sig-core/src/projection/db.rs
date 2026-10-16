@@ -306,18 +306,20 @@ impl ProjectionDb {
 
     /// Whether the contact is in the phone's address book (its storage record carries system
     /// names), which makes it never a request. The chat is created if needed.
-    pub async fn set_phone_contact(&self, id: &str, on: bool) -> Result<(), sqlx::Error> {
+    /// True if it changed.
+    pub async fn set_phone_contact(&self, id: &str, on: bool) -> Result<bool, sqlx::Error> {
         let kind = kind_of(id)?;
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO conversations(id, kind, phone_contact) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET phone_contact = excluded.phone_contact",
+             ON CONFLICT(id) DO UPDATE SET phone_contact = excluded.phone_contact
+               WHERE phone_contact != excluded.phone_contact",
         )
         .bind(id)
         .bind(kind_to_i64(kind))
         .bind(on)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     /// Deletes a chat's contents here: messages, their files, reactions, edits, events and held
@@ -370,6 +372,14 @@ impl ProjectionDb {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        // unpinned too (as Desktop): an unlisted chat would hold a pin slot no one can free
+        let unpinned =
+            sqlx::query("UPDATE conversations SET pinned_order = NULL WHERE id = ?1 AND pinned_order IS NOT NULL")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                == 1;
         sqlx::query(
             "UPDATE conversations SET whitelisted = 0, marked_unread = 0,
                storage_dirty = CASE WHEN ?2 THEN 1 ELSE storage_dirty END WHERE id = ?1",
@@ -380,6 +390,9 @@ impl ProjectionDb {
         .await?;
         refresh_summary(&mut tx, id).await?;
         tx.commit().await?;
+        if unpinned && dirty {
+            self.set_account_dirty(true).await?;
+        }
         Ok(files)
     }
 
@@ -1255,7 +1268,15 @@ impl ProjectionDb {
                     listed.extend(self.group_by_identifier(g).await?);
                 }
                 let mut changed = false;
-                for id in self.blocked_chats().await? {
+                // not unblocked: a block made here the phone hasn't seen yet (still to write),
+                // or a PNI chat (a list can't name it)
+                let unlisted: Vec<String> = sqlx::query_scalar(
+                    "SELECT id FROM conversations WHERE blocked = 1 AND storage_dirty = 0
+                       AND id NOT LIKE 'c:PNI:%' ORDER BY id",
+                )
+                .fetch_all(&self.pool)
+                .await?;
+                for id in unlisted {
                     if !listed.contains(&id) {
                         changed |= self.apply_phone_block(&id, false).await?;
                     }
@@ -5301,7 +5322,14 @@ mod tests {
             .unwrap();
         db.queue_receipts(&[k("alice", 1)]).await.unwrap();
         db.accept("c:alice").await.unwrap();
+        db.set_pinned("c:alice", true).await.unwrap();
+        db.set_account_dirty(false).await.unwrap();
         db.delete_chat("c:alice").await.unwrap();
+        assert!(db.pinned_chat_ids().await.unwrap().is_empty(), "no invisible pin");
+        assert!(
+            db.storage_state().await.unwrap().unwrap().account_dirty,
+            "the phone unpins too"
+        );
         let ids: Vec<String> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
         assert_eq!(ids, vec!["c:bob".to_string()], "no longer listed");
         assert!(db.message(&k("alice", 1)).await.unwrap().is_none());
@@ -5314,6 +5342,10 @@ mod tests {
         assert_eq!(db.presage_forget_threads().await.unwrap(), vec!["c:alice".to_string()]);
         db.presage_thread_forgotten("c:alice").await.unwrap();
         assert!(db.presage_forget_threads().await.unwrap().is_empty());
+        // a new message brings it back, as a request
+        phone_state_known(&db).await;
+        db.insert_message(&msg("alice", 9, "again")).await.unwrap();
+        assert!(conv(&db, "c:alice").await.message_request);
     }
 
     const G: &str = "g:abababababababababababababababababababababababababababababababab";
@@ -5324,6 +5356,18 @@ mod tests {
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&in_conv(G, msg("bob", 2, "b"))).await.unwrap();
         db.block("c:alice").await.unwrap();
+        db.clear_dirty(&db.dirty_chats().await.unwrap()).await.unwrap(); // the phone has it
+                                                                         // blocked here, not on the phone yet: the phone's older list can't undo it
+        db.insert_message(&in_conv("c:carol", msg("carol", 3, "c")))
+            .await
+            .unwrap();
+        db.block("c:carol").await.unwrap();
+        // the list can't name a PNI chat, so it can't unblock one either
+        let pni = "c:PNI:44444444-4444-4444-4444-444444444444";
+        db.insert_message(&in_conv(pni, msg("pni", 4, "p"))).await.unwrap();
+        db.block(pni).await.unwrap();
+        db.clear_dirty(&db.dirty_chats().await.unwrap()).await.unwrap();
+        db.block("c:carol").await.unwrap();
         let bob = "22222222-2222-2222-2222-222222222222";
         let op = Op::BlockedList {
             acis: vec![bob.into()],
@@ -5338,6 +5382,8 @@ mod tests {
             "an unknown ACI gets a row"
         );
         assert!(db.is_blocked(G).await.unwrap(), "groups match by identifier");
+        assert!(db.is_blocked("c:carol").await.unwrap(), "a block not yet written stays");
+        assert!(db.is_blocked(pni).await.unwrap(), "a PNI block stays");
         assert!(
             db.dirty_chats().await.unwrap().iter().all(|(id, _)| id != G),
             "not written back"

@@ -91,7 +91,7 @@ timestamp) and removed by the existing sweep. Logged as a count with the kind on
 | `accept_request(id)` | `whitelisted=1, blocked=0` | 1:1: MRR `ACCEPT`; if it was blocked: `Blocked` list | 1:1: our profile key (`DataMessage{flags: PROFILE_KEY_UPDATE}`); the held read receipts |
 | `block(id)` | `blocked=1, whitelisted=0` | 1:1: MRR `BLOCK`; `Blocked` list | — |
 | `unblock(id)` | as `accept_request` | as `accept_request` | as `accept_request` |
-| `delete_chat(id)` | `whitelisted=0`; messages, files, events, search rows gone; presage thread cleared | 1:1: MRR `DELETE` | — |
+| `delete_chat(id)` | `whitelisted=0`, unpinned; messages, files, events, search rows gone; presage thread cleared | 1:1: MRR `DELETE` | — |
 
 Every change marks the chat `storage_dirty` and triggers a storage sync, so the record follows
 (when the chat has one; when it doesn't, the `Blocked` list and the MRR tell the phone, which
@@ -103,14 +103,18 @@ Sends ride the existing send queue as new jobs (`RequestResponse`, `BlockedList`
 `ProfileKey`): failures are logged and reported like `StorageChanged`'s, not retried.
 
 ### Receipts
-`unsent_receipts` leaves out messages of chats that are requests or blocked: receipts queued
-while reading a request wait, and go out once it's accepted (Desktop sends them on accept).
+Our other devices learn every read at once (the read sync), a request's too; each queued row
+remembers that (`unsent_receipts.synced`). The receipts to the senders go out only for rows
+already synced, and not for chats that are requests or blocked: those wait, and go out once
+it's accepted (Desktop sends them on accept).
 Typing needs nothing: the composer isn't there.
 
 ### From the phone (projector + db)
 - `Blocked`: the list replaces ours. Each listed ACI or group (matched by identifier against
   our group chats' master keys) not blocked here → `blocked=1, whitelisted=0`; each chat blocked
-  here and missing from the list → `blocked=0, whitelisted=1`. An ACI we have no chat for gets
+  here and missing from the list → `blocked=0, whitelisted=1`, except a block made here not yet
+  written to the storage record (the phone hasn't seen it) and a PNI chat (no list can name
+  it, so its block stays local). An ACI we have no chat for gets
   a row (not listed until a message), as storage pull does. Not marked dirty: the phone wrote
   its records.
 - `MessageRequestResponse` (thread ACI or group identifier): `ACCEPT` → accept;
