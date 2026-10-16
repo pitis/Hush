@@ -120,6 +120,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func setMarkedUnread(conversationId: String, marked: Bool) async throws {
         try await flag("markedUnread \(conversationId) \(marked)")
     }
+    var storageWritesAnswer = true
+    private(set) var storageWritesSet: [Bool] = []
+    func storageWrites() async throws -> Bool { lock.withLock { storageWritesAnswer } }
+    func setStorageWrites(on: Bool) async throws {
+        if let changeError { throw changeError }
+        lock.withLock { storageWritesSet.append(on) }
+    }
     /// What the core answers to "is this chat muted now?".
     var muted: Set<String> = []
     func isMuted(conversationId: String) async throws -> Bool { lock.withLock { muted.contains(conversationId) } }
@@ -281,7 +288,9 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
         unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
-        lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false)
+        lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
+        blocked: false,
+        whitelisted: false)
 }
 
 final class Counter: @unchecked Sendable {
