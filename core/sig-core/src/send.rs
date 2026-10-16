@@ -22,7 +22,7 @@ use presage_store_sqlite::SqliteStore;
 use tokio::sync::{mpsc, watch};
 
 use crate::events::{from_applied, CoreEvent, EventListener};
-use crate::projection::{project, Message, MessageKey, MessageStatus, Op, ProjectionDb, Quote};
+use crate::projection::{project, Message, MessageKey, MessageStatus, Op, ProjectionDb, Quote, RequestResponse};
 use crate::typing::TYPING_IDLE;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +88,17 @@ pub enum Job {
     Receipts,
     /// Tell our other devices the Storage Service changed (we just wrote to it).
     StorageChanged,
+    /// Tell our other devices how we answered a 1:1 chat's message request (nothing for groups).
+    RequestResponse {
+        conversation_id: String,
+        response: RequestResponse,
+    },
+    /// Send our other devices the whole block list, as it is when the job runs.
+    BlockedList,
+    /// Give a contact our profile key (name, avatar): we accepted their message request.
+    ProfileKey {
+        conversation_id: String,
+    },
     /// Started or Stopped; dropped if it waited `TYPING_IDLE` (since `queued`) before going out.
     Typing {
         conversation_id: String,
@@ -234,6 +245,64 @@ pub fn storage_changed_sync() -> SyncMessage {
     }
 }
 
+/// Tells our other devices how we answered a contact's message request. None for a group (as
+/// Desktop: they have no ACI to name; the block list carries group blocks) or a PNI chat.
+pub fn request_response_sync(conversation_id: &str, response: RequestResponse) -> Option<SyncMessage> {
+    use sync_message::message_request_response::Type;
+    let Recipient::Direct(ServiceId::Aci(aci)) = recipient(conversation_id)? else {
+        return None;
+    };
+    let uuid = Uuid::from(aci);
+    let t = match response {
+        RequestResponse::Accept => Type::Accept,
+        RequestResponse::Delete => Type::Delete,
+        RequestResponse::Block => Type::Block,
+        RequestResponse::BlockAndDelete => Type::BlockAndDelete,
+    };
+    Some(SyncMessage {
+        content: Some(sync_message::Content::MessageRequestResponse(
+            sync_message::MessageRequestResponse {
+                thread_aci: Some(uuid.to_string()),
+                thread_aci_binary: Some(uuid.as_bytes().to_vec()),
+                group_id: None,
+                r#type: Some(t as i32),
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// Our whole block list for our other devices: contacts by ACI (both encodings), groups by
+/// identifier. PNI chats can't be named here and are left out.
+pub fn blocked_sync(blocked: &[String]) -> SyncMessage {
+    let mut b = sync_message::Blocked::default();
+    for id in blocked {
+        match recipient(id) {
+            Some(Recipient::Direct(ServiceId::Aci(aci))) => {
+                let uuid = Uuid::from(aci);
+                b.acis.push(uuid.to_string());
+                b.acis_binary.push(uuid.as_bytes().to_vec());
+            }
+            Some(Recipient::Group(_)) => b.group_ids.extend(crate::projection::ids::group_identifier(id)),
+            _ => {}
+        }
+    }
+    SyncMessage {
+        content: Some(sync_message::Content::Blocked(b)),
+        ..Default::default()
+    }
+}
+
+/// A message that only carries our profile key (presage adds the key to every message it
+/// sends).
+pub fn profile_key_update(at: u64) -> DataMessage {
+    DataMessage {
+        flags: Some(data_message::Flags::ProfileKeyUpdate as u32),
+        timestamp: Some(at),
+        ..Default::default()
+    }
+}
+
 /// Tells our other devices that we read `targets`.
 pub fn read_sync(targets: &[MessageKey]) -> SyncMessage {
     SyncMessage {
@@ -375,6 +444,31 @@ pub async fn sender(
                     tracing::warn!(error = %e, "telling the phone the storage changed failed");
                 }
             }
+            Job::RequestResponse {
+                conversation_id,
+                response,
+            } => {
+                let Some(sm) = request_response_sync(&conversation_id, response) else {
+                    continue;
+                };
+                if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
+                    report(l.as_ref(), "telling the phone about the message request", &e);
+                }
+            }
+            Job::BlockedList => match db.blocked_chats().await {
+                Ok(blocked) => {
+                    if let Err(e) = timed(Box::pin(m.send_message(me, blocked_sync(&blocked), now_ms()))).await {
+                        report(l.as_ref(), "sending the phone the block list", &e);
+                    }
+                }
+                Err(e) => report(l.as_ref(), "reading the block list", &e),
+            },
+            Job::ProfileKey { conversation_id } => {
+                let at = now_ms();
+                if let Err(e) = send_to(&mut m, &conversation_id, profile_key_update(at).into(), at).await {
+                    report(l.as_ref(), "sharing our profile with the contact", &e);
+                }
+            }
             Job::Typing {
                 conversation_id,
                 started,
@@ -398,6 +492,14 @@ pub async fn sender(
             }
         }
     }
+}
+
+/// A send that failed and isn't retried: logged and shown (ids and errors only).
+fn report(l: &dyn EventListener, what: &str, e: &dyn std::fmt::Display) {
+    tracing::warn!(error = %e, "{what} failed");
+    l.on_event(CoreEvent::Error {
+        message: format!("{what} failed: {e}"),
+    });
 }
 
 async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener, job: SendJob) {
@@ -641,6 +743,60 @@ mod tests {
                 if f.r#type == Some(sync_message::fetch_latest::Type::StorageManifest as i32)
         ));
         assert!(sm.read.is_empty());
+    }
+
+    #[test]
+    fn a_request_answer_tells_the_other_devices_which_contact_and_what() {
+        use sync_message::message_request_response::Type;
+        let u = Uuid::parse_str(U).unwrap();
+        for (response, t) in [
+            (RequestResponse::Accept, Type::Accept),
+            (RequestResponse::Block, Type::Block),
+            (RequestResponse::Delete, Type::Delete),
+            (RequestResponse::BlockAndDelete, Type::BlockAndDelete),
+        ] {
+            let Some(sync_message::Content::MessageRequestResponse(r)) =
+                request_response_sync(&format!("c:{U}"), response).and_then(|s| s.content)
+            else {
+                panic!("{response:?}")
+            };
+            assert_eq!(r.r#type, Some(t as i32));
+            assert_eq!(r.thread_aci.as_deref(), Some(U));
+            assert_eq!(r.thread_aci_binary.as_deref(), Some(&u.as_bytes()[..]));
+            assert_eq!(r.group_id, None);
+        }
+        let group = format!("g:{}", "ab".repeat(32));
+        assert!(
+            request_response_sync(&group, RequestResponse::Accept).is_none(),
+            "Desktop sends none for groups (they have no ACI); the block list covers them"
+        );
+        assert!(request_response_sync(&format!("c:PNI:{U}"), RequestResponse::Accept).is_none());
+    }
+
+    #[test]
+    fn the_block_list_names_contacts_both_ways_and_groups_by_identifier() {
+        let u = Uuid::parse_str(U).unwrap();
+        let group = format!("g:{}", "ab".repeat(32));
+        let Some(sync_message::Content::Blocked(b)) =
+            blocked_sync(&[format!("c:{U}"), group.clone(), format!("c:PNI:{U}")]).content
+        else {
+            panic!()
+        };
+        assert_eq!(b.acis, vec![U.to_string()]);
+        assert_eq!(b.acis_binary, vec![u.as_bytes().to_vec()]);
+        assert_eq!(
+            b.group_ids,
+            vec![crate::projection::ids::group_identifier(&group).unwrap()]
+        );
+        assert!(b.numbers.is_empty());
+    }
+
+    #[test]
+    fn the_profile_key_message_is_flagged_and_bodiless() {
+        let dm = profile_key_update(42);
+        assert_eq!(dm.flags, Some(data_message::Flags::ProfileKeyUpdate as u32));
+        assert_eq!((dm.timestamp, dm.body), (Some(42), None));
+        assert_eq!(dm.profile_key, None, "presage fills in our key as it sends");
     }
 
     #[test]
