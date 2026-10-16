@@ -464,6 +464,15 @@ final class AppStore {
         }
     }
 
+    /// View-once media was just opened (its file is already linked for the viewer): the core
+    /// drops it and tells our phone.
+    func viewOnceOpened(_ m: Message) async {
+        guard let client else { return }
+        do { try await client.viewOnceOpened(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
+            showError("Couldn't mark the view-once media opened: \(Self.describe(error))")
+        }
+    }
+
     func deleteForEveryone(_ m: Message) async {
         guard let client else { return }
         do { try await client.deleteForEveryone(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {

@@ -101,6 +101,11 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
             editedRanges.append(ranges)
         }
     }
+    private(set) var viewedOnce: [MessageKey] = []
+    func viewOnceOpened(key: MessageKey) async throws {
+        if let changeError { throw changeError }
+        lock.withLock { viewedOnce.append(key) }
+    }
     func deleteForEveryone(key: MessageKey) async throws {
         if let changeError { throw changeError }
         lock.withLock { deletedForEveryone.append(key) }

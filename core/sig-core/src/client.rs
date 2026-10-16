@@ -124,10 +124,11 @@ impl Client {
             Job::BlockedList => "BlockedList".into(),
             Job::ProfileKey { .. } => "ProfileKey".into(),
             Job::Receipts => "Receipts".into(),
+            Job::ViewOnceOpen { .. } => "ViewOnceOpen".into(),
             _ => "other".into(),
         });
         if let Err(e) = self.send(Command::Send(job)) {
-            tracing::warn!(error = %e, "a block or request job was dropped");
+            tracing::warn!(error = %e, "a send job was dropped");
         }
     }
 
@@ -687,6 +688,27 @@ impl Client {
             seconds,
             at,
         }))
+    }
+
+    /// View-once media was opened here: it's dropped (its files too) and our phone is told.
+    /// The app shows it from its own link to the file, made before calling this.
+    pub async fn view_once_opened(&self, key: MessageKey) -> Result<(), CoreError> {
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let m = self.stored(&key).await?;
+        if m.kind != (MessageKind::ViewOnce { viewed: false }) {
+            return Err(CoreError::InvalidInput {
+                message: "not view-once media that can still be opened".into(),
+            });
+        }
+        for applied in self
+            .db
+            .apply(&crate::projection::Op::ViewOnceOpened { target: key.clone() })
+            .await?
+        {
+            self.listener.on_event(crate::events::from_applied(applied));
+        }
+        self.queue(Job::ViewOnceOpen { key });
+        Ok(())
     }
 
     /// Deletes our own message (sent, under 24 hours old) for everyone. It shows here once sent.
@@ -1372,6 +1394,34 @@ mod tests {
 
     fn jobs(client: &Client) -> Vec<String> {
         std::mem::take(&mut *client.sent_jobs.lock().unwrap())
+    }
+
+    #[test]
+    fn opening_view_once_media_drops_it_here_and_tells_the_phone() {
+        let (_dir, sink, client, rt) = as_me("client-view-once");
+        let key = MessageKey {
+            author: ALICE.into(),
+            sent_at: 5,
+        };
+        rt.block_on(async {
+            let mut m = stored(ALICE, 5);
+            m.kind = MessageKind::ViewOnce { viewed: false };
+            client.db.insert_message(&m).await.unwrap();
+            client.db.insert_message(&stored(ALICE, 6)).await.unwrap();
+            client.view_once_opened(key.clone()).await.unwrap();
+            let opened = client.message(key.clone()).await.unwrap().unwrap();
+            assert_eq!(opened.kind, MessageKind::ViewOnce { viewed: true });
+            assert_eq!(jobs(&client), vec!["ViewOnceOpen"]);
+            assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::MessageChanged { .. })), 1);
+            // once only, and only view-once media
+            assert!(invalid(client.view_once_opened(key).await));
+            let normal = MessageKey {
+                author: ALICE.into(),
+                sent_at: 6,
+            };
+            assert!(invalid(client.view_once_opened(normal).await));
+            assert!(jobs(&client).is_empty());
+        });
     }
 
     #[test]

@@ -220,11 +220,21 @@ pub struct Reaction {
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum MessageKind {
     Normal,
-    Sticker { emoji: Option<String> },
-    Contact { name: Option<String> },
+    Sticker {
+        emoji: Option<String>,
+    },
+    Contact {
+        name: Option<String>,
+    },
     Payment,
-    Poll { question: Option<String> },
+    Poll {
+        question: Option<String>,
+    },
     GiftBadge,
+    /// A photo or video to open once; `viewed` once opened (or ours, which we can't open).
+    ViewOnce {
+        viewed: bool,
+    },
 }
 
 impl MessageKind {
@@ -237,6 +247,7 @@ impl MessageKind {
             Self::Payment => (3, None),
             Self::Poll { question } => (4, question.as_deref()),
             Self::GiftBadge => (5, None),
+            Self::ViewOnce { viewed } => (6, viewed.then_some("viewed")),
         }
     }
 
@@ -248,6 +259,7 @@ impl MessageKind {
             3 => Self::Payment,
             4 => Self::Poll { question: text },
             5 => Self::GiftBadge,
+            6 => Self::ViewOnce { viewed: text.is_some() },
             _ => return None,
         })
     }

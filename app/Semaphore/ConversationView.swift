@@ -12,8 +12,12 @@ struct ConversationView: View {
             ConversationHeader(store: store, conversation: conversation)
             Divider().overlay(Color.black.opacity(0.4))
             TimelineList(store: store, conversation: conversation) { a in
-                do { quickLook = try Files.openable(a) } catch {
+                do {
+                    quickLook = try Files.openable(a)
+                    return true
+                } catch {
                     store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
+                    return false
                 }
             }
             if conversation.blocked || conversation.messageRequest {
@@ -205,7 +209,8 @@ struct ConversationHeader: View {
 struct TimelineList: View {
     let store: AppStore
     let conversation: Conversation
-    let open: (Attachment) -> Void
+    /// Shows a file; false if it couldn't be.
+    let open: (Attachment) -> Bool
     @State private var atBottom = true
     @State private var nearTop = false
     @State private var unseenNew = false
@@ -244,6 +249,7 @@ struct TimelineList: View {
                                     react: { emoji in Task { await store.react(to: m, with: emoji) } },
                                     edit: { store.startEditing(m) },
                                     delete: { Task { await store.deleteForEveryone(m) } },
+                                    viewOnce: { Task { await store.viewOnceOpened(m) } },
                                     name: store.senderName))
                         }
                     }
@@ -347,13 +353,16 @@ struct MessageRow: View {
     let reply: () -> Void
     let retry: () -> Void
     let download: (Int64) -> Void
-    let open: (Attachment) -> Void
+    /// Shows a file; false if it couldn't be.
+    let open: (Attachment) -> Bool
     var actions = Actions()
     @State private var hovering = false
     @State private var picking = false
     @State private var showingReactors = false
     @State private var confirmingDelete = false
     @State private var spoilersRevealed = false
+    /// View-once media was opened here; the core's word that it's viewed is on its way.
+    @State private var viewOnceOpening = false
 
     /// React, edit, delete (after Signal Desktop).
     struct Actions {
@@ -365,6 +374,8 @@ struct MessageRow: View {
         var react: (String) -> Void = { _ in }
         var edit: () -> Void = {}
         var delete: () -> Void = {}
+        /// View-once media was opened.
+        var viewOnce: () -> Void = {}
         /// A reactor's display name.
         var name: (String) -> String = { $0 }
     }
@@ -472,14 +483,16 @@ struct MessageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
-            if !message.deleted {
-                AttachmentList(files: files, download: download, open: open)
+            if !message.deleted && !isViewOnce {
+                AttachmentList(files: files, download: download, open: { _ = open($0) })
                 if let preview { LinkPreviewCard(preview: preview) }
             }
             HStack(alignment: .lastTextBaseline, spacing: 8) {
                 Group {
                     if message.deleted {
                         Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
+                    } else if isViewOnce {
+                        viewOnce
                     } else if let placeholder = Placeholder.text(message.kind) {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
                         Text(placeholder).italic()
@@ -509,6 +522,35 @@ struct MessageRow: View {
         .overlay {
             RoundedRectangle(cornerRadius: Theme.bubbleRadius).stroke(.yellow, lineWidth: highlighted ? 3 : 0)
                 .animation(.easeOut(duration: 0.4), value: highlighted)
+        }
+    }
+
+    private var isViewOnce: Bool {
+        if case .viewOnce = message.kind { return true }
+        return false
+    }
+
+    @ViewBuilder private var viewOnce: some View {
+        let state = ViewOnce.state(message, files: files)
+        let label = Label(ViewOnce.label(state), systemImage: "circle.dashed")
+        switch state {
+        case .open(let file):
+            Button {
+                // linked for the viewer first: the core drops the file next
+                viewOnceOpening = ViewOnce.open(file, with: open, then: actions.viewOnce)
+            } label: {
+                label
+            }
+            .buttonStyle(.bordered)
+            .disabled(viewOnceOpening)  // one look: a second click would relink what's showing
+        case .download(let id):
+            Button {
+                download(id)
+            } label: {
+                label
+            }.buttonStyle(.bordered)
+        case .sent, .viewed, .downloading:
+            label.italic()
         }
     }
 
