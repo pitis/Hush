@@ -36,7 +36,7 @@ struct ComposerView: View {
                         Image(systemName: "xmark.circle.fill")
                     }
                     .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                    .keyboardShortcut(.cancelAction)
+                    .keyboardShortcut(mentions.isOpen ? nil : .cancelAction)
                 }
                 .frame(height: 34)
                 .padding(.horizontal, 12)
@@ -56,7 +56,7 @@ struct ComposerView: View {
                     Spacer()
                     Button(action: store.cancelEditing) { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                        .keyboardShortcut(.cancelAction)
+                        .keyboardShortcut(mentions.isOpen ? nil : .cancelAction)
                         .accessibilityLabel("Cancel editing")
                 }
                 .frame(height: 34)
@@ -100,7 +100,10 @@ struct ComposerView: View {
             text = Self.plain(Composer.draft(for: conversationId))
             takeFocusIfAsked()
         }
-        .task(id: conversationId) { mentions.members = await store.mentionCandidates(conversationId) }
+        .task(id: conversationId) {
+            mentions.reset()
+            mentions.members = await store.mentionCandidates(conversationId)
+        }
         .onChange(of: conversationId) { _, new in
             // an edit doesn't follow to another chat, nor does the draft it put aside
             draftBeforeEdit = nil
@@ -212,7 +215,7 @@ struct MentionList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(picker.matches.prefix(8).enumerated()), id: \.element.0) { i, member in
+            ForEach(Array(picker.matches.enumerated()), id: \.element.0) { i, member in
                 Button {
                     picker.pick(i)
                 } label: {

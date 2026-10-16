@@ -15,9 +15,15 @@ enum MessageActions {
         return now.timeIntervalSince1970 * 1000 - Double(m.sentAt) <= changeWindow * 1000
     }
 
-    /// As `canDelete`, and it has text to edit.
+    /// As `canDelete`, and it has text to edit whose mentions the composer can hold (one
+    /// placeholder each, inside the text): an edit would lose any other.
     static func canEdit(_ m: Message, me: String?, now: Date = .now) -> Bool {
-        canDelete(m, me: me, now: now) && !(m.body ?? "").isEmpty
+        let length = (m.body ?? "").utf16.count
+        return canDelete(m, me: me, now: now) && length > 0
+            && m.ranges.allSatisfy {
+                guard case .mention = $0.style else { return true }
+                return $0.length == 1 && Int($0.start) < length
+            }
     }
 
     /// A picked character that can be a reaction: an emoji, not a digit or symbol that only has

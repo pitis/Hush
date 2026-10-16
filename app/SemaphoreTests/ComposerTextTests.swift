@@ -93,7 +93,9 @@ final class ComposerMentionTests: XCTestCase {
     }
 
     func testTheQueryIsTheWordAfterAnAtSignBeforeTheCaret() {
-        let q = { (s: String) in ComposerText.mentionQuery(in: s as NSString, caret: (s as NSString).length) }
+        let q = { (s: String) in
+            ComposerText.mentionQuery(in: NSAttributedString(string: s), caret: (s as NSString).length)
+        }
         XCTAssertEqual(q("hi @bo")?.query, "bo")
         XCTAssertEqual(q("hi @bo")?.range, NSRange(location: 3, length: 3))
         XCTAssertEqual(q("@")?.query, "")
@@ -149,5 +151,36 @@ final class ComposerMentionTests: XCTestCase {
         XCTAssertEqual(ComposerText.matches(members, query: "pop").map(\.0), ["a", "c"])
         XCTAssertEqual(ComposerText.matches(members, query: "").map(\.0), ["a", "b", "d", "c"])
         XCTAssertEqual(ComposerText.matches(members, query: "zz").map(\.0), [])
+    }
+
+    func testTwoMentionsSideBySideStayTwo() {
+        let ranges = [mention(0, "bob"), mention(1, "bob")]
+        let text = ComposerText.attributed("\u{FFFC}\u{FFFC}", ranges: ranges, name: { _ in "Bob" })
+        XCTAssertEqual(text.string, "@Bob@Bob")
+        XCTAssertFalse(ComposerText.repairMentions(text))
+        let message = ComposerText.message(from: text)
+        XCTAssertEqual(message.body, "\u{FFFC}\u{FFFC}")
+        XCTAssertEqual(message.ranges, ranges)
+    }
+
+    func testAStyleSpanningAMentionComesBackWhole() {
+        let ranges = [BodyRange(start: 0, length: 5, style: .bold), mention(3, "bob")]
+        let text = ComposerText.attributed("hi \u{FFFC}!", ranges: ranges, name: { _ in "Bob" })
+        let message = ComposerText.message(from: text)
+        XCTAssertEqual(message.body, "hi \u{FFFC}!")
+        XCTAssertEqual(Set(message.ranges.map { "\($0.start) \($0.length)" }), ["0 5", "3 1"])
+    }
+
+    func testAMentionAfterTrimmedSpaceStartsAtZero() {
+        let text = NSMutableAttributedString(string: "  ", attributes: ComposerText.display([]))
+        ComposerText.insertMention(aci: "bob", name: "Bob", in: text, replacing: NSRange(location: 2, length: 0))
+        XCTAssertEqual(ComposerText.message(from: text).ranges, [mention(0, "bob")])
+    }
+
+    func testAFinishedMentionIsntAQuery() {
+        let text = NSMutableAttributedString(string: "hi ", attributes: ComposerText.display([]))
+        ComposerText.insertMention(aci: "bob", name: "Bob", in: text, replacing: NSRange(location: 3, length: 0))
+        text.deleteCharacters(in: NSRange(location: text.length - 1, length: 1))  // the space after it
+        XCTAssertNil(ComposerText.mentionQuery(in: text, caret: text.length))
     }
 }

@@ -11,6 +11,8 @@ enum ComposerText {
     /// The token's text as inserted; once it differs, the token is just text.
     static let mentionTextKey = NSAttributedString.Key("semaphore.mentionText")
     static let mentionColor = NSColor.controlAccentColor
+    /// Unique per token, so two tokens side by side (even of one person) stay two runs.
+    static let mentionTokenKey = NSAttributedString.Key("semaphore.mentionToken")
     static let size: CGFloat = 14
 
     /// Each style once, with Signal's name for it.
@@ -41,6 +43,7 @@ enum ComposerText {
                 }
             }
         }
+        // one placeholder per token now
         text.enumerateAttribute(mentionKey, in: NSRange(location: start, length: length)) { value, run, _ in
             guard let aci = value as? String else { return }
             for i in 0..<run.length {
@@ -55,7 +58,7 @@ enum ComposerText {
     private static func placeholders(_ text: NSAttributedString) -> NSAttributedString {
         let out = NSMutableAttributedString(attributedString: text)
         var tokens: [NSRange] = []
-        text.enumerateAttribute(mentionKey, in: NSRange(location: 0, length: text.length)) { value, run, _ in
+        text.enumerateAttribute(mentionTokenKey, in: NSRange(location: 0, length: text.length)) { value, run, _ in
             if value != nil { tokens.append(run) }
         }
         for run in tokens.reversed() {
@@ -66,7 +69,10 @@ enum ComposerText {
     }
 
     /// The "@word" being typed just before `caret` (at the start or after a space), and the word.
-    static func mentionQuery(in text: NSString, caret: Int) -> (range: NSRange, query: String)? {
+    static func mentionQuery(in styled: NSAttributedString, caret: Int) -> (range: NSRange, query: String)? {
+        let text = styled.string as NSString
+        // a finished mention isn't a query
+        if caret > 0, styled.attribute(mentionKey, at: caret - 1, effectiveRange: nil) != nil { return nil }
         var i = caret
         while i > 0 {
             let c = text.character(at: i - 1)
@@ -99,6 +105,7 @@ enum ComposerText {
         var attributes = display(styles)
         attributes[mentionKey] = aci
         attributes[mentionTextKey] = shown
+        attributes[mentionTokenKey] = UUID().uuidString
         attributes[.foregroundColor] = mentionColor
         let token = NSMutableAttributedString(string: shown, attributes: attributes)
         token.append(NSAttributedString(string: " ", attributes: display(styles)))
@@ -110,7 +117,7 @@ enum ComposerText {
     @discardableResult
     static func repairMentions(_ text: NSMutableAttributedString) -> Bool {
         var broken: [NSRange] = []
-        text.enumerateAttribute(mentionKey, in: NSRange(location: 0, length: text.length)) { value, run, _ in
+        text.enumerateAttribute(mentionTokenKey, in: NSRange(location: 0, length: text.length)) { value, run, _ in
             guard value != nil else { return }
             let shown = text.attribute(mentionTextKey, at: run.location, effectiveRange: nil) as? String
             if (text.string as NSString).substring(with: run) != shown { broken.append(run) }
@@ -118,6 +125,7 @@ enum ComposerText {
         for run in broken {
             text.removeAttribute(mentionKey, range: run)
             text.removeAttribute(mentionTextKey, range: run)
+            text.removeAttribute(mentionTokenKey, range: run)
             text.addAttribute(.foregroundColor, value: NSColor.labelColor, range: run)
         }
         return !broken.isEmpty
@@ -153,6 +161,7 @@ enum ComposerText {
             var attributes = text.attributes(at: at, effectiveRange: nil)
             attributes[mentionKey] = aci
             attributes[mentionTextKey] = shown
+            attributes[mentionTokenKey] = UUID().uuidString
             attributes[.foregroundColor] = mentionColor
             text.replaceCharacters(
                 in: NSRange(location: at, length: 1), with: NSAttributedString(string: shown, attributes: attributes))

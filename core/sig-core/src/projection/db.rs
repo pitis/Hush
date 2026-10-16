@@ -172,7 +172,6 @@ impl ProjectionDb {
         self
     }
 
-    /// Creates the conversation or updates its title; an empty title never replaces a known one.
     /// Replaces a group's members (ACIs) with `acis`.
     pub async fn set_group_members(&self, conversation_id: &str, acis: &[String]) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -198,6 +197,7 @@ impl ProjectionDb {
             .await
     }
 
+    /// Creates the conversation or updates its title; an empty title never replaces a known one.
     pub async fn upsert_conversation_title(&self, id: &str, title: &str) -> Result<(), sqlx::Error> {
         let kind = kind_of(id)?;
         sqlx::query(

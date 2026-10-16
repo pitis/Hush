@@ -115,7 +115,7 @@ struct ComposerField: NSViewRepresentable {
             let caret = view.selectedRange()
             let found =
                 caret.length == 0 && !view.hasMarkedText()
-                ? ComposerText.mentionQuery(in: view.string as NSString, caret: caret.location) : nil
+                ? ComposerText.mentionQuery(in: view.attributedString(), caret: caret.location) : nil
             mentions.update(found)
         }
 
@@ -149,6 +149,8 @@ struct ComposerField: NSViewRepresentable {
 /// The group members matching the "@word" being typed, one of them selected.
 @MainActor @Observable
 final class MentionPicker {
+    /// How many matches show (and can be chosen).
+    static let shown = 8
     /// (ACI, name) of who can be mentioned.
     var members: [(String, String)] = []
     private(set) var query: String?
@@ -158,7 +160,9 @@ final class MentionPicker {
     private var dismissedAt: Int?
     @ObservationIgnored weak var view: ComposerTextView?
 
-    var matches: [(String, String)] { query.map { ComposerText.matches(members, query: $0) } ?? [] }
+    var matches: [(String, String)] {
+        Array((query.map { ComposerText.matches(members, query: $0) } ?? []).prefix(Self.shown))
+    }
     var isOpen: Bool { !matches.isEmpty }
 
     func update(_ found: (range: NSRange, query: String)?) {
@@ -195,6 +199,13 @@ final class MentionPicker {
         query = nil
         return true
     }
+
+    /// Another chat: nothing from this one's text carries over.
+    func reset() {
+        query = nil
+        dismissedAt = nil
+        members = []
+    }
 }
 
 /// Styles with Desktop's shortcuts and the Format menu, pastes text plain and files as files,
@@ -215,7 +226,9 @@ final class ComposerTextView: NSTextView {
 
     /// Replaces the "@word" at `range` with a mention token, undoably.
     func insertMention(aci: String, name: String, replacing range: NSRange) {
-        guard let storage = textStorage, shouldChangeText(in: range, replacementString: "@\(name) ") else { return }
+        guard let storage = textStorage, NSMaxRange(range) <= storage.length,
+            shouldChangeText(in: range, replacementString: "@\(name) ")
+        else { return }
         storage.beginEditing()
         let caret = ComposerText.insertMention(aci: aci, name: name, in: storage, replacing: range)
         storage.endEditing()
