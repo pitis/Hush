@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{ConnectOptions, Row};
@@ -42,6 +43,9 @@ pub enum Applied {
 pub struct ProjectionDb {
     pool: SqlitePool,
     files: Option<PathBuf>,
+    /// Counts pin changes (`set_account_dirty(true)`), so the sync clears the account's mark
+    /// only if nothing changed while it wrote; the lock makes the count and the mark move together.
+    account_changes: Arc<tokio::sync::Mutex<u64>>,
 }
 
 /// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
@@ -138,7 +142,11 @@ impl ProjectionDb {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool, files: None })
+        Ok(Self {
+            pool,
+            files: None,
+            account_changes: Default::default(),
+        })
     }
 
     /// Closes the database: later calls fail. Before its file is removed (unlinking).
@@ -290,13 +298,14 @@ impl ProjectionDb {
         ))
     }
 
+    /// `account_dirty` is taken only when there is no state yet: afterwards it moves only through
+    /// `set_account_dirty` and `clear_account_dirty`, so a sync can't put back a stale value.
     pub async fn set_storage_state(&self, s: &StorageState) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO storage_sync(id, version, record_ikm, key_fingerprint, account_dirty, unmappable_pins)
              VALUES (1, ?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET version = excluded.version, record_ikm = excluded.record_ikm,
-               key_fingerprint = excluded.key_fingerprint, account_dirty = excluded.account_dirty,
-               unmappable_pins = excluded.unmappable_pins",
+               key_fingerprint = excluded.key_fingerprint, unmappable_pins = excluded.unmappable_pins",
         )
         .bind(i64::try_from(s.version).unwrap_or(i64::MAX))
         .bind(&s.record_ikm)
@@ -309,11 +318,18 @@ impl ProjectionDb {
     }
 
     /// Forgets the applied manifest and its items (a new storage key): the next pull starts
-    /// from nothing. Dirty marks on chats stay.
+    /// from nothing. Dirty marks stay, the account's too.
     pub async fn reset_storage_state(&self) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM storage_items").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM storage_sync").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM storage_sync WHERE account_dirty = 0")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE storage_sync SET version = 0, record_ikm = X'', key_fingerprint = X'', unmappable_pins = X''",
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await
     }
 
@@ -484,19 +500,31 @@ impl ProjectionDb {
             .collect())
     }
 
-    pub async fn clear_dirty(&self, ids: &[String]) -> Result<(), sqlx::Error> {
+    /// Clears the marks of chats written with these flags; a chat whose flags changed since
+    /// (while the write was in flight) stays dirty for the next push.
+    pub async fn clear_dirty(&self, written: &[(String, ChatFlags)]) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        for id in ids {
-            sqlx::query("UPDATE conversations SET storage_dirty = 0 WHERE id = ?1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+        for (id, f) in written {
+            sqlx::query(
+                "UPDATE conversations SET storage_dirty = 0
+                 WHERE id = ?1 AND archived = ?2 AND marked_unread = ?3 AND mute_until = ?4",
+            )
+            .bind(id)
+            .bind(f.archived)
+            .bind(f.marked_unread)
+            .bind(f.mute_until)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await
     }
 
     /// A pin change is (or is no longer) waiting to be written.
     pub async fn set_account_dirty(&self, dirty: bool) -> Result<(), sqlx::Error> {
+        let mut changes = self.account_changes.lock().await;
+        if dirty {
+            *changes += 1;
+        }
         sqlx::query(
             "INSERT INTO storage_sync(id, account_dirty) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET account_dirty = excluded.account_dirty",
@@ -504,6 +532,22 @@ impl ProjectionDb {
         .bind(dirty)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// How many pin changes there have been: read before reading the pins to write.
+    pub async fn account_changes(&self) -> u64 {
+        *self.account_changes.lock().await
+    }
+
+    /// Clears the account's mark, unless a pin changed after `account_changes` returned `seen`.
+    pub async fn clear_account_dirty(&self, seen: u64) -> Result<(), sqlx::Error> {
+        let changes = self.account_changes.lock().await;
+        if *changes == seen {
+            sqlx::query("UPDATE storage_sync SET account_dirty = 0")
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -3145,9 +3189,17 @@ mod tests {
         }])
         .await
         .unwrap();
+        // the pending pin change is ours, not the old manifest's: it survives
+        db.reset_storage_state().await.unwrap();
+        let reset = db.storage_state().await.unwrap().unwrap();
+        assert_eq!(
+            (reset.version, reset.account_dirty, reset.key_fingerprint.len()),
+            (0, true, 0)
+        );
+        assert!(db.storage_items().await.unwrap().is_empty());
+        db.set_account_dirty(false).await.unwrap();
         db.reset_storage_state().await.unwrap();
         assert_eq!(db.storage_state().await.unwrap(), None);
-        assert!(db.storage_items().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3238,13 +3290,18 @@ mod tests {
     #[tokio::test]
     async fn local_flag_changes_mark_the_chat_or_the_account_dirty() {
         let db = db().await;
+        // as a push does: clears what it wrote, as it is now
+        async fn clear(db: &ProjectionDb) {
+            let flags = db.chat_flags("c:alice").await.unwrap().unwrap();
+            db.clear_dirty(&[("c:alice".into(), flags)]).await.unwrap();
+        }
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         assert!(db.dirty_chats().await.unwrap().is_empty());
         db.set_mute_until("c:alice", 9).await.unwrap();
         let dirty = db.dirty_chats().await.unwrap();
         assert_eq!(dirty.len(), 1);
         assert_eq!((dirty[0].0.as_str(), dirty[0].1.mute_until), ("c:alice", 9));
-        db.clear_dirty(&["c:alice".into()]).await.unwrap();
+        clear(&db).await;
         assert!(db.dirty_chats().await.unwrap().is_empty());
         assert_eq!(db.storage_state().await.unwrap(), None);
         db.set_pinned("c:alice", true).await.unwrap();
@@ -3254,11 +3311,30 @@ mod tests {
         db.set_archived("c:alice", true).await.unwrap(); // archiving unpins: the account changes too
         assert!(db.storage_state().await.unwrap().unwrap().account_dirty);
         // opening a chat marked unread is a change the phone should learn about
-        db.clear_dirty(&["c:alice".into()]).await.unwrap();
+        clear(&db).await;
         db.set_marked_unread("c:alice", true).await.unwrap();
-        db.clear_dirty(&["c:alice".into()]).await.unwrap();
+        clear(&db).await;
         assert!(db.clear_marked_unread("c:alice").await.unwrap());
         assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn a_mark_is_cleared_only_while_the_flags_are_as_written() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.set_mute_until("c:alice", 9).await.unwrap();
+        let written = db.dirty_chats().await.unwrap();
+        db.set_archived("c:alice", true).await.unwrap(); // while the write is in flight
+        db.clear_dirty(&written).await.unwrap();
+        assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+        // the account: a pin change after the count was read keeps the mark
+        db.set_pinned("c:alice", true).await.unwrap();
+        let seen = db.account_changes().await;
+        db.set_pinned("c:alice", false).await.unwrap();
+        db.clear_account_dirty(seen).await.unwrap();
+        assert!(db.storage_state().await.unwrap().unwrap().account_dirty);
+        let seen = db.account_changes().await;
+        db.clear_account_dirty(seen).await.unwrap();
+        assert!(!db.storage_state().await.unwrap().unwrap().account_dirty);
     }
 
     #[tokio::test]

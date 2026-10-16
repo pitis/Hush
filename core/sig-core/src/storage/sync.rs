@@ -35,7 +35,6 @@ pub(crate) async fn pull(
 ) -> Result<PullOutcome, StorageError> {
     let mut state = db.storage_state().await?;
     // a pending pin change survives a reset (it is ours, not the old manifest's)
-    let account_dirty = state.as_ref().is_some_and(|s| s.account_dirty);
     if state.as_ref().is_some_and(|s| s.key_fingerprint != keys.fingerprint) {
         tracing::info!("the storage key changed: the sync starts from nothing");
         db.reset_storage_state().await?;
@@ -66,7 +65,7 @@ pub(crate) async fn pull(
         .filter(|k| !manifest.identifiers.iter().any(|(m, _)| m == *k))
         .count();
     let items = api.read_items(&wanted, &manifest.record_ikm).await?;
-    let missing = wanted.len() - items.len();
+    let missing = wanted.len().saturating_sub(items.len());
     // decode everything before touching the projection: one bad item and the whole pull waits
     let mut decoded: HashMap<Vec<u8>, Remote> = HashMap::with_capacity(items.len());
     for (key, plain) in items {
@@ -120,7 +119,7 @@ pub(crate) async fn pull(
         version: manifest.version,
         record_ikm: manifest.record_ikm.clone(),
         key_fingerprint: keys.fingerprint.clone(),
-        account_dirty,
+        account_dirty: false, // only if there was no state: then nothing was pending
         unmappable_pins,
     })
     .await?;
@@ -165,6 +164,8 @@ pub(crate) async fn push(
     if !db.storage_writes().await? {
         return Ok(nothing);
     }
+    // before the mark and the pins are read: a pin changed after this keeps the mark
+    let account_seen = db.account_changes().await;
     // never pulled, or pulled under another key: nothing to write against (a pull comes first)
     let Some(state) = db.storage_state().await? else {
         return Ok(nothing);
@@ -176,11 +177,11 @@ pub(crate) async fn push(
     let mut dirty = db.dirty_chats().await?;
     // Note to Self has no record of its own: its flags live in the account record
     let mut account_dirty = state.account_dirty;
-    let mut note_to_self_dirty = false;
-    dirty.retain(|(id, _)| {
+    let mut note_to_self = None;
+    dirty.retain(|(id, flags)| {
         if *id == me_id {
             account_dirty = true;
-            note_to_self_dirty = true;
+            note_to_self = Some(flags.clone());
         }
         *id != me_id
     });
@@ -235,7 +236,7 @@ pub(crate) async fn push(
         rekey(&mut rows, &old, &new_key);
         inserts.push((new_key, patched));
         deletes.push(old);
-        written_chats.push(id);
+        written_chats.push((id, flags));
     }
     let mut account_written = false;
     if let Some(old) = account_key {
@@ -284,12 +285,15 @@ pub(crate) async fn push(
     db.replace_storage_items(&rows).await?;
     db.set_storage_state(&StorageState {
         version: state.version + 1,
-        account_dirty: account_dirty && !account_written,
         ..state
     })
     .await?;
-    if note_to_self_dirty && account_written {
-        written_chats.push(me_id);
+    // only what is still as written: a change made meanwhile goes out with the next push
+    if account_written {
+        db.clear_account_dirty(account_seen).await?;
+        if let Some(flags) = note_to_self {
+            written_chats.push((me_id, flags));
+        }
     }
     db.clear_dirty(&written_chats).await?;
     tracing::info!(version = write.manifest.version, written, skipped, "storage push");
@@ -402,7 +406,15 @@ mod tests {
         reads: Vec<Vec<Vec<u8>>>,
         manifest_calls: Vec<u64>,
         write_attempts: u32,
+        /// Runs once while items are being read / the write is in flight: a change the user
+        /// makes meanwhile.
+        during_read: Option<Hook>,
+        during_write: Option<Hook>,
+        /// An item the server returns although nobody asked for it.
+        extra_item: Option<(Vec<u8>, Vec<u8>)>,
     }
+
+    type Hook = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
 
     impl StorageApi for FakeApi {
         async fn manifest_if_changed(&mut self, version: u64) -> Result<Option<Manifest>, StorageError> {
@@ -415,17 +427,24 @@ mod tests {
 
         async fn read_items(&mut self, keys: &[Vec<u8>], _ikm: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             self.reads.push(keys.to_vec());
+            if let Some(hook) = self.during_read.take() {
+                hook().await;
+            }
             if keys.iter().any(|k| self.fail_items.contains(k)) {
                 return Err(StorageError::Invalid("a storage item".into()));
             }
             Ok(keys
                 .iter()
                 .filter_map(|k| self.items.get(k).map(|v| (k.clone(), v.clone())))
+                .chain(self.extra_item.clone())
                 .collect())
         }
 
         async fn write(&mut self, w: &Write) -> Result<(), StorageError> {
             self.write_attempts += 1;
+            if let Some(hook) = self.during_write.take() {
+                hook().await;
+            }
             if self.unauthorized {
                 return Err(StorageError::Unauthorized);
             }
@@ -907,6 +926,68 @@ mod tests {
 
     fn no_sleep(_: std::time::Duration) -> std::future::Ready<()> {
         std::future::ready(())
+    }
+
+    #[tokio::test]
+    async fn a_flag_changed_while_the_push_is_writing_stays_dirty() {
+        let db = synced_db().await;
+        let alice = format!("c:{ALICE}");
+        db.set_mute_until(&alice, 9).await.unwrap();
+        let mut api = synced_api();
+        let (d, a) = (db.clone(), alice.clone());
+        api.during_write = Some(Box::new(move || {
+            Box::pin(async move { d.set_archived(&a, true).await.unwrap() })
+        }));
+        let out = push(&mut api, &db, &keys(), ME, 1).await.unwrap();
+        assert_eq!(out.written, 1);
+        let dirty = db.dirty_chats().await.unwrap();
+        assert_eq!(dirty.len(), 1, "the archive hasn't reached the phone yet");
+        assert!(dirty[0].1.archived && dirty[0].1.mute_until == 9);
+    }
+
+    #[tokio::test]
+    async fn a_pin_changed_while_the_push_is_writing_stays_dirty() {
+        let db = synced_db().await;
+        db.set_account_dirty(true).await.unwrap();
+        let mut api = synced_api();
+        let d = db.clone();
+        api.during_write = Some(Box::new(move || {
+            Box::pin(async move { assert!(d.set_pinned(&format!("c:{ALICE}"), true).await.unwrap()) })
+        }));
+        let out = push(&mut api, &db, &keys(), ME, 1).await.unwrap();
+        assert!(out.written >= 1);
+        assert!(db.storage_state().await.unwrap().unwrap().account_dirty);
+    }
+
+    #[tokio::test]
+    async fn a_pin_changed_during_a_pull_stays_dirty() {
+        let db = synced_db().await;
+        let mut api = synced_api();
+        if let Some(m) = api.manifest.as_mut() {
+            m.version = 4;
+            m.identifiers.push((key(0xB), KIND_CONTACT));
+        }
+        api.items.insert(key(0xB), contact(BOB, ChatFlags::default()));
+        let d = db.clone();
+        api.during_read = Some(Box::new(move || {
+            Box::pin(async move { assert!(d.set_pinned(&format!("c:{ALICE}"), true).await.unwrap()) })
+        }));
+        pull(&mut api, &db, &keys(), ME).await.unwrap();
+        let state = db.storage_state().await.unwrap().unwrap();
+        assert_eq!(state.version, 4);
+        assert!(state.account_dirty, "the pin made meanwhile is still to be written");
+    }
+
+    #[tokio::test]
+    async fn an_item_nobody_asked_for_does_not_break_the_pull() {
+        let db = synced_db().await;
+        let mut api = synced_api();
+        if let Some(m) = api.manifest.as_mut() {
+            m.version = 4;
+        }
+        api.extra_item = Some((key(0xF), contact(BOB, ChatFlags::default())));
+        pull(&mut api, &db, &keys(), ME).await.unwrap();
+        assert_eq!(db.storage_state().await.unwrap().unwrap().version, 4);
     }
 
     #[tokio::test]

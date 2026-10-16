@@ -683,7 +683,8 @@ fn spawn_storage_sync(
     send_tx: mpsc::UnboundedSender<Job>,
     mut rx: mpsc::UnboundedReceiver<storage::Trigger>,
 ) {
-    tokio::task::spawn_local(async move {
+    let l = listener.clone();
+    let task = tokio::task::spawn_local(async move {
         while let Some(trigger) = rx.recv().await {
             if trigger == storage::Trigger::Local {
                 tokio::time::sleep(STORAGE_DEBOUNCE).await;
@@ -723,6 +724,14 @@ fn spawn_storage_sync(
                     listener.on_event(CoreEvent::Error { message });
                 }
             }
+        }
+    });
+    // a panic must not end syncing unnoticed (the triggers' channel died with the task)
+    tokio::task::spawn_local(async move {
+        if let Err(e) = task.await {
+            l.on_event(CoreEvent::Error {
+                message: format!("Syncing chat settings with the phone stopped until Semaphore restarts: {e}"),
+            });
         }
     });
 }

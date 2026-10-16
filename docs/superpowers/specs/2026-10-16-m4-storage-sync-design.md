@@ -32,8 +32,8 @@ What exists (verified 2026-10-16 on the pinned revisions):
   `storageRecordOps.preload.ts`): sync at startup and on `FetchLatest`; **sync before every
   write**; a changed record gets a **new random key** and the old key goes in `deleteKey`;
   **unknown record types and unknown fields are kept** and re-listed verbatim; the manifest
-  version is `current + 1`, a 409 means someone else wrote first (back off 1 s, 5 s, 30 s, then
-  give up until the next trigger); a linked device never `clearAll`s; remote values of the chat
+  version is `current + 1`, a 409 means someone else wrote first (three attempts, 1 s then 5 s
+  apart, then give up until the next trigger); a linked device never `clearAll`s; remote values of the chat
   flags **overwrite local ones** outright; the remote pinned list replaces the local one; a
   record that can't be decrypted aborts the sync; nothing runs without the storage key.
 
@@ -106,7 +106,9 @@ A new core module `core/sig-core/src/storage/`:
 4. Read the new keys in batches of at most 2 500 (`read_items`). A key the server doesn't
    return is dropped from our set. An item that doesn't decrypt or decode aborts the pull with
    an error, version unchanged (Desktop does the same and asks for keys; we log).
-5. Apply, in one transaction, in manifest order with the account record last:
+5. Apply, record by record, in manifest order with the account record last, and store the new
+   version only at the end: a pull cut short leaves the old version, and the next one re-reads
+   and re-applies the same records (applying is idempotent):
    - `ContactRecord` with an ACI (string or binary) → `c:<aci>`; `GroupV2Record` → `g:<hex>`.
      The chat row is created if it doesn't exist (empty title, no messages: not listed until
      one arrives, but its flags are in place when it does). Set `archived`, `marked_unread`,
@@ -138,8 +140,10 @@ and the version is the server's).
    replaced key in `deleteKey`, `clearAll = false` always.
 4. `PUT /v1/storage`. 2xx → replace the rows for the rewritten records, store the version, clear
    the dirty marks, send a `FetchLatest(STORAGE_MANIFEST)` sync message so the phone and other
-   devices pull (as Desktop does). 409 → someone wrote first: pull, then retry; back off 1 s,
-   5 s, 30 s; after the third conflict leave the dirty marks and stop until the next trigger.
+   devices pull (as Desktop does). Only marks still matching what was written are cleared: a
+   flag or pin changed while the write was in flight goes out with the next push. 409 → someone
+   wrote first: pull, then retry after 1 s, then 5 s; after the third conflict leave the dirty
+   marks and stop until the next trigger.
    Other errors → leave the dirty marks, log, retry at the next trigger.
 5. A dirty chat **without** a record stays dirty and local; every later pull checks whether the
    phone has created one since, and the next push then writes it.
@@ -179,7 +183,9 @@ has one.
 | PNI-only or e164-only contact | ignored for flags, preserved in the manifest and the pinned list |
 | Pinned group we don't know | the chat row is created (we have the master key) and pinned |
 | Storage key changed | state wiped, full pull |
-| A panic in the task | supervised like the history task: logged, state untouched |
+| A panic in the task | reported like the history task's: logged, state untouched; syncing resumes at the next start |
+
+Every failure but a missing master key is also reported to the app (Core Log and error banner).
 
 ### Testing
 - `records.rs`: decode of contact/group/account fixtures (string and binary ACIs, "always"
@@ -190,7 +196,7 @@ has one.
   and applies flags; 204 changes nothing; gone keys drop; pins replace, unmappable pins are kept
   and re-written; note-to-self flags; undecryptable item aborts without touching the version;
   push rewrites only dirty records with new keys and deletes old ones, manifest at version + 1
-  with every untouched identifier; a 409 pulls and retries, the fourth conflict stops; a dirty
+  with every untouched identifier; a 409 pulls and retries, the third conflict stops; a dirty
   chat with no record stays dirty; writes off → push does nothing; key fingerprint change wipes
   and pulls; blocked/whitelisted land in the projection.
 - Actor: `FetchLatest` reaches the sync, a local change marks dirty and triggers it.
