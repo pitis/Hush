@@ -436,7 +436,15 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         // ours start disappearing when sent; others' once read
         expires_at: (outgoing && expires_in > 0).then(|| sent_at + i64::from(expires_in) * 1000),
     };
-    let attachments: Vec<_> = dm.attachments.iter().map(new_attachment).collect();
+    let mut attachments: Vec<_> = dm.attachments.iter().map(new_attachment).collect();
+    // a sticker's image is its file (most are WebP, often sent untyped)
+    if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.as_ref()) {
+        let mut image = new_attachment(data);
+        if image.content_type.is_empty() || image.content_type == "application/octet-stream" {
+            image.content_type = "image/webp".into();
+        }
+        attachments.push(image);
+    }
     let preview = dm.preview.first().and_then(|p| {
         Some(NewPreview {
             url: p.url.clone()?,
@@ -904,6 +912,34 @@ mod tests {
                 target: key(BOB, 600)
             }]
         );
+    }
+
+    #[test]
+    fn a_stickers_image_comes_as_its_file_typed_as_an_image() {
+        let sticker = DataMessage {
+            timestamp: Some(700),
+            sticker: Some(data_message::Sticker {
+                emoji: Some("🦊".into()),
+                // stickers often come without a content type
+                data: Some(AttachmentPointer {
+                    size: Some(9),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ops = project(&content(ALICE, 710, ContentBody::DataMessage(sticker)), ME);
+        assert!(matches!(&ops[0], Op::InsertMessage(m) if m.kind == MessageKind::Sticker { emoji: Some("🦊".into()) }));
+        match &ops[1] {
+            Op::AddAttachments { attachments, .. } => {
+                assert_eq!(
+                    attachments.iter().map(|a| a.content_type.as_str()).collect::<Vec<_>>(),
+                    ["image/webp"]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

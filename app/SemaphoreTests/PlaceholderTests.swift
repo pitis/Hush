@@ -58,6 +58,31 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(fake.viewedOnce, [MessageKey(author: "a", sentAt: 9)])
     }
 
+    func testAStickerShowsItsImageOnceItsHere() {
+        let file = { (state: AttachmentState) in
+            Attachment(
+                id: 3, message: MessageKey(author: "a", sentAt: 1), contentType: "image/webp", fileName: nil, size: 1,
+                width: nil, height: nil, isVoiceNote: false, path: state == .ready ? "/s.webp" : nil, state: state)
+        }
+        var m = message("c:a", "a", 1)
+        m.kind = .sticker(emoji: "🦊")
+        XCTAssertEqual(Placeholder.stickerImage(m, files: [file(.ready)]), "/s.webp")
+        XCTAssertNil(Placeholder.stickerImage(m, files: [file(.downloading)]), "the placeholder until it's here")
+        XCTAssertNil(Placeholder.stickerImage(m, files: []))
+        // a failed download can be tried again; one under way or done needs nothing
+        XCTAssertEqual(Placeholder.stickerFile(m, files: [file(.failed)])?.state, .failed)
+        XCTAssertEqual(Placeholder.stickerFile(m, files: [file(.pending)])?.state, .pending)
+        XCTAssertNil(Placeholder.stickerFile(m, files: [file(.ready)]))
+        var lottie = file(.ready)
+        lottie.contentType = "application/x-signal-sticker-lottie"
+        XCTAssertNil(Placeholder.stickerImage(m, files: [lottie]), "an animated sticker keeps its words")
+        lottie.state = .pending
+        XCTAssertNil(Placeholder.stickerFile(m, files: [lottie]))
+        m.kind = .normal
+        XCTAssertNil(Placeholder.stickerImage(m, files: [file(.ready)]))
+        XCTAssertNil(Placeholder.stickerFile(m, files: [file(.failed)]))
+    }
+
     func testTheChatListAndNotificationsUseTheirWords() {
         var c = conversation("c:a")
         c.lastMessageKind = .poll(question: "Pizza?")

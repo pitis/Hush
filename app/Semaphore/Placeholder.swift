@@ -34,6 +34,22 @@ enum Placeholder {
         seconds == 0 ? "Off" : duration(Int64(seconds))
     }
 
+    /// The image a sticker shows once its file is here (else its placeholder words).
+    static func stickerImage(_ m: Message, files: [Attachment]) -> String? {
+        guard case .sticker = m.kind, let file = files.first, file.state == .ready, file.contentType.hasPrefix("image/")
+        else { return nil }
+        return file.path
+    }
+
+    /// A sticker's file still to fetch (pending or failed: its placeholder offers the download).
+    static func stickerFile(_ m: Message, files: [Attachment]) -> Attachment? {
+        // an animated (Lottie) sticker can't be drawn here: its words stay
+        guard case .sticker = m.kind, let file = files.first, [.pending, .failed].contains(file.state),
+            file.contentType.hasPrefix("image/")
+        else { return nil }
+        return file
+    }
+
     /// A timer length in its largest whole unit: "30 seconds", "8 hours", "1 week".
     static func duration(_ seconds: Int64) -> String {
         let units: [(Int64, String)] = [(604_800, "week"), (86_400, "day"), (3_600, "hour"), (60, "minute")]
