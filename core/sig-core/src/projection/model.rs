@@ -47,6 +47,43 @@ pub struct Conversation {
     pub mute_until: i64,
     /// Shown unread although every message is read ("Mark as unread").
     pub marked_unread: bool,
+    /// Blocked on the phone (as its Storage Service record says; read-only here).
+    pub blocked: bool,
+    /// The message request was accepted / profile sharing is on (as the phone says; read-only).
+    pub whitelisted: bool,
+}
+
+/// The per-chat values the Storage Service carries, in our units (`mute_until` ms; `i64::MAX`
+/// for good).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ChatFlags {
+    pub archived: bool,
+    pub marked_unread: bool,
+    pub mute_until: i64,
+    pub blocked: bool,
+    pub whitelisted: bool,
+}
+
+/// The Storage Service manifest we last applied, and what is waiting to be written.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct StorageState {
+    pub version: u64,
+    pub record_ikm: Vec<u8>,
+    /// SHA-256 of the storage key this state belongs to.
+    pub key_fingerprint: Vec<u8>,
+    /// A pin change not yet written.
+    pub account_dirty: bool,
+    /// Pinned-list entries we couldn't map (raw `PinnedConversation` bytes), carried unchanged.
+    pub unmappable_pins: Vec<Vec<u8>>,
+}
+
+/// One identifier of the applied manifest: its key, record type, and the chat it maps to when
+/// we understood the record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StorageItemRow {
+    pub key: Vec<u8>,
+    pub kind: i32,
+    pub conversation_id: Option<String>,
 }
 
 /// What kind of file a message has (its first one).
