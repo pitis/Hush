@@ -1,5 +1,11 @@
 //! 1:1 voice calls on RingRTC: signaling translation, relays, and the call engine's thread.
 
+// The pieces land one by one and are wired together by the call actor; until then they are
+// unused. TODO(remove when the call actor lands): drop this allow.
+#![allow(dead_code)]
+
+pub(crate) mod wire;
+
 /// Where a call is, as the app shows it.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallPhase {
