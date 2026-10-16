@@ -433,6 +433,13 @@ impl ProjectionDb {
         Ok(res.rows_affected() == 1)
     }
 
+    /// The pinned chats in pin order, listed or not.
+    pub async fn pinned_chat_ids(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM conversations WHERE pinned_order IS NOT NULL ORDER BY pinned_order, id")
+            .fetch_all(&self.pool)
+            .await
+    }
+
     /// A chat's flags, listed or not; None for a chat we don't have.
     pub async fn chat_flags(&self, id: &str) -> Result<Option<ChatFlags>, sqlx::Error> {
         let row: Option<(bool, bool, i64, bool, bool)> = sqlx::query_as(
