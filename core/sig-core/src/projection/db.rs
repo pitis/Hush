@@ -404,6 +404,54 @@ impl ProjectionDb {
         Ok(before != ids)
     }
 
+    /// Note to Self's archived / marked unread from the account record (its other flags have no
+    /// field there). Remote wins; true if either changed.
+    pub async fn apply_remote_note_to_self(
+        &self,
+        id: &str,
+        archived: bool,
+        marked_unread: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(id)
+            .bind(kind_to_i64(kind))
+            .execute(&mut *tx)
+            .await?;
+        let res = sqlx::query(
+            "UPDATE conversations SET archived = ?2, marked_unread = ?3, storage_dirty = 0,
+               pinned_order = CASE WHEN ?2 THEN NULL ELSE pinned_order END
+             WHERE id = ?1 AND (archived != ?2 OR marked_unread != ?3)",
+        )
+        .bind(id)
+        .bind(archived)
+        .bind(marked_unread)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// A chat's flags, listed or not; None for a chat we don't have.
+    pub async fn chat_flags(&self, id: &str) -> Result<Option<ChatFlags>, sqlx::Error> {
+        let row: Option<(bool, bool, i64, bool, bool)> = sqlx::query_as(
+            "SELECT archived, marked_unread, mute_until, blocked, whitelisted FROM conversations WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(archived, marked_unread, mute_until, blocked, whitelisted)| ChatFlags {
+                archived,
+                marked_unread,
+                mute_until,
+                blocked,
+                whitelisted,
+            },
+        ))
+    }
+
     /// Chats whose flags changed here and haven't reached the phone, by id.
     pub async fn dirty_chats(&self) -> Result<Vec<(String, ChatFlags)>, sqlx::Error> {
         let rows: Vec<(String, bool, bool, i64, bool, bool)> = sqlx::query_as(

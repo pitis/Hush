@@ -34,6 +34,8 @@ pub(crate) enum StorageError {
     Invalid(String),
     /// The server couldn't be reached, or answered with something unexpected.
     Network(String),
+    /// Our own projection failed.
+    Local(String),
 }
 
 impl fmt::Display for StorageError {
@@ -43,7 +45,14 @@ impl fmt::Display for StorageError {
             Self::Unauthorized => write!(f, "the server refused the storage credentials"),
             Self::Invalid(what) => write!(f, "couldn't read {what}"),
             Self::Network(what) => write!(f, "{what}"),
+            Self::Local(what) => write!(f, "storage: {what}"),
         }
+    }
+}
+
+impl From<sqlx::Error> for StorageError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Local(e.to_string())
     }
 }
 

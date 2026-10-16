@@ -7,6 +7,12 @@ use crate::projection::ChatFlags;
 
 pub(crate) mod client;
 pub(crate) mod records;
+pub(crate) mod sync;
+
+/// `ManifestRecord.Identifier.Type` values we understand.
+pub(crate) const KIND_CONTACT: i32 = 1;
+pub(crate) const KIND_GROUPV2: i32 = 3;
+pub(crate) const KIND_ACCOUNT: i32 = 4;
 
 /// What a storage record means to us.
 #[derive(Debug, PartialEq)]
