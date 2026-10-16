@@ -1453,10 +1453,6 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
                 match contact {
                     Ok(c) => {
                         let id = direct_id(&Aci::from(c.uuid).into());
-                        // in the phone's address book: never a message request
-                        if let Err(e) = db.set_phone_contact(&id).await {
-                            problems.push(format!("storing a contact: {e}"));
-                        }
                         if !c.name.is_empty() {
                             if let Err(e) = db.upsert_conversation_title(&id, &c.name).await {
                                 problems.push(format!("storing a contact name: {e}"));
@@ -1809,7 +1805,7 @@ mod tests {
             })
         };
         for id in [format!("c:{ALICE}"), group.clone()] {
-            db.set_phone_contact(&id).await.unwrap(); // makes the chat's row
+            db.set_phone_contact(&id, false).await.unwrap(); // makes the chat's row
             db.block(&id).await.unwrap();
         }
         let dropped = |c| {
@@ -1880,7 +1876,7 @@ mod tests {
         let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
             .await
             .unwrap();
-        db.set_phone_contact(&format!("c:{ALICE}")).await.unwrap();
+        db.set_phone_contact(&format!("c:{ALICE}"), false).await.unwrap();
         db.delete_chat(&format!("c:{ALICE}")).await.unwrap();
         super::sweep(&mut store, &db, &Quiet).await.unwrap();
         assert!(store.message(&thread, 100).await.unwrap().is_none());

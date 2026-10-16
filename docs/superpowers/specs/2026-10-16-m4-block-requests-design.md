@@ -61,7 +61,6 @@ Signal Desktop's rules (main, `ts/util/isConversationAccepted`, `MessageReceiver
 - Leaving a group; group invites (pending membership); Report spam.
 - Blocking by phone number only (`numbers` in the list are kept by the phone, ignored here).
 - Rotating the profile key on block (the phone does it).
-- System contacts as "trusted" (the Mac has none; the phone's `whitelisted` stands for them).
 
 ## Rules
 
@@ -69,6 +68,9 @@ Signal Desktop's rules (main, `ts/util/isConversationAccepted`, `MessageReceiver
 `Conversation` gains `message_request: bool`, true when all hold:
 - the Storage Service state is known (`storage_sync.version > 0`);
 - not `whitelisted`, not `blocked`;
+- not in the phone's address book: its `ContactRecord` has no system name
+  (`systemGivenName`/`systemFamilyName`/`systemNickname`, Desktop's "system contact" test).
+  presage's own contact list can't stand in: it saves every sender "on first sight";
 - no outgoing message in the chat (ours from this Mac, synced from the phone, or imported
   history — Note to Self always has them).
 
@@ -129,6 +131,7 @@ GroupV2Record 2/3); `clear_dirty` compares all five flags. Everything else in #5
 - Notifications as now (Desktop notifies for requests); blocked senders never reach it.
 
 ## Data (migration 0012)
+- `conversations.phone_contact`: set from each pulled `ContactRecord`'s system names.
 - `presage_forget_threads (conversation_id TEXT PRIMARY KEY)`: presage threads to clear,
   processed by the sweep next to `presage_forget`, so a deleted chat's copies go even if
   clearing fails once.

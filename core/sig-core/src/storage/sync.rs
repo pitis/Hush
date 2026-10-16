@@ -77,8 +77,13 @@ pub(crate) async fn pull(
     let mut rows = Vec::with_capacity(manifest.identifiers.len());
     for (key, kind) in &manifest.identifiers {
         let conversation_id = match decoded.get(key) {
-            Some(Remote::Chat { conversation_id, flags }) => {
+            Some(Remote::Chat {
+                conversation_id,
+                flags,
+                phone_contact,
+            }) => {
                 changed |= db.apply_remote_chat(conversation_id, flags).await?;
+                db.set_phone_contact(conversation_id, *phone_contact).await?;
                 Some(conversation_id.clone())
             }
             Some(Remote::Account { pins, note_to_self }) => {
@@ -914,6 +919,52 @@ mod tests {
         assert!(f.blocked && f.whitelisted);
     }
 
+    #[tokio::test]
+    async fn a_contact_in_the_phones_address_book_is_never_a_request() {
+        let db = synced_db().await;
+        let mut api = FakeApi {
+            manifest: Some(Manifest {
+                version: 4,
+                identifiers: vec![(key(0xAC), KIND_ACCOUNT), (key(0xA2), KIND_CONTACT)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let named = |system_given_name: &str| {
+            wrap(Record::Contact(ContactRecord {
+                aci: ALICE.into(),
+                system_given_name: system_given_name.into(),
+                ..Default::default()
+            }))
+        };
+        api.items.insert(key(0xA2), named("Alice"));
+        pull(&mut api, &db, &keys(), ME).await.unwrap();
+        let listed = |db: &ProjectionDb| {
+            let db = db.clone();
+            async move {
+                db.conversations()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|c| c.id == format!("c:{ALICE}"))
+                    .unwrap()
+            }
+        };
+        assert!(
+            !listed(&db).await.message_request,
+            "a system contact counts as accepted"
+        );
+        // out of the address book on the phone: a request again
+        api.manifest = Some(Manifest {
+            version: 5,
+            identifiers: vec![(key(0xAC), KIND_ACCOUNT), (key(0xA3), KIND_CONTACT)],
+            ..Default::default()
+        });
+        api.items.insert(key(0xA3), named(""));
+        pull(&mut api, &db, &keys(), ME).await.unwrap();
+        assert!(listed(&db).await.message_request);
+    }
+
     // ---- push ----
 
     /// A contact record with a field no client knows, so a rewrite can prove it kept it.
@@ -1051,7 +1102,10 @@ mod tests {
         let (new_key, plain) = &w.inserts[0];
         assert_eq!(new_key.len(), 16);
         assert_ne!(new_key, &key(0xA));
-        let Remote::Chat { conversation_id, flags } = records::decode(plain).unwrap() else {
+        let Remote::Chat {
+            conversation_id, flags, ..
+        } = records::decode(plain).unwrap()
+        else {
             panic!()
         };
         assert_eq!((conversation_id, flags.mute_until), (format!("c:{ALICE}"), 42));

@@ -38,6 +38,9 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                     c.blocked,
                     c.whitelisted,
                 ),
+                phone_contact: !(c.system_given_name.is_empty()
+                    && c.system_family_name.is_empty()
+                    && c.system_nickname.is_empty()),
             },
             None => Remote::Other,
         },
@@ -50,6 +53,7 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                 g.blocked,
                 g.whitelisted,
             ),
+            phone_contact: false,
         },
         Some(Record::Account(a)) => Remote::Account {
             pins: a.pinned_conversations.iter().map(pin_of).collect(),
@@ -306,7 +310,10 @@ mod tests {
 
     #[test]
     fn a_contact_record_gives_the_chat_and_its_flags() {
-        let Remote::Chat { conversation_id, flags } = decode(&contact(ALICE)).unwrap() else {
+        let Remote::Chat {
+            conversation_id, flags, ..
+        } = decode(&contact(ALICE)).unwrap()
+        else {
             panic!()
         };
         assert_eq!(conversation_id, format!("c:{ALICE}"));
@@ -351,7 +358,10 @@ mod tests {
             whitelisted: true,
             ..Default::default()
         }));
-        let Remote::Chat { conversation_id, flags } = decode(&g).unwrap() else {
+        let Remote::Chat {
+            conversation_id, flags, ..
+        } = decode(&g).unwrap()
+        else {
             panic!()
         };
         assert_eq!(conversation_id, format!("g:{}", "ab".repeat(32)));

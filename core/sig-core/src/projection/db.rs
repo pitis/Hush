@@ -304,15 +304,17 @@ impl ProjectionDb {
             .await
     }
 
-    /// The contact is in the phone's synced contact list (its address book): never a request.
-    pub async fn set_phone_contact(&self, id: &str) -> Result<(), sqlx::Error> {
+    /// Whether the contact is in the phone's address book (its storage record carries system
+    /// names), which makes it never a request. The chat is created if needed.
+    pub async fn set_phone_contact(&self, id: &str, on: bool) -> Result<(), sqlx::Error> {
         let kind = kind_of(id)?;
         sqlx::query(
-            "INSERT INTO conversations(id, kind, phone_contact) VALUES (?1, ?2, 1)
-             ON CONFLICT(id) DO UPDATE SET phone_contact = 1",
+            "INSERT INTO conversations(id, kind, phone_contact) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET phone_contact = excluded.phone_contact",
         )
         .bind(id)
         .bind(kind_to_i64(kind))
+        .bind(on)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -5193,7 +5195,7 @@ mod tests {
                 .unwrap();
         }
         db.insert_message(&mine("c:alice", 9)).await.unwrap();
-        db.set_phone_contact("c:bob").await.unwrap();
+        db.set_phone_contact("c:bob", true).await.unwrap();
         db.block("c:carol").await.unwrap();
         for c in ["c:alice", "c:bob", "c:carol"] {
             assert!(!conv(&db, c).await.message_request, "{c}");
