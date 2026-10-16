@@ -64,9 +64,14 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func ownAci() -> String? { aci }
 
     var sendError: Error?
-    func sendText(conversationId: String, body: String, quote: Quote?) async throws -> MessageKey {
+    /// Each sent text's or caption's ranges, in order.
+    private(set) var sentRanges: [[BodyRange]] = []
+    func sendText(conversationId: String, body: String, ranges: [BodyRange], quote: Quote?) async throws -> MessageKey {
         if let sendError { throw sendError }
-        lock.withLock { sent.append((conversationId, body, quote)) }
+        lock.withLock {
+            sent.append((conversationId, body, quote))
+            sentRanges.append(ranges)
+        }
         return MessageKey(author: aci ?? "", sentAt: Int64(sent.count))
     }
 
@@ -83,9 +88,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let changeError { throw changeError }
         lock.withLock { reacted.append((target, emoji, remove)) }
     }
-    func edit(key: MessageKey, newBody: String) async throws {
+    private(set) var editedRanges: [[BodyRange]] = []
+    func edit(key: MessageKey, newBody: String, ranges: [BodyRange]) async throws {
         if let changeError { throw changeError }
-        lock.withLock { edited.append((key, newBody)) }
+        lock.withLock {
+            edited.append((key, newBody))
+            editedRanges.append(ranges)
+        }
     }
     func deleteForEveryone(key: MessageKey) async throws {
         if let changeError { throw changeError }
@@ -144,12 +153,15 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let downloadError { throw downloadError }
         lock.withLock { downloads.append(id) }
     }
-    func sendAttachments(conversationId: String, files: [OutgoingFile], caption: String?, quote: Quote?) async throws
-        -> MessageKey
-    {
+    func sendAttachments(
+        conversationId: String, files: [OutgoingFile], caption: String?, ranges: [BodyRange], quote: Quote?
+    ) async throws -> MessageKey {
         if let sendDelay { try? await Task.sleep(for: sendDelay) }
         if let sendError { throw sendError }
-        lock.withLock { sentFiles.append((conversationId, files, caption)) }
+        lock.withLock {
+            sentFiles.append((conversationId, files, caption))
+            sentRanges.append(ranges)
+        }
         return MessageKey(author: aci ?? "", sentAt: Int64(sentFiles.count))
     }
     func attachments(key: MessageKey) async throws -> [Attachment] { lock.withLock { attachmentAnswers[key] ?? [] } }

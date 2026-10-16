@@ -79,6 +79,20 @@ final class AppStoreConversationTests: XCTestCase {
         XCTAssertEqual(fake.sent.count, 1)
     }
 
+    func testStylesGoWithTheTextAndWithACaption() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        let bold = BodyRange(start: 0, length: 2, style: .bold)
+        await store.send("hi", ranges: [bold])
+        store.addFiles([
+            OutgoingFile(path: "/tmp/a.png", contentType: "image/png", width: nil, height: nil, isVoiceNote: false)
+        ])
+        await store.send("hi", ranges: [bold])
+        XCTAssertEqual(fake.sentFiles.first?.caption, "hi")
+        XCTAssertEqual(fake.sentRanges, [[bold], [bold]])
+    }
+
     func testRetryAsksTheCore() async {
         let fake = FakeClient(linked: true)
         let store = await linkedStore(fake)

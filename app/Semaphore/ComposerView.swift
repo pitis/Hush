@@ -4,12 +4,11 @@ import SwiftUI
 struct ComposerView: View {
     let store: AppStore
     let conversationId: String
-    @State private var text = ""
-    @FocusState private var focused: Bool
+    @State private var text = NSAttributedString()
+    /// Bumped to put the caret in the field.
+    @State private var focusRequest = 0
     /// What was typed before editing started; back once the edit is saved or cancelled.
-    @State private var draftBeforeEdit: String?
-    /// ⌘V of files or images while the field is focused (the field itself only pastes text).
-    @State private var pasteMonitor: Any?
+    @State private var draftBeforeEdit: NSAttributedString?
 
     var body: some View {
         VStack(spacing: 6) {
@@ -71,73 +70,57 @@ struct ComposerView: View {
                 .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
                 .padding(.bottom, 9)
                 Button {
-                    focused = true  // the palette types into the focused field
-                    NSApp.orderFrontCharacterPalette(nil)
+                    focusRequest += 1  // the palette types into the focused field
+                    DispatchQueue.main.async { NSApp.orderFrontCharacterPalette(nil) }
                 } label: {
                     Image(systemName: "face.smiling").font(.system(size: 20))
                 }
                 .accessibilityLabel("Emoji")
                 .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
                 .padding(.bottom, 8)
-                TextField("Message", text: $text, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 14))
-                    .lineLimit(1...6)
-                    .focused($focused)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(Theme.field, in: RoundedRectangle(cornerRadius: 18))
+                ComposerField(
+                    text: $text, focusRequest: focusRequest, onReturn: submit,
                     // ↑ in an empty field edits your last message, as in Desktop
-                    .onKeyPress(.upArrow) {
-                        text.isEmpty && store.editing == nil && store.editLast() ? .handled : .ignored
-                    }
-                    .onKeyPress(.return, phases: .down) { press in
-                        switch Composer.action(for: press.modifiers) {
-                        case .send:
-                            submit()
-                            return .handled
-                        case .newline:
-                            text += "\n"
-                            return .handled
-                        }
-                    }
+                    onUpInEmpty: { store.editing == nil && store.editLast() },
+                    onPasteFiles: { store.addFiles($0.map(Files.outgoing)) },
+                    onPasteError: { store.showError("Couldn't attach what you pasted: \($0.localizedDescription)") }
+                )
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Theme.field, in: RoundedRectangle(cornerRadius: 18))
             }
             .padding(.horizontal, 14)
             .padding(.bottom, 12)
             .padding(.top, store.replyTo == nil ? 8 : 0)
         }
         .onAppear {
-            text = Composer.draft(for: conversationId)
+            text = Self.plain(Composer.draft(for: conversationId))
             takeFocusIfAsked()
         }
         .onChange(of: conversationId) { _, new in
             // an edit doesn't follow to another chat, nor does the draft it put aside
             draftBeforeEdit = nil
-            text = Composer.draft(for: new)
+            text = Self.plain(Composer.draft(for: new))
         }
         .onChange(of: text) { _, new in
-            if store.editing == nil { Composer.saveDraft(new, for: conversationId) }
+            // drafts keep the words, not their styles
+            if store.editing == nil { Composer.saveDraft(new.string, for: conversationId) }
         }
         .onChange(of: store.editing?.sentAt) { _, _ in
             if let editing = store.editing {
                 if draftBeforeEdit == nil { draftBeforeEdit = text }
-                text = editing.body ?? ""
+                text = ComposerText.attributed(editing.body ?? "", ranges: editing.ranges)
             } else if let draft = draftBeforeEdit {
                 text = draft
                 draftBeforeEdit = nil
             }
-        }
-        .onAppear { pasteMonitor = installPasteMonitor() }
-        .onDisappear {
-            if let pasteMonitor { NSEvent.removeMonitor(pasteMonitor) }
-            pasteMonitor = nil
         }
         .onChange(of: store.composerWantsFocus) { _, _ in takeFocusIfAsked() }
     }
 
     private func takeFocusIfAsked() {
         guard store.composerWantsFocus else { return }
-        focused = true
+        focusRequest += 1
         store.composerTookFocus()
     }
 
@@ -146,37 +129,21 @@ struct ComposerView: View {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if panel.runModal() == .OK { store.addFiles(Files.attachable(panel.urls).map(Files.outgoing)) }
-        focused = true
+        focusRequest += 1
     }
 
-    /// Menu shortcuts (⌘V is Edit ▸ Paste) reach the text field before SwiftUI's key handlers, so
-    /// a local monitor sees ⌘V first and takes it only when files or an image are being pasted.
-    private func installPasteMonitor() -> Any? {
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-                event.charactersIgnoringModifiers == "v",
-                MainActor.assumeIsolated({ focused && event.window === NSApp.mainWindow })
-            else { return event }
-            do {
-                let files = try Composer.pastedFiles(from: .general)
-                guard !files.isEmpty else { return event }
-                MainActor.assumeIsolated { store.addFiles(files.map(Files.outgoing)) }
-            } catch {
-                MainActor.assumeIsolated {
-                    store.showError("Couldn't attach what you pasted: \(error.localizedDescription)")
-                }
-            }
-            return nil
-        }
+    private static func plain(_ s: String) -> NSAttributedString {
+        NSAttributedString(string: s, attributes: ComposerText.display([]))
     }
 
     private func submit() {
         let outgoing = text
-        guard Composer.canSend(outgoing) || !store.outgoingFiles.isEmpty else { return }
-        text = ""
+        let message = ComposerText.message(from: outgoing)
+        guard Composer.canSend(message.body) || !store.outgoingFiles.isEmpty else { return }
+        text = NSAttributedString()
         Task {
             // give the text back if the core couldn't take it
-            if await !store.send(outgoing), text.isEmpty { text = outgoing }
+            if await !store.send(message.body, ranges: message.ranges), text.length == 0 { text = outgoing }
         }
     }
 }
@@ -186,7 +153,7 @@ enum Composer {
     enum ReturnAction: Equatable { case send, newline }
 
     /// ↩ sends, ⇧↩ (or ⌥↩) inserts a newline.
-    static func action(for modifiers: EventModifiers) -> ReturnAction {
+    static func action(for modifiers: NSEvent.ModifierFlags) -> ReturnAction {
         modifiers.contains(.shift) || modifiers.contains(.option) ? .newline : .send
     }
 

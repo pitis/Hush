@@ -31,10 +31,12 @@ final class MessageActionsTests: XCTestCase {
         XCTAssertFalse(MessageActions.canEdit(mine(hour, body: nil), me: "me", now: now))
     }
 
-    func testAFormattedMessageCantBeEditedHereYet() {
-        // the composer can't write styles or mentions yet: an edit would strip them
+    func testAStyledMessageCanBeEditedOneWithMentionsNotYet() {
         var m = mine(3_600_000)
         m.ranges = [BodyRange(start: 0, length: 1, style: .bold)]
+        XCTAssertTrue(MessageActions.canEdit(m, me: "me", now: now))
+        // the composer can't write mentions yet: an edit would strip them
+        m.ranges.append(BodyRange(start: 0, length: 1, style: .mention(aci: "bob")))
         XCTAssertTrue(MessageActions.canDelete(m, me: "me", now: now))
         XCTAssertFalse(MessageActions.canEdit(m, me: "me", now: now))
     }
@@ -116,6 +118,20 @@ final class AppStoreMessageActionsTests: XCTestCase {
         XCTAssertEqual(fake.edited.first?.key, MessageKey(author: "me", sentAt: 2))
         XCTAssertTrue(fake.sent.isEmpty)
         XCTAssertNil(store.editing)
+    }
+
+    func testAnEditKeepsItsStyles() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        var own = store.messages[1]
+        own.body = "bold move"
+        own.ranges = [BodyRange(start: 0, length: 4, style: .bold)]
+        store.startEditing(own)
+        // what the composer holds, saved unchanged
+        let message = ComposerText.message(from: ComposerText.attributed(own.body!, ranges: own.ranges))
+        await store.send(message.body, ranges: message.ranges)
+        XCTAssertEqual(fake.edited.map(\.body), ["bold move"])
+        XCTAssertEqual(fake.editedRanges, [own.ranges])
     }
 
     func testAFailedChangeSaysWhyAndKeepsEditing() async {

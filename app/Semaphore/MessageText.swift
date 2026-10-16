@@ -11,6 +11,8 @@ enum MessageText {
         static let italic = Styles(rawValue: 2)
         static let strikethrough = Styles(rawValue: 4)
         static let monospace = Styles(rawValue: 8)
+        /// Only in the composer: bubbles cover spoilers instead.
+        static let spoiler = Styles(rawValue: 16)
     }
 
     enum StylesKey: AttributedStringKey {

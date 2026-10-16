@@ -10,7 +10,7 @@ use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
-    Attachment, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey, MessageKind,
+    Attachment, BodyRange, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey, MessageKind,
     MessageStatus, OutgoingFile, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
 };
 use crate::send::{self, Job, SendJob};
@@ -314,14 +314,48 @@ impl Client {
     }
 }
 
+/// The ranges that fit `text` (counted in UTF-16 units, as Signal counts them); a sender's app
+/// could otherwise send ranges the recipients can't place.
+fn fitting(text: &str, mut ranges: Vec<BodyRange>) -> Vec<BodyRange> {
+    let units = text.encode_utf16().count() as u64;
+    ranges.retain(|r| r.length > 0 && u64::from(r.start) + u64::from(r.length) <= units);
+    ranges
+}
+
+/// `text` without surrounding whitespace, its ranges moved and cut to match (a range only on
+/// the whitespace goes).
+fn trimmed(text: &str, ranges: Vec<BodyRange>) -> (String, Vec<BodyRange>) {
+    let lead = text.len() - text.trim_start().len();
+    let shift = text[..lead].encode_utf16().count() as u64;
+    let kept = text.trim().to_string();
+    let units = kept.encode_utf16().count() as u64;
+    let ranges = ranges
+        .into_iter()
+        .filter_map(|r| {
+            let start = u64::from(r.start).max(shift) - shift;
+            let end = (u64::from(r.start) + u64::from(r.length))
+                .saturating_sub(shift)
+                .min(units);
+            (end > start).then(|| BodyRange {
+                start: start as u32,
+                length: (end - start) as u32,
+                ..r
+            })
+        })
+        .collect();
+    (kept, ranges)
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     /// Shows `body` at once as a pending message and queues it for sending (it moves to Sent or
-    /// Failed, reported through `MessageChanged`). Returns the new message's key.
+    /// Failed, reported through `MessageChanged`). Returns the new message's key. `ranges` are
+    /// its styles and mentions; ones that don't fit the text are dropped.
     pub async fn send_text(
         &self,
         conversation_id: String,
         body: String,
+        ranges: Vec<BodyRange>,
         quote: Option<Quote>,
     ) -> Result<MessageKey, CoreError> {
         if body.trim().is_empty() {
@@ -342,7 +376,7 @@ impl Client {
             author,
             sent_at: self.next_sent_at(),
             received_at: 0,
-            ranges: vec![],
+            ranges: fitting(&body, ranges),
             body: Some(body.clone()),
             is_outgoing: true,
             status: MessageStatus::Pending,
@@ -374,6 +408,7 @@ impl Client {
             key: key.clone(),
             conversation_id,
             body: Some(body),
+            ranges: message.ranges.clone(),
             quote,
             attachments: vec![],
         })));
@@ -401,6 +436,7 @@ impl Client {
             key,
             conversation_id: m.conversation_id,
             body: m.body,
+            ranges: m.ranges,
             quote: m.quote,
             attachments,
         })))?;
@@ -414,6 +450,7 @@ impl Client {
         conversation_id: String,
         files: Vec<OutgoingFile>,
         caption: Option<String>,
+        ranges: Vec<BodyRange>,
         quote: Option<Quote>,
     ) -> Result<MessageKey, CoreError> {
         let invalid = |message: String| CoreError::InvalidInput { message };
@@ -440,13 +477,16 @@ impl Client {
         let author = self.own_aci().ok_or(CoreError::NotLinked)?;
         // the chat's timer; ours start disappearing when sent
         let expires_in = self.db.expire_timer(&conversation_id).await?;
-        let body = caption.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+        let (body, ranges) = match caption.map(|c| trimmed(&c, ranges)) {
+            Some((c, r)) if !c.is_empty() => (Some(c), r),
+            _ => (None, vec![]),
+        };
         let mut message = Message {
             conversation_id: conversation_id.clone(),
             author,
             sent_at: self.next_sent_at(),
             received_at: 0,
-            ranges: vec![],
+            ranges: ranges.clone(),
             body: body.clone(),
             is_outgoing: true,
             status: MessageStatus::Pending,
@@ -478,6 +518,7 @@ impl Client {
             key: key.clone(),
             conversation_id,
             body,
+            ranges,
             quote,
             attachments,
         })));
@@ -612,7 +653,7 @@ impl Client {
     }
 
     /// Replaces the text of our own message (sent, under 24 hours old). It shows here once sent.
-    pub async fn edit(&self, key: MessageKey, new_body: String) -> Result<(), CoreError> {
+    pub async fn edit(&self, key: MessageKey, new_body: String, ranges: Vec<BodyRange>) -> Result<(), CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
         if new_body.trim().is_empty() {
             return Err(CoreError::InvalidInput {
@@ -622,7 +663,8 @@ impl Client {
         let m = self.stored(&key).await?;
         let at = self.next_sent_at();
         send::check_own_change(&m, &me, at).map_err(|message| CoreError::InvalidInput { message })?;
-        let body = send::edit(&m, new_body, at as u64);
+        let ranges = fitting(&new_body, ranges);
+        let body = send::edit(&m, new_body, ranges, at as u64);
         self.send_mutation(m.conversation_id, body, at as u64)
     }
 
@@ -1054,15 +1096,15 @@ mod tests {
         rt.block_on(async {
             let to = "c:22222222-2222-2222-2222-222222222222".to_string();
             assert!(matches!(
-                client.send_text(to.clone(), "  ".into(), None).await,
+                client.send_text(to.clone(), "  ".into(), vec![], None).await,
                 Err(CoreError::InvalidInput { .. })
             ));
             assert!(matches!(
-                client.send_text("c:nope".into(), "hi".into(), None).await,
+                client.send_text("c:nope".into(), "hi".into(), vec![], None).await,
                 Err(CoreError::InvalidInput { .. })
             ));
             assert!(matches!(
-                client.send_text(to, "hi".into(), None).await,
+                client.send_text(to, "hi".into(), vec![], None).await,
                 Err(CoreError::NotLinked)
             ));
         });
@@ -1139,7 +1181,7 @@ mod tests {
         rt.block_on(async {
             let not_linked = |r: Result<(), CoreError>| matches!(r, Err(CoreError::NotLinked));
             assert!(not_linked(client.react(k.clone(), "👍".into(), false).await));
-            assert!(not_linked(client.edit(k.clone(), "new".into()).await));
+            assert!(not_linked(client.edit(k.clone(), "new".into(), vec![]).await));
             assert!(not_linked(client.delete_for_everyone(k).await));
             assert!(matches!(
                 client.mark_read(conv.clone()).await,
@@ -1166,15 +1208,15 @@ mod tests {
                 sent_at,
             };
             // someone else's, too old, unknown, or no text
-            assert!(invalid(client.edit(key(ALICE, now - 900), "new".into()).await));
+            assert!(invalid(client.edit(key(ALICE, now - 900), "new".into(), vec![]).await));
             assert!(invalid(client.delete_for_everyone(key(ALICE, now - 900)).await));
             let old = key(ME, now - 25 * 3600 * 1000);
-            assert!(invalid(client.edit(old.clone(), "new".into()).await));
+            assert!(invalid(client.edit(old.clone(), "new".into(), vec![]).await));
             assert!(invalid(client.delete_for_everyone(old).await));
-            assert!(invalid(client.edit(key(ME, now - 500), "new".into()).await));
-            assert!(invalid(client.edit(key(ME, now - 1000), " ".into()).await));
+            assert!(invalid(client.edit(key(ME, now - 500), "new".into(), vec![]).await));
+            assert!(invalid(client.edit(key(ME, now - 1000), " ".into(), vec![]).await));
             // own and recent: queued (shown once sent)
-            client.edit(key(ME, now - 1000), "new".into()).await.unwrap();
+            client.edit(key(ME, now - 1000), "new".into(), vec![]).await.unwrap();
             client.delete_for_everyone(key(ME, now - 1000)).await.unwrap();
             assert_eq!(
                 client
@@ -1466,7 +1508,7 @@ mod tests {
         let requests = || client.storage_sync_requests.load(Ordering::SeqCst);
         rt.block_on(async {
             client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
-            client.send_text(conv.clone(), "hi".into(), None).await.unwrap();
+            client.send_text(conv.clone(), "hi".into(), vec![], None).await.unwrap();
             assert_eq!(requests(), 0, "not archived: nothing for the phone");
             client.set_archived(conv.clone(), true).await.unwrap();
             client
@@ -1474,7 +1516,10 @@ mod tests {
                 .clear_dirty(&client.db.dirty_chats().await.unwrap())
                 .await
                 .unwrap();
-            client.send_text(conv.clone(), "back".into(), None).await.unwrap();
+            client
+                .send_text(conv.clone(), "back".into(), vec![], None)
+                .await
+                .unwrap();
             assert_eq!(requests(), 2);
             let dirty = client.db.dirty_chats().await.unwrap();
             assert_eq!(dirty.len(), 1);
@@ -1537,6 +1582,7 @@ mod tests {
                     conv.clone(),
                     vec![outgoing(photo.clone(), "image/heic"), outgoing(pdf, "application/pdf")],
                     Some(" sunset ".into()),
+                    vec![],
                     None,
                 )
                 .await
@@ -1568,6 +1614,7 @@ mod tests {
                     conv.clone(),
                     vec![outgoing(copy, "image/heic")],
                     Some("  ".into()),
+                    vec![],
                     None,
                 )
                 .await
@@ -1592,7 +1639,7 @@ mod tests {
             .set_len(MAX_ATTACHMENT + 1)
             .unwrap();
         rt.block_on(async {
-            let send = |files: Vec<OutgoingFile>| client.send_attachments(conv.clone(), files, None, None);
+            let send = |files: Vec<OutgoingFile>| client.send_attachments(conv.clone(), files, None, vec![], None);
             assert!(invalid(send(vec![]).await));
             assert!(invalid(
                 send(vec![outgoing("/nope/missing.jpg".into(), "image/jpeg")]).await
@@ -1658,6 +1705,48 @@ mod tests {
     }
 
     #[test]
+    fn styles_go_with_what_we_send_and_ones_that_dont_fit_are_dropped() {
+        let (dir, _sink, client, rt) = as_me("client-send-ranges");
+        let photo = file_in(&dir.0.join("src"), "a.heic", b"x");
+        let conv = format!("c:{ALICE}");
+        let range = |start, length| BodyRange {
+            start,
+            length,
+            style: crate::projection::TextStyle::Bold,
+        };
+        rt.block_on(async {
+            // "👋 hi": the wave is two UTF-16 units, so "hi" is 3..5
+            let key = client
+                .send_text(
+                    conv.clone(),
+                    "👋 hi".into(),
+                    vec![range(3, 2), range(4, 2), range(0, 0)],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.message(key).await.unwrap().unwrap().ranges, vec![range(3, 2)]);
+            // a caption's ranges follow its trimming
+            let key = client
+                .send_attachments(
+                    conv.clone(),
+                    vec![outgoing(photo.clone(), "image/heic")],
+                    Some("  sunset ".into()),
+                    // inside, only on the spaces, and running into them on both sides
+                    vec![range(2, 6), range(0, 1), range(1, 3), range(6, 3)],
+                    None,
+                )
+                .await
+                .unwrap();
+            let m = client.message(key).await.unwrap().unwrap();
+            assert_eq!(
+                (m.body.as_deref(), m.ranges),
+                (Some("sunset"), vec![range(0, 6), range(0, 2), range(4, 2)])
+            );
+        });
+    }
+
+    #[test]
     fn our_messages_take_the_chats_timer_and_start_it_at_once() {
         let (_dir, _sink, client, rt) = as_me("client-timer");
         let conv = format!("c:{ALICE}");
@@ -1672,7 +1761,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let key = client.send_text(conv, "brb".into(), None).await.unwrap();
+            let key = client.send_text(conv, "brb".into(), vec![], None).await.unwrap();
             let m = client.message(key.clone()).await.unwrap().unwrap();
             assert_eq!((m.expires_in, m.expires_at), (60, Some(key.sent_at + 60_000)));
         });

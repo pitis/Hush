@@ -371,12 +371,12 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
-    /// Sends `text` to the open conversation. Returns false if it couldn't be handed to the core
-    /// (the caller keeps the text).
+    /// Sends `text` (already trimmed when it has `ranges`, its styles) to the open conversation.
+    /// Returns false if it couldn't be handed to the core (the caller keeps the text).
     @discardableResult
-    func send(_ text: String) async -> Bool {
+    func send(_ text: String, ranges: [BodyRange] = []) async -> Bool {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let editing { return await saveEdit(of: editing, body) }
+        if let editing { return await saveEdit(of: editing, body, ranges: ranges) }
         let files = outgoingFiles
         guard let client, let id = selectedId, !body.isEmpty || !files.isEmpty else { return false }
         // taken out of the tray now, so a second ↩ while this one is busy can't send them again
@@ -385,11 +385,11 @@ final class AppStore {
         do {
             // the core announces the new pending message itself
             if files.isEmpty {
-                _ = try await client.sendText(conversationId: id, body: body, quote: quote)
+                _ = try await client.sendText(conversationId: id, body: body, ranges: ranges, quote: quote)
             } else {
                 // the text goes with the files, as their caption
                 _ = try await client.sendAttachments(
-                    conversationId: id, files: files, caption: body.isEmpty ? nil : body, quote: quote)
+                    conversationId: id, files: files, caption: body.isEmpty ? nil : body, ranges: ranges, quote: quote)
             }
             replyTo = nil
             return true
@@ -452,10 +452,10 @@ final class AppStore {
         return true
     }
 
-    private func saveEdit(of m: Message, _ body: String) async -> Bool {
+    private func saveEdit(of m: Message, _ body: String, ranges: [BodyRange]) async -> Bool {
         guard let client, !body.isEmpty else { return false }
         do {
-            try await client.edit(key: MessageKey(author: m.author, sentAt: m.sentAt), newBody: body)
+            try await client.edit(key: MessageKey(author: m.author, sentAt: m.sentAt), newBody: body, ranges: ranges)
             editing = nil
             return true
         } catch {
@@ -720,7 +720,7 @@ final class AppStore {
             return replyFailed(conversationId, because: "Semaphore wasn't ready")
         }
         do {
-            _ = try await client.sendText(conversationId: conversationId, body: body, quote: nil)
+            _ = try await client.sendText(conversationId: conversationId, body: body, ranges: [], quote: nil)
             markRead(conversationId)
         } catch {
             replyFailed(conversationId, because: Self.describe(error))

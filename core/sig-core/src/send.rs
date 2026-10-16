@@ -62,6 +62,8 @@ pub struct SendJob {
     pub key: MessageKey,
     pub conversation_id: String,
     pub body: Option<String>,
+    /// Styles and mentions in `body`.
+    pub ranges: Vec<BodyRange>,
     pub quote: Option<Quote>,
     /// Ids of its stored files, uploaded before it is sent.
     pub attachments: Vec<i64>,
@@ -124,6 +126,7 @@ fn group_context(conversation_id: &str) -> Option<GroupContextV2> {
 fn data_message(job: &SendJob, attachments: Vec<AttachmentPointer>) -> DataMessage {
     DataMessage {
         body: job.body.clone(),
+        body_ranges: body_ranges(&job.ranges),
         attachments,
         timestamp: Some(job.key.sent_at as u64),
         quote: job.quote.as_ref().map(|q| data_message::Quote {
@@ -187,7 +190,7 @@ pub fn delete(conversation_id: &str, target_sent_at: i64, at: u64) -> DataMessag
 }
 
 /// Replaces the text of our own `original`; the new revision keeps its quote.
-pub fn edit(original: &Message, new_body: String, at: u64) -> EditMessage {
+pub fn edit(original: &Message, new_body: String, ranges: Vec<BodyRange>, at: u64) -> EditMessage {
     let revision = SendJob {
         key: MessageKey {
             author: original.author.clone(),
@@ -195,6 +198,7 @@ pub fn edit(original: &Message, new_body: String, at: u64) -> EditMessage {
         },
         conversation_id: original.conversation_id.clone(),
         body: Some(new_body),
+        ranges,
         quote: original.quote.clone(),
         attachments: vec![],
     };
@@ -881,6 +885,7 @@ mod tests {
             },
             conversation_id: format!("g:{}", "ab".repeat(32)),
             body: Some("hi".into()),
+            ranges: vec![],
             attachments: vec![],
             quote: None,
         };
@@ -902,6 +907,7 @@ mod tests {
             },
             conversation_id: format!("c:{U}"),
             body: None,
+            ranges: vec![],
             quote: None,
             attachments: vec![1, 2],
         };
@@ -931,6 +937,11 @@ mod tests {
             },
             conversation_id: format!("c:{U}"),
             body: Some("hi".into()),
+            ranges: vec![BodyRange {
+                start: 0,
+                length: 2,
+                style: TextStyle::Italic,
+            }],
             attachments: vec![],
             quote: Some(Quote {
                 author: U.into(),
@@ -952,13 +963,21 @@ mod tests {
         };
         let dm = data_message(&job, vec![]);
         assert_eq!((dm.body.as_deref(), dm.timestamp), (Some("hi"), Some(42)));
+        use presage::proto::body_range::{AssociatedValue, Style};
+        assert_eq!(
+            dm.body_ranges,
+            vec![presage::proto::BodyRange {
+                start: Some(0),
+                length: Some(2),
+                associated_value: Some(AssociatedValue::Style(Style::Italic as i32)),
+            }]
+        );
         let q = dm.quote.unwrap();
         assert_eq!(
             (q.id, q.author_aci.as_deref(), q.text.as_deref()),
             (Some(7), Some(U), Some("\u{fffc} orig"))
         );
         // the quoted text's mention and style go along, so it reads the same there
-        use presage::proto::body_range::{AssociatedValue, Style};
         assert_eq!(
             q.body_ranges,
             vec![
@@ -1052,7 +1071,12 @@ mod tests {
     #[test]
     fn own_edit_applies_like_an_incoming_one_and_keeps_the_quote() {
         for conv in [format!("c:{U}"), group()] {
-            let em = edit(&mine(&conv, 100), "fixed".into(), 800);
+            let bold = BodyRange {
+                start: 0,
+                length: 5,
+                style: TextStyle::Bold,
+            };
+            let em = edit(&mine(&conv, 100), "fixed".into(), vec![bold.clone()], 800);
             let dm = em.data_message.as_ref().unwrap();
             assert_eq!(em.target_sent_timestamp, Some(100));
             assert_eq!(
@@ -1065,7 +1089,7 @@ mod tests {
                 vec![Op::Edit {
                     target: key(ME, 100),
                     new_body: Some("fixed".into()),
-                    new_ranges: vec![],
+                    new_ranges: vec![bold.clone()],
                     edited_at: 800
                 }]
             );
