@@ -93,6 +93,18 @@ final class AppStoreConversationTests: XCTestCase {
         XCTAssertEqual(fake.sentRanges, [[bold], [bold]])
     }
 
+    func testAGroupsMembersButUsCanBeMentionedByName() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        fake.members["g:00"] = ["alice-aci", "me-aci"]
+        fake.titles["c:alice-aci"] = "Alice"
+        let candidates = await store.mentionCandidates("g:00")
+        XCTAssertEqual(candidates.map(\.0), ["alice-aci"])
+        XCTAssertEqual(candidates.map(\.1), ["Alice"])
+        let direct = await store.mentionCandidates("c:alice-aci")
+        XCTAssertTrue(direct.isEmpty)
+    }
+
     func testRetryAsksTheCore() async {
         let fake = FakeClient(linked: true)
         let store = await linkedStore(fake)

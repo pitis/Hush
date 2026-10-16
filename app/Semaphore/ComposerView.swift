@@ -9,9 +9,11 @@ struct ComposerView: View {
     @State private var focusRequest = 0
     /// What was typed before editing started; back once the edit is saved or cancelled.
     @State private var draftBeforeEdit: NSAttributedString?
+    @State private var mentions = MentionPicker()
 
     var body: some View {
         VStack(spacing: 6) {
+            if mentions.isOpen { MentionList(picker: mentions) }
             if let reply = store.replyTo {
                 HStack {
                     Rectangle().fill(Theme.outgoing).frame(width: 3)
@@ -34,7 +36,7 @@ struct ComposerView: View {
                         Image(systemName: "xmark.circle.fill")
                     }
                     .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                    .keyboardShortcut(.cancelAction)
+                    .keyboardShortcut(mentions.isOpen ? nil : .cancelAction)
                 }
                 .frame(height: 34)
                 .padding(.horizontal, 12)
@@ -54,7 +56,7 @@ struct ComposerView: View {
                     Spacer()
                     Button(action: store.cancelEditing) { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                        .keyboardShortcut(.cancelAction)
+                        .keyboardShortcut(mentions.isOpen ? nil : .cancelAction)
                         .accessibilityLabel("Cancel editing")
                 }
                 .frame(height: 34)
@@ -83,7 +85,8 @@ struct ComposerView: View {
                     // ↑ in an empty field edits your last message, as in Desktop
                     onUpInEmpty: { store.editing == nil && store.editLast() },
                     onPasteFiles: { store.addFiles($0.map(Files.outgoing)) },
-                    onPasteError: { store.showError("Couldn't attach what you pasted: \($0.localizedDescription)") }
+                    onPasteError: { store.showError("Couldn't attach what you pasted: \($0.localizedDescription)") },
+                    mentions: conversationId.hasPrefix("g:") ? mentions : nil
                 )
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)
@@ -97,6 +100,10 @@ struct ComposerView: View {
             text = Self.plain(Composer.draft(for: conversationId))
             takeFocusIfAsked()
         }
+        .task(id: conversationId) {
+            mentions.reset()
+            mentions.members = await store.mentionCandidates(conversationId)
+        }
         .onChange(of: conversationId) { _, new in
             // an edit doesn't follow to another chat, nor does the draft it put aside
             draftBeforeEdit = nil
@@ -109,7 +116,7 @@ struct ComposerView: View {
         .onChange(of: store.editing?.sentAt) { _, _ in
             if let editing = store.editing {
                 if draftBeforeEdit == nil { draftBeforeEdit = text }
-                text = ComposerText.attributed(editing.body ?? "", ranges: editing.ranges)
+                text = ComposerText.attributed(editing.body ?? "", ranges: editing.ranges, name: store.mentionName)
             } else if let draft = draftBeforeEdit {
                 text = draft
                 draftBeforeEdit = nil
@@ -199,6 +206,35 @@ enum Composer {
         } else {
             defaults.removeObject(forKey: "draft.\(conversationId)")
         }
+    }
+}
+
+/// The members matching the "@word" being typed; ↑/↓ choose, ↩ or a click picks.
+struct MentionList: View {
+    let picker: MentionPicker
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(picker.matches.enumerated()), id: \.element.0) { i, member in
+                Button {
+                    picker.pick(i)
+                } label: {
+                    HStack(spacing: 8) {
+                        Avatar(id: "c:\(member.0)", name: member.1, size: 22)
+                        Text(member.1).font(.system(size: 13))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(i == picker.selected ? Theme.outgoing.opacity(0.35) : .clear)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 4)
+        .background(Theme.field, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 14)
+        .accessibilityLabel("Mention someone")
     }
 }
 

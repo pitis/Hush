@@ -1300,6 +1300,19 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
+    /// Who can be mentioned in a group: its members but us, each with a name (ACI, name).
+    func mentionCandidates(_ conversationId: String) async -> [(String, String)] {
+        guard let client, conversationId.hasPrefix("g:") else { return [] }
+        do {
+            let members = try await client.groupMembers(conversationId: conversationId).filter { $0 != ownAci }
+            for aci in members { await loadName(aci) }
+            return members.map { ($0, senderName($0)) }
+        } catch {
+            append("query failed: \(error)")
+            return []
+        }
+    }
+
     /// One query at a time; events arriving meanwhile cause exactly one more pass, so a burst
     /// can't flood the core and an older result can never overwrite a newer one.
     private func refreshConversations() {

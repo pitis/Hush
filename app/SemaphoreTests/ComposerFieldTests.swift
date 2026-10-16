@@ -16,9 +16,9 @@ final class ComposerFieldTests: XCTestCase {
     private var window: NSWindow!
     private var box: Box!
 
-    private func field(upUsed: Bool = true) -> ComposerField {
+    private func field(upUsed: Bool = true, mentions: MentionPicker? = nil) -> ComposerField {
         let box = box!
-        return ComposerField(
+        var field = ComposerField(
             text: Binding(get: { box.text }, set: { box.text = $0 }), focusRequest: 0,
             onReturn: { box.returns += 1 },
             onUpInEmpty: {
@@ -26,6 +26,8 @@ final class ComposerFieldTests: XCTestCase {
                 return upUsed
             },
             onPasteFiles: { _ in }, onPasteError: { _ in })
+        field.mentions = mentions
+        return field
     }
 
     /// The text view inside a hosted field, focused.
@@ -151,5 +153,63 @@ final class ComposerFieldTests: XCTestCase {
         XCTAssertEqual(view.string, "")
         view.insertText("plain", replacementRange: NSRange(location: NSNotFound, length: 0))
         XCTAssertEqual(ComposerText.message(from: box.text).ranges, [])
+    }
+
+    func testTypingAtOpensThePickerAndReturnPicksAMention() {
+        let picker = MentionPicker()
+        picker.members = [("alice", "Alice"), ("albert", "Albert"), ("bob", "Bob")]
+        let (_, view) = host(field(mentions: picker))
+        view.insertText("hi @al", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(picker.matches.map(\.0), ["albert", "alice"])
+        let command = { (s: Selector) in view.delegate!.textView!(view, doCommandBy: s) }
+        XCTAssertTrue(command(#selector(NSResponder.moveDown(_:))))
+        XCTAssertTrue(command(#selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(box.returns, 0, "↩ picked, didn't send")
+        XCTAssertFalse(picker.isOpen)
+        view.insertText("hey", replacementRange: NSRange(location: NSNotFound, length: 0))
+        let message = ComposerText.message(from: box.text)
+        XCTAssertEqual(message.body, "hi \u{FFFC} hey")
+        XCTAssertEqual(message.ranges, [BodyRange(start: 3, length: 1, style: .mention(aci: "alice"))])
+    }
+
+    func testEscClosesThePickerAndReturnThenSends() {
+        let picker = MentionPicker()
+        picker.members = [("bob", "Bob")]
+        let (_, view) = host(field(mentions: picker))
+        view.insertText("@b", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(picker.isOpen)
+        XCTAssertTrue(view.delegate!.textView!(view, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        XCTAssertFalse(picker.isOpen)
+        view.insertText("o", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertFalse(picker.isOpen, "stays closed for this word")
+        XCTAssertTrue(view.delegate!.textView!(view, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(box.returns, 1)
+    }
+
+    func testTypingRightAfterAMentionKeepsIt() {
+        let picker = MentionPicker()
+        picker.members = [("bob", "Bob")]
+        let (_, view) = host(field(mentions: picker))
+        view.insertText("hi @b", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(picker.pick())
+        view.deleteBackward(nil)  // the space after it
+        XCTAssertFalse(picker.isOpen, "a finished mention doesn't reopen the picker")
+        view.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+        let message = ComposerText.message(from: box.text)
+        XCTAssertEqual(message.body, "hi \u{FFFC}x")
+        XCTAssertEqual(message.ranges, [BodyRange(start: 3, length: 1, style: .mention(aci: "bob"))])
+    }
+
+    func testOnlyTheShownMembersCanBeChosenAndEscOnlyClosesThisWord() {
+        let picker = MentionPicker()
+        picker.members = (0..<12).map { ("a\($0)", "Ann \($0)") }
+        let (_, view) = host(field(mentions: picker))
+        view.insertText("@a", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(picker.matches.count, MentionPicker.shown)
+        XCTAssertTrue(picker.move(-1))
+        XCTAssertEqual(picker.selected, MentionPicker.shown - 1)
+        XCTAssertTrue(picker.dismiss())
+        view.insertText(" @a", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(picker.isOpen, "a new @word opens it again")
     }
 }

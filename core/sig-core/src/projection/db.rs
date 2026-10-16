@@ -172,6 +172,31 @@ impl ProjectionDb {
         self
     }
 
+    /// Replaces a group's members (ACIs) with `acis`.
+    pub async fn set_group_members(&self, conversation_id: &str, acis: &[String]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM group_members WHERE conversation_id = ?1")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        for aci in acis {
+            sqlx::query("INSERT OR IGNORE INTO group_members(conversation_id, aci) VALUES (?1, ?2)")
+                .bind(conversation_id)
+                .bind(aci)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// A group's members (ACIs), as last synced from presage's group store.
+    pub async fn group_members(&self, conversation_id: &str) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT aci FROM group_members WHERE conversation_id = ?1 ORDER BY aci")
+            .bind(conversation_id)
+            .fetch_all(&self.pool)
+            .await
+    }
+
     /// Creates the conversation or updates its title; an empty title never replaces a known one.
     pub async fn upsert_conversation_title(&self, id: &str, title: &str) -> Result<(), sqlx::Error> {
         let kind = kind_of(id)?;
@@ -3959,6 +3984,17 @@ mod tests {
         db.apply(&Op::Delete { target: k("alice", 2) }).await.unwrap();
         let deleted = db.message(&k("alice", 2)).await.unwrap().unwrap();
         assert_eq!((deleted.ranges, deleted.quote.unwrap().ranges), (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_groups_members_are_replaced_whole() {
+        let db = db().await;
+        let g = format!("g:{}", "ab".repeat(32));
+        assert_eq!(db.group_members(&g).await.unwrap(), Vec::<String>::new());
+        db.set_group_members(&g, &["bob".into(), "alice".into()]).await.unwrap();
+        assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
+        db.set_group_members(&g, &["carol".into()]).await.unwrap();
+        assert_eq!(db.group_members(&g).await.unwrap(), vec!["carol"]);
     }
 
     #[tokio::test]

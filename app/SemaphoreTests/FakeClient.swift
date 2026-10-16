@@ -63,6 +63,11 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
 
     func ownAci() -> String? { aci }
 
+    var members: [String: [String]] = [:]
+    func groupMembers(conversationId: String) async throws -> [String] {
+        lock.withLock { members[conversationId] ?? [] }
+    }
+
     var sendError: Error?
     /// Each sent text's or caption's ranges, in order.
     private(set) var sentRanges: [[BodyRange]] = []

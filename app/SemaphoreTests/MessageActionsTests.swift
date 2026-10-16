@@ -31,13 +31,16 @@ final class MessageActionsTests: XCTestCase {
         XCTAssertFalse(MessageActions.canEdit(mine(hour, body: nil), me: "me", now: now))
     }
 
-    func testAStyledMessageCanBeEditedOneWithMentionsNotYet() {
+    func testStyledMessagesAndOnesWithMentionsCanBeEdited() {
         var m = mine(3_600_000)
-        m.ranges = [BodyRange(start: 0, length: 1, style: .bold)]
+        m.ranges = [
+            BodyRange(start: 0, length: 1, style: .bold), BodyRange(start: 0, length: 1, style: .mention(aci: "bob")),
+        ]
         XCTAssertTrue(MessageActions.canEdit(m, me: "me", now: now))
-        // the composer can't write mentions yet: an edit would strip them
-        m.ranges.append(BodyRange(start: 0, length: 1, style: .mention(aci: "bob")))
-        XCTAssertTrue(MessageActions.canDelete(m, me: "me", now: now))
+        // a mention the composer can't hold would be lost by the edit
+        m.ranges = [BodyRange(start: 0, length: 2, style: .mention(aci: "bob"))]
+        XCTAssertFalse(MessageActions.canEdit(m, me: "me", now: now))
+        m.ranges = [BodyRange(start: 50, length: 1, style: .mention(aci: "bob"))]
         XCTAssertFalse(MessageActions.canEdit(m, me: "me", now: now))
     }
 
