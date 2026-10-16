@@ -19,6 +19,7 @@ libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag
 # mac-arm64 at build time, so no WebRTC source build. Pinned by tag; bump in its own PR.
 ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.72.1", features = ["prebuilt_webrtc"] }
 protobuf = "3.7.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # the history fetcher talks through libsignal-service's PushService, whose request builder and
 # answers are reqwest types (already in the tree through libsignal-service)

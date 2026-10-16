@@ -8,6 +8,7 @@ mod error;
 mod events;
 mod history;
 mod logging;
+mod net;
 pub mod projection;
 mod send;
 mod typing;
