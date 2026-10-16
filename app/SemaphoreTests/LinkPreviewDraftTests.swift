@@ -32,6 +32,16 @@ final class LinkPreviewDraftTests: XCTestCase {
         XCTAssertNil(store.previewDraft, "used up")
     }
 
+    func testALinkWithoutAPreviewIsntFetchedAgainWhileTyping() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        await store.composerChanged("https://example.com/plain")
+        await store.composerChanged("https://example.com/plain and more")
+        XCTAssertEqual(fake.previewFetches, 1)
+        XCTAssertNil(store.previewDraft)
+    }
+
     func testADismissedOrStalePreviewIsntSent() async {
         let fake = FakeClient(linked: true)
         fake.previewDrafts["https://example.com/a"] = draft("https://example.com/a")

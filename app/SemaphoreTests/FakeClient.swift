@@ -74,8 +74,12 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     /// Each sent text's link preview, in order.
     private(set) var sentPreviews: [PreviewDraft?] = []
     var previewDrafts: [String: PreviewDraft] = [:]
+    private(set) var previewFetches = 0
     func linkPreviewFor(text: String) async throws -> PreviewDraft? {
-        lock.withLock { previewDrafts.first { text.contains($0.key) }?.value }
+        lock.withLock {
+            previewFetches += 1
+            return previewDrafts.first { text.contains($0.key) }?.value
+        }
     }
     func sendText(conversationId: String, body: String, ranges: [BodyRange], quote: Quote?, preview: PreviewDraft?)
         async throws -> MessageKey

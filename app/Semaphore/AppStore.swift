@@ -141,6 +141,7 @@ final class AppStore {
     /// The link `previewDraft` is (or will be) for.
     private var previewLink: String?
     private var fetchingPreview: String?
+    /// Links already asked about (or dismissed) in this chat: not fetched again.
     private var dismissedPreviews: Set<String> = []
     /// The polls of the open chat's loaded messages, as their votes stand.
     private(set) var polls: [MessageKey: Poll] = [:]
@@ -432,6 +433,8 @@ final class AppStore {
         guard let link, previewDraft == nil, fetchingPreview != link, !dismissedPreviews.contains(link), let client
         else { return }
         fetchingPreview = link
+        // asked once per link in a chat: a page without a preview isn't fetched at every pause
+        dismissedPreviews.insert(link)
         defer { if fetchingPreview == link { fetchingPreview = nil } }
         do {
             let draft = try await client.linkPreviewFor(text: text)

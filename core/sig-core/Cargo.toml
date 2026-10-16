@@ -28,7 +28,7 @@ url = "2"
 # link previews fetch pages with the ring provider presage uses
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
-tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.48", features = ["rt", "sync", "time", "macros", "net"] }
 hex = "0.4"
 # Storage Service item crypto on raw bytes (libsignal-service only offers it on decoded
 # records, which would drop the fields our proto doesn't know); all already in the tree

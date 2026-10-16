@@ -27,8 +27,19 @@ when "Generate link previews" is on (an account setting the phone syncs in
   (`link_previews` row, image as the message's position -1 file) and the send job uploads the
   image and sets `DataMessage.preview` (an image that won't upload is left off). A retry sends it
   again.
+- Only the public internet is fetched: names resolve through a resolver that keeps public
+  addresses only (so the address checked is the one connected to), a link written as an address
+  must be public, and, as Desktop, links with credentials, single-word or `.local` hosts are
+  refused; the same for every redirect and the image. Only the page's head (at most 256 KB) is
+  parsed.
+- Fetched images wait in `previews/` under the data folder: one draft at a time (the folder is
+  cleared before each fetch and at start), and the file goes once sent (the message keeps its own
+  copy).
+- Privacy: fetching tells the site (and the image's host) the Mac's address, as on Desktop; it
+  happens only when the phone's setting is on.
 - App: the composer waits 700 ms after typing, asks the store, which fetches for the first link
-  and drops a draft whose link is gone; `PreviewDraftCard` shows it.
+  and drops a draft whose link is gone (each link is asked about once per chat);
+  `PreviewDraftCard` shows it.
 
 ## Testing
 - link_preview: first link as typed, Open Graph and fallback, entities, relative and http images,

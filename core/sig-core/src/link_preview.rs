@@ -1,7 +1,9 @@
 //! Link previews for what we send: the first https link in a message, and the title,
 //! description and image its page declares (Open Graph tags, else its `<title>`).
 
-use url::Url;
+use std::net::{IpAddr, SocketAddr};
+
+use url::{Host, Url};
 
 /// What a page says about itself.
 #[derive(Debug, Default, PartialEq)]
@@ -32,8 +34,10 @@ pub(crate) async fn fetch(page: &Url) -> Result<Fetched, String> {
     }
     let client = reqwest::Client::builder()
         .timeout(TIMEOUT)
+        // names resolve to public addresses only: the address checked is the one connected to
+        .dns_resolver(std::sync::Arc::new(PublicOnly))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" {
+            if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" || !host_allowed(attempt.url()) {
                 attempt.stop()
             } else {
                 attempt.follow()
@@ -67,6 +71,9 @@ async fn get(
     cut: bool,
     accept: impl Fn(&str) -> bool,
 ) -> Result<(Vec<u8>, Url), String> {
+    if !host_allowed(url) {
+        return Err("not a public address".into());
+    }
     let mut res = client
         .get(url.as_str())
         .send()
@@ -99,6 +106,70 @@ async fn get(
     Ok((body, final_url))
 }
 
+/// Resolves names to their public internet addresses only (none: the fetch fails), so a link
+/// can't reach this Mac, its network or the cloud metadata service.
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let public: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 443))
+                .await?
+                .filter(|a| is_public(a.ip()))
+                .collect();
+            if public.is_empty() {
+                return Err("not a public address".into());
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// A link's host when it's an address (those skip the name lookup): public ones only.
+fn host_allowed(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => is_public(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => is_public(IpAddr::V6(ip)),
+        Some(Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name.contains('.') && !name.ends_with(".local") && url.username().is_empty() && url.password().is_none()
+        }
+        None => false,
+    }
+}
+
+/// An address on the public internet: not this machine, a private or shared network, link-local
+/// (the cloud metadata service), multicast or reserved.
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 /// An image's type from its first bytes (what's sent must be what it is).
 fn image_type(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
@@ -123,8 +194,20 @@ pub(crate) fn first_link(text: &str) -> Option<(String, Url)> {
     })
 }
 
-/// The page's title, description and image from its HTML.
+/// How much of a page is read for its tags: they're in its head.
+const MAX_HEAD: usize = 256 * 1024;
+
+/// The page's title, description and image from its HTML (its head, at most 256 KB of it).
 pub(crate) fn parse(html: &str, page: &Url) -> PageInfo {
+    let mut cut = html.len().min(MAX_HEAD);
+    while !html.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let html = &html[..cut];
+    let html = match html.to_ascii_lowercase().find("</head") {
+        Some(end) => &html[..end],
+        None => html,
+    };
     let mut info = PageInfo::default();
     let mut fallback_title = None;
     let lower = html.to_ascii_lowercase();
@@ -237,6 +320,51 @@ fn decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_public_internet_addresses_are_fetched() {
+        for private in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!is_public(private.parse().unwrap()), "{private}");
+        }
+        for public in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
+        // an address written in the link skips the name lookup: checked here instead
+        let allowed = |u: &str| host_allowed(&Url::parse(u).unwrap());
+        assert!(!allowed("https://127.0.0.1/admin"));
+        assert!(!allowed("https://[::1]/"));
+        assert!(!allowed("https://192.168.1.1/"));
+        assert!(allowed("https://93.184.216.34/"));
+        assert!(allowed("https://example.com/"));
+        // as Desktop: no credentials in the link, no single-word or .local names
+        assert!(!allowed("https://user:pw@example.com/"));
+        assert!(!allowed("https://intranet/"));
+        assert!(!allowed("https://printer.local/"));
+    }
+
+    #[tokio::test]
+    async fn a_name_resolving_only_to_this_machine_isnt_fetched() {
+        let err = fetch(&Url::parse("https://localhost/").unwrap()).await.unwrap_err();
+        assert!(!err.is_empty());
+        let err = fetch(&Url::parse("https://127.0.0.1/").unwrap()).await.unwrap_err();
+        assert!(err.contains("not a public address"), "{err}");
+    }
 
     /// A real page over the network: run by hand (`cargo test -- --ignored live_page`).
     #[tokio::test]

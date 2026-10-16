@@ -78,6 +78,11 @@ impl Client {
         Ok(*slot)
     }
 
+    /// Where fetched preview images wait until sent.
+    fn previews_dir(&self) -> PathBuf {
+        self.data_dir.join("previews")
+    }
+
     /// The stored link preview of our message `key`, for the send job.
     async fn send_preview(&self, key: &MessageKey) -> Result<Option<Box<crate::send::SendPreview>>, CoreError> {
         Ok(self.db.link_preview(key).await?.map(|p| {
@@ -194,6 +199,8 @@ impl Client {
         let linked = Arc::new(AtomicBool::new(false));
         let own_aci = Arc::new(Mutex::new(None));
         let data_dir = PathBuf::from(data_dir);
+        // preview images of drafts from before (never sent) don't stay
+        let _ = std::fs::remove_dir_all(data_dir.join("previews"));
         let h = actor::spawn(
             data_dir.clone(),
             db_key_hex,
@@ -430,6 +437,12 @@ impl Client {
             }
             message.sent_at = self.next_sent_at();
         }
+        // the fetched image was copied: it isn't kept twice (and not past the message)
+        if let Some(image) = preview.as_ref().and_then(|p| p.image.as_ref()) {
+            if std::path::Path::new(&image.path).starts_with(self.previews_dir()) {
+                let _ = std::fs::remove_file(&image.path);
+            }
+        }
         self.unarchived_by_sending(&conversation_id, was_archived).await?;
         let key = message.key();
         let preview = self.send_preview(&key).await?;
@@ -472,7 +485,9 @@ impl Client {
         }
         let image = match fetched.image {
             Some((bytes, content_type)) => {
-                let dir = self.data_dir.join("previews");
+                // one draft at a time: an earlier one (dismissed, edited away) goes
+                let dir = self.previews_dir();
+                let _ = std::fs::remove_dir_all(&dir);
                 // named by a timestamp nothing else takes (the one a message would get)
                 let path = dir.join(self.next_sent_at().to_string());
                 let saved = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes));
@@ -2051,6 +2066,33 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(client.link_preview(key).await.unwrap(), None);
+            // the fetched image is the message's own copy once sent: the fetched file goes
+            let fetched = client.data_dir.join("previews").join("1");
+            std::fs::create_dir_all(fetched.parent().unwrap()).unwrap();
+            std::fs::write(&fetched, b"jpg").unwrap();
+            let with_image = PreviewDraft {
+                image: Some(OutgoingFile {
+                    path: fetched.to_string_lossy().into_owned(),
+                    content_type: "image/jpeg".into(),
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                }),
+                ..draft()
+            };
+            let key = client
+                .send_text(
+                    conv.clone(),
+                    "again https://example.com/a".into(),
+                    vec![],
+                    None,
+                    Some(with_image),
+                )
+                .await
+                .unwrap();
+            assert!(!fetched.exists());
+            let image = client.link_preview(key).await.unwrap().unwrap().image.unwrap();
+            assert_eq!(std::fs::read(image.path.unwrap()).unwrap(), b"jpg");
             // no page is fetched while the phone hasn't allowed link previews
             assert_eq!(
                 client
