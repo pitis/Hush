@@ -55,6 +55,7 @@ struct SettingsView: View {
     @State private var openAtLogin = LoginItem.isEnabled
     @State private var loginItemError: String?
     @State private var confirmUnlink = false
+    @State private var confirmRelink = false
     @State private var unlinkFailed: String?
     @State private var working = false
 
@@ -82,6 +83,9 @@ struct SettingsView: View {
             if let loginItemError { Text(loginItemError).font(.caption).foregroundStyle(.secondary) }
             if store.screen == .chats {
                 Divider()
+                LabeledContent("Message history") {
+                    Button("Transfer Message History…") { confirmRelink = true }.disabled(working)
+                }
                 LabeledContent("Linked device") {
                     Button("Unlink This Mac…", role: .destructive) { confirmUnlink = true }.disabled(working)
                 }
@@ -89,6 +93,13 @@ struct SettingsView: View {
         }
         .padding(20)
         .frame(width: 440)
+        .confirmationDialog("Transfer message history from your phone?", isPresented: $confirmRelink) {
+            Button("Relink and Transfer") { relink() }
+        } message: {
+            Text(
+                "This Mac is relinked as a new device: you scan a QR code again, and your phone offers to "
+                    + "transfer its message history. Everything already here is kept.")
+        }
         .confirmationDialog("Unlink this Mac?", isPresented: $confirmUnlink) {
             Button("Unlink", role: .destructive) { unlink(tellServer: true) }
         } message: {
@@ -104,6 +115,14 @@ struct SettingsView: View {
             Text(
                 "\(reason)\n\nUnlinking anyway removes everything here, but your phone keeps listing this Mac "
                     + "until you remove it there.")
+        }
+    }
+
+    private func relink() {
+        working = true
+        Task {
+            if let failed = await store.relinkForHistory() { store.showError(failed) }
+            working = false
         }
     }
 

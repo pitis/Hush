@@ -17,29 +17,35 @@ struct ContentView: View {
             case .unlinked:
                 UnlinkedView(store: core)
             case .chats:
-                NavigationSplitView {
-                    VStack(spacing: 0) {
-                        ConnectionBanner(store: core)
-                        SidebarView(store: core)
+                ZStack {
+                    NavigationSplitView {
+                        VStack(spacing: 0) {
+                            ConnectionBanner(store: core)
+                            SidebarView(store: core)
+                        }
+                        .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
+                    } detail: {
+                        if let c = core.selectedConversation {
+                            ConversationView(store: core, conversation: c)
+                        } else {
+                            ContentUnavailableView(
+                                core.conversations.isEmpty
+                                    ? (core.connection == .online ? "Connected — no messages yet" : "Connecting…")
+                                    : "Select a chat",
+                                systemImage: "bubble.left.and.bubble.right",
+                                description: Text(
+                                    core.lastError
+                                        ?? (core.conversations.isEmpty
+                                            ? "New messages appear here as they arrive."
+                                            : "")))
+                        }
                     }
-                    .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
-                } detail: {
-                    if let c = core.selectedConversation {
-                        ConversationView(store: core, conversation: c)
-                    } else {
-                        ContentUnavailableView(
-                            core.conversations.isEmpty
-                                ? (core.connection == .online ? "Connected — no messages yet" : "Connecting…")
-                                : "Select a chat",
-                            systemImage: "bubble.left.and.bubble.right",
-                            description: Text(
-                                core.lastError
-                                    ?? (core.conversations.isEmpty
-                                        ? "New messages appear here as they arrive. Older history isn't synced yet."
-                                        : "")))
+                    .navigationTitle("")
+                    if let progress = core.history {
+                        Color.black.opacity(0.35).ignoresSafeArea()
+                        HistoryView(progress: progress, cancel: core.cancelHistory, retry: core.retryHistory)
                     }
                 }
-                .navigationTitle("")
             }
         }
         .frame(minWidth: 820, minHeight: 520)

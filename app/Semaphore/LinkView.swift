@@ -12,6 +12,11 @@ struct LinkView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 360)
+            Text("If your phone offers to transfer your message history, accept it to see your older messages here.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 360)
             Group {
                 if let url, let image = QRCode.image(for: url) {
                     Image(nsImage: image).interpolation(.none).resizable()
