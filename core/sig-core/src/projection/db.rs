@@ -29,6 +29,18 @@ pub enum Applied {
     ChatEvent {
         conversation_id: String,
     },
+    /// Chats' flags changed, or a chat went (blocks and request answers from our phone).
+    ConversationsChanged,
+}
+
+/// SQL: the chat `c` is a message request (see `Conversation::message_request`). A macro so
+/// queries stay static strings (`concat!`).
+macro_rules! is_request {
+    () => {
+        "(EXISTS (SELECT 1 FROM storage_sync WHERE version > 0)
+           AND NOT c.whitelisted AND NOT c.blocked AND NOT c.phone_contact
+           AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = c.id AND o.is_outgoing = 1))"
+    };
 }
 
 /// Encrypted SQLite store the UI reads from. Separate from presage's database because both use
@@ -247,6 +259,193 @@ impl ProjectionDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    // ---- Blocking and message requests ----
+
+    /// Blocks a chat (profile sharing goes off with it, as on Signal), for the phone to learn.
+    pub async fn block(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE conversations SET blocked = 1, whitelisted = 0, storage_dirty = 1 WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Accepts a chat's message request, or unblocks it (the same on Signal), for the phone to
+    /// learn. True if it was blocked.
+    pub async fn accept(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let was: Option<bool> = sqlx::query_scalar("SELECT blocked FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE conversations SET blocked = 0, whitelisted = 1, storage_dirty = 1 WHERE id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(was.unwrap_or(false))
+    }
+
+    /// Whether the chat is blocked (false for a chat we don't have).
+    pub async fn is_blocked(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let b: Option<bool> = sqlx::query_scalar("SELECT blocked FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(b.unwrap_or(false))
+    }
+
+    /// Every blocked chat, listed or not, by id.
+    pub async fn blocked_chats(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM conversations WHERE blocked = 1 ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// The contact is in the phone's synced contact list (its address book): never a request.
+    pub async fn set_phone_contact(&self, id: &str) -> Result<(), sqlx::Error> {
+        let kind = kind_of(id)?;
+        sqlx::query(
+            "INSERT INTO conversations(id, kind, phone_contact) VALUES (?1, ?2, 1)
+             ON CONFLICT(id) DO UPDATE SET phone_contact = 1",
+        )
+        .bind(id)
+        .bind(kind_to_i64(kind))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes a chat's contents here: messages, their files, reactions, edits, events and held
+    /// receipts; its request is no longer accepted (`whitelisted` off, for the phone to learn).
+    /// The row and its other flags stay, unlisted until a new message. presage's copy of the
+    /// thread is queued (`presage_forget_threads`) in the same transaction.
+    pub async fn delete_chat(&self, id: &str) -> Result<(), sqlx::Error> {
+        let files = self.delete_chat_in(id, true).await?;
+        self.remove_files(&files);
+        Ok(())
+    }
+
+    async fn delete_chat_in(&self, id: &str, dirty: bool) -> Result<Vec<String>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let keys: Vec<(String, i64)> =
+            sqlx::query_as("SELECT author, sent_at FROM messages WHERE conversation_id = ?1")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut files = vec![];
+        for (author, sent_at) in keys {
+            let key = MessageKey { author, sent_at };
+            files.extend(forget_deleted_text(&mut tx, &key).await?);
+            for sql in [
+                "DELETE FROM unsent_receipts WHERE author = ?1 AND sent_at = ?2",
+                "DELETE FROM pending_deletes WHERE author = ?1 AND sent_at = ?2",
+                "DELETE FROM pending_status WHERE author = ?1 AND sent_at = ?2",
+            ] {
+                sqlx::query(sql)
+                    .bind(&key.author)
+                    .bind(key.sent_at)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            sqlx::query("DELETE FROM message_revisions WHERE author = ?1 AND original_sent_at = ?2")
+                .bind(&key.author)
+                .bind(key.sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM messages WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chat_events WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT OR IGNORE INTO presage_forget_threads(conversation_id) VALUES (?1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE conversations SET whitelisted = 0, marked_unread = 0,
+               storage_dirty = CASE WHEN ?2 THEN 1 ELSE storage_dirty END WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(dirty)
+        .execute(&mut *tx)
+        .await?;
+        refresh_summary(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(files)
+    }
+
+    /// presage threads (deleted chats) still to clear there.
+    pub async fn presage_forget_threads(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT conversation_id FROM presage_forget_threads ORDER BY conversation_id")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// One queued presage thread is cleared.
+    pub async fn presage_thread_forgotten(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM presage_forget_threads WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// presage keeps a copy of a message we didn't take (from a blocked sender): queued for
+    /// deletion there, like an expired message's.
+    pub async fn queue_presage_forget(&self, conversation_id: &str, sent_at: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT OR IGNORE INTO presage_forget(conversation_id, sent_at) VALUES (?1, ?2)")
+            .bind(conversation_id)
+            .bind(sent_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The chat a request response from our phone names, if we have it (groups by identifier).
+    async fn request_chat(&self, thread: &RequestThread) -> Result<Option<String>, sqlx::Error> {
+        Ok(match thread {
+            RequestThread::Aci(aci) => Some(format!("c:{aci}")),
+            RequestThread::Group(identifier) => self.group_by_identifier(identifier).await?,
+        })
+    }
+
+    async fn group_by_identifier(&self, identifier: &[u8]) -> Result<Option<String>, sqlx::Error> {
+        let groups: Vec<String> = sqlx::query_scalar("SELECT id FROM conversations WHERE kind = 1")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(groups
+            .into_iter()
+            .find(|g| super::ids::group_identifier(g).as_deref() == Some(identifier)))
+    }
+
+    /// Sets a chat's blocked state as our phone reports it (not written back): blocked means not
+    /// accepted, unblocked means accepted, as on Signal. The chat is created if needed. True if
+    /// anything changed.
+    async fn apply_phone_block(&self, id: &str, blocked: bool) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(id)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(id)
+            .bind(kind_to_i64(kind))
+            .execute(&mut *tx)
+            .await?;
+        let res = sqlx::query(
+            "UPDATE conversations SET blocked = ?2, whitelisted = NOT ?2
+             WHERE id = ?1 AND (blocked != ?2 OR whitelisted != NOT ?2)",
+        )
+        .bind(id)
+        .bind(blocked)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() == 1)
     }
 
     pub async fn has_conversation(&self, id: &str) -> Result<bool, sqlx::Error> {
@@ -507,12 +706,15 @@ impl ProjectionDb {
         for (id, f) in written {
             sqlx::query(
                 "UPDATE conversations SET storage_dirty = 0
-                 WHERE id = ?1 AND archived = ?2 AND marked_unread = ?3 AND mute_until = ?4",
+                 WHERE id = ?1 AND archived = ?2 AND marked_unread = ?3 AND mute_until = ?4
+                   AND blocked = ?5 AND whitelisted = ?6",
             )
             .bind(id)
             .bind(f.archived)
             .bind(f.marked_unread)
             .bind(f.mute_until)
+            .bind(f.blocked)
+            .bind(f.whitelisted)
             .execute(&mut *tx)
             .await?;
         }
@@ -631,8 +833,10 @@ impl ProjectionDb {
     /// recent first. Contacts known only by name (synced from the phone) aren't listed until a
     /// message arrives. Archived chats are listed too, flagged.
     pub async fn conversations(&self) -> Result<Vec<Conversation>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT c.*, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
+        let rows = sqlx::query(concat!(
+            "SELECT c.*, ",
+            is_request!(),
+            " AS message_request, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
                m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
                a.is_voice_note AS file_voice, m.sent_at AS last_sent_at, m.kind AS last_kind,
                m.kind_text AS last_kind_text,
@@ -642,8 +846,8 @@ impl ProjectionDb {
              LEFT JOIN attachments a ON a.message_author = m.author AND a.message_sent_at = m.sent_at
                AND a.position = 0
              WHERE c.last_message_at > 0
-             ORDER BY c.pinned_order IS NULL, c.pinned_order, c.last_message_at DESC, c.id",
-        )
+             ORDER BY c.pinned_order IS NULL, c.pinned_order, c.last_message_at DESC, c.id"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_conversation).collect()
@@ -1042,6 +1246,48 @@ impl ProjectionDb {
                 tx.commit().await?;
                 Ok(vec![])
             }
+            Op::BlockedList { acis, groups } => {
+                let mut listed: Vec<String> = acis.iter().map(|a| format!("c:{a}")).collect();
+                for g in groups {
+                    listed.extend(self.group_by_identifier(g).await?);
+                }
+                let mut changed = false;
+                for id in self.blocked_chats().await? {
+                    if !listed.contains(&id) {
+                        changed |= self.apply_phone_block(&id, false).await?;
+                    }
+                }
+                for id in &listed {
+                    changed |= self.apply_phone_block(id, true).await?;
+                }
+                Ok(if changed {
+                    vec![Applied::ConversationsChanged]
+                } else {
+                    vec![]
+                })
+            }
+            Op::RequestResponse { thread, response } => {
+                let Some(id) = self.request_chat(thread).await? else {
+                    return Ok(vec![]);
+                };
+                let mut changed = match response {
+                    RequestResponse::Accept => self.apply_phone_block(&id, false).await?,
+                    RequestResponse::Block | RequestResponse::BlockAndDelete => {
+                        self.apply_phone_block(&id, true).await?
+                    }
+                    RequestResponse::Delete => false,
+                };
+                if matches!(response, RequestResponse::Delete | RequestResponse::BlockAndDelete) {
+                    let files = self.delete_chat_in(&id, false).await?;
+                    self.remove_files(&files);
+                    changed = true;
+                }
+                Ok(if changed {
+                    vec![Applied::ConversationsChanged]
+                } else {
+                    vec![]
+                })
+            }
             Op::SetStatus { targets, status } => self.set_status(targets, *status, None).await,
             Op::Read { targets, at } => self.set_status(targets, MessageStatus::Read, Some(*at)).await,
             Op::SetTimer {
@@ -1339,12 +1585,19 @@ impl ProjectionDb {
         tx.commit().await
     }
 
-    /// Read receipts still to send, by sender then time.
+    /// Read receipts still to send, by sender then time, except those of message requests and
+    /// blocked chats.
     pub async fn unsent_receipts(&self) -> Result<Vec<MessageKey>, sqlx::Error> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT author, sent_at FROM unsent_receipts ORDER BY author, sent_at")
-                .fetch_all(&self.pool)
-                .await?;
+        // a request's or blocked chat's wait until it is accepted (or unblocked)
+        let rows: Vec<(String, i64)> = sqlx::query_as(concat!(
+            "SELECT u.author, u.sent_at FROM unsent_receipts u
+             WHERE NOT EXISTS (SELECT 1 FROM messages m JOIN conversations c ON c.id = m.conversation_id
+               WHERE m.author = u.author AND m.sent_at = u.sent_at AND (c.blocked OR ",
+            is_request!(),
+            ")) ORDER BY u.author, u.sent_at"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|(author, sent_at)| MessageKey { author, sent_at })
@@ -2212,6 +2465,7 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         marked_unread: r.try_get("marked_unread")?,
         blocked: r.try_get("blocked")?,
         whitelisted: r.try_get("whitelisted")?,
+        message_request: r.try_get("message_request")?,
         id,
     })
 }
@@ -4895,5 +5149,197 @@ mod tests {
         db.apply(&op).await.unwrap();
         db.apply(&op).await.unwrap();
         assert_eq!(db.chat_events("c:alice", 0).await.unwrap().len(), 1);
+    }
+
+    // ---- Blocking and message requests ----
+
+    async fn phone_state_known(db: &ProjectionDb) {
+        db.set_storage_state(&StorageState {
+            version: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    fn mine(conv: &str, sent_at: i64) -> Message {
+        Message {
+            conversation_id: conv.into(),
+            is_outgoing: true,
+            status: MessageStatus::Sent,
+            ..msg("me", sent_at, "hi")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chat_is_a_request_only_once_the_phones_state_is_known() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hello?")).await.unwrap();
+        assert!(!conv(&db, "c:alice").await.message_request, "state unknown: accepted");
+        phone_state_known(&db).await;
+        assert!(conv(&db, "c:alice").await.message_request);
+        db.accept("c:alice").await.unwrap();
+        assert!(!conv(&db, "c:alice").await.message_request);
+    }
+
+    #[tokio::test]
+    async fn sending_a_phone_contact_or_a_block_means_no_request() {
+        let db = db().await;
+        phone_state_known(&db).await;
+        for (i, c) in ["c:alice", "c:bob", "c:carol"].into_iter().enumerate() {
+            db.insert_message(&in_conv(c, msg("x", i as i64, "hello?")))
+                .await
+                .unwrap();
+        }
+        db.insert_message(&mine("c:alice", 9)).await.unwrap();
+        db.set_phone_contact("c:bob").await.unwrap();
+        db.block("c:carol").await.unwrap();
+        for c in ["c:alice", "c:bob", "c:carol"] {
+            assert!(!conv(&db, c).await.message_request, "{c}");
+        }
+        assert!(conv(&db, "c:carol").await.blocked);
+    }
+
+    #[tokio::test]
+    async fn block_and_accept_set_the_flags_and_mark_the_chat_for_the_phone() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.accept("c:alice").await.unwrap();
+        db.block("c:alice").await.unwrap();
+        let dirty = db.dirty_chats().await.unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty[0].1.blocked && !dirty[0].1.whitelisted);
+        assert!(db.is_blocked("c:alice").await.unwrap());
+        assert_eq!(db.blocked_chats().await.unwrap(), vec!["c:alice".to_string()]);
+        assert!(db.accept("c:alice").await.unwrap(), "it was blocked");
+        let f = db.chat_flags("c:alice").await.unwrap().unwrap();
+        assert!(!f.blocked && f.whitelisted);
+        assert!(!db.is_blocked("c:alice").await.unwrap());
+        // the write of the blocked state lands after the unblock: the chat stays dirty
+        db.clear_dirty(&dirty).await.unwrap();
+        assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receipts_wait_while_a_chat_is_a_request_or_blocked() {
+        let db = db().await;
+        phone_state_known(&db).await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        db.accept("c:bob").await.unwrap();
+        db.block("c:bob").await.unwrap();
+        db.queue_receipts(&[k("alice", 1), k("bob", 2)]).await.unwrap();
+        assert!(db.unsent_receipts().await.unwrap().is_empty());
+        db.accept("c:alice").await.unwrap();
+        db.accept("c:bob").await.unwrap();
+        assert_eq!(db.unsent_receipts().await.unwrap(), vec![k("alice", 1), k("bob", 2)]);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_chat_removes_its_contents_and_queues_presages_copy() {
+        let files = TempFiles::new("delete-chat");
+        let db = db().await.with_files(files.0.clone());
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        let id = db.attachments(&k("alice", 1)).await.unwrap()[0].id;
+        db.start_download(id).await.unwrap();
+        db.finish_download(id, Ok(b"jpg".to_vec())).await.unwrap();
+        let path = db.attachment(id).await.unwrap().unwrap().path.unwrap();
+        db.apply(&Op::React {
+            target: k("alice", 1),
+            reactor: "me".into(),
+            emoji: Some("👍".into()),
+        })
+        .await
+        .unwrap();
+        db.add_chat_event("c:alice", 5, ChatEventKind::MissedCall, "alice", None)
+            .await
+            .unwrap();
+        db.queue_receipts(&[k("alice", 1)]).await.unwrap();
+        db.accept("c:alice").await.unwrap();
+        db.delete_chat("c:alice").await.unwrap();
+        let ids: Vec<String> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["c:bob".to_string()], "no longer listed");
+        assert!(db.message(&k("alice", 1)).await.unwrap().is_none());
+        assert!(db.reactions(&k("alice", 1)).await.unwrap().is_empty());
+        assert!(db.chat_events("c:alice", 0).await.unwrap().is_empty());
+        assert!(db.unsent_receipts().await.unwrap().is_empty());
+        assert!(db.search("a", None, 10).await.unwrap().is_empty());
+        assert!(!std::path::Path::new(&path).exists(), "its files are gone");
+        assert!(!db.chat_flags("c:alice").await.unwrap().unwrap().whitelisted);
+        assert_eq!(db.presage_forget_threads().await.unwrap(), vec!["c:alice".to_string()]);
+        db.presage_thread_forgotten("c:alice").await.unwrap();
+        assert!(db.presage_forget_threads().await.unwrap().is_empty());
+    }
+
+    const G: &str = "g:abababababababababababababababababababababababababababababababab";
+
+    #[tokio::test]
+    async fn the_phones_blocked_list_replaces_ours() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv(G, msg("bob", 2, "b"))).await.unwrap();
+        db.block("c:alice").await.unwrap();
+        let bob = "22222222-2222-2222-2222-222222222222";
+        let op = Op::BlockedList {
+            acis: vec![bob.into()],
+            groups: vec![super::super::ids::group_identifier(G).unwrap()],
+        };
+        let applied = db.apply(&op).await.unwrap();
+        assert_eq!(applied, vec![Applied::ConversationsChanged]);
+        let a = db.chat_flags("c:alice").await.unwrap().unwrap();
+        assert!(!a.blocked && a.whitelisted, "off the list: unblocked and accepted");
+        assert!(
+            db.is_blocked(&format!("c:{bob}")).await.unwrap(),
+            "an unknown ACI gets a row"
+        );
+        assert!(db.is_blocked(G).await.unwrap(), "groups match by identifier");
+        assert!(
+            db.dirty_chats().await.unwrap().iter().all(|(id, _)| id != G),
+            "not written back"
+        );
+        assert!(
+            db.apply(&op).await.unwrap().is_empty(),
+            "nothing changed the second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_responses_from_the_phone_apply_without_writing_back() {
+        use crate::projection::{RequestResponse as R, RequestThread};
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv(G, msg("bob", 2, "b"))).await.unwrap();
+        let alice = |response| Op::RequestResponse {
+            thread: RequestThread::Aci("alice".into()),
+            response,
+        };
+        db.apply(&alice(R::Accept)).await.unwrap();
+        assert!(db.chat_flags("c:alice").await.unwrap().unwrap().whitelisted);
+        db.apply(&alice(R::Block)).await.unwrap();
+        assert!(db.is_blocked("c:alice").await.unwrap());
+        db.apply(&alice(R::BlockAndDelete)).await.unwrap();
+        assert!(db.message(&k("alice", 1)).await.unwrap().is_none());
+        db.apply(&Op::RequestResponse {
+            thread: RequestThread::Group(super::super::ids::group_identifier(G).unwrap()),
+            response: R::Delete,
+        })
+        .await
+        .unwrap();
+        assert!(db.message(&k("bob", 2)).await.unwrap().is_none());
+        assert!(db.dirty_chats().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_message_is_queued_for_forgetting_in_presage() {
+        let db = db().await;
+        db.queue_presage_forget("c:alice", 9).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 9)]
+        );
     }
 }

@@ -65,6 +65,17 @@ pub enum Op {
         read_receipts: Option<bool>,
         typing_indicators: Option<bool>,
     },
+    /// Our phone's whole block list (`SyncMessage.Blocked`): it replaces ours. `groups` are
+    /// group identifiers. Phone numbers aren't kept here.
+    BlockedList {
+        acis: Vec<String>,
+        groups: Vec<Vec<u8>>,
+    },
+    /// Our phone answered a message request.
+    RequestResponse {
+        thread: RequestThread,
+        response: RequestResponse,
+    },
 }
 
 /// The ops one received (or locally sent) `Content` produces. `me` is our own ACI as a canonical

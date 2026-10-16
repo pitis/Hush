@@ -14,7 +14,6 @@ use presage::libsignal_service::content::{
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Aci, DeviceId, Pni, ServiceId};
 use presage::libsignal_service::sender::AttachmentSpec;
-use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 use presage::manager::Registered;
 use presage::proto::{data_message, receipt_message, typing_message, AttachmentPointer};
 use presage::store::{ContentsStore, Thread};
@@ -175,11 +174,7 @@ pub fn edit(original: &Message, new_body: String, at: u64) -> EditMessage {
 pub fn typing(conversation_id: &str, started: bool, at: u64) -> Option<TypingMessage> {
     use typing_message::Action;
     let group_id = match recipient(conversation_id)? {
-        Recipient::Group(key) => Some(
-            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key))
-                .get_group_identifier()
-                .to_vec(),
-        ),
+        Recipient::Group(_) => crate::projection::ids::group_identifier(conversation_id),
         Recipient::Direct(_) => None,
     };
     let action = if started { Action::Started } else { Action::Stopped };
