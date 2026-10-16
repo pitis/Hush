@@ -59,6 +59,13 @@ pub enum CoreEvent {
         done: u64,
         total: u64,
     },
+    /// A 1:1 call changed state. `conversation_id` is the peer's chat; `reason` is set for
+    /// `Ended` ("hung up", "declined", "busy", "no answer", or an error).
+    CallChanged {
+        conversation_id: String,
+        phase: crate::calls::CallPhase,
+        reason: Option<String>,
+    },
     /// A message's file was added or changed state (downloading, ready, failed).
     AttachmentChanged {
         conversation_id: String,

@@ -1,6 +1,7 @@
 uniffi::setup_scaffolding!();
 
 mod actor;
+mod calls;
 mod client;
 mod download;
 mod error;
@@ -11,6 +12,7 @@ pub mod projection;
 mod send;
 mod typing;
 
+pub use calls::CallPhase;
 pub use client::Client;
 pub use error::CoreError;
 pub use events::{ConnectionState, CoreEvent, EventListener};
