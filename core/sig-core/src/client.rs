@@ -565,6 +565,9 @@ impl Client {
     /// sending runs (retried until sent). Returns how many were unread.
     pub async fn mark_read(&self, conversation_id: String) -> Result<u32, CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
+        if self.db.clear_marked_unread(&conversation_id).await? {
+            self.listener.on_event(CoreEvent::ConversationsChanged);
+        }
         let targets = self.db.unread(&conversation_id).await?;
         if targets.is_empty() {
             return Ok(0);
@@ -578,6 +581,49 @@ impl Client {
         // if the core is closing, the stored receipts go out on the next start
         let _ = self.send(Command::Send(Job::Receipts));
         Ok(targets.len() as u32)
+    }
+
+    /// Archives a chat (out of the list, behind "Archived") or brings it back.
+    pub async fn set_archived(&self, conversation_id: String, archived: bool) -> Result<(), CoreError> {
+        check_conversation(&conversation_id)?;
+        self.db.set_archived(&conversation_id, archived).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Pins a chat at the top of the list (after the pinned ones, at most four, like the phone),
+    /// or unpins it.
+    pub async fn set_pinned(&self, conversation_id: String, pinned: bool) -> Result<(), CoreError> {
+        check_conversation(&conversation_id)?;
+        if !self.db.set_pinned(&conversation_id, pinned).await? {
+            return Err(CoreError::InvalidInput {
+                message: format!("up to {} chats can be pinned", ProjectionDb::MAX_PINNED),
+            });
+        }
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Mutes a chat's notifications until `until_ms` (ms since the epoch; `i64::MAX` for good),
+    /// or unmutes it (0).
+    pub async fn set_mute_until(&self, conversation_id: String, until_ms: i64) -> Result<(), CoreError> {
+        check_conversation(&conversation_id)?;
+        if until_ms < 0 {
+            return Err(CoreError::InvalidInput {
+                message: "a mute ends at a time, or never".into(),
+            });
+        }
+        self.db.set_mute_until(&conversation_id, until_ms).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Shows a chat as unread although its messages are read (until it is opened), or not.
+    pub async fn set_marked_unread(&self, conversation_id: String, marked: bool) -> Result<(), CoreError> {
+        check_conversation(&conversation_id)?;
+        self.db.set_marked_unread(&conversation_id, marked).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
     }
 
     /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).
@@ -620,6 +666,16 @@ impl Client {
     pub async fn reactions(&self, key: MessageKey) -> Result<Vec<Reaction>, CoreError> {
         Ok(self.db.reactions(&key).await?)
     }
+}
+
+/// Rejects anything that isn't a conversation id (`c:<aci>` or `g:<master key>`).
+fn check_conversation(id: &str) -> Result<(), CoreError> {
+    if send::recipient(id).is_none() {
+        return Err(CoreError::InvalidInput {
+            message: format!("not a conversation: {id}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1043,6 +1099,69 @@ mod tests {
             .filter(|e| matches!(e, CoreEvent::MessageChanged { conversation_id, .. } if *conversation_id == conv))
             .count();
         assert_eq!(changed, 2);
+    }
+
+    fn announced(sink: &Sink, e: fn(&CoreEvent) -> bool) -> usize {
+        sink.0.lock().unwrap().iter().filter(|x| e(x)).count()
+    }
+
+    #[test]
+    fn chat_flags_announce_the_list_and_refuse_bad_ids() {
+        let (_dir, sink, client, rt) = as_me("client-flags");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client.set_archived(conv.clone(), true).await.unwrap();
+            client.set_pinned(conv.clone(), true).await.unwrap();
+            client.set_mute_until(conv.clone(), i64::MAX).await.unwrap();
+            client.set_marked_unread(conv.clone(), true).await.unwrap();
+            let c = &client.conversations().await.unwrap()[0];
+            assert_eq!(
+                (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
+                (false, Some(1), i64::MAX, true)
+            );
+            assert!(invalid(client.set_archived("nope".into(), true).await));
+            assert!(invalid(client.set_mute_until(conv.clone(), -1).await));
+        });
+        assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 4);
+    }
+
+    #[test]
+    fn a_fifth_pin_is_refused() {
+        let (_dir, _sink, client, rt) = as_me("client-pins");
+        let chat = |n: u8| format!("c:00000000-0000-4000-8000-00000000000{n}");
+        rt.block_on(async {
+            for n in 1..=5 {
+                let m = Message {
+                    conversation_id: chat(n),
+                    ..stored(ALICE, i64::from(n))
+                };
+                client.db.insert_message(&m).await.unwrap();
+            }
+            for n in 1..=4 {
+                client.set_pinned(chat(n), true).await.unwrap();
+            }
+            assert!(invalid(client.set_pinned(chat(5), true).await));
+        });
+    }
+
+    #[test]
+    fn mark_read_clears_marked_unread_even_without_unread_messages() {
+        let (_dir, sink, client, rt) = as_me("client-marked-unread");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            let seen = Message {
+                status: MessageStatus::Read,
+                ..stored(ALICE, 1)
+            };
+            client.db.insert_message(&seen).await.unwrap();
+            client.set_marked_unread(conv.clone(), true).await.unwrap();
+            assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 0);
+            assert!(!client.conversations().await.unwrap()[0].marked_unread);
+            // already clear: nothing to announce
+            assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 0);
+        });
+        assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 2);
     }
 
     #[test]

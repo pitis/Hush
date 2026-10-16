@@ -167,6 +167,70 @@ impl ProjectionDb {
         Ok(())
     }
 
+    /// How many chats can be pinned (the phone's limit).
+    pub const MAX_PINNED: u32 = 4;
+
+    pub async fn set_archived(&self, id: &str, archived: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE conversations SET archived = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(archived)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Pins a chat after the ones pinned already (and takes it out of the archive), or unpins it.
+    /// False, and nothing changed, if pinning would go past `MAX_PINNED`.
+    pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<bool, sqlx::Error> {
+        if !pinned {
+            sqlx::query("UPDATE conversations SET pinned_order = NULL WHERE id = ?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            return Ok(true);
+        }
+        let res = sqlx::query(
+            "UPDATE conversations SET archived = 0,
+               pinned_order = COALESCE(pinned_order,
+                 (SELECT COALESCE(MAX(pinned_order), 0) + 1 FROM conversations))
+             WHERE id = ?1 AND (pinned_order IS NOT NULL
+               OR (SELECT COUNT(*) FROM conversations WHERE pinned_order IS NOT NULL) < ?2)",
+        )
+        .bind(id)
+        .bind(i64::from(Self::MAX_PINNED))
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// `until`: ms since the epoch; 0 unmutes; `i64::MAX` mutes for good.
+    pub async fn set_mute_until(&self, id: &str, until: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE conversations SET mute_until = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(until)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_marked_unread(&self, id: &str, marked: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE conversations SET marked_unread = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(marked)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The chat was read: "marked unread" goes away. True if it was set.
+    pub async fn clear_marked_unread(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE conversations SET marked_unread = 0 WHERE id = ?1 AND marked_unread = 1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     /// Inserts a message and refreshes its conversation's summary. Returns false (and changes
     /// nothing) if a message with the same `(author, sent_at)` already exists. A deleted message
     /// is stored without its text.
@@ -225,8 +289,9 @@ impl ProjectionDb {
         }
     }
 
-    /// Conversations that have messages, most recent first. Contacts known only by name (synced
-    /// from the phone) aren't listed until a message arrives.
+    /// Conversations that have messages: pinned ones first in their pin order, then the most
+    /// recent first. Contacts known only by name (synced from the phone) aren't listed until a
+    /// message arrives. Archived chats are listed too, flagged.
     pub async fn conversations(&self) -> Result<Vec<Conversation>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT c.*, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
@@ -238,7 +303,8 @@ impl ProjectionDb {
                WHERE conversation_id = c.id ORDER BY sent_at DESC, author DESC LIMIT 1)
              LEFT JOIN attachments a ON a.message_author = m.author AND a.message_sent_at = m.sent_at
                AND a.position = 0
-             WHERE c.last_message_at > 0 ORDER BY c.last_message_at DESC, c.id",
+             WHERE c.last_message_at > 0
+             ORDER BY c.pinned_order IS NULL, c.pinned_order, c.last_message_at DESC, c.id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1229,15 +1295,24 @@ impl ProjectionDb {
         let mut touched = std::collections::BTreeSet::new();
         for c in &batch.conversations {
             let kind = kind_of(&c.id)?;
+            // the phone's chat flags win: at link time they are the truth
             sqlx::query(
-                "INSERT INTO conversations(id, kind, title, expire_timer) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO conversations(id, kind, title, expire_timer, archived, pinned_order, mute_until,
+                   marked_unread)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
-                   title = CASE WHEN conversations.title = '' THEN excluded.title ELSE conversations.title END",
+                   title = CASE WHEN conversations.title = '' THEN excluded.title ELSE conversations.title END,
+                   archived = excluded.archived, pinned_order = excluded.pinned_order,
+                   mute_until = excluded.mute_until, marked_unread = excluded.marked_unread",
             )
             .bind(&c.id)
             .bind(kind_to_i64(kind))
             .bind(&c.title)
             .bind(i64::from(c.expire_timer))
+            .bind(c.archived)
+            .bind(c.pinned_order.map(i64::from))
+            .bind(c.mute_until)
+            .bind(c.marked_unread)
             .execute(&mut *tx)
             .await?;
         }
@@ -1547,6 +1622,13 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     .await?;
     let inserted = res.rows_affected() == 1;
     if inserted {
+        if m.is_outgoing {
+            // writing in an archived chat brings it back (Desktop's rule; an incoming message doesn't)
+            sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1 AND archived = 1")
+                .bind(&m.conversation_id)
+                .execute(&mut *conn)
+                .await?;
+        }
         // (the chat's timer comes from presage, which orders changes by version: see the actor)
         apply_pending(conn, &m.key()).await?;
         refresh_summary(conn, &m.conversation_id).await?;
@@ -1759,6 +1841,13 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         last_message_at: r.try_get("last_message_at")?,
         last_message_preview: r.try_get("last_message_preview")?,
         unread_count: u32::try_from(unread).map_err(|_| decode_err(format!("unread_count {unread}")))?,
+        archived: r.try_get("archived")?,
+        pinned_order: r
+            .try_get::<Option<i64>, _>("pinned_order")?
+            .map(|o| u32::try_from(o).map_err(|_| decode_err(format!("pinned_order {o}"))))
+            .transpose()?,
+        mute_until: r.try_get("mute_until")?,
+        marked_unread: r.try_get("marked_unread")?,
         id,
     })
 }
@@ -1983,6 +2072,7 @@ mod tests {
                         id: "c:alice".into(),
                         title: "Alice".into(),
                         expire_timer: 60,
+                        ..Default::default()
                     }],
                     messages: vec![m],
                     events: vec![ImportEvent {
@@ -2029,11 +2119,13 @@ mod tests {
                         id: "c:alice".into(),
                         title: "Imported".into(),
                         expire_timer: 0,
+                        ..Default::default()
                     },
                     ImportConversation {
                         id: "c:bob".into(),
                         title: "Bob".into(),
                         expire_timer: 30,
+                        ..Default::default()
                     },
                 ],
                 messages: vec![imported("c:bob", "bob", 2, "hi", MessageStatus::Read)],
@@ -2051,6 +2143,37 @@ mod tests {
                 (bob.title.as_str(), bob.expire_timer),
                 ("Bob", 30),
                 "new chat filled in"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_import_sets_the_chat_flags_and_a_later_import_resets_them() {
+            let db = db().await;
+            db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+            db.set_pinned("c:alice", true).await.unwrap();
+            let flagged = |archived, pinned_order, mute_until, marked_unread| HistoryBatch {
+                conversations: vec![ImportConversation {
+                    id: "c:alice".into(),
+                    title: "Alice".into(),
+                    expire_timer: 0,
+                    archived,
+                    pinned_order,
+                    mute_until,
+                    marked_unread,
+                }],
+                ..Default::default()
+            };
+            db.import_history(&flagged(true, None, 5_000, true)).await.unwrap();
+            let c = conv(&db, "c:alice").await;
+            assert_eq!(
+                (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
+                (true, None, 5_000, true)
+            );
+            db.import_history(&flagged(false, Some(2), 0, false)).await.unwrap();
+            let c = conv(&db, "c:alice").await;
+            assert_eq!(
+                (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
+                (false, Some(2), 0, false)
             );
         }
 
@@ -2553,6 +2676,98 @@ mod tests {
         let ids: Vec<_> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
         // carol has a name but no messages: not listed
         assert_eq!(ids, vec!["c:bob", "c:alice"]);
+    }
+
+    #[tokio::test]
+    async fn chat_flags_are_off_until_set() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!(
+            (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
+            (false, None, 0, false)
+        );
+        db.set_archived("c:alice", true).await.unwrap();
+        db.set_mute_until("c:alice", i64::MAX).await.unwrap();
+        db.set_marked_unread("c:alice", true).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.archived, c.mute_until, c.marked_unread), (true, i64::MAX, true));
+        db.set_archived("c:alice", false).await.unwrap();
+        db.set_mute_until("c:alice", 0).await.unwrap();
+        db.set_marked_unread("c:alice", false).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.archived, c.mute_until, c.marked_unread), (false, 0, false));
+    }
+
+    #[tokio::test]
+    async fn pinned_chats_come_first_in_the_order_they_were_pinned() {
+        let db = db().await;
+        for (conv_id, author, t) in [("c:alice", "alice", 3), ("c:bob", "bob", 2), ("c:carol", "carol", 1)] {
+            db.insert_message(&in_conv(conv_id, msg(author, t, "x"))).await.unwrap();
+        }
+        assert!(db.set_pinned("c:carol", true).await.unwrap());
+        assert!(db.set_pinned("c:bob", true).await.unwrap());
+        let ids: Vec<_> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["c:carol", "c:bob", "c:alice"]);
+        assert_eq!(conv(&db, "c:carol").await.pinned_order, Some(1));
+        assert!(db.set_pinned("c:carol", false).await.unwrap());
+        let ids: Vec<_> = db.conversations().await.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["c:bob", "c:alice", "c:carol"]);
+        assert_eq!(conv(&db, "c:carol").await.pinned_order, None);
+    }
+
+    #[tokio::test]
+    async fn at_most_four_chats_are_pinned() {
+        let db = db().await;
+        for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            db.insert_message(&in_conv(&format!("c:{name}"), msg(name, i as i64 + 1, "x")))
+                .await
+                .unwrap();
+        }
+        for name in ["a", "b", "c", "d"] {
+            assert!(db.set_pinned(&format!("c:{name}"), true).await.unwrap());
+        }
+        assert!(!db.set_pinned("c:e", true).await.unwrap());
+        assert_eq!(conv(&db, "c:e").await.pinned_order, None);
+        // pinning a pinned chat is fine, and unpinning makes room
+        assert!(db.set_pinned("c:a", true).await.unwrap());
+        assert!(db.set_pinned("c:a", false).await.unwrap());
+        assert!(db.set_pinned("c:e", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pinning_takes_a_chat_out_of_the_archive() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.set_archived("c:alice", true).await.unwrap();
+        db.set_pinned("c:alice", true).await.unwrap();
+        assert!(!conv(&db, "c:alice").await.archived);
+    }
+
+    #[tokio::test]
+    async fn our_own_message_unarchives_a_chat_but_an_incoming_one_does_not() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.set_archived("c:alice", true).await.unwrap();
+        db.insert_message(&msg("alice", 2, "b")).await.unwrap();
+        assert!(conv(&db, "c:alice").await.archived);
+        db.insert_message(&Message {
+            is_outgoing: true,
+            ..msg("me", 3, "c")
+        })
+        .await
+        .unwrap();
+        assert!(!conv(&db, "c:alice").await.archived);
+    }
+
+    #[tokio::test]
+    async fn clearing_marked_unread_says_whether_it_was_set() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        assert!(!db.clear_marked_unread("c:alice").await.unwrap());
+        db.set_marked_unread("c:alice", true).await.unwrap();
+        assert!(db.clear_marked_unread("c:alice").await.unwrap());
+        assert!(!conv(&db, "c:alice").await.marked_unread);
     }
 
     #[tokio::test]

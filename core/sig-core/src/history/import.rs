@@ -29,11 +29,16 @@ impl HistoryBatch {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 pub(crate) struct ImportConversation {
     pub id: String,
     pub title: String,
     pub expire_timer: u32,
+    pub archived: bool,
+    pub pinned_order: Option<u32>,
+    /// Ms since the epoch; 0: not muted; `i64::MAX`: always (the backup's INT64_MAX).
+    pub mute_until: i64,
+    pub marked_unread: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -294,6 +299,10 @@ impl Importer {
             id,
             title: self.titles.get(&c.recipientId).cloned().unwrap_or_default(),
             expire_timer,
+            archived: c.archived,
+            pinned_order: c.pinnedOrder,
+            mute_until: c.muteUntilMs.map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+            marked_unread: c.markedUnread,
         });
         self.counts.conversations += 1;
     }
@@ -726,7 +735,8 @@ mod tests {
             vec![ImportConversation {
                 id: format!("c:{ALICE}"),
                 title: "Alice".into(),
-                expire_timer: 0
+                expire_timer: 0,
+                ..Default::default()
             }]
         );
         let m = &batch.messages[0].message;
@@ -745,6 +755,37 @@ mod tests {
         );
         assert_eq!(seed.contacts[0].profile_key, vec![3u8; 32]);
         assert_eq!((counts.messages, counts.conversations, counts.skipped), (1, 1, 0));
+    }
+
+    #[test]
+    fn chat_flags_come_from_the_backup() {
+        let mut imp = Importer::new(ME, NOW);
+        assert!(imp.add(contact_frame(1, ALICE, "Alice")).is_none());
+        assert!(imp.add(self_frame(2)).is_none());
+        assert!(imp
+            .add(frame(backup::frame::Item::Chat(backup::Chat {
+                id: 10,
+                recipientId: 1,
+                archived: true,
+                pinnedOrder: Some(2),
+                muteUntilMs: Some(i64::MAX as u64), // the backup's "always"
+                markedUnread: true,
+                ..Default::default()
+            })))
+            .is_none());
+        let (batch, _, _) = imp.finish();
+        assert_eq!(
+            batch.conversations,
+            vec![ImportConversation {
+                id: format!("c:{ALICE}"),
+                title: "Alice".into(),
+                expire_timer: 0,
+                archived: true,
+                pinned_order: Some(2),
+                mute_until: i64::MAX,
+                marked_unread: true,
+            }]
+        );
     }
 
     #[test]
@@ -1111,7 +1152,8 @@ mod tests {
             vec![ImportConversation {
                 id: gid,
                 title: "Friends".into(),
-                expire_timer: 0
+                expire_timer: 0,
+                ..Default::default()
             }]
         );
         let (master_key, group) = &seed.groups[0];
