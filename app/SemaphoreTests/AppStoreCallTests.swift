@@ -90,6 +90,26 @@ final class AppStoreCallTests: XCTestCase {
         XCTAssertEqual(store.call?.muted, false, "the optimistic flip is taken back")
     }
 
+    /// Call notifications honor the notification-content privacy setting like message ones.
+    func testCallNotificationsHonorTheContentSetting() async {
+        let defaults = UserDefaults(suiteName: "semaphore.tests.\(UUID())")!
+        NotificationContent.defaults = defaults
+        defer { NotificationContent.defaults = .standard }
+        let notifier = FakeNotifier()
+        let store = await store(FakeClient(linked: true), notifier: notifier)
+        active = false
+        defaults.set("count", forKey: NotificationContent.key)  // "No name or content"
+        store.handle(.callChanged(conversationId: "c:alice", phase: .incoming, reason: nil))
+        store.handle(.callChanged(conversationId: "c:alice", phase: .ended, reason: "hung up"))
+        XCTAssertEqual(notifier.posted.map(\.title), ["Semaphore", "Semaphore"], "no name shown")
+        XCTAssertEqual(notifier.posted.map(\.body), ["Incoming voice call", "Missed voice call"])
+        store.dismissEndedCall()
+        defaults.set("off", forKey: NotificationContent.key)
+        store.handle(.callChanged(conversationId: "c:alice", phase: .incoming, reason: nil))
+        store.handle(.callChanged(conversationId: "c:alice", phase: .ended, reason: "hung up"))
+        XCTAssertEqual(notifier.posted.count, 2, "off means no call notifications either")
+    }
+
     func testCallEventWordingCarriesTheDuration() {
         XCTAssertEqual(Placeholder.call("Outgoing voice call", seconds: 125), "Outgoing voice call (2:05)")
         XCTAssertEqual(Placeholder.call("Incoming voice call", seconds: nil), "Incoming voice call")

@@ -51,18 +51,33 @@ enum Notifications {
     /// The one ringing notification of a conversation's incoming call.
     static func callId(_ conversationId: String) -> String { "call|\(conversationId)" }
 
-    /// Rings until answered, declined, or the caller gives up.
-    static func incomingCall(conversationId: String, title: String) -> NotificationRequest {
-        NotificationRequest(
+    /// Rings until answered, declined, or the caller gives up. Nil when notifications are off;
+    /// the caller's name only when the setting shows names.
+    static func incomingCall(setting: NotificationContent, conversationId: String, title: String)
+        -> NotificationRequest?
+    {
+        guard let title = callTitle(setting, title) else { return nil }
+        return NotificationRequest(
             id: callId(conversationId), conversationId: conversationId, title: title,
             body: "Incoming voice call", hasActions: false, category: callCategory)
     }
 
-    /// Posted when an incoming call ends without ever connecting.
-    static func missedCall(conversationId: String, title: String, at: Date) -> NotificationRequest {
-        NotificationRequest(
+    /// Posted when an incoming call ends without ever connecting (same privacy rules).
+    static func missedCall(setting: NotificationContent, conversationId: String, title: String, at: Date)
+        -> NotificationRequest?
+    {
+        guard let title = callTitle(setting, title) else { return nil }
+        return NotificationRequest(
             id: "call-missed|\(conversationId)|\(Int(at.timeIntervalSince1970))", conversationId: conversationId,
             title: title, body: "Missed voice call", hasActions: false)
+    }
+
+    private static func callTitle(_ setting: NotificationContent, _ name: String) -> String? {
+        switch setting {
+        case .off: nil
+        case .noNameOrMessage: "Semaphore"
+        case .nameOnly, .nameAndMessage: name
+        }
     }
 
     /// The id of a notification about a message: the message itself (`reactor` nil) or a reaction

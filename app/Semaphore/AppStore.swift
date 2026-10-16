@@ -673,8 +673,11 @@ final class AppStore {
             notifier?.remove(ids: [Notifications.callId(conversationId)])
             let wasConnected = call?.connectedAt != nil
             let wasIncoming = call?.incoming ?? false
-            if wasIncoming && !wasConnected {
-                notifier?.post(Notifications.missedCall(conversationId: conversationId, title: title, at: now))
+            if wasIncoming && !wasConnected,
+                let missed = Notifications.missedCall(
+                    setting: NotificationContent.current(), conversationId: conversationId, title: title, at: now)
+            {
+                notifier?.post(missed)
             }
             guard var ended = call, ended.conversationId == conversationId else { return }
             ended.phase = .ended
@@ -683,8 +686,11 @@ final class AppStore {
         case .incoming:
             call = ActiveCall(
                 conversationId: conversationId, title: title, phase: .incoming, incoming: true, connectedAt: nil)
-            if !isAppActive() {
-                notifier?.post(Notifications.incomingCall(conversationId: conversationId, title: title))
+            if !isAppActive(),
+                let ring = Notifications.incomingCall(
+                    setting: NotificationContent.current(), conversationId: conversationId, title: title)
+            {
+                notifier?.post(ring)
             }
         case .outgoing:
             if call == nil {
