@@ -34,6 +34,8 @@ pub(crate) async fn fetch(page: &Url) -> Result<Fetched, String> {
     }
     let client = reqwest::Client::builder()
         .timeout(TIMEOUT)
+        // a proxy would look names up itself, past the check below
+        .no_proxy()
         // names resolve to public addresses only: the address checked is the one connected to
         .dns_resolver(std::sync::Arc::new(PublicOnly))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -144,7 +146,7 @@ fn host_allowed(url: &Url) -> bool {
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -154,18 +156,36 @@ fn is_public(ip: IpAddr) -> bool {
                 || v4.is_multicast()
                 || a == 0
                 || a >= 240
-                || (a == 100 && (64..128).contains(&b)))
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 88 && c == 99))
         }
         IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let embedded =
+                |hi: u16, lo: u16| IpAddr::V4(std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
+            // IPv4 carried inside: mapped (::ffff:a.b.c.d), compatible (::a.b.c.d), NAT64
+            // (64:ff9b::a.b.c.d) and 6to4 (2002:aabb:ccdd::) reach that IPv4 address
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
+            if s[..6] == [0; 6] && !v6.is_loopback() && !v6.is_unspecified() {
+                return is_public(embedded(s[6], s[7]));
+            }
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return is_public(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return is_public(embedded(s[1], s[2]));
+            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x2001 && s[1] == 0xdb8))
         }
     }
 }
@@ -324,6 +344,17 @@ mod tests {
     #[test]
     fn only_public_internet_addresses_are_fetched() {
         for private in [
+            // reserved and benchmarking ranges, and IPv4 inside IPv6 (compatible, NAT64, 6to4)
+            "198.18.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "::127.0.0.1",
+            "64:ff9b::a00:1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "2002:c0a8:101::",
+            "fec0::1",
+            "2001:db8::1",
             "127.0.0.1",
             "10.1.2.3",
             "172.16.0.1",
