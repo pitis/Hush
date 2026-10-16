@@ -53,6 +53,17 @@ pub(crate) struct ImportMessage {
     pub revisions: Vec<i64>,
     /// The newest revision's timestamp (0: never edited), so only a later live edit wins.
     pub edited_at: i64,
+    /// A poll's options and votes.
+    pub poll: Option<ImportPoll>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct ImportPoll {
+    pub options: Vec<String>,
+    pub allow_multiple: bool,
+    pub ended: bool,
+    /// (voter, vote count, option indexes), one per voter, in voter order.
+    pub votes: Vec<(String, u32, Vec<u32>)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -390,6 +401,7 @@ impl Importer {
         let mut kind = MessageKind::Normal;
         let mut deleted = false;
         let mut reactions = vec![];
+        let mut poll = None;
         let mut attachments = vec![];
         let mut preview = None;
         match &item.item {
@@ -438,6 +450,7 @@ impl Importer {
                     question: Some(p.question.clone()).filter(|q| !q.is_empty()),
                 };
                 reactions = self.latest_reactions(&p.reactions);
+                poll = Some(self.poll_of(p));
             }
             Some(Item::ViewOnceMessage(m)) => {
                 // its file isn't brought over (history comes without what was meant to be seen once)
@@ -473,6 +486,7 @@ impl Importer {
             preview,
             edited_at: if item.revisions.is_empty() { 0 } else { sent_at },
             revisions,
+            poll,
         });
         self.counts.messages += 1;
     }
@@ -491,6 +505,30 @@ impl Importer {
             Some(Some(Known::Me)) => Some(self.me.clone()),
             Some(Some(Known::Direct(sid))) => Some(sid.clone()),
             _ => None,
+        }
+    }
+
+    /// A poll's options, and its votes regrouped per voter (a voter we can't resolve is dropped).
+    fn poll_of(&self, p: &backup::Poll) -> ImportPoll {
+        let mut votes: std::collections::BTreeMap<String, (u32, Vec<u32>)> = Default::default();
+        for (i, o) in p.options.iter().enumerate() {
+            for v in &o.votes {
+                let Some(voter) = self.author_of(v.voterId) else {
+                    continue;
+                };
+                let entry = votes.entry(voter).or_default();
+                entry.0 = entry.0.max(v.voteCount);
+                entry.1.push(i as u32);
+            }
+        }
+        ImportPoll {
+            options: p.options.iter().map(|o| o.option.clone()).collect(),
+            allow_multiple: p.allowMultiple,
+            ended: p.hasEnded,
+            votes: votes
+                .into_iter()
+                .map(|(voter, (count, picks))| (voter, count, picks))
+                .collect(),
         }
     }
 
@@ -1006,6 +1044,47 @@ mod tests {
             ]
         );
         assert_eq!(counts.skipped, 0);
+    }
+
+    #[test]
+    fn a_poll_comes_with_its_options_and_votes() {
+        let mut imp = with_alice();
+        let vote = |voter_id, vote_count| backup::poll::poll_option::PollVote {
+            voterId: voter_id,
+            voteCount: vote_count,
+            ..Default::default()
+        };
+        let option = |text: &str, votes| backup::poll::PollOption {
+            option: text.into(),
+            votes,
+            ..Default::default()
+        };
+        imp.add(frame(backup::frame::Item::ChatItem(chat_item(
+            10,
+            1,
+            1_000,
+            backup::chat_item::Item::Poll(backup::Poll {
+                question: "Lunch?".into(),
+                allowMultiple: true,
+                hasEnded: true,
+                // Alice (1) picked both, we (2) the second; 99 isn't anyone we know
+                options: vec![
+                    option("A", vec![vote(1, 3)]),
+                    option("B", vec![vote(1, 3), vote(2, 1), vote(99, 1)]),
+                ],
+                ..Default::default()
+            }),
+        ))));
+        let (batch, _, _) = imp.finish();
+        assert_eq!(
+            batch.messages[0].poll,
+            Some(ImportPoll {
+                options: vec!["A".into(), "B".into()],
+                allow_multiple: true,
+                ended: true,
+                votes: vec![(ME.into(), 1, vec![1]), (ALICE.into(), 3, vec![0, 1])],
+            })
+        );
     }
 
     #[test]

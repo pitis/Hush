@@ -33,6 +33,10 @@ pub struct Client {
     data_dir: PathBuf,
     /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
     last_sent_at: Mutex<i64>,
+    /// The highest vote count handed out per poll (author, sent_at): our vote is stored only once
+    /// sent, so a second quick vote must not reuse the first one's count (others keep only a
+    /// higher one).
+    vote_counts: Mutex<std::collections::HashMap<(String, i64), u32>>,
     /// How many storage syncs were asked for (tests can't see the core's commands).
     #[cfg(test)]
     storage_sync_requests: std::sync::atomic::AtomicUsize,
@@ -63,6 +67,17 @@ impl Client {
     }
 
     /// A stored message, or why there is none.
+    /// Our next vote count on the poll `key`: above both what's stored and what was handed out.
+    async fn next_vote_count(&self, key: &MessageKey, me: &str) -> Result<u32, CoreError> {
+        let stored = self.db.my_poll_vote_count(key, me).await?;
+        let mut handed = self.vote_counts.lock().map_err(|_| CoreError::InvalidInput {
+            message: "vote counts unavailable".into(),
+        })?;
+        let slot = handed.entry((key.author.clone(), key.sent_at)).or_insert(0);
+        *slot = (*slot).max(stored) + 1;
+        Ok(*slot)
+    }
+
     async fn stored(&self, key: &MessageKey) -> Result<Message, CoreError> {
         self.db.message(key).await?.ok_or(CoreError::InvalidInput {
             message: "unknown message".into(),
@@ -183,6 +198,7 @@ impl Client {
             listener,
             data_dir,
             last_sent_at: Mutex::new(0),
+            vote_counts: Default::default(),
             #[cfg(test)]
             storage_sync_requests: Default::default(),
             #[cfg(test)]
@@ -688,6 +704,55 @@ impl Client {
             seconds,
             at,
         }))
+    }
+
+    /// Votes on a poll (indexes into its options; none takes our vote back). It shows here once
+    /// sent.
+    pub async fn vote(&self, key: MessageKey, options: Vec<u32>) -> Result<(), CoreError> {
+        let me = self.own_aci().ok_or(CoreError::NotLinked)?;
+        let invalid = |message: &str| CoreError::InvalidInput {
+            message: message.into(),
+        };
+        let m = self.stored(&key).await?;
+        let poll = self.db.poll(&key).await?.ok_or_else(|| invalid("not a poll"))?;
+        if poll.ended {
+            return Err(invalid("the poll has ended"));
+        }
+        if options.iter().any(|&i| i as usize >= poll.options.len()) {
+            return Err(invalid("not one of the poll's options"));
+        }
+        if !poll.allow_multiple && options.len() > 1 {
+            return Err(invalid("this poll takes one choice"));
+        }
+        let count = self.next_vote_count(&key, &me).await?;
+        let at = self.next_sent_at() as u64;
+        let body = send::poll_vote(&m.conversation_id, &key, options, count, at)
+            .ok_or_else(|| invalid("the poll's author isn't known"))?;
+        self.send_mutation(m.conversation_id, body, at)
+    }
+
+    /// Ends our own poll: no more votes. It shows here once sent.
+    pub async fn end_poll(&self, key: MessageKey) -> Result<(), CoreError> {
+        let me = self.own_aci().ok_or(CoreError::NotLinked)?;
+        let invalid = |message: &str| CoreError::InvalidInput {
+            message: message.into(),
+        };
+        let m = self.stored(&key).await?;
+        let poll = self.db.poll(&key).await?.ok_or_else(|| invalid("not a poll"))?;
+        if m.author != me {
+            return Err(invalid("only its author can end a poll"));
+        }
+        if poll.ended {
+            return Err(invalid("the poll has ended"));
+        }
+        let at = self.next_sent_at() as u64;
+        let body = send::poll_end(&m.conversation_id, m.sent_at, at);
+        self.send_mutation(m.conversation_id, body, at)
+    }
+
+    /// The poll in message `key` as its votes stand (None if it isn't one).
+    pub async fn poll(&self, key: MessageKey) -> Result<Option<crate::projection::Poll>, CoreError> {
+        Ok(self.db.poll(&key).await?)
     }
 
     /// View-once media was opened here: it's dropped (its files too) and our phone is told.
@@ -1251,6 +1316,57 @@ mod tests {
             ));
             assert!(invalid(client.set_disappearing_timer("c:nope".into(), 60).await));
             client.set_disappearing_timer(format!("c:{ALICE}"), 3600).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn votes_count_up_and_only_open_polls_and_their_options_take_them() {
+        let (_dir, _sink, client, rt) = as_me("client-polls");
+        let g = format!("g:{}", "ab".repeat(32));
+        let poll_key = |author: &str| MessageKey {
+            author: author.into(),
+            sent_at: 5,
+        };
+        rt.block_on(async {
+            let mut poll = stored(ALICE, 5);
+            poll.conversation_id = g.clone();
+            poll.kind = MessageKind::Poll {
+                question: Some("Lunch?".into()),
+            };
+            client.db.insert_message(&poll).await.unwrap();
+            client
+                .db
+                .apply(&crate::projection::Op::PollCreated {
+                    message: poll_key(ALICE),
+                    options: vec!["A".into(), "B".into()],
+                    allow_multiple: false,
+                })
+                .await
+                .unwrap();
+            client.vote(poll_key(ALICE), vec![1]).await.unwrap();
+            client.vote(poll_key(ALICE), vec![]).await.unwrap(); // taken back
+                                                                 // both went out before either was stored here: each still got its own count
+            assert_eq!(client.next_vote_count(&poll_key(ALICE), ME).await.unwrap(), 3);
+            // not one of its options; two picks on a single-choice poll; not a poll
+            assert!(invalid(client.vote(poll_key(ALICE), vec![2]).await));
+            assert!(invalid(client.vote(poll_key(ALICE), vec![0, 1]).await));
+            client.db.insert_message(&stored(ALICE, 6)).await.unwrap();
+            let normal = MessageKey {
+                author: ALICE.into(),
+                sent_at: 6,
+            };
+            assert!(invalid(client.vote(normal, vec![0]).await));
+            // only its author ends it, and an ended poll takes no votes
+            assert!(invalid(client.end_poll(poll_key(ALICE)).await));
+            client
+                .db
+                .apply(&crate::projection::Op::PollEnded {
+                    conversation_id: g.clone(),
+                    target: poll_key(ALICE),
+                })
+                .await
+                .unwrap();
+            assert!(invalid(client.vote(poll_key(ALICE), vec![0]).await));
         });
     }
 

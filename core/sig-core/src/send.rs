@@ -199,6 +199,41 @@ pub fn timer_update(conversation_id: &str, seconds: u32, at: u64) -> DataMessage
     }
 }
 
+/// Our vote on the poll `target` (indexes into its options; none: taken back), our
+/// `vote_count`th. None if its author isn't an ACI.
+pub fn poll_vote(
+    conversation_id: &str,
+    target: &MessageKey,
+    options: Vec<u32>,
+    vote_count: u32,
+    at: u64,
+) -> Option<DataMessage> {
+    let author = Uuid::parse_str(&target.author).ok()?;
+    Some(DataMessage {
+        timestamp: Some(at),
+        poll_vote: Some(data_message::PollVote {
+            target_author_aci_binary: Some(author.as_bytes().to_vec()),
+            target_sent_timestamp: Some(target.sent_at as u64),
+            option_indexes: options,
+            vote_count: Some(vote_count),
+        }),
+        group_v2: group_context(conversation_id),
+        ..Default::default()
+    })
+}
+
+/// Ends our own poll sent at `target_sent_at`.
+pub fn poll_end(conversation_id: &str, target_sent_at: i64, at: u64) -> DataMessage {
+    DataMessage {
+        timestamp: Some(at),
+        poll_terminate: Some(data_message::PollTerminate {
+            target_sent_timestamp: Some(target_sent_at as u64),
+        }),
+        group_v2: group_context(conversation_id),
+        ..Default::default()
+    }
+}
+
 /// Deletes our own message sent at `target_sent_at` for everyone.
 pub fn delete(conversation_id: &str, target_sent_at: i64, at: u64) -> DataMessage {
     DataMessage {
@@ -1197,6 +1232,31 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn own_votes_and_poll_ends_apply_like_incoming_ones() {
+        let conv = group();
+        let dm = poll_vote(&conv, &key(U, 600), vec![0, 2], 4, 700).unwrap();
+        assert!(dm.group_v2.is_some());
+        assert_eq!(
+            own_ops(ME, &conv, dm.into()),
+            vec![Op::PollVote {
+                conversation_id: conv.clone(),
+                target: key(U, 600),
+                voter: ME.into(),
+                vote_count: 4,
+                options: vec![0, 2]
+            }]
+        );
+        assert_eq!(
+            own_ops(ME, &conv, poll_end(&conv, 600, 710).into()),
+            vec![Op::PollEnded {
+                conversation_id: conv.clone(),
+                target: key(ME, 600)
+            }]
+        );
+        assert!(poll_vote(&conv, &key("not-an-aci", 1), vec![0], 1, 1).is_none());
     }
 
     #[test]

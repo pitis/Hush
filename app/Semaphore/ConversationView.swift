@@ -238,6 +238,7 @@ struct TimelineList: View {
                                 senderName: store.senderName(m.author), mentionName: store.mentionName,
                                 reactions: store.reactions[key] ?? [],
                                 files: store.attachments[key] ?? [], preview: store.previews[key],
+                                poll: store.polls[key],
                                 highlighted: store.highlighted == key,
                                 reply: { store.reply(to: m) },
                                 retry: { Task { await store.retry(key) } },
@@ -250,6 +251,8 @@ struct TimelineList: View {
                                     edit: { store.startEditing(m) },
                                     delete: { Task { await store.deleteForEveryone(m) } },
                                     viewOnce: { Task { await store.viewOnceOpened(m) } },
+                                    vote: { options in Task { await store.vote(m, options: options) } },
+                                    endPoll: { Task { await store.endPoll(m) } },
                                     name: store.senderName))
                         }
                     }
@@ -348,6 +351,7 @@ struct MessageRow: View {
     let reactions: [Reaction]
     let files: [Attachment]
     let preview: LinkPreview?
+    var poll: Poll?
     /// Just opened from search: outlined for a moment.
     var highlighted = false
     let reply: () -> Void
@@ -376,6 +380,8 @@ struct MessageRow: View {
         var delete: () -> Void = {}
         /// View-once media was opened.
         var viewOnce: () -> Void = {}
+        var vote: ([UInt32]) -> Void = { _ in }
+        var endPoll: () -> Void = {}
         /// A reactor's display name.
         var name: (String) -> String = { $0 }
     }
@@ -493,6 +499,10 @@ struct MessageRow: View {
                         Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
                     } else if isViewOnce {
                         viewOnce
+                    } else if case .poll(let question) = message.kind, let poll {
+                        PollCard(
+                            question: question, poll: poll, me: actions.me, mine: message.author == actions.me,
+                            vote: actions.vote, end: actions.endPoll)
                     } else if let placeholder = Placeholder.text(message.kind) {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
                         Text(placeholder).italic()

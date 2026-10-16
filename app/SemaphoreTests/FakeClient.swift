@@ -130,6 +130,10 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func setDisappearingTimer(conversationId: String, seconds: UInt32) async throws {
         try await flag("timer \(conversationId) \(seconds)")
     }
+    var polls: [MessageKey: Poll] = [:]
+    func poll(key: MessageKey) async throws -> Poll? { lock.withLock { polls[key] } }
+    func vote(key: MessageKey, options: [UInt32]) async throws { try await flag("vote \(key.sentAt) \(options)") }
+    func endPoll(key: MessageKey) async throws { try await flag("end poll \(key.sentAt)") }
     func setArchived(conversationId: String, archived: Bool) async throws {
         try await flag("archived \(conversationId) \(archived)")
     }

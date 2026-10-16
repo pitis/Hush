@@ -31,6 +31,27 @@ pub enum Op {
     Delete {
         target: MessageKey,
     },
+    /// The options of the poll `message` (inserted with it).
+    PollCreated {
+        message: MessageKey,
+        options: Vec<String>,
+        allow_multiple: bool,
+    },
+    /// `voter`'s vote on a poll (indexes into its options; none: taken back); the highest
+    /// `vote_count` per voter wins.
+    PollVote {
+        /// The chat it came in: it only counts on a poll there.
+        conversation_id: String,
+        target: MessageKey,
+        voter: String,
+        vote_count: u32,
+        options: Vec<u32>,
+    },
+    /// A poll was ended (always by its author, in the chat it came in).
+    PollEnded {
+        conversation_id: String,
+        target: MessageKey,
+    },
     /// View-once media was opened (here or on another of our devices): it's gone.
     ViewOnceOpened {
         target: MessageKey,
@@ -319,6 +340,37 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
             })
             .unwrap_or_default();
     }
+    if let Some(v) = &dm.poll_vote {
+        return (|| {
+            Some(Op::PollVote {
+                conversation_id: conv.to_string(),
+                target: MessageKey {
+                    author: aci(None, v.target_author_aci_binary.as_deref())?,
+                    sent_at: i64::try_from(v.target_sent_timestamp?).ok()?,
+                },
+                voter: author.to_string(),
+                vote_count: v.vote_count.unwrap_or(0),
+                options: v.option_indexes.clone(),
+            })
+        })()
+        .into_iter()
+        .collect();
+    }
+    if let Some(t) = &dm.poll_terminate {
+        return t
+            .target_sent_timestamp
+            .and_then(|t| i64::try_from(t).ok())
+            .map(|sent_at| {
+                vec![Op::PollEnded {
+                    conversation_id: conv.to_string(),
+                    target: MessageKey {
+                        author: author.to_string(),
+                        sent_at,
+                    },
+                }]
+            })
+            .unwrap_or_default();
+    }
     if dm.flags.unwrap_or(0) & presage::proto::data_message::Flags::ExpirationTimerUpdate as u32 != 0 {
         return vec![Op::SetTimer {
             conversation_id: conv.to_string(),
@@ -400,6 +452,13 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
             message: message.key(),
             attachments,
             preview,
+        });
+    }
+    if let Some(p) = &dm.poll_create {
+        ops.push(Op::PollCreated {
+            message: message.key(),
+            options: p.options.clone(),
+            allow_multiple: p.allow_multiple.unwrap_or(false),
         });
     }
     ops.insert(0, Op::InsertMessage(message));
@@ -771,6 +830,80 @@ mod tests {
         };
         let ops = project(&content(ALICE, 450, ContentBody::DataMessage(dm)), ME);
         assert!(matches!(&ops[..], [Op::InsertMessage(m), Op::AddAttachments { .. }] if m.body.is_none()));
+    }
+
+    #[test]
+    fn a_poll_brings_its_options_and_votes_and_its_end_count() {
+        let poll = DataMessage {
+            timestamp: Some(600),
+            poll_create: Some(data_message::PollCreate {
+                question: Some("Lunch?".into()),
+                allow_multiple: Some(true),
+                options: vec!["Pizza".into(), "Sushi".into()],
+            }),
+            ..Default::default()
+        };
+        let ops = project(
+            &content(ALICE, 610, ContentBody::DataMessage(in_group(poll, KEY.to_vec()))),
+            ME,
+        );
+        assert!(
+            matches!(&ops[0], Op::InsertMessage(m) if m.kind == MessageKind::Poll { question: Some("Lunch?".into()) })
+        );
+        assert_eq!(
+            ops[1],
+            Op::PollCreated {
+                message: key(ALICE, 600),
+                options: vec!["Pizza".into(), "Sushi".into()],
+                allow_multiple: true,
+            }
+        );
+        let vote = DataMessage {
+            timestamp: Some(620),
+            poll_vote: Some(data_message::PollVote {
+                target_author_aci_binary: Some(uuid(ALICE).as_bytes().to_vec()),
+                target_sent_timestamp: Some(600),
+                option_indexes: vec![1],
+                vote_count: Some(2),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            project(
+                &content(BOB, 630, ContentBody::DataMessage(in_group(vote.clone(), KEY.to_vec()))),
+                ME
+            ),
+            vec![Op::PollVote {
+                conversation_id: format!("g:{}", hex::encode(KEY)),
+                target: key(ALICE, 600),
+                voter: BOB.into(),
+                vote_count: 2,
+                options: vec![1],
+            }]
+        );
+        // our vote from the phone counts as ours
+        assert!(matches!(
+            &project(&content(ME, 640, sent_sync(ALICE, in_group(vote, KEY.to_vec()))), ME)[..],
+            [Op::PollVote { voter, .. }] if voter == ME
+        ));
+        // only its author ends it: the target is the sender's own poll
+        let end = DataMessage {
+            timestamp: Some(650),
+            poll_terminate: Some(data_message::PollTerminate {
+                target_sent_timestamp: Some(600),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            project(
+                &content(BOB, 660, ContentBody::DataMessage(in_group(end, KEY.to_vec()))),
+                ME
+            ),
+            vec![Op::PollEnded {
+                conversation_id: format!("g:{}", hex::encode(KEY)),
+                target: key(BOB, 600)
+            }]
+        );
     }
 
     #[test]
@@ -1379,7 +1512,8 @@ mod tests {
     fn placeholder(dm: DataMessage) -> MessageKind {
         let ops = project(&content(ALICE, 150, ContentBody::DataMessage(dm)), ME);
         match ops.as_slice() {
-            [Op::InsertMessage(m)] => m.kind.clone(),
+            // a poll brings its options too
+            [Op::InsertMessage(m)] | [Op::InsertMessage(m), Op::PollCreated { .. }] => m.kind.clone(),
             _ => panic!("{ops:?}"),
         }
     }
