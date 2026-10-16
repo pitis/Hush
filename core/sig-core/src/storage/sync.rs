@@ -373,7 +373,7 @@ mod tests {
     use super::*;
     use crate::projection::{ChatFlags, ProjectionDb, StorageItemRow, StorageState};
     use crate::storage::client::{Manifest, StorageApi, StorageError, Write};
-    use crate::storage::{KIND_ACCOUNT, KIND_CONTACT, KIND_GROUPV2};
+    use crate::storage::KIND_ACCOUNT;
     use presage::libsignal_service::prelude::ProtobufMessage as _;
     use presage::libsignal_service::proto::{
         account_record::{pinned_conversation, PinnedConversation},
@@ -385,6 +385,8 @@ mod tests {
     const ME: &str = "11111111-1111-1111-1111-111111111111";
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
     const BOB: &str = "33333333-3333-3333-3333-333333333333";
+    const KIND_CONTACT: i32 = 1;
+    const KIND_GROUPV2: i32 = 3;
     const KIND_CHAT_FOLDER: i32 = 8;
 
     /// The service as the tests script it: a manifest (None answers "unchanged"), the items it

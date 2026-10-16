@@ -32,6 +32,7 @@ use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListen
 use crate::projection::ids::{direct_id, group_id};
 use crate::projection::{project, ChatEventKind, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
+use crate::storage;
 use crate::typing::{Typing, TYPING_IDLE};
 
 /// libsignal's post-quantum crypto (libcrux ML-KEM key generation, also run by presage's pre-key
@@ -88,6 +89,8 @@ pub enum Command {
     Relink {
         done: oneshot::Sender<()>,
     },
+    /// A chat setting changed here (or Storage Service writes were turned on): sync soon.
+    StorageSync,
 }
 
 pub struct Handles {
@@ -243,10 +246,13 @@ async fn run(
     let mut downloading = false;
     // Received call messages route to the call router below.
     let (incoming_calls_tx, incoming_calls_rx) = mpsc::unbounded_channel::<crate::calls::IncomingEnvelope>();
+    // Storage Service sync triggers go to the single sync task below.
+    let (storage_tx, storage_rx) = mpsc::unbounded_channel::<storage::Trigger>();
     let queues = Queues {
         sends: send_tx.clone(),
         downloads: download_tx.clone(),
         calls: incoming_calls_tx,
+        storage: storage_tx.clone(),
     };
     // What the call engine needs from the link: our device id, ACI, and credentials.
     let registration: Rc<RefCell<Option<presage::manager::RegistrationData>>> =
@@ -261,6 +267,14 @@ async fn run(
         call_out_tx,
         call_out_rx,
         incoming_calls_rx,
+    );
+    spawn_storage_sync(
+        registration.clone(),
+        store.clone(),
+        projection.clone(),
+        listener.clone(),
+        send_tx.clone(),
+        storage_rx,
     );
     // Downloads cut off by the previous run start over.
     if let Err(e) = projection.reset_downloads().await {
@@ -435,6 +449,9 @@ async fn run(
             }
             // wakes only what waits now: a stored request would later drop a fresh connection
             Command::Reconnect => wake.notify_waiters(),
+            Command::StorageSync => {
+                let _ = storage_tx.send(storage::Trigger::Local);
+            }
             // presage resets sessions by ACI only (it panics on a PNI)
             Command::ResetSession { conversation_id } => match (&manager, crate::send::recipient(&conversation_id)) {
                 (Some(m), Some(crate::send::Recipient::Direct(to @ ServiceId::Aci(_)))) => {
@@ -645,6 +662,67 @@ fn start_history(
                 done: 0,
                 total: 0,
             });
+        }
+    });
+}
+
+/// Local changes come in bursts (a few clicks): one sync after they settle.
+#[cfg(not(test))]
+const STORAGE_DEBOUNCE: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const STORAGE_DEBOUNCE: Duration = Duration::ZERO;
+
+/// The Storage Service sync, one at a time: each trigger (connected, the phone's request, a
+/// local change) runs a pull then push; triggers that arrive meanwhile fold into the next run.
+/// Runs only while linked; survives relinks like the call router (same `registration`).
+fn spawn_storage_sync(
+    registration: Rc<RefCell<Option<presage::manager::RegistrationData>>>,
+    store: SqliteStore,
+    db: ProjectionDb,
+    listener: Arc<dyn EventListener>,
+    send_tx: mpsc::UnboundedSender<Job>,
+    mut rx: mpsc::UnboundedReceiver<storage::Trigger>,
+) {
+    tokio::task::spawn_local(async move {
+        while let Some(trigger) = rx.recv().await {
+            if trigger == storage::Trigger::Local {
+                tokio::time::sleep(STORAGE_DEBOUNCE).await;
+            }
+            while rx.try_recv().is_ok() {}
+            let Some(data) = registration.borrow().clone() else {
+                continue; // unlinked: the next connect syncs
+            };
+            match storage::sync_once(&store, &db, &data).await {
+                Ok(None) => {}
+                Ok(Some(out)) => {
+                    let written = out.pushed.as_ref().map_or(0, |p| p.written);
+                    tracing::info!(
+                        ?trigger,
+                        applied = out.pulled.applied,
+                        version = out.pulled.version,
+                        written,
+                        "storage synced"
+                    );
+                    if out.pulled.chats_changed {
+                        listener.on_event(CoreEvent::ConversationsChanged);
+                    }
+                    if written > 0 {
+                        let _ = send_tx.send(Job::StorageChanged);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?trigger, error = %e, "storage sync failed");
+                    let message = match e {
+                        storage::client::StorageError::Conflict => {
+                            "Syncing chat settings with the phone failed: another device kept writing; \
+                             it will be tried again after the next change"
+                                .to_string()
+                        }
+                        e => format!("Syncing chat settings with the phone failed: {e}"),
+                    };
+                    listener.on_event(CoreEvent::Error { message });
+                }
+            }
         }
     });
 }
@@ -1179,6 +1257,7 @@ async fn handle(
                 sync_titles(m, db, l).await;
             }
             l.on_event(CoreEvent::Ready);
+            let _ = queues.storage.send(storage::Trigger::Connected);
         }
         Received::Contacts => sync_titles(m, db, l).await,
         // Ids only: never log message content.
@@ -1210,6 +1289,12 @@ async fn handle(
                 });
                 return;
             }
+            if storage::is_storage_fetch_latest(&content.body) {
+                let _ = queues.storage.send(storage::Trigger::Phone);
+            } else if storage::is_keys_sync(&content.body) {
+                // presage stores the new master key as it receives it; a new key starts over
+                let _ = queues.storage.send(storage::Trigger::Connected);
+            }
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
             let sender = content.metadata.sender.service_id_string();
@@ -1233,6 +1318,7 @@ struct Queues {
     sends: mpsc::UnboundedSender<Job>,
     downloads: mpsc::UnboundedSender<Download>,
     calls: mpsc::UnboundedSender<crate::calls::IncomingEnvelope>,
+    storage: mpsc::UnboundedSender<storage::Trigger>,
 }
 
 /// What applying one received content changed beyond the projection.

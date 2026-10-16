@@ -33,6 +33,9 @@ pub struct Client {
     data_dir: PathBuf,
     /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
     last_sent_at: Mutex<i64>,
+    /// How many storage syncs were asked for (tests can't see the core's commands).
+    #[cfg(test)]
+    storage_sync_requests: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for Client {
@@ -88,6 +91,14 @@ impl Client {
         }))
     }
 
+    /// A chat setting changed here: the Storage Service sync writes it (debounced). If the core
+    /// is closing, the dirty marks stay and the next start's sync writes them.
+    fn request_storage_sync(&self) {
+        #[cfg(test)]
+        self.storage_sync_requests.fetch_add(1, Ordering::SeqCst);
+        let _ = self.send(Command::StorageSync);
+    }
+
     fn send(&self, cmd: Command) -> Result<(), CoreError> {
         let commands = self.commands.lock().map_err(|_| CoreError::Closed)?;
         commands
@@ -127,6 +138,8 @@ impl Client {
             listener,
             data_dir,
             last_sent_at: Mutex::new(0),
+            #[cfg(test)]
+            storage_sync_requests: Default::default(),
         }))
     }
 
@@ -578,6 +591,7 @@ impl Client {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
         if self.db.clear_marked_unread(&conversation_id).await? {
             self.listener.on_event(CoreEvent::ConversationsChanged);
+            self.request_storage_sync();
         }
         let targets = self.db.unread(&conversation_id).await?;
         if targets.is_empty() {
@@ -599,6 +613,7 @@ impl Client {
         self.known_conversation(&conversation_id).await?;
         self.db.set_archived(&conversation_id, archived).await?;
         self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
         Ok(())
     }
 
@@ -612,6 +627,7 @@ impl Client {
             });
         }
         self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
         Ok(())
     }
 
@@ -626,6 +642,7 @@ impl Client {
         }
         self.db.set_mute_until(&conversation_id, until_ms).await?;
         self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
         Ok(())
     }
 
@@ -634,6 +651,23 @@ impl Client {
         self.known_conversation(&conversation_id).await?;
         self.db.set_marked_unread(&conversation_id, marked).await?;
         self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
+        Ok(())
+    }
+
+    /// Whether chat settings changed here are written to the Storage Service (the phone sees
+    /// them). On unless turned off; the phone's changes are read either way.
+    pub async fn storage_writes(&self) -> Result<bool, CoreError> {
+        Ok(self.db.storage_writes().await?)
+    }
+
+    /// Turns writing chat settings to the Storage Service on or off. Turning it on writes what
+    /// changed meanwhile.
+    pub async fn set_storage_writes(&self, on: bool) -> Result<(), CoreError> {
+        self.db.set_storage_writes(on).await?;
+        if on {
+            self.request_storage_sync();
+        }
         Ok(())
     }
 
@@ -1227,6 +1261,44 @@ mod tests {
             assert!(client.is_muted(conv.clone()).await.unwrap());
             client.set_mute_until(conv.clone(), 1).await.unwrap(); // long over
             assert!(!client.is_muted(conv.clone()).await.unwrap());
+        });
+    }
+
+    #[test]
+    fn flag_changes_ask_for_a_storage_sync() {
+        let (_dir, _sink, client, rt) = as_me("client-storage-sync");
+        let conv = format!("c:{ALICE}");
+        let requests = || client.storage_sync_requests.load(Ordering::SeqCst);
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client.set_archived(conv.clone(), true).await.unwrap();
+            client.set_pinned(conv.clone(), true).await.unwrap();
+            client.set_mute_until(conv.clone(), 1).await.unwrap();
+            client.set_marked_unread(conv.clone(), true).await.unwrap();
+            assert_eq!(requests(), 4);
+            // opening the chat clears the mark: the phone should know that too
+            client.mark_read(conv.clone()).await.unwrap();
+            assert_eq!(requests(), 5);
+            client.mark_read(conv.clone()).await.unwrap(); // nothing to clear this time
+            assert_eq!(requests(), 5);
+            // a refused change asks for nothing
+            assert!(invalid(client.set_pinned("c:nope".into(), true).await));
+            assert_eq!(requests(), 5);
+        });
+    }
+
+    #[test]
+    fn the_storage_writes_switch_round_trips_and_asks_for_a_sync_when_turned_on() {
+        let (_dir, _sink, client, rt) = as_me("client-storage-writes");
+        let requests = || client.storage_sync_requests.load(Ordering::SeqCst);
+        rt.block_on(async {
+            assert!(client.storage_writes().await.unwrap());
+            client.set_storage_writes(false).await.unwrap();
+            assert!(!client.storage_writes().await.unwrap());
+            assert_eq!(requests(), 0);
+            client.set_storage_writes(true).await.unwrap();
+            assert!(client.storage_writes().await.unwrap());
+            assert_eq!(requests(), 1);
         });
     }
 

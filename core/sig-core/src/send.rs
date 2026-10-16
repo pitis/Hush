@@ -87,6 +87,8 @@ pub enum Job {
     /// Send the unsent read receipts (`ProjectionDb::unsent_receipts`) and the read state to our
     /// phone. Queued by mark-read and when the phone's settings arrive.
     Receipts,
+    /// Tell our other devices the Storage Service changed (we just wrote to it).
+    StorageChanged,
     /// Started or Stopped; dropped if it waited `TYPING_IDLE` (since `queued`) before going out.
     Typing {
         conversation_id: String,
@@ -227,6 +229,16 @@ pub fn configuration_request() -> SyncMessage {
     }
 }
 
+/// Asks our other devices to fetch the Storage Service manifest: we wrote a new one.
+pub fn storage_changed_sync() -> SyncMessage {
+    SyncMessage {
+        content: Some(sync_message::Content::FetchLatest(sync_message::FetchLatest {
+            r#type: Some(sync_message::fetch_latest::Type::StorageManifest as i32),
+        })),
+        ..Default::default()
+    }
+}
+
 /// Tells our other devices that we read `targets`.
 pub fn read_sync(targets: &[MessageKey]) -> SyncMessage {
     SyncMessage {
@@ -362,6 +374,12 @@ pub async fn sender(
                 let _ = done.send(sent.is_ok());
             }
             Job::Receipts => send_receipts(&mut m, &db, l.as_ref()).await,
+            Job::StorageChanged => {
+                // the write is done either way; the phone also fetches on its own schedule
+                if let Err(e) = timed(Box::pin(m.send_message(me, storage_changed_sync(), now_ms()))).await {
+                    tracing::warn!(error = %e, "telling the phone the storage changed failed");
+                }
+            }
             Job::Typing {
                 conversation_id,
                 started,
@@ -618,6 +636,17 @@ mod tests {
 
     const U: &str = "22222222-2222-2222-2222-222222222222";
     const ME: &str = "11111111-1111-1111-1111-111111111111";
+
+    #[test]
+    fn the_storage_changed_sync_asks_the_other_devices_for_the_manifest() {
+        let sm = storage_changed_sync();
+        assert!(matches!(
+            sm.content,
+            Some(sync_message::Content::FetchLatest(f))
+                if f.r#type == Some(sync_message::fetch_latest::Type::StorageManifest as i32)
+        ));
+        assert!(sm.read.is_empty());
+    }
 
     #[test]
     fn parses_every_conversation_id_form() {
