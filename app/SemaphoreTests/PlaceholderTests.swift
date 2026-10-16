@@ -77,7 +77,8 @@ final class AppStoreExpiryTests: XCTestCase {
         XCTAssertEqual(store.messages.map(\.sentAt), [2])
         // one prefix covers the message's notification and those of reactions to it, even ones
         // shown before the app started
-        XCTAssertEqual(notifier.removedPrefixes, ["c:a|a|1|"])
+        // (boot also clears stale call rings, "call|"; that is not this message's doing)
+        XCTAssertEqual(notifier.removedPrefixes.filter { $0 != "call|" }, ["c:a|a|1|"])
         XCTAssertTrue(Notifications.id("c:a", key, reactor: nil, emoji: nil).hasPrefix("c:a|a|1|"))
         XCTAssertTrue(Notifications.id("c:a", key, reactor: "b", emoji: "👍").hasPrefix("c:a|a|1|"))
         XCTAssertNotEqual(

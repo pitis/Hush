@@ -15,6 +15,9 @@ struct CallWindow: View {
         .frame(width: 320, height: 300)
         .background(Theme.window)
         .preferredColorScheme(.dark)
+        // closing the window mid-call ends the call: a running call with no window would be
+        // a call you can't hang up
+        .onDisappear { if let call = store.call, call.phase != .ended { store.hangupCall() } }
     }
 }
 
@@ -26,14 +29,29 @@ private struct CallView: View {
     @State private var now = Date()
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
+    /// An incoming call can be taken only once RingRTC rings it locally (`.ringing`); until
+    /// then Accept waits (the core holds an early accept and applies it when it rings).
+    private var answerable: Bool { call.incoming && (call.phase == .incoming || call.phase == .ringing) }
+
     private var stateLine: String {
         switch call.phase {
         case .incoming: "Incoming voice call…"
         case .outgoing: "Calling…"
-        case .ringing: "Ringing…"
+        case .ringing: call.incoming ? "Incoming voice call" : "Ringing…"
         case .connecting: "Connecting…"
         case .connected: duration
-        case .ended: call.endedReason.map { "Call over — \($0)" } ?? "Call over"
+        case .ended: "Call over — \(Self.wording(call.endedReason))"
+        }
+    }
+
+    static func wording(_ reason: CallEnd?) -> String {
+        switch reason {
+        case .hungUp, .remoteHungUp, nil: "hung up"
+        case .answeredElsewhere: "answered on your phone"
+        case .declinedElsewhere: "declined on your phone"
+        case .busy: "busy"
+        case .noAnswer: "no answer"
+        case .failed: "the call failed"
         }
     }
 
@@ -49,7 +67,7 @@ private struct CallView: View {
             Text(call.title).font(.title3.bold()).lineLimit(1)
             Text(stateLine).font(.callout).foregroundStyle(Theme.secondaryText).monospacedDigit()
             Spacer(minLength: 0)
-            if call.phase == .incoming {
+            if answerable {
                 HStack(spacing: 24) {
                     Button {
                         store.hangupCall()
@@ -107,15 +125,6 @@ private struct CallView: View {
         .padding(20)
         .task { devices = await store.callAudioDevices() }
         .onReceive(clock) { now = $0 }
-        // the ended state lingers briefly, then the window empties itself
-        .onChange(of: call.phase) { _, phase in
-            if phase == .ended {
-                Task {
-                    try? await Task.sleep(for: .seconds(3))
-                    store.dismissEndedCall()
-                }
-            }
-        }
     }
 }
 

@@ -71,15 +71,17 @@ struct ConversationHeader: View {
             }
             Spacer()
             if canCall {
+                let inCall = store.call != nil && store.call?.phase != .ended
                 Button {
-                    store.startCall(conversation.id)
+                    if inCall { store.showCallWindow() } else { store.startCall(conversation.id) }
                 } label: {
-                    Image(systemName: "phone").font(.system(size: 15))
+                    Image(systemName: inCall ? "phone.fill" : "phone").font(.system(size: 15))
                 }
                 .buttonStyle(.bordered)
-                .disabled(store.call != nil && store.call?.phase != .ended)
-                .help("Voice call")
-                .accessibilityLabel("Start a voice call")
+                // signaling rides the message pipeline: no call before it is connected
+                .disabled(!inCall && store.connection != .online)
+                .help(inCall ? "Show the call" : "Voice call")
+                .accessibilityLabel(inCall ? "Show the call" : "Start a voice call")
             }
         }
         .padding(.horizontal, 18)

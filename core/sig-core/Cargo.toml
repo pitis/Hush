@@ -36,6 +36,8 @@ http = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-oslog = "0.3"
+# RingRTC and WebRTC log through `log`; without this bridge a failed call leaves no trace
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 [dev-dependencies]

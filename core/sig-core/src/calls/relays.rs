@@ -54,12 +54,29 @@ pub(crate) fn to_ice_servers(groups: &[RelayGroup]) -> Vec<IceServer> {
     servers
 }
 
-/// Fetches and converts. An error or empty answer gives no relays with a warning — a call
-/// still tries direct ICE.
+/// A relay answer later than this would only delay the ring; the call proceeds without.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Fetches and converts. An error, a timeout or an empty answer gives no relays with the cause
+/// in the log — a call still tries direct ICE.
 pub(crate) async fn fetch(push: &PushService) -> Vec<IceServer> {
+    match tokio::time::timeout(FETCH_TIMEOUT, fetch_relays(push)).await {
+        Ok(Ok(v)) => to_ice_servers(&parse_relays(&v)),
+        Ok(Err(e)) => {
+            tracing::warn!("fetching calling relays failed: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("fetching calling relays timed out");
+            Vec::new()
+        }
+    }
+}
+
+async fn fetch_relays(push: &PushService) -> Result<serde_json::Value, String> {
     use presage::libsignal_service::configuration::Endpoint;
     use presage::libsignal_service::push_service::HttpAuthOverride;
-    let answer = async {
+    {
         let resp = push
             .request(
                 reqwest::Method::GET,
@@ -76,14 +93,6 @@ pub(crate) async fn fetch(push: &PushService) -> Vec<IceServer> {
         resp.json::<serde_json::Value>()
             .await
             .map_err(|e| e.without_url().to_string())
-    }
-    .await;
-    match answer {
-        Ok(v) => to_ice_servers(&parse_relays(&v)),
-        Err(e) => {
-            tracing::warn!("fetching calling relays failed: {e}");
-            Vec::new()
-        }
     }
 }
 

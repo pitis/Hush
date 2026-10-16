@@ -37,9 +37,15 @@ final class AppStore {
         /// Set on the first `.connected`; drives the duration ticker.
         var connectedAt: Date?
         var muted: Bool = false
-        /// Why it ended ("hung up", "no answer", …), shown briefly.
-        var endedReason: String?
+        /// Why it ended, shown briefly.
+        var endedReason: CallEnd?
     }
+
+    /// How long a hang-up may take to come back as `Ended` before the window is forced closed
+    /// (a dead engine must not leave a call you can't end).
+    static var hangupGrace: Duration = .seconds(5)
+    /// How long the ended state stays on screen.
+    static var endedLinger: Duration = .seconds(3)
 
     /// The history transfer's state, for the overlay over the chats.
     struct HistoryProgress: Equatable {
@@ -207,6 +213,7 @@ final class AppStore {
                     // resuming an interrupted transfer: show it before its first event arrives
                     history = HistoryProgress(stage: .waiting, done: 0, total: 0)
                 }
+                notifier?.remove(idPrefix: "call|")  // a ring from a previous run can't be answered
             } else {
                 screen = .link
                 try client.link(deviceName: Self.deviceName)
@@ -663,44 +670,49 @@ final class AppStore {
     // MARK: Calls
 
     /// A `CallChanged` event: keeps `call` current, rings, and notes missed calls.
-    private func callChanged(_ conversationId: String, phase: CallPhase, reason: String?, now: Date) {
+    private func callChanged(_ conversationId: String, phase: CallPhase, reason: CallEnd?, now: Date) {
         let title =
             conversations.first { $0.id == conversationId }?.title
-            ?? call?.title
+            ?? (call?.conversationId == conversationId ? call?.title : nil)
             ?? "Call"
         switch phase {
         case .ended:
             notifier?.remove(ids: [Notifications.callId(conversationId)])
-            let wasConnected = call?.connectedAt != nil
-            let wasIncoming = call?.incoming ?? false
-            if wasIncoming && !wasConnected,
-                let missed = Notifications.missedCall(
+            // an end belongs to the call that is up, not to a stale one
+            guard var ended = call, ended.conversationId == conversationId, ended.phase != .ended else { return }
+            // a call we never took that the caller gave up on; not one we declined, nor one
+            // our phone took
+            let missed = ended.incoming && ended.connectedAt == nil && reason.map(Self.isMissed) == true
+            if missed,
+                let notification = Notifications.missedCall(
                     setting: NotificationContent.current(), conversationId: conversationId, title: title, at: now)
             {
-                notifier?.post(missed)
+                notifier?.post(notification)
             }
-            guard var ended = call, ended.conversationId == conversationId else { return }
             ended.phase = .ended
             ended.endedReason = reason
             call = ended
-        case .incoming:
-            call = ActiveCall(
-                conversationId: conversationId, title: title, phase: .incoming, incoming: true, connectedAt: nil)
-            if !isAppActive(),
+            lingerEndedCall()
+        case .incoming, .outgoing:
+            // a fresh call: an ended (or different) one must not lend it its state
+            let fresh =
+                call.map { $0.conversationId != conversationId || $0.phase == .ended } ?? true
+            if fresh {
+                call = ActiveCall(
+                    conversationId: conversationId, title: title, phase: phase, incoming: phase == .incoming,
+                    connectedAt: nil)
+            } else {
+                call?.phase = phase
+            }
+            WindowOpener.open?(id: "call")
+            if phase == .incoming, !isAppActive(),
                 let ring = Notifications.incomingCall(
                     setting: NotificationContent.current(), conversationId: conversationId, title: title)
             {
                 notifier?.post(ring)
             }
-        case .outgoing:
-            if call == nil {
-                call = ActiveCall(
-                    conversationId: conversationId, title: title, phase: .outgoing, incoming: false, connectedAt: nil)
-            } else {
-                call?.phase = .outgoing
-            }
         case .ringing, .connecting, .connected:
-            guard call?.conversationId == conversationId else { return }
+            guard call?.conversationId == conversationId, call?.phase != .ended else { return }
             call?.phase = phase
             if phase == .connected {
                 notifier?.remove(ids: [Notifications.callId(conversationId)])
@@ -709,30 +721,75 @@ final class AppStore {
         }
     }
 
+    /// The caller gave up, or nobody could answer: a missed call worth a notification.
+    private static func isMissed(_ reason: CallEnd) -> Bool {
+        switch reason {
+        case .remoteHungUp, .noAnswer, .failed: true
+        case .hungUp, .answeredElsewhere, .declinedElsewhere, .busy: false
+        }
+    }
+
     /// Starts a voice call in a direct chat (the call window opens on the event).
     func startCall(_ conversationId: String) {
         guard call == nil || call?.phase == .ended else { return showError("You're already in a call.") }
         guard let client else { return showError("Semaphore isn't running.") }
         do { try client.startCall(conversationId: conversationId) } catch {
-            showError("Couldn't start the call: \(Self.describe(error))")
+            return showError("Couldn't start the call: \(Self.describe(error))")
         }
+        // shown at once, so a second click can't start a second call before the core answers
+        let title = conversations.first { $0.id == conversationId }?.title ?? "Call"
+        call = ActiveCall(
+            conversationId: conversationId, title: title, phase: .outgoing, incoming: false, connectedAt: nil)
+        WindowOpener.open?(id: "call")
     }
 
     func acceptCall() {
-        do { try client?.acceptCall() } catch { showError("Couldn't accept the call: \(Self.describe(error))") }
+        guard call != nil, call?.phase != .ended else { return showError("That call is over.") }
+        guard let client else { return showError("Semaphore isn't running.") }
+        do { try client.acceptCall() } catch { showError("Couldn't accept the call: \(Self.describe(error))") }
     }
 
-    /// Hangs up — or declines, while it still rings.
+    /// Hangs up — or declines, while it still rings. If the core doesn't confirm within
+    /// `hangupGrace`, the window is ended anyway: a stuck engine must not hold the user.
     func hangupCall() {
-        if let id = call?.conversationId { notifier?.remove(ids: [Notifications.callId(id)]) }
-        do { try client?.hangupCall() } catch { showError("Couldn't hang up: \(Self.describe(error))") }
+        guard let current = call, current.phase != .ended else { return }
+        notifier?.remove(ids: [Notifications.callId(current.conversationId)])
+        guard let client else { return endCallLocally(current.conversationId) }
+        do { try client.hangupCall() } catch {
+            showError("Couldn't hang up: \(Self.describe(error))")
+            return endCallLocally(current.conversationId)
+        }
+        Task {
+            try? await Task.sleep(for: Self.hangupGrace)
+            if call?.conversationId == current.conversationId, call?.phase != .ended {
+                showError("The call didn't end; the call engine may have stopped.")
+                endCallLocally(current.conversationId)
+            }
+        }
+    }
+
+    private func endCallLocally(_ conversationId: String) {
+        guard call?.conversationId == conversationId else { return }
+        call?.phase = .ended
+        call?.endedReason = .failed
+        lingerEndedCall()
+    }
+
+    /// The ended state stays `endedLinger`, then the window empties itself.
+    private func lingerEndedCall() {
+        let ended = call
+        Task {
+            try? await Task.sleep(for: Self.endedLinger)
+            if call == ended { dismissEndedCall() }
+        }
     }
 
     func toggleCallMuted() {
-        guard var current = call else { return }
+        guard var current = call, current.phase != .ended else { return }
+        guard let client else { return showError("Semaphore isn't running.") }
         current.muted.toggle()
         do {
-            try client?.setCallMuted(muted: current.muted)
+            try client.setCallMuted(muted: current.muted)
             call = current
         } catch { showError("Couldn't change the microphone: \(Self.describe(error))") }
     }
@@ -740,6 +797,11 @@ final class AppStore {
     /// The ended state was shown long enough: close the call window.
     func dismissEndedCall() {
         if call?.phase == .ended { call = nil }
+    }
+
+    /// Brings the call window back (closed mid-call, or hidden behind others).
+    func showCallWindow() {
+        WindowOpener.open?(id: "call")
     }
 
     func callAudioDevices() async -> AudioDevices? {

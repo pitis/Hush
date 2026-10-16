@@ -489,8 +489,8 @@ async fn run(
                         });
                     }
                 }
-                None => listener.on_event(CoreEvent::Connection {
-                    state: ConnectionState::Unlinked,
+                None => listener.on_event(CoreEvent::Error {
+                    message: "calls need a linked phone".into(),
                 }),
             },
             Command::CancelHistory => {
@@ -677,12 +677,7 @@ fn spawn_call_router(
             let reg = registration.borrow();
             let data = reg.as_ref()?;
             let device_id = data.device_id.unwrap_or(1);
-            let tx = crate::calls::actor::spawn(
-                device_id,
-                data.service_ids.aci.to_string(),
-                listener.clone(),
-                call_out_tx.clone(),
-            );
+            let tx = crate::calls::actor::spawn(device_id, listener.clone(), call_out_tx.clone());
             *engine.borrow_mut() = Some(tx.clone());
             Some(tx)
         }
@@ -690,7 +685,7 @@ fn spawn_call_router(
     // Incoming envelopes: attach identity keys (RingRTC's call fingerprint) and hand them in.
     {
         let ensure_engine = ensure_engine.clone();
-        let (store, listener) = (store.clone(), listener.clone());
+        let (store, listener, registration) = (store.clone(), listener.clone(), registration.clone());
         tokio::task::spawn_local(async move {
             use presage::libsignal_service::protocol::{IdentityKeyStore, ProtocolAddress};
             while let Some(envelope) = incoming_rx.recv().await {
@@ -698,13 +693,20 @@ fn spawn_call_router(
                     tracing::warn!("a call message from a non-ACI sender was ignored");
                     continue;
                 };
+                let our_device_id = registration.borrow().as_ref().and_then(|d| d.device_id).unwrap_or(1);
+                let calls = crate::calls::wire::from_proto(&envelope.message, our_device_id);
+                if calls.is_empty() {
+                    continue; // not for this device, or nothing we handle: no audio stack for it
+                }
                 let Some(engine) = ensure_engine() else {
                     tracing::warn!("a call message arrived while unlinked");
                     continue;
                 };
                 let store = store.aci_protocol_store();
+                // RingRTC derives media keys from both identity keys; phones use the bare
+                // 32-byte key (no type byte), so we must too
                 let ours = match store.get_identity_key_pair().await {
-                    Ok(pair) => pair.identity_key().serialize().to_vec(),
+                    Ok(pair) => pair.identity_key().public_key().public_key_bytes().to_vec(),
                     Err(e) => {
                         listener.on_event(CoreEvent::Error {
                             message: format!("a call couldn't be checked against our identity: {e}"),
@@ -720,7 +722,7 @@ fn spawn_call_router(
                 };
                 let address = ProtocolAddress::new(envelope.sender.service_id_string(), device_id);
                 let theirs = match store.get_identity(&address).await {
-                    Ok(Some(identity)) => identity.serialize().to_vec(),
+                    Ok(Some(identity)) => identity.public_key().public_key_bytes().to_vec(),
                     Ok(None) => {
                         // no session with this device: a call can't be verified, so it can't ring
                         tracing::warn!(sender = %sender_aci, "a call from an unknown device was ignored");
@@ -741,7 +743,7 @@ fn spawn_call_router(
                     age_secs,
                     sender_identity_key: theirs,
                     receiver_identity_key: ours,
-                    calls: crate::calls::wire::from_proto(&envelope.message),
+                    calls,
                 });
             }
         });
@@ -778,22 +780,28 @@ fn spawn_call_router(
                             }
                         });
                     }
-                    CallOutput::NeedRelays => {
+                    CallOutput::NeedRelays { call_id_u64 } => {
                         let data = registration.borrow().clone();
                         let engine = engine.clone();
                         let listener = listener.clone();
                         tokio::task::spawn_local(async move {
                             let servers = match data.as_ref().map(crate::net::push_service) {
                                 Some(Ok(push)) => crate::calls::relays::fetch(&push).await,
-                                _ => Vec::new(),
+                                Some(Err(e)) => {
+                                    tracing::warn!("no credentials for the relay fetch: {e}");
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
                             };
                             if servers.is_empty() {
                                 listener.on_event(CoreEvent::Error {
-                                    message: "calling relays unavailable; the call tries a direct connection".into(),
+                                    message:
+                                        "calling relays unavailable (see the log); the call tries a direct connection"
+                                            .into(),
                                 });
                             }
                             if let Some(tx) = engine.borrow().clone() {
-                                let _ = tx.send(CallCommand::Relays(servers));
+                                let _ = tx.send(CallCommand::Relays { call_id_u64, servers });
                             }
                         });
                     }

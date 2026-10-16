@@ -70,9 +70,13 @@ pub(crate) struct IncomingCall {
 }
 
 /// Decodes an envelope, skipping junk (missing ids, undecodable opaques) without failing:
-/// offer first, then answer, ice, hangup, busy.
-pub(crate) fn from_proto(proto: &CallMessage) -> Vec<IncomingCall> {
+/// offer first, then answer, ice, hangup, busy. An envelope addressed to another of our
+/// devices (`destination_device_id`) is not ours to act on.
+pub(crate) fn from_proto(proto: &CallMessage, our_device_id: u32) -> Vec<IncomingCall> {
     let mut out = Vec::new();
+    if proto.destination_device_id.is_some_and(|d| d != our_device_id) {
+        return out;
+    }
     if let Some(offer) = &proto.offer {
         let media = match offer.r#type.and_then(|t| pcm::offer::Type::try_from(t).ok()) {
             Some(pcm::offer::Type::OfferVideoCall) => CallMediaType::Video,
@@ -161,7 +165,7 @@ mod tests {
         assert_eq!(offer_proto.id, Some(7));
         assert_eq!(offer_proto.r#type, Some(pcm::offer::Type::OfferAudioCall as i32));
         assert_eq!(proto.destination_device_id, Some(3));
-        let incoming = from_proto(&proto);
+        let incoming = from_proto(&proto, 3);
         assert_eq!(incoming.len(), 1);
         assert_eq!(incoming[0].call_id, CallId::new(7));
         assert!(matches!(incoming[0].message, signaling::Message::Offer(_)));
@@ -178,7 +182,7 @@ mod tests {
         let proto = to_proto(CallId::new(9), None, &signaling::Message::Ice(ice));
         assert_eq!(proto.ice_update.len(), 2);
         assert_eq!(proto.destination_device_id, None);
-        let incoming = from_proto(&proto);
+        let incoming = from_proto(&proto, 3);
         assert_eq!(incoming.len(), 1, "all candidates in one Ice");
         match &incoming[0].message {
             signaling::Message::Ice(ice) => assert_eq!(ice.candidates.len(), 2),
@@ -205,7 +209,7 @@ mod tests {
             let h = proto.hangup.as_ref().unwrap();
             assert_eq!(h.r#type, Some(proto_type as i32));
             assert_eq!(h.device_id, device);
-            let back = from_proto(&proto);
+            let back = from_proto(&proto, 3);
             assert!(matches!(back[0].message, signaling::Message::Hangup(_)));
         }
     }
@@ -214,7 +218,7 @@ mod tests {
     fn busy_round_trips() {
         let proto = to_proto(CallId::new(4), None, &signaling::Message::Busy);
         assert_eq!(proto.busy.as_ref().unwrap().id, Some(4));
-        assert!(matches!(from_proto(&proto)[0].message, signaling::Message::Busy));
+        assert!(matches!(from_proto(&proto, 3)[0].message, signaling::Message::Busy));
     }
 
     /// The proto allows several fields in one envelope: offer first, nothing dropped.
@@ -226,7 +230,7 @@ mod tests {
             id: Some(7),
             opaque: Some(vec![1]),
         });
-        let incoming = from_proto(&proto);
+        let incoming = from_proto(&proto, 3);
         assert_eq!(incoming.len(), 2);
         assert!(matches!(incoming[0].message, signaling::Message::Offer(_)));
         assert!(matches!(incoming[1].message, signaling::Message::Ice(_)));
@@ -244,7 +248,15 @@ mod tests {
             busy: Some(pcm::Busy { id: None }),
             ..Default::default()
         };
-        assert!(from_proto(&proto).is_empty());
+        assert!(from_proto(&proto, 3).is_empty());
+    }
+
+    /// An envelope for another of our devices (a phone's answer to our phone) is dropped.
+    #[test]
+    fn envelopes_for_another_device_are_not_ours() {
+        let proto = to_proto(CallId::new(4), Some(2), &signaling::Message::Busy);
+        assert!(from_proto(&proto, 3).is_empty());
+        assert_eq!(from_proto(&proto, 2).len(), 1);
     }
 
     /// A video offer still decodes (we answer voice-only; RingRTC negotiates).
@@ -256,6 +268,6 @@ mod tests {
             proto.offer.as_ref().unwrap().r#type,
             Some(pcm::offer::Type::OfferVideoCall as i32)
         );
-        assert_eq!(from_proto(&proto).len(), 1);
+        assert_eq!(from_proto(&proto, 3).len(), 1);
     }
 }

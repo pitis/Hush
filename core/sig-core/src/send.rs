@@ -353,8 +353,11 @@ pub async fn sender(
             } => {
                 let sent = send_to(&mut m, &conversation_id, *body, at).await;
                 if let Err(e) = &sent {
-                    // ids only; the call engine shows the user a failed call
+                    // ids only; the call engine ends the call, this says why
                     tracing::warn!(conversation = %conversation_id, error = %e, "a call message wasn't sent");
+                    l.on_event(CoreEvent::Error {
+                        message: format!("a call message to {conversation_id} wasn't sent: {e}"),
+                    });
                 }
                 let _ = done.send(sent.is_ok());
             }

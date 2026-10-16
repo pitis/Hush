@@ -26,6 +26,7 @@ pub(crate) enum CallCommand {
     Start {
         peer_aci: String,
     },
+    /// Accept the ringing incoming call (held until RingRTC can take it).
     Accept,
     Hangup,
     SetMuted(bool),
@@ -40,8 +41,12 @@ pub(crate) enum CallCommand {
         receiver_identity_key: Vec<u8>,
         calls: Vec<wire::IncomingCall>,
     },
-    /// The relays answer for a pending proceed (possibly empty: direct ICE still tries).
-    Relays(Vec<IceServer>),
+    /// The relays answer for a pending proceed (possibly empty: direct ICE still tries). Tagged
+    /// with the call it was fetched for, so a late answer can't proceed a later call.
+    Relays {
+        call_id_u64: u64,
+        servers: Vec<IceServer>,
+    },
     /// The send outcome of an outgoing envelope.
     SendResult {
         call_id_u64: u64,
@@ -63,8 +68,8 @@ pub(crate) enum CallOutput {
         call_id_u64: u64,
         proto: presage::proto::CallMessage,
     },
-    /// Fetch relays and answer with `CallCommand::Relays`.
-    NeedRelays,
+    /// Fetch relays and answer with `CallCommand::Relays` for this call.
+    NeedRelays { call_id_u64: u64 },
     /// Write a chat event into the peer's conversation.
     ChatEvent {
         peer_aci: String,
@@ -88,21 +93,34 @@ pub struct AudioDevices {
 }
 
 /// Call state shared between the thread and RingRTC's callbacks.
+#[derive(Default)]
 struct Shared {
     active: Option<ActiveCall>,
+    /// A Start was handed to RingRTC and its Outgoing state hasn't come back yet: a second
+    /// Start meanwhile would make RingRTC kill the first call as "already in progress".
+    starting: bool,
+    /// An incoming call can be accepted only once RingRTC says it rings locally.
+    ringing: bool,
+    /// The user accepted before that: taken as soon as it rings.
+    accept_pending: bool,
 }
 
-/// Spawns the call thread. Dropping the returned sender ends it.
+/// A panic in one callback must not take the whole engine down with a poisoned lock.
+fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Spawns the call thread. Dropping the returned sender ends it (and closes the engine).
 pub(crate) fn spawn(
     our_device_id: u32,
-    our_aci: String,
     listener: Arc<dyn EventListener>,
     out_tx: tokio::sync::mpsc::UnboundedSender<CallOutput>,
 ) -> std::sync::mpsc::Sender<CallCommand> {
     let (tx, rx) = std::sync::mpsc::channel::<CallCommand>();
+    let commands = tx.clone();
     std::thread::Builder::new()
         .name("sig-calls".into())
-        .spawn(move || run(our_device_id, our_aci, listener, out_tx, rx))
+        .spawn(move || run(our_device_id, listener, out_tx, commands, rx))
         .expect("spawn the call thread");
     tx
 }
@@ -117,12 +135,12 @@ struct Engine {
 
 fn run(
     our_device_id: u32,
-    our_aci: String,
     listener: Arc<dyn EventListener>,
     out_tx: tokio::sync::mpsc::UnboundedSender<CallOutput>,
+    commands: std::sync::mpsc::Sender<CallCommand>,
     rx: std::sync::mpsc::Receiver<CallCommand>,
 ) {
-    let shared = Arc::new(Mutex::new(Shared { active: None }));
+    let shared = Arc::new(Mutex::new(Shared::default()));
     let mut engine: Option<Engine> = None;
     while let Ok(cmd) = rx.recv() {
         // Lazy init: the audio stack opens on first use, not at app start.
@@ -136,7 +154,7 @@ fn run(
                     | CallCommand::SetAudioOutput(_)
             )
         {
-            match init_engine(&shared, &listener, &out_tx) {
+            match init_engine(&shared, &listener, &out_tx, &commands) {
                 Ok(e) => engine = Some(e),
                 Err(e) => {
                     listener.on_event(CoreEvent::Error {
@@ -149,22 +167,33 @@ fn run(
         let Some(engine) = engine.as_mut() else { continue };
         match cmd {
             CallCommand::Start { peer_aci } => {
-                if shared.lock().unwrap().active.is_some() {
-                    listener.on_event(CoreEvent::Error {
-                        message: "already in a call".into(),
-                    });
-                    continue;
+                {
+                    let mut shared = lock(&shared);
+                    if shared.active.is_some() || shared.starting {
+                        listener.on_event(CoreEvent::Error {
+                            message: "already in a call".into(),
+                        });
+                        continue;
+                    }
+                    shared.starting = true;
                 }
+                // a call never starts muted, whatever the last one ended as
+                engine.audio_track.set_enabled(true);
                 engine.call_manager.call(peer_aci, CallMediaType::Audio, our_device_id);
             }
             CallCommand::Accept => {
-                let active = shared.lock().unwrap().active.clone();
-                if let Some(active) = active {
-                    engine.call_manager.accept_call(CallId::new(active.call_id_u64));
+                let mut shared = lock(&shared);
+                match shared.active.clone() {
+                    Some(active) if active.incoming && shared.ringing => {
+                        engine.call_manager.accept_call(CallId::new(active.call_id_u64));
+                    }
+                    // RingRTC takes an accept only once the call rings locally: hold it
+                    Some(active) if active.incoming => shared.accept_pending = true,
+                    _ => {}
                 }
             }
             CallCommand::Hangup => {
-                if shared.lock().unwrap().active.is_some() {
+                if lock(&shared).active.is_some() {
                     engine.call_manager.hangup();
                 }
             }
@@ -225,22 +254,26 @@ fn run(
                     }
                 }
             }
-            CallCommand::Relays(ice_servers) => {
-                let active = shared.lock().unwrap().active.clone();
+            CallCommand::Relays { call_id_u64, servers } => {
+                let active = lock(&shared).active.clone();
                 let Some(active) = active else { continue };
+                if active.call_id_u64 != call_id_u64 {
+                    continue; // fetched for a call that is already over
+                }
+                engine.audio_track.set_enabled(true);
                 let context = NativeCallContext::new(
                     // hide_ip=false is Signal's own default: a 1:1 call may connect peer-to-peer,
                     // which shows your IP to your contact. The "Always relay calls" privacy
                     // setting (which sets this true and forces TURN) is planned M4 settings work.
                     false,
-                    ice_servers,
+                    servers,
                     engine.audio_track.clone(),
                     engine.video_track.clone(),
                     Box::new(NoVideo),
                 );
                 engine
                     .call_manager
-                    .proceed(CallId::new(active.call_id_u64), context, CallConfig::default(), None);
+                    .proceed(CallId::new(call_id_u64), context, CallConfig::default(), None);
             }
             CallCommand::SendResult { call_id_u64, ok } => {
                 if ok {
@@ -268,14 +301,20 @@ fn run(
             }
         }
     }
+    // the core is going away (unlink, relink): end whatever call is up with it
+    if let Some(mut engine) = engine {
+        if let Err(e) = engine.call_manager.close() {
+            tracing::warn!("closing the call engine failed: {e}");
+        }
+    }
     tracing::info!("the call thread ended");
-    let _ = our_aci;
 }
 
 fn init_engine(
     shared: &Arc<Mutex<Shared>>,
     listener: &Arc<dyn EventListener>,
     out_tx: &tokio::sync::mpsc::UnboundedSender<CallOutput>,
+    commands: &std::sync::mpsc::Sender<CallCommand>,
 ) -> Result<Engine, String> {
     let pcf = PeerConnectionFactory::new(&AudioConfig::default(), false, "", None).map_err(|e| e.to_string())?;
     let audio_track = pcf.create_outgoing_audio_track().map_err(|e| e.to_string())?;
@@ -289,6 +328,7 @@ fn init_engine(
         shared: shared.clone(),
         listener: listener.clone(),
         out_tx: out_tx.clone(),
+        commands: commands.clone(),
     };
     let platform = NativePlatform::new(
         pcf.clone(),
@@ -334,17 +374,104 @@ fn list_devices(pcf: &mut PeerConnectionFactory) -> AudioDevices {
     }
 }
 
-/// RingRTC's callbacks (its worker threads): map and forward, never block, never touch presage.
+/// RingRTC's callbacks (its worker threads): map and forward, never block, never touch presage,
+/// never call back into the engine (that goes through `commands`, handled on the call thread).
 #[derive(Clone)]
 struct Bridge {
     shared: Arc<Mutex<Shared>>,
     listener: Arc<dyn EventListener>,
     out_tx: tokio::sync::mpsc::UnboundedSender<CallOutput>,
+    commands: std::sync::mpsc::Sender<CallCommand>,
 }
 
 impl Bridge {
     fn now_ms() -> i64 {
         chrono::Utc::now().timestamp_millis()
+    }
+
+    /// One state change of the call with `remote_peer_id`, at `now`.
+    fn state_changed(&self, remote_peer_id: &str, call_id: CallId, state: CallState, now: i64) {
+        // ids, states and reasons only: this is what a failed call leaves to debug with
+        match &state {
+            CallState::Ended(reason, _) => tracing::warn!(call = %call_id, ?reason, "call ended"),
+            CallState::Rejected(reason) => tracing::warn!(call = %call_id, ?reason, "offer rejected"),
+            other => tracing::info!(call = %call_id, state = %other, "call state"),
+        }
+        let mut shared = lock(&self.shared);
+        // an offer that couldn't start a call (expired while we were away, or we were busy)
+        // still was a call we missed; it needs no active call to be recorded
+        if let CallState::Rejected(_) = state {
+            let _ = self.out_tx.send(CallOutput::ChatEvent {
+                peer_aci: remote_peer_id.to_owned(),
+                kind: ChatEventKind::MissedCall,
+                value: None,
+            });
+            return;
+        }
+        // the first we hear of a call: remember it
+        if matches!(state, CallState::Incoming(_) | CallState::Outgoing(_)) && shared.active.is_none() {
+            *shared = Shared {
+                active: Some(ActiveCall {
+                    call_id_u64: call_id.as_u64(),
+                    incoming: matches!(state, CallState::Incoming(_)),
+                    connected_at: None,
+                }),
+                starting: false,
+                ringing: false,
+                accept_pending: false,
+            };
+        }
+        let Some(active) = shared.active.clone() else {
+            // a call that failed before it started (RingRTC's own refusal): nothing is shown,
+            // so say why
+            if let CallState::Ended(reason, _) = &state {
+                shared.starting = false;
+                drop(shared);
+                self.listener.on_event(CoreEvent::Error {
+                    message: format!("the call couldn't start: {reason:?}"),
+                });
+            }
+            return;
+        };
+        if active.call_id_u64 != call_id.as_u64() {
+            return; // a stale state of a call that is already over
+        }
+        if matches!(state, CallState::Connected) {
+            if let Some(active) = shared.active.as_mut() {
+                active.connected_at.get_or_insert(now);
+            }
+        }
+        // an incoming call can be accepted from now on; take an accept the user already gave
+        if matches!(state, CallState::Ringing) && active.incoming {
+            shared.ringing = true;
+            if std::mem::take(&mut shared.accept_pending) {
+                let _ = self.commands.send(CallCommand::Accept);
+            }
+        }
+        let mapped = map_state(&active, &state, now);
+        if matches!(state, CallState::Incoming(_) | CallState::Outgoing(_)) {
+            let _ = self.out_tx.send(CallOutput::NeedRelays {
+                call_id_u64: call_id.as_u64(),
+            });
+        }
+        if let Some((kind, value)) = mapped.chat_event {
+            let _ = self.out_tx.send(CallOutput::ChatEvent {
+                peer_aci: remote_peer_id.to_owned(),
+                kind,
+                value,
+            });
+        }
+        if mapped.call_over {
+            *shared = Shared::default();
+        }
+        drop(shared);
+        if let Some((phase, reason)) = mapped.phase {
+            self.listener.on_event(CoreEvent::CallChanged {
+                conversation_id: format!("c:{remote_peer_id}"),
+                phase,
+                reason,
+            });
+        }
     }
 }
 
@@ -357,12 +484,14 @@ impl SignalingSender for Bridge {
         message: signaling::Message,
     ) -> ringrtc::common::Result<()> {
         let proto = wire::to_proto(call_id, receiver_device_id, &message);
-        let _ = self.out_tx.send(CallOutput::Send {
-            peer_aci: recipient_id.to_owned(),
-            call_id_u64: call_id.as_u64(),
-            proto,
-        });
-        Ok(())
+        // a closed router means the core is gone: fail the call now rather than at the timeout
+        self.out_tx
+            .send(CallOutput::Send {
+                peer_aci: recipient_id.to_owned(),
+                call_id_u64: call_id.as_u64(),
+                proto,
+            })
+            .map_err(|_| std::io::Error::other("the call router is gone").into())
     }
 
     fn send_call_message(
@@ -405,50 +534,7 @@ impl CallStateHandler for Bridge {
         call_id: CallId,
         state: CallState,
     ) -> ringrtc::common::Result<()> {
-        let now = Self::now_ms();
-        let mut shared = self.shared.lock().unwrap();
-        // the first we hear of a call names the peer: remember it
-        if matches!(state, CallState::Incoming(_) | CallState::Outgoing(_)) && shared.active.is_none() {
-            shared.active = Some(ActiveCall {
-                call_id_u64: call_id.as_u64(),
-                peer: remote_peer_id.to_owned(),
-                incoming: matches!(state, CallState::Incoming(_)),
-                started_at: now,
-                connected_at: None,
-            });
-        }
-        if matches!(state, CallState::Connected) {
-            if let Some(active) = shared.active.as_mut() {
-                active.connected_at.get_or_insert(now);
-            }
-        }
-        let Some(active) = shared.active.clone() else {
-            return Ok(());
-        };
-        let mapped = map_state(&active, &state, now);
-        // the engine needs relays before it can proceed with a fresh call
-        if matches!(state, CallState::Incoming(_) | CallState::Outgoing(_)) {
-            let _ = self.out_tx.send(CallOutput::NeedRelays);
-        }
-        if let Some((kind, value)) = mapped.chat_event {
-            let _ = self.out_tx.send(CallOutput::ChatEvent {
-                // a Rejected state belongs to the rejected caller, not the active call
-                peer_aci: remote_peer_id.to_owned(),
-                kind,
-                value,
-            });
-        }
-        if mapped.call_over && active.call_id_u64 == call_id.as_u64() {
-            shared.active = None;
-        }
-        drop(shared);
-        if let Some((phase, reason)) = mapped.phase {
-            self.listener.on_event(CoreEvent::CallChanged {
-                conversation_id: format!("c:{remote_peer_id}"),
-                phase,
-                reason,
-            });
-        }
+        self.state_changed(remote_peer_id, call_id, state, Self::now_ms());
         Ok(())
     }
 
@@ -511,7 +597,12 @@ impl http::Delegate for NoHttp {
 
 #[cfg(test)]
 mod tests {
+    use ringrtc::common::{CallEndReason, CallMediaType};
+    use ringrtc::core::call_summary::CallSummary;
+    use ringrtc::native::RejectReason;
+
     use super::*;
+    use crate::calls::{CallEnd, CallPhase};
 
     struct Quiet;
     impl EventListener for Quiet {
@@ -524,7 +615,7 @@ mod tests {
     #[test]
     fn the_call_actor_spawns_and_lists_devices() {
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let tx = spawn(1, "me".into(), Arc::new(Quiet), out_tx);
+        let tx = spawn(1, Arc::new(Quiet), out_tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let (reply, rx) = tokio::sync::oneshot::channel();
@@ -536,5 +627,200 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no audio devices in 5s");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    // The Bridge is RingRTC's view of us; it is plain state plus channels, so its sequencing is
+    // tested without the engine.
+
+    struct Recorder(Mutex<Vec<CoreEvent>>);
+    impl EventListener for Recorder {
+        fn on_event(&self, e: CoreEvent) {
+            self.0.lock().unwrap().push(e);
+        }
+    }
+
+    struct Harness {
+        bridge: Bridge,
+        events: Arc<Recorder>,
+        out_rx: tokio::sync::mpsc::UnboundedReceiver<CallOutput>,
+        commands_rx: std::sync::mpsc::Receiver<CallCommand>,
+    }
+
+    fn harness() -> Harness {
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let events = Arc::new(Recorder(Mutex::new(vec![])));
+        let bridge = Bridge {
+            shared: Arc::new(Mutex::new(Shared::default())),
+            listener: events.clone(),
+            out_tx,
+            commands,
+        };
+        Harness {
+            bridge,
+            events,
+            out_rx,
+            commands_rx,
+        }
+    }
+
+    const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+    const BOB: &str = "33333333-3333-3333-3333-333333333333";
+
+    fn phases(h: &Harness) -> Vec<(CallPhase, Option<CallEnd>)> {
+        h.events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::CallChanged { phase, reason, .. } => Some((*phase, *reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ended(reason: CallEndReason) -> CallState {
+        CallState::Ended(reason, CallSummary::default())
+    }
+
+    #[test]
+    fn an_incoming_call_is_remembered_and_asks_for_relays() {
+        let mut h = harness();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Incoming(CallMediaType::Audio), 1_000);
+        let active = h.bridge.shared.lock().unwrap().active.clone().unwrap();
+        assert_eq!(
+            (active.call_id_u64, active.incoming, active.connected_at),
+            (7, true, None)
+        );
+        assert!(matches!(
+            h.out_rx.try_recv(),
+            Ok(CallOutput::NeedRelays { call_id_u64: 7 })
+        ));
+        assert_eq!(phases(&h), vec![(CallPhase::Incoming, None)]);
+    }
+
+    /// Offers that sat in the queue while we were away arrive expired: no call starts, but the
+    /// chat still shows the missed call.
+    #[test]
+    fn an_expired_offer_is_a_missed_call() {
+        let mut h = harness();
+        h.bridge.state_changed(
+            BOB,
+            CallId::new(5),
+            CallState::Rejected(RejectReason::ReceivedOfferExpired {
+                age: std::time::Duration::from_secs(120),
+            }),
+            1_000,
+        );
+        match h.out_rx.try_recv() {
+            Ok(CallOutput::ChatEvent { peer_aci, kind, value }) => {
+                assert_eq!((peer_aci.as_str(), kind, value), (BOB, ChatEventKind::MissedCall, None));
+            }
+            other => panic!("expected a missed-call event, got {}", other.is_ok()),
+        }
+        assert!(h.bridge.shared.lock().unwrap().active.is_none());
+        assert!(phases(&h).is_empty(), "nothing to show");
+    }
+
+    #[test]
+    fn a_rejected_offer_while_busy_is_missed_and_leaves_the_active_call_alone() {
+        let mut h = harness();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Incoming(CallMediaType::Audio), 1_000);
+        let _ = h.out_rx.try_recv();
+        h.bridge.state_changed(
+            BOB,
+            CallId::new(8),
+            CallState::Rejected(RejectReason::ReceivedOfferWhileActive),
+            2_000,
+        );
+        match h.out_rx.try_recv() {
+            Ok(CallOutput::ChatEvent { peer_aci, kind, .. }) => {
+                assert_eq!((peer_aci.as_str(), kind), (BOB, ChatEventKind::MissedCall));
+            }
+            _ => panic!("expected bob's missed call"),
+        }
+        assert_eq!(h.bridge.shared.lock().unwrap().active.as_ref().unwrap().call_id_u64, 7);
+        assert_eq!(phases(&h).len(), 1, "no phase change for the active call");
+    }
+
+    /// An accept given before RingRTC can take it is replayed the moment the call rings.
+    #[test]
+    fn an_early_accept_is_taken_when_the_call_rings() {
+        let h = harness();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Incoming(CallMediaType::Audio), 1_000);
+        h.bridge.shared.lock().unwrap().accept_pending = true; // what the thread does for an early Accept
+        h.bridge.state_changed(ALICE, CallId::new(7), CallState::Ringing, 1_500);
+        assert!(matches!(h.commands_rx.try_recv(), Ok(CallCommand::Accept)));
+        assert!(h.bridge.shared.lock().unwrap().ringing);
+    }
+
+    /// RingRTC refusing a call before it exists (busy engine, internal error) would otherwise
+    /// be invisible: the window never opened, so the user needs to hear why.
+    #[test]
+    fn a_call_that_fails_to_start_is_reported() {
+        let h = harness();
+        h.bridge.shared.lock().unwrap().starting = true;
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), ended(CallEndReason::InternalFailure), 1_000);
+        let said = h
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::Error { message } if message.contains("couldn't start")));
+        assert!(said);
+        assert!(!h.bridge.shared.lock().unwrap().starting, "a new Start may follow");
+    }
+
+    #[test]
+    fn the_duration_counts_from_the_first_connect() {
+        let h = harness();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Outgoing(CallMediaType::Audio), 1_000);
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Connected, 5_000);
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Connected, 9_000);
+        assert_eq!(
+            h.bridge.shared.lock().unwrap().active.as_ref().unwrap().connected_at,
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn a_stale_end_of_another_call_changes_nothing() {
+        let mut h = harness();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Incoming(CallMediaType::Audio), 1_000);
+        let _ = h.out_rx.try_recv();
+        h.bridge
+            .state_changed(BOB, CallId::new(9), ended(CallEndReason::RemoteHangup), 2_000);
+        assert!(h.out_rx.try_recv().is_err(), "no chat event for a foreign call");
+        assert_eq!(phases(&h).len(), 1);
+        assert!(h.bridge.shared.lock().unwrap().active.is_some());
+    }
+
+    #[test]
+    fn the_active_call_ending_clears_it_and_reports_why() {
+        let mut h = harness();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), CallState::Incoming(CallMediaType::Audio), 1_000);
+        let _ = h.out_rx.try_recv();
+        h.bridge
+            .state_changed(ALICE, CallId::new(7), ended(CallEndReason::RemoteHangupAccepted), 3_000);
+        assert!(
+            h.out_rx.try_recv().is_err(),
+            "the phone took it: nothing to record here"
+        );
+        assert!(h.bridge.shared.lock().unwrap().active.is_none());
+        assert_eq!(
+            phases(&h).last(),
+            Some(&(CallPhase::Ended, Some(CallEnd::AnsweredElsewhere)))
+        );
     }
 }

@@ -7,6 +7,22 @@ use presage::libsignal_service::protocol::ServiceId;
 
 pub use actor::{AudioDevice, AudioDevices};
 
+/// Why a call ended, typed so the app can decide what to show and whether to notify.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallEnd {
+    /// We hung up (or declined).
+    HungUp,
+    /// The other side hung up (or declined our call).
+    RemoteHungUp,
+    /// One of our other devices (the phone) took the call.
+    AnsweredElsewhere,
+    /// One of our other devices declined it.
+    DeclinedElsewhere,
+    Busy,
+    NoAnswer,
+    Failed,
+}
+
 /// A received `CallMessage`, as the receive loop hands it to the call router.
 pub(crate) struct IncomingEnvelope {
     pub sender: ServiceId,
