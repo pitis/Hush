@@ -27,6 +27,15 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
 tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
 hex = "0.4"
+# Storage Service item crypto on raw bytes (libsignal-service only offers it on decoded
+# records, which would drop the fields our proto doesn't know); all already in the tree
+aes-gcm = "0.11"
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.22"
+# fresh IVs for the items we write
+rand = "0.9"
 chrono = "0.4"
 futures = "0.3"
 # to tell "this device was unlinked" (a 401/403 websocket handshake) from a network error; both are
@@ -41,5 +50,4 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 [dev-dependencies]
-rand = "0.9"
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros", "test-util"] }

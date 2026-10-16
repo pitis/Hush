@@ -5,6 +5,7 @@
 
 use crate::projection::ChatFlags;
 
+pub(crate) mod client;
 pub(crate) mod records;
 
 /// What a storage record means to us.
