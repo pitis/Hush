@@ -73,26 +73,27 @@ New core code lives in `core/sig-core/src/calls/`.
 
 - **Dependency (`core/sig-core/Cargo.toml`).**
   `ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.72.1", features = ["prebuilt_webrtc"] }`.
-- **Bridge (`calls/bridge.rs`).** Implements ringrtc's `SignalingSender` (outgoing
-  Offer/Answer/ICE/Hangup → `CallMessage` protos → a channel into the actor → presage send to
-  the peer's ServiceId) and `CallStateHandler` (ringing/connected/ended, remote mute states,
-  audio levels, network route → `CoreEvent::CallEvent`s). RingRTC calls these from its own
-  worker threads; the bridge owns `Send + Sync` channel ends only — presage stays on the actor
-  thread.
-- **Manager (`calls/manager.rs`).** Owns the `CallManager` and `PeerConnectionFactory`,
-  translates our commands (start/accept/hangup/mute/select device) into CallManager calls, and
-  incoming `ContentBody::CallMessage`s into `received_offer/answer/ice/hangup/busy`. One call
-  at a time; a second incoming call gets the busy path.
-- **Relays (`calls/relays.rs`).** Authenticated GET of the calling relay (TURN) configuration
-  through the same `PushService` route the history fetcher uses; cached briefly; fetched on
-  `proceed()`.
-- **Actor (`actor.rs`).** Routes incoming call messages to the manager (a new arm next to the
-  existing content handling), carries a `Command::Call(...)` family, and hands the bridge's
-  outgoing envelopes to the existing sender. Call events also land in the projection as chat
-  events (missed/outgoing/incoming call, duration) with `refresh_summary`.
-- **Client (`client.rs`, uniffi).** `start_call(conversation_id)`, `accept_call()`,
-  `hangup()`, `set_muted(bool)`, `audio_devices()`, `set_audio_device(...)`, and a
-  `CoreEvent::CallEvent { state, peer, ... }` enum for the app.
+- **Wire codec (`calls/wire.rs`).** Pure translation between RingRTC's `signaling::Message`
+  and the `CallMessage` proto, both directions; junk fields are skipped, never fatal.
+- **Call thread (`calls/actor.rs` + `calls/state.rs`).** Its own OS thread owns the
+  `CallManager` and `PeerConnectionFactory` (created lazily — the audio stack opens on first
+  use). RingRTC's callbacks (its worker threads) only map state (pure `state.rs` rules) and
+  push channel messages; `proceed()` routes back through the thread after the relays arrive.
+  One call at a time; a second incoming offer gets RingRTC's busy path and a missed-call event.
+  Sends are ack-driven (`should_assume_messages_sent = false`): the sender reports each
+  envelope's outcome back as `message_sent`/`message_send_failure`.
+- **Relays (`calls/relays.rs`).** Authenticated `GET /v2/calling/relays` through the shared
+  `net.rs` PushService (also used by the history fetcher), fetched per `proceed()`; failure or
+  an empty answer still lets the call try direct ICE, with a Core Log note.
+- **Core actor (`actor.rs`).** A call router task: incoming `CallMessage`s get the sender's and
+  our identity keys from presage's store (RingRTC's call fingerprint needs the real ones; a
+  sender with no stored identity can't ring) and go to the call thread; outgoing envelopes ride
+  the existing sender as `Job::Call` with an ack; chat events (OutgoingCall/IncomingCall with
+  duration, MissedCall for unanswered or declined) land in the projection.
+- **Client (`client.rs`, uniffi).** `start_call(conversation_id)` (direct non-PNI chats only),
+  `accept_call()`, `hangup_call()`, `set_call_muted(bool)`, `call_audio_devices()`,
+  `set_call_audio_input/output(id)`, and `CoreEvent::CallChanged { conversation_id, phase,
+  reason }` with `CallPhase` (Incoming/Outgoing/Ringing/Connecting/Connected/Ended).
 - **App.**
   - `CallWindow.swift`: a small fixed-size window per active call (peer name/avatar initials,
     state line, duration, mute toggle, device pickers, hang up).
@@ -150,6 +151,11 @@ wired to "always relay calls" later (M4 settings); default follows Signal's defa
   with device credentials; confirm path and JSON against Signal-Server).
 - Ring-on-all-devices semantics: what the phone expects from us when it answers first
   (RingRTC handles glare/accepted-elsewhere; verify the events we must surface).
+
+## Build packaging
+Cargo never folds foreign static archives into a staticlib, so Signal's prebuilt `libwebrtc.a`
+is merged into the xcframework by `scripts/build-core.sh` (libtool), and the app links
+CoreAudio, AudioToolbox, CoreGraphics and libc++ (WebRTC and cubeb are C++).
 
 ## Estimate
 - M3a voice: dependency + bridge + relays ~2–3 days; actor/client wiring ~2 days; app UI +
