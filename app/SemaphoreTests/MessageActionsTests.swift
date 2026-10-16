@@ -120,6 +120,20 @@ final class AppStoreMessageActionsTests: XCTestCase {
         XCTAssertNil(store.editing)
     }
 
+    func testAnEditKeepsItsStyles() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        var own = store.messages[1]
+        own.body = "bold move"
+        own.ranges = [BodyRange(start: 0, length: 4, style: .bold)]
+        store.startEditing(own)
+        // what the composer holds, saved unchanged
+        let message = ComposerText.message(from: ComposerText.attributed(own.body!, ranges: own.ranges))
+        await store.send(message.body, ranges: message.ranges)
+        XCTAssertEqual(fake.edited.map(\.body), ["bold move"])
+        XCTAssertEqual(fake.editedRanges, [own.ranges])
+    }
+
     func testAFailedChangeSaysWhyAndKeepsEditing() async {
         let fake = FakeClient(linked: true)
         fake.changeError = CoreError.InvalidInput(message: "messages can only be changed for 24 hours")

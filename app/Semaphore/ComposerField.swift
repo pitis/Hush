@@ -49,6 +49,8 @@ struct ComposerField: NSViewRepresentable {
         guard let view = scroll.documentView as? ComposerTextView else { return }
         if !view.attributedString().isEqual(to: text) {
             view.textStorage?.setAttributedString(text)
+            // typing undone now would land in text that's gone (sent, another chat's draft)
+            context.coordinator.undo.removeAllActions()
             if text.length == 0 { view.typingAttributes = ComposerText.display([]) }
             view.setSelectedRange(NSRange(location: text.length, length: 0))
         }
@@ -74,11 +76,16 @@ struct ComposerField: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ComposerField
         var focusRequest: Int
+        /// The field's own: cleared when its text is replaced, without touching the window's.
+        let undo: UndoManager
 
-        init(_ parent: ComposerField) {
+        @MainActor init(_ parent: ComposerField) {
             self.parent = parent
             focusRequest = parent.focusRequest
+            undo = UndoManager()
         }
+
+        func undoManager(for view: NSTextView) -> UndoManager? { undo }
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
@@ -106,6 +113,8 @@ struct ComposerField: NSViewRepresentable {
 /// and shows "Message" while empty.
 final class ComposerTextView: NSTextView {
     weak var coordinator: ComposerField.Coordinator?
+    /// Where ⌘V reads from (tests use their own).
+    var pasteboard: NSPasteboard = .general
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard window?.firstResponder === self,
@@ -132,16 +141,23 @@ final class ComposerTextView: NSTextView {
 
     override func paste(_ sender: Any?) {
         do {
-            let files = try Composer.pastedFiles(from: .general)
+            let files = try Composer.pastedFiles(from: pasteboard)
             if !files.isEmpty { return coordinator?.parent.onPasteFiles(files) ?? () }
         } catch {
             return coordinator?.parent.onPasteError(error) ?? ()
         }
         // others' fonts and colours stay out: only our styles
-        pasteAsPlainText(sender)
+        guard let words = pasteboard.string(forType: .string) else { return }
+        insertText(words, replacementRange: selectedRange())
     }
 
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] { [.string] }
+
+    /// Paste is on for files and a copied image too (a screenshot has no text to paste).
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        guard item.action == #selector(paste(_:)) else { return super.validateUserInterfaceItem(item) }
+        return pasteboard.availableType(from: [.string, .fileURL]) != nil || NSImage.canInit(with: pasteboard)
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event) ?? NSMenu()

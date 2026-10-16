@@ -322,21 +322,28 @@ fn fitting(text: &str, mut ranges: Vec<BodyRange>) -> Vec<BodyRange> {
     ranges
 }
 
-/// `text` without surrounding whitespace, its ranges moved to match.
+/// `text` without surrounding whitespace, its ranges moved and cut to match (a range only on
+/// the whitespace goes).
 fn trimmed(text: &str, ranges: Vec<BodyRange>) -> (String, Vec<BodyRange>) {
-    let start = text.len() - text.trim_start().len();
-    let shift = text[..start].encode_utf16().count() as u32;
-    let text = text.trim().to_string();
-    let moved = ranges
+    let lead = text.len() - text.trim_start().len();
+    let shift = text[..lead].encode_utf16().count() as u64;
+    let kept = text.trim().to_string();
+    let units = kept.encode_utf16().count() as u64;
+    let ranges = ranges
         .into_iter()
-        .filter(|r| r.start >= shift)
-        .map(|r| BodyRange {
-            start: r.start - shift,
-            ..r
+        .filter_map(|r| {
+            let start = u64::from(r.start).max(shift) - shift;
+            let end = (u64::from(r.start) + u64::from(r.length))
+                .saturating_sub(shift)
+                .min(units);
+            (end > start).then(|| BodyRange {
+                start: start as u32,
+                length: (end - start) as u32,
+                ..r
+            })
         })
         .collect();
-    let ranges = fitting(&text, moved);
-    (text, ranges)
+    (kept, ranges)
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1725,13 +1732,17 @@ mod tests {
                     conv.clone(),
                     vec![outgoing(photo.clone(), "image/heic")],
                     Some("  sunset ".into()),
-                    vec![range(2, 6), range(0, 1)],
+                    // inside, only on the spaces, and running into them on both sides
+                    vec![range(2, 6), range(0, 1), range(1, 3), range(6, 3)],
                     None,
                 )
                 .await
                 .unwrap();
             let m = client.message(key).await.unwrap().unwrap();
-            assert_eq!((m.body.as_deref(), m.ranges), (Some("sunset"), vec![range(0, 6)]));
+            assert_eq!(
+                (m.body.as_deref(), m.ranges),
+                (Some("sunset"), vec![range(0, 6), range(0, 2), range(4, 2)])
+            );
         });
     }
 

@@ -101,6 +101,46 @@ final class ComposerFieldTests: XCTestCase {
         XCTAssertEqual(hosting.fittingSize.height / one, 6, accuracy: 0.2)
     }
 
+    func testPasteIsOfferedForAnImageOnlyClipboardAndAttachesIt() throws {
+        var pasted: [URL] = []
+        let box = box!
+        let field = ComposerField(
+            text: Binding(get: { box.text }, set: { box.text = $0 }), focusRequest: 0, onReturn: {},
+            onUpInEmpty: { false }, onPasteFiles: { pasted = $0 }, onPasteError: { _ in })
+        let (_, view) = host(field)
+        let board = NSPasteboard(name: NSPasteboard.Name("semaphore-test-\(UUID())"))
+        defer { board.releaseGlobally() }
+        view.pasteboard = board
+        board.clearContents()
+        let image = NSImage(size: NSSize(width: 2, height: 2))
+        image.lockFocus()
+        NSColor.red.drawSwatch(in: NSRect(x: 0, y: 0, width: 2, height: 2))
+        image.unlockFocus()
+        board.writeObjects([image])
+        let item = NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        XCTAssertTrue(view.validateUserInterfaceItem(item), "a screenshot on the clipboard can be pasted")
+        view.paste(nil)
+        XCTAssertEqual(pasted.count, 1)
+        XCTAssertEqual(box.text.string, "")
+        // text comes in plain
+        board.clearContents()
+        board.setString("words", forType: .string)
+        view.paste(nil)
+        XCTAssertEqual(box.text.string, "words")
+        XCTAssertEqual(ComposerText.message(from: box.text).ranges, [])
+    }
+
+    func testUndoAfterTheTextIsReplacedFromOutsideDoesNothing() {
+        let (hosting, view) = host(field())
+        view.insertText("hello world", replacementRange: NSRange(location: NSNotFound, length: 0))
+        box.text = NSAttributedString()  // sent
+        hosting.rootView = AnyView(field().frame(width: 300))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertFalse(view.undoManager?.canUndo ?? false)
+        view.undoManager?.undo()
+        XCTAssertEqual(view.string, "")
+    }
+
     func testTextSetFromOutsideShowsAndClearsWithPlainTypingAfter() {
         box.text = ComposerText.attributed("edit me", ranges: [BodyRange(start: 0, length: 4, style: .bold)])
         let (hosting, view) = host(field())
