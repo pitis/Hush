@@ -63,8 +63,10 @@ final class AppStore {
     private(set) var connection: ConnectionState = .offline
     private(set) var conversations: [Conversation] = [] {
         didSet {
-            badge = ChatList.badge(conversations)
+            badge = ChatList.badge(conversations, now: Date())
             NSApp?.dockTile.badgeLabel = badge
+            // an archive that emptied (the last chat unarchived, or written in) closes
+            if showingArchive, ChatList.archived(conversations).isEmpty { showingArchive = false }
             // a chat read here or on the phone takes its message notifications with it
             for c in conversations where c.unreadCount == 0 && notified[c.id] == true {
                 removeNotifications(c.id)
@@ -487,10 +489,11 @@ final class AppStore {
         } catch { append("retry failed: \(error)") }
     }
 
-    /// Marks a chat read (here, on the phone, and with read receipts) if it has unread messages.
+    /// Marks a chat read (here, on the phone, and with read receipts) if it has unread messages
+    /// or was marked unread.
     func markRead(_ conversationId: String) {
         guard let client, !markingRead.contains(conversationId),
-            conversations.first(where: { $0.id == conversationId })?.unreadCount ?? 0 > 0
+            conversations.first(where: { $0.id == conversationId }).map(ChatList.isUnread) == true
         else { return }
         markingRead.insert(conversationId)
         Task {
@@ -498,6 +501,38 @@ final class AppStore {
             do { _ = try await client.markRead(conversationId: conversationId) } catch {
                 lastError = "Couldn't mark the chat read: \(Self.describe(error))"
                 append("mark read failed: \(error)")
+            }
+        }
+    }
+
+    func setArchived(_ conversationId: String, _ archived: Bool) {
+        change(conversationId) { try await $0.setArchived(conversationId: conversationId, archived: archived) }
+    }
+
+    func setPinned(_ conversationId: String, _ pinned: Bool) {
+        change(conversationId) { try await $0.setPinned(conversationId: conversationId, pinned: pinned) }
+    }
+
+    func mute(_ conversationId: String, for option: ChatList.MuteOption) {
+        let until = option.until(now: Date())
+        change(conversationId) { try await $0.setMuteUntil(conversationId: conversationId, untilMs: until) }
+    }
+
+    func unmute(_ conversationId: String) {
+        change(conversationId) { try await $0.setMuteUntil(conversationId: conversationId, untilMs: 0) }
+    }
+
+    func setMarkedUnread(_ conversationId: String, _ marked: Bool) {
+        change(conversationId) { try await $0.setMarkedUnread(conversationId: conversationId, marked: marked) }
+    }
+
+    /// A chat flag change: the core announces the list when it is done; a failure is shown.
+    private func change(_ conversationId: String, _ call: @escaping (any ClientProtocol) async throws -> Void) {
+        guard let client else { return }
+        Task {
+            do { try await call(client) } catch {
+                lastError = "Couldn't change the chat: \(Self.describe(error))"
+                append("chat change failed for \(conversationId): \(error)")
             }
         }
     }
@@ -540,6 +575,9 @@ final class AppStore {
         guard let notifier, let client, !isAppActive() else { return }
         let setting = NotificationContent.current()
         guard setting != .off else { return }
+        if let c = conversations.first(where: { $0.id == conversationId }), ChatList.isMuted(c, now: Date()) {
+            return
+        }
         do {
             guard let m = try await client.message(key: key), !m.deleted else { return }
             // a message with files reads "📷 Photo" (or "📷 caption"), as in Desktop
@@ -1023,9 +1061,20 @@ final class AppStore {
     }
 
     /// The chats the list shows: all, or those matching the search.
+    /// The chats the sidebar lists: the inbox or the archive, or every match while searching.
     var visibleConversations: [Conversation] {
-        conversations.filter { Formatting.matches(title($0), query: searchQuery) }
+        if !searchQuery.isEmpty {
+            return conversations.filter { Formatting.matches(title($0), query: searchQuery) }
+        }
+        return showingArchive ? ChatList.archived(conversations) : ChatList.inbox(conversations)
     }
+
+    var archivedCount: Int { ChatList.archived(conversations).count }
+
+    /// The sidebar shows the archived chats instead of the inbox.
+    private(set) var showingArchive = false
+
+    func showArchive(_ on: Bool) { showingArchive = on }
 
     func title(_ c: Conversation) -> String { Self.displayTitle(c, ownAci: ownAci) }
 

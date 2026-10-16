@@ -99,6 +99,25 @@ final class AppStoreNotificationTests: XCTestCase {
         XCTAssertEqual(notifier.posted.count, 1)
     }
 
+    func testAMutedChatPostsNoNotification() async {
+        let fake = FakeClient(linked: true)
+        var muted = conversation("c:m")
+        muted.muteUntil = Int64.max
+        fake.conversationAnswers = [.success([muted, conversation("c:alice")])]
+        fake.messageAnswers["c:m"] = [message("c:m", "m", 1, "psst")]
+        fake.messageAnswers["c:alice"] = [message("c:alice", "alice", 1, "hi")]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        await eventually { store.conversations.count == 2 }
+        store.handle(newMessage("c:m", "m", 1))
+        store.handle(
+            .newReaction(conversationId: "c:m", target: MessageKey(author: "m", sentAt: 1), reactor: "m", emoji: "👍"))
+        store.handle(newMessage("c:alice", "alice", 1))
+        await eventually { notifier.posted.count == 1 }
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(notifier.posted.map(\.conversationId), ["c:alice"])
+    }
+
     func testGroupMessagesNameSenderAndGroupAndOffMeansNone() async {
         let fake = FakeClient(linked: true)
         fake.titles["c:alice"] = "Alice"

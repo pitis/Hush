@@ -99,6 +99,24 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return 0
     }
     func setTyping(conversationId: String, started: Bool) throws {}
+    /// Chat flag changes, in order ("archived c:a true", "mute c:a 0"…); fail with `changeError`.
+    private(set) var flagCalls: [String] = []
+    private func flag(_ call: String) throws {
+        if let changeError { throw changeError }
+        lock.withLock { flagCalls.append(call) }
+    }
+    func setArchived(conversationId: String, archived: Bool) async throws {
+        try flag("archived \(conversationId) \(archived)")
+    }
+    func setPinned(conversationId: String, pinned: Bool) async throws {
+        try flag("pinned \(conversationId) \(pinned)")
+    }
+    func setMuteUntil(conversationId: String, untilMs: Int64) async throws {
+        try flag("mute \(conversationId) \(untilMs)")
+    }
+    func setMarkedUnread(conversationId: String, marked: Bool) async throws {
+        try flag("markedUnread \(conversationId) \(marked)")
+    }
     private(set) var downloads: [Int64] = []
     private(set) var sentFiles: [(conversationId: String, files: [OutgoingFile], caption: String?)] = []
     var attachmentAnswers: [MessageKey: [Attachment]] = [:]
@@ -257,7 +275,7 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
         unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
-        lastMessageUndecryptable: false)
+        lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false)
 }
 
 final class Counter: @unchecked Sendable {
