@@ -93,6 +93,9 @@ A new core module `core/sig-core/src/storage/`:
 - `conversations` gains `blocked INTEGER NOT NULL DEFAULT 0`, `whitelisted INTEGER NOT NULL
   DEFAULT 0`, and `storage_dirty INTEGER NOT NULL DEFAULT 0` (a local flag change not yet
   written). `storage_sync` also carries `account_dirty` (a pin change not yet written).
+  Sending from the Mac in an archived chat unarchives it (Desktop's rule) and marks it dirty, so
+  the phone unarchives it too; a sent transcript from the phone doesn't (the phone wrote its own
+  record).
 - Setting `storage_writes` (settings table; absent = on).
 - `Conversation` (the app's record) gains `blocked` and `whitelisted`.
 

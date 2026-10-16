@@ -518,6 +518,82 @@ mod tests {
         );
     }
 
+    /// `raw` with unknown fields inside its record: a bytes field 900 at the end, and a varint
+    /// 901 in the middle when `middle` (between two pinned entries, say).
+    fn with_unknown_fields(raw: &[u8], middle: Option<&[u8]>) -> Vec<u8> {
+        let (outer, inner) = wire::first_field(raw).unwrap();
+        let mut inner = inner.to_vec();
+        if let Some(rest) = middle {
+            wire::append_varint(&mut inner, 901, 7);
+            inner.extend_from_slice(rest);
+        }
+        wire::append_bytes(&mut inner, 900, b"future");
+        let mut out = vec![];
+        wire::append_bytes(&mut out, outer, &inner);
+        out
+    }
+
+    #[test]
+    fn patching_the_account_keeps_unknown_fields_byte_for_byte() {
+        let one = |k: u8| PinnedConversation {
+            identifier: Some(pinned_conversation::Identifier::GroupMasterKey(vec![k; 32])),
+        };
+        let acct = wrap(Record::Account(AccountRecord {
+            pinned_conversations: vec![one(1)],
+            username: "u".into(),
+            ..Default::default()
+        }));
+        let mut second = vec![];
+        wire::append_bytes(&mut second, 14, &one(2).encode_to_vec());
+        let raw = with_unknown_fields(&acct, Some(&second));
+        let patched = patch_account(
+            &raw,
+            &[Pin::Chat(format!("g:{}", hex::encode([3u8; 32])))],
+            (true, false),
+        )
+        .unwrap();
+        let (_, before) = wire::first_field(&raw).unwrap();
+        let (_, after) = wire::first_field(&patched).unwrap();
+        // apart from the fields we own, the record is exactly what it was
+        assert_eq!(
+            wire::strip_fields(after, &[5, 10, 14]).unwrap(),
+            wire::strip_fields(before, &[5, 10, 14]).unwrap()
+        );
+        let Some(Record::Account(a)) = StorageRecord::decode(&*patched).unwrap().record else {
+            panic!()
+        };
+        assert_eq!((a.pinned_conversations.len(), a.note_to_self_archived), (1, true));
+    }
+
+    #[test]
+    fn patching_a_group_writes_marked_unread_at_its_number_and_keeps_unknown_fields() {
+        let g = with_unknown_fields(
+            &wrap(Record::GroupV2(GroupV2Record {
+                master_key: vec![1; 32],
+                ..Default::default()
+            })),
+            None,
+        );
+        let p = patch_chat(
+            &g,
+            &ChatFlags {
+                marked_unread: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let Some(Record::GroupV2(g2)) = StorageRecord::decode(&*p).unwrap().record else {
+            panic!()
+        };
+        assert!(g2.marked_unread && !g2.archived && g2.muted_until_timestamp == 0);
+        let (_, before) = wire::first_field(&g).unwrap();
+        let (_, after) = wire::first_field(&p).unwrap();
+        assert_eq!(
+            wire::strip_fields(after, &[4, 5, 6]).unwrap(),
+            wire::strip_fields(before, &[4, 5, 6]).unwrap()
+        );
+    }
+
     #[test]
     fn the_wire_walker_handles_every_scalar_wire_type_and_rejects_groups() {
         let mut m = vec![];

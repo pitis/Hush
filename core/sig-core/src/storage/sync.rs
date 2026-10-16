@@ -412,6 +412,11 @@ mod tests {
         during_write: Option<Hook>,
         /// An item the server returns although nobody asked for it.
         extra_item: Option<(Vec<u8>, Vec<u8>)>,
+        /// The device that wins a conflict rewrote alice's record (A → A2, archived) instead of
+        /// adding a contact.
+        conflict_rekeys_alice: bool,
+        /// The write is stored, but the answer is lost on the way back.
+        fail_after_write: bool,
     }
 
     type Hook = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
@@ -453,6 +458,17 @@ mod tests {
                 self.conflicts_left -= 1;
                 let m = self.manifest.get_or_insert_with(Manifest::default);
                 m.version += 1;
+                if self.conflict_rekeys_alice {
+                    m.identifiers.retain(|(k, _)| *k != key(0xA));
+                    m.identifiers.push((key(0xA2), KIND_CONTACT));
+                    self.items.remove(&key(0xA));
+                    let archived = ChatFlags {
+                        archived: true,
+                        ..Default::default()
+                    };
+                    self.items.insert(key(0xA2), contact(ALICE, archived));
+                    return Err(StorageError::Conflict);
+                }
                 let k = vec![0xE0 + self.conflicts_left as u8; 16];
                 m.identifiers.push((k.clone(), KIND_CONTACT));
                 self.items.insert(k, contact(BOB, ChatFlags::default()));
@@ -465,6 +481,10 @@ mod tests {
             }
             for k in &w.deletes {
                 self.items.remove(k);
+            }
+            if self.fail_after_write {
+                self.fail_after_write = false;
+                return Err(StorageError::Network("the answer was lost".into()));
             }
             Ok(())
         }
@@ -1149,6 +1169,122 @@ mod tests {
         assert!(db.has_conversation(&format!("c:{BOB}")).await.unwrap());
         assert!(db.dirty_chats().await.unwrap().is_empty());
         assert_eq!(db.storage_state().await.unwrap().unwrap().version, 5);
+    }
+
+    #[tokio::test]
+    async fn a_conflict_over_the_same_chat_lets_the_phone_win_and_lists_it_once() {
+        let db = synced_db().await;
+        let alice = format!("c:{ALICE}");
+        db.set_mute_until(&alice, 7).await.unwrap();
+        db.set_account_dirty(true).await.unwrap(); // so the retry still writes something
+        let mut api = synced_api();
+        api.conflicts_left = 1;
+        api.conflict_rekeys_alice = true;
+        run(&mut api, &db, &keys(), ME, 1, no_sleep).await.unwrap();
+        let f = flags_of(&db, &alice).await;
+        assert!(f.archived && f.mute_until == 0, "the phone's rewrite won");
+        assert!(db.dirty_chats().await.unwrap().is_empty());
+        let w = api.writes.last().unwrap();
+        let listed: Vec<&Vec<u8>> = w.manifest.identifiers.iter().map(|(k, _)| k).collect();
+        assert!(!listed.contains(&&key(0xA)) && !w.deletes.contains(&key(0xA2)));
+        let alice_rows = db
+            .storage_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.conversation_id.as_deref() == Some(alice.as_str()))
+            .count();
+        assert_eq!(alice_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_answer_was_lost_is_caught_up_by_the_next_run() {
+        let db = synced_db().await;
+        db.set_mute_until(&format!("c:{ALICE}"), 7).await.unwrap();
+        let mut api = synced_api();
+        api.fail_after_write = true;
+        assert!(matches!(
+            run(&mut api, &db, &keys(), ME, 1, no_sleep).await,
+            Err(StorageError::Network(_))
+        ));
+        assert_eq!(api.writes.len(), 1, "the server has it");
+        assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+        // the next run reads our own write back: v4, and nothing left to write
+        let out = run(&mut api, &db, &keys(), ME, 1, no_sleep).await.unwrap();
+        assert_eq!(out.pulled.version, 4);
+        assert_eq!(api.writes.len(), 1, "nothing written twice");
+        assert!(db.dirty_chats().await.unwrap().is_empty());
+        assert_eq!(flags_of(&db, &format!("c:{ALICE}")).await.mute_until, 7);
+    }
+
+    #[tokio::test]
+    async fn records_we_do_not_interpret_pass_through_a_push_with_their_kinds() {
+        let db = synced_db().await;
+        let mut rows = db.storage_items().await.unwrap();
+        for (k, kind) in [(0x8, KIND_CHAT_FOLDER), (0x42, 42)] {
+            rows.push(StorageItemRow {
+                key: key(k),
+                kind,
+                conversation_id: None,
+            });
+        }
+        db.replace_storage_items(&rows).await.unwrap();
+        db.set_mute_until(&format!("c:{ALICE}"), 7).await.unwrap();
+        let mut api = synced_api();
+        push(&mut api, &db, &keys(), ME, 1).await.unwrap();
+        let ids = &api.writes[0].manifest.identifiers;
+        assert!(ids.contains(&(key(0x8), KIND_CHAT_FOLDER)) && ids.contains(&(key(0x42), 42)));
+        assert!(!api.writes[0].deletes.iter().any(|d| *d == key(0x8) || *d == key(0x42)));
+    }
+
+    #[tokio::test]
+    async fn our_own_manifest_check_refuses_before_anything_is_written() {
+        let k = |n| (key(n), KIND_CONTACT);
+        let acct = |n| (key(n), KIND_ACCOUNT);
+        assert!(check_manifest(&[acct(1), k(2)], &[key(3)]).is_ok());
+        assert!(check_manifest(&[k(2)], &[]).is_err(), "no account");
+        assert!(check_manifest(&[acct(1), acct(4)], &[]).is_err(), "two accounts");
+        assert!(check_manifest(&[acct(1), k(2), k(2)], &[]).is_err(), "a key twice");
+        assert!(
+            check_manifest(&[acct(1), k(2)], &[key(2)]).is_err(),
+            "deleted but listed"
+        );
+        // in a push: a second account row in our state stops the write
+        let db = synced_db().await;
+        let mut rows = db.storage_items().await.unwrap();
+        rows.push(StorageItemRow {
+            key: key(0xAD),
+            kind: KIND_ACCOUNT,
+            conversation_id: None,
+        });
+        db.replace_storage_items(&rows).await.unwrap();
+        db.set_mute_until(&format!("c:{ALICE}"), 7).await.unwrap();
+        let mut api = synced_api();
+        assert!(matches!(
+            push(&mut api, &db, &keys(), ME, 1).await,
+            Err(StorageError::Invalid(_))
+        ));
+        assert_eq!(api.write_attempts, 0);
+        assert_eq!(db.dirty_chats().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pin_made_before_the_first_sync_is_written_after_it() {
+        let db = db().await;
+        msg_in(&db, &format!("c:{ALICE}"), ALICE, 1).await;
+        assert!(db.set_pinned(&format!("c:{ALICE}"), true).await.unwrap());
+        let mut api = synced_api();
+        let out = push(&mut api, &db, &keys(), ME, 1).await.unwrap();
+        assert_eq!(out.written, 0);
+        assert!(
+            api.reads.is_empty() && api.write_attempts == 0,
+            "nothing to write against yet"
+        );
+        run(&mut api, &db, &keys(), ME, 1, no_sleep).await.unwrap();
+        assert_eq!(api.writes.len(), 1);
+        assert_eq!(api.writes[0].manifest.version, 4);
+        let state = db.storage_state().await.unwrap().unwrap();
+        assert_eq!((state.version, state.account_dirty), (4, false));
     }
 
     #[tokio::test]

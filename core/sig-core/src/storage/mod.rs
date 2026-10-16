@@ -8,6 +8,7 @@ use presage::store::StateStore;
 use presage_store_sqlite::SqliteStore;
 use sha2::{Digest, Sha256};
 
+use crate::events::CoreEvent;
 use crate::projection::{ChatFlags, ProjectionDb};
 use client::{StorageError, StorageHttp};
 use sync::{Keys, RunOutcome};
@@ -100,6 +101,34 @@ pub(crate) async fn sync_once(
         .map(Some)
 }
 
+/// What one sync's result means: the events for the app, and whether to tell our other devices
+/// that the storage changed (we wrote).
+pub(crate) fn effects(result: &Result<Option<RunOutcome>, StorageError>) -> (Vec<CoreEvent>, bool) {
+    match result {
+        Ok(None) => (vec![], false),
+        Ok(Some(out)) => {
+            let events = if out.pulled.chats_changed {
+                vec![CoreEvent::ConversationsChanged]
+            } else {
+                vec![]
+            };
+            (events, out.pushed.as_ref().is_some_and(|p| p.written > 0))
+        }
+        Err(e) => {
+            let why = match e {
+                StorageError::Conflict => "another device kept writing; it will be tried again at the next sync".into(),
+                e => e.to_string(),
+            };
+            let message = format!("Syncing chat settings with the phone failed: {why}");
+            // a pull may have applied the phone's changes before the failure: refresh anyway
+            (
+                vec![CoreEvent::ConversationsChanged, CoreEvent::Error { message }],
+                false,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +160,41 @@ mod tests {
         assert!(!is_storage_fetch_latest(&ContentBody::DataMessage(
             DataMessage::default()
         )));
+    }
+
+    fn outcome(chats_changed: bool, written: usize) -> RunOutcome {
+        RunOutcome {
+            pulled: sync::PullOutcome {
+                applied: 1,
+                chats_changed,
+                version: 4,
+            },
+            pushed: Some(sync::PushOutcome {
+                written,
+                skipped_no_record: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_sync_announces_what_changed_and_tells_the_phone_after_a_write() {
+        assert_eq!(effects(&Ok(None)), (vec![], false));
+        assert_eq!(effects(&Ok(Some(outcome(false, 0)))), (vec![], false));
+        assert_eq!(
+            effects(&Ok(Some(outcome(true, 2)))),
+            (vec![CoreEvent::ConversationsChanged], true)
+        );
+    }
+
+    #[test]
+    fn a_failed_sync_still_refreshes_the_list_and_says_why() {
+        // a pull may have applied the phone's changes before the failure
+        let (events, nudge) = effects(&Err(StorageError::Network("offline".into())));
+        assert!(!nudge);
+        assert_eq!(events[0], CoreEvent::ConversationsChanged);
+        assert!(matches!(&events[1], CoreEvent::Error { message } if message.ends_with("offline")));
+        let (events, _) = effects(&Err(StorageError::Conflict));
+        assert!(matches!(&events[1], CoreEvent::Error { message } if message.contains("next sync")));
     }
 
     #[test]

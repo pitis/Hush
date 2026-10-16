@@ -693,36 +693,24 @@ fn spawn_storage_sync(
             let Some(data) = registration.borrow().clone() else {
                 continue; // unlinked: the next connect syncs
             };
-            match storage::sync_once(&store, &db, &data).await {
+            let result = storage::sync_once(&store, &db, &data).await;
+            match &result {
+                Ok(Some(out)) => tracing::info!(
+                    ?trigger,
+                    applied = out.pulled.applied,
+                    version = out.pulled.version,
+                    written = out.pushed.as_ref().map_or(0, |p| p.written),
+                    "storage synced"
+                ),
                 Ok(None) => {}
-                Ok(Some(out)) => {
-                    let written = out.pushed.as_ref().map_or(0, |p| p.written);
-                    tracing::info!(
-                        ?trigger,
-                        applied = out.pulled.applied,
-                        version = out.pulled.version,
-                        written,
-                        "storage synced"
-                    );
-                    if out.pulled.chats_changed {
-                        listener.on_event(CoreEvent::ConversationsChanged);
-                    }
-                    if written > 0 {
-                        let _ = send_tx.send(Job::StorageChanged);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(?trigger, error = %e, "storage sync failed");
-                    let message = match e {
-                        storage::client::StorageError::Conflict => {
-                            "Syncing chat settings with the phone failed: another device kept writing; \
-                             it will be tried again after the next change"
-                                .to_string()
-                        }
-                        e => format!("Syncing chat settings with the phone failed: {e}"),
-                    };
-                    listener.on_event(CoreEvent::Error { message });
-                }
+                Err(e) => tracing::warn!(?trigger, error = %e, "storage sync failed"),
+            }
+            let (events, wrote) = storage::effects(&result);
+            for event in events {
+                listener.on_event(event);
+            }
+            if wrote {
+                let _ = send_tx.send(Job::StorageChanged);
             }
         }
     });
