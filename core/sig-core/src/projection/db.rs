@@ -1294,10 +1294,9 @@ impl ProjectionDb {
             } => {
                 let mut tx = self.pool.begin().await?;
                 let options = serde_json::to_string(options).expect("strings serialize");
-                // an end that came first stays
+                // the same poll again (a resend under its timestamp) never changes what was voted on
                 let res = sqlx::query(
-                    "INSERT INTO polls(author, sent_at, options, allow_multiple) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(author, sent_at) DO UPDATE SET options = ?3, allow_multiple = ?4",
+                    "INSERT OR IGNORE INTO polls(author, sent_at, options, allow_multiple) VALUES (?1, ?2, ?3, ?4)",
                 )
                 .bind(&message.author)
                 .bind(message.sent_at)
@@ -2375,8 +2374,9 @@ async fn is_deleted(conn: &mut SqliteConnection, key: &MessageKey) -> Result<boo
     Ok(deleted == Some(true))
 }
 
-/// Whether `key` is a poll here, in `conversation_id`, not deleted: a vote or end names its poll
-/// by author and time only, and must not reach one in a chat its sender isn't in.
+/// Whether `key` is a poll here, in `conversation_id`, not deleted and not ended: a vote or end
+/// names its poll by author and time only, and must not reach one in a chat its sender isn't
+/// in, nor change one that's over.
 async fn is_open_poll_in(
     conn: &mut SqliteConnection,
     conversation_id: &str,
@@ -2384,7 +2384,8 @@ async fn is_open_poll_in(
 ) -> Result<bool, sqlx::Error> {
     let found: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM messages m JOIN polls p ON p.author = m.author AND p.sent_at = m.sent_at
-         WHERE m.author = ?1 AND m.sent_at = ?2 AND m.conversation_id = ?3 AND m.deleted = 0",
+         WHERE m.author = ?1 AND m.sent_at = ?2 AND m.conversation_id = ?3 AND m.deleted = 0
+           AND p.ended = 0",
     )
     .bind(&key.author)
     .bind(key.sent_at)
@@ -4447,6 +4448,51 @@ mod tests {
         assert_eq!(db.my_poll_vote_count(&k("alice", 1), "bob").await.unwrap(), 0);
         assert!(db.apply(&vote("bob", 9, vec![0])).await.unwrap().is_empty());
         assert_eq!(db.my_poll_vote_count(&k("alice", 1), "bob").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_ended_poll_takes_no_votes_and_its_options_never_change() {
+        let db = db().await;
+        db.insert_message(&Message {
+            kind: MessageKind::Poll {
+                question: Some("Lunch?".into()),
+            },
+            body: None,
+            ..msg("alice", 1, "")
+        })
+        .await
+        .unwrap();
+        let created = |options: Vec<String>| Op::PollCreated {
+            message: k("alice", 1),
+            options,
+            allow_multiple: false,
+        };
+        db.apply(&created(vec!["A".into(), "B".into()])).await.unwrap();
+        // the same poll again, with other options: the first stands
+        assert!(db.apply(&created(vec!["Rigged".into()])).await.unwrap().is_empty());
+        let vote = |voter: &str| Op::PollVote {
+            conversation_id: "c:alice".into(),
+            target: k("alice", 1),
+            voter: voter.into(),
+            vote_count: 1,
+            options: vec![0],
+        };
+        db.apply(&vote("bob")).await.unwrap();
+        db.apply(&Op::PollEnded {
+            conversation_id: "c:alice".into(),
+            target: k("alice", 1),
+        })
+        .await
+        .unwrap();
+        assert!(db.apply(&vote("carol")).await.unwrap().is_empty());
+        let p = db.poll(&k("alice", 1)).await.unwrap().unwrap();
+        assert_eq!(
+            p.options
+                .iter()
+                .map(|o| (o.text.as_str(), o.voters.clone()))
+                .collect::<Vec<_>>(),
+            vec![("A", vec!["bob".to_string()]), ("B", vec![])]
+        );
     }
 
     #[tokio::test]
