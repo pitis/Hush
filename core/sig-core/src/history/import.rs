@@ -439,8 +439,13 @@ impl Importer {
                 };
                 reactions = self.latest_reactions(&p.reactions);
             }
+            Some(Item::ViewOnceMessage(m)) => {
+                // its file isn't brought over (history comes without what was meant to be seen once)
+                kind = MessageKind::ViewOnce { viewed: true };
+                reactions = self.latest_reactions(&m.reactions);
+            }
             Some(Item::UpdateMessage(_)) => unreachable!("handled above"),
-            // view-once media and story replies have no M1 kind yet
+            // story replies have no kind yet
             Some(_) | None => {
                 self.counts.skipped += 1;
                 return;
@@ -996,9 +1001,11 @@ mod tests {
                 MessageKind::Poll {
                     question: Some("Lunch?".into())
                 },
+                // its file isn't brought over: it counts as opened
+                MessageKind::ViewOnce { viewed: true },
             ]
         );
-        assert_eq!(counts.skipped, 1, "view-once has no kind yet");
+        assert_eq!(counts.skipped, 0);
     }
 
     #[test]

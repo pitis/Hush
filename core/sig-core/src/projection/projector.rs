@@ -31,6 +31,10 @@ pub enum Op {
     Delete {
         target: MessageKey,
     },
+    /// View-once media was opened (here or on another of our devices): it's gone.
+    ViewOnceOpened {
+        target: MessageKey,
+    },
     /// Raises the status of the targets: delivery/read receipts for our messages, or the phone
     /// telling us it read incoming ones. Never lowers it.
     SetStatus {
@@ -117,6 +121,16 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
                 }
                 Some(sync_message::Content::Blocked(b)) => vec![blocked_list(b)],
                 Some(sync_message::Content::MessageRequestResponse(r)) => request_response(r).into_iter().collect(),
+                Some(sync_message::Content::ViewOnceOpen(v)) => (|| {
+                    Some(Op::ViewOnceOpened {
+                        target: MessageKey {
+                            author: aci(v.sender_aci.as_deref(), v.sender_aci_binary.as_deref())?,
+                            sent_at: i64::try_from(v.timestamp?).ok()?,
+                        },
+                    })
+                })()
+                .into_iter()
+                .collect(),
                 _ => vec![],
             };
             let read: Vec<_> = sm
@@ -267,12 +281,11 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     let Some(sent_at) = dm.timestamp.and_then(|t| i64::try_from(t).ok()) else {
         return vec![];
     };
-    // Not shown yet: story replies (they belong to the story, M4), view-once media (M4), and
-    // messages with nothing visible to us yet (stickers, shared contacts, payments, polls; see the
-    // "Needs decision" card).
-    if dm.story_context.is_some() || dm.is_view_once == Some(true) {
+    // Not shown yet: story replies (they belong to the story, M4).
+    if dm.story_context.is_some() {
         return vec![];
     }
+    let view_once = dm.is_view_once == Some(true);
     if let Some(r) = &dm.reaction {
         let target = (|| {
             Some(MessageKey {
@@ -315,7 +328,10 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         }];
     }
     // what we can't show yet becomes a placeholder rather than vanishing
-    let kind = if let Some(s) = &dm.sticker {
+    let kind = if view_once {
+        // we can't open what we sent
+        MessageKind::ViewOnce { viewed: outgoing }
+    } else if let Some(s) = &dm.sticker {
         MessageKind::Sticker { emoji: s.emoji.clone() }
     } else if let Some(c) = dm.contact.first() {
         MessageKind::Contact { name: contact_name(c) }
@@ -347,8 +363,13 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         author: author.to_string(),
         sent_at,
         received_at,
-        ranges: text_ranges(&dm.body_ranges),
-        body: dm.body.clone(),
+        // a view-once message's caption goes with the media: not kept
+        ranges: if view_once {
+            vec![]
+        } else {
+            text_ranges(&dm.body_ranges)
+        },
+        body: dm.body.clone().filter(|_| !view_once),
         is_outgoing: outgoing,
         status: if outgoing {
             MessageStatus::Sent
@@ -373,7 +394,8 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         })
     });
     let mut ops = vec![];
-    if !attachments.is_empty() || preview.is_some() {
+    // ours, view-once: nothing we may open, so nothing to fetch
+    if (!attachments.is_empty() || preview.is_some()) && !(view_once && outgoing) {
         ops.push(Op::AddAttachments {
             message: message.key(),
             attachments,
@@ -752,21 +774,67 @@ mod tests {
     }
 
     #[test]
-    fn story_replies_and_view_once_are_not_shown_yet() {
+    fn story_replies_are_not_shown_yet() {
         let mut reply = text(460, "nice story");
         reply.story_context = Some(StoryContext::default());
-        let mut view_once = DataMessage {
-            timestamp: Some(461),
-            attachments: vec![Default::default()],
-            ..Default::default()
-        };
-        view_once.is_view_once = Some(true);
-        for dm in [reply.clone(), in_group(reply, KEY.to_vec()), view_once] {
+        for dm in [reply.clone(), in_group(reply, KEY.to_vec())] {
             assert!(
                 project(&content(ALICE, 470, ContentBody::DataMessage(dm.clone())), ME).is_empty(),
                 "{dm:?}"
             );
         }
+    }
+
+    #[test]
+    fn view_once_media_arrives_unviewed_and_ours_from_the_phone_counts_as_viewed() {
+        let view_once = DataMessage {
+            timestamp: Some(461),
+            body: Some("caption".into()),
+            attachments: vec![Default::default()],
+            is_view_once: Some(true),
+            ..Default::default()
+        };
+        let inserted = |ops: Vec<Op>| {
+            ops.into_iter()
+                .find_map(|o| match o {
+                    Op::InsertMessage(m) => Some(m),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let ops = project(&content(ALICE, 470, ContentBody::DataMessage(view_once.clone())), ME);
+        let m = inserted(ops.clone());
+        assert_eq!(m.kind, MessageKind::ViewOnce { viewed: false });
+        assert_eq!(m.body, None, "a view-once message's caption isn't kept");
+        assert!(ops.iter().any(|o| matches!(o, Op::AddAttachments { .. })));
+        // we can't open what we sent
+        let ops = project(&content(ME, 480, sent_sync(ALICE, view_once)), ME);
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::AddAttachments { .. })),
+            "nothing to fetch"
+        );
+        let m = inserted(ops);
+        assert_eq!(m.kind, MessageKind::ViewOnce { viewed: true });
+    }
+
+    #[test]
+    fn opened_on_my_phone_marks_view_once_media_viewed() {
+        let sm = SyncMessage {
+            content: Some(sync_message::Content::ViewOnceOpen(sync_message::ViewOnceOpen {
+                sender_aci_binary: Some(uuid(ALICE).as_bytes().to_vec()),
+                timestamp: Some(461),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            project(&content(ME, 500, ContentBody::SynchronizeMessage(sm.clone())), ME),
+            vec![Op::ViewOnceOpened {
+                target: key(ALICE, 461)
+            }]
+        );
+        // only our own devices say so
+        assert!(project(&content(BOB, 500, ContentBody::SynchronizeMessage(sm)), ME).is_empty());
     }
 
     #[test]

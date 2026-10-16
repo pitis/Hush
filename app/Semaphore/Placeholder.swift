@@ -18,6 +18,7 @@ enum Placeholder {
         case .payment: "💳 Payment"
         case .poll(let question): "📊 Poll: \(question ?? "")"
         case .giftBadge: "✨ Gift badge"
+        case .viewOnce: "View-once media"
         }
     }
 
@@ -50,5 +51,35 @@ enum Placeholder {
         return seconds == 0
             ? "\(subject) disabled disappearing messages."
             : "\(subject) set the disappearing message time to \(duration(seconds))."
+    }
+}
+
+/// View-once media: one look, then gone (as in Desktop).
+enum ViewOnce: Equatable {
+    /// Ours: we can't open it.
+    case sent
+    case viewed
+    case download(Int64)
+    case downloading
+    case open(Attachment)
+
+    static func state(_ m: Message, files: [Attachment]) -> ViewOnce {
+        if m.isOutgoing { return .sent }
+        guard case .viewOnce(viewed: false) = m.kind, let file = files.first else { return .viewed }
+        switch file.state {
+        case .ready: return .open(file)
+        case .downloading: return .downloading
+        case .pending, .failed: return .download(file.id)
+        }
+    }
+
+    static func label(_ state: ViewOnce) -> String {
+        switch state {
+        case .sent: "View-once media"
+        case .viewed: "Viewed"
+        case .download: "Download view-once media"
+        case .downloading: "Downloading…"
+        case .open(let file): file.contentType.hasPrefix("video/") ? "View video" : "View photo"
+        }
     }
 }

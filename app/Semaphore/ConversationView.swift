@@ -244,6 +244,7 @@ struct TimelineList: View {
                                     react: { emoji in Task { await store.react(to: m, with: emoji) } },
                                     edit: { store.startEditing(m) },
                                     delete: { Task { await store.deleteForEveryone(m) } },
+                                    viewOnce: { Task { await store.viewOnceOpened(m) } },
                                     name: store.senderName))
                         }
                     }
@@ -365,6 +366,8 @@ struct MessageRow: View {
         var react: (String) -> Void = { _ in }
         var edit: () -> Void = {}
         var delete: () -> Void = {}
+        /// View-once media was opened.
+        var viewOnce: () -> Void = {}
         /// A reactor's display name.
         var name: (String) -> String = { $0 }
     }
@@ -472,7 +475,7 @@ struct MessageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
-            if !message.deleted {
+            if !message.deleted && !isViewOnce {
                 AttachmentList(files: files, download: download, open: open)
                 if let preview { LinkPreviewCard(preview: preview) }
             }
@@ -480,6 +483,8 @@ struct MessageRow: View {
                 Group {
                     if message.deleted {
                         Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
+                    } else if isViewOnce {
+                        viewOnce
                     } else if let placeholder = Placeholder.text(message.kind) {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
                         Text(placeholder).italic()
@@ -509,6 +514,34 @@ struct MessageRow: View {
         .overlay {
             RoundedRectangle(cornerRadius: Theme.bubbleRadius).stroke(.yellow, lineWidth: highlighted ? 3 : 0)
                 .animation(.easeOut(duration: 0.4), value: highlighted)
+        }
+    }
+
+    private var isViewOnce: Bool {
+        if case .viewOnce = message.kind { return true }
+        return false
+    }
+
+    @ViewBuilder private var viewOnce: some View {
+        let state = ViewOnce.state(message, files: files)
+        let label = Label(ViewOnce.label(state), systemImage: "circle.dashed")
+        switch state {
+        case .open(let file):
+            Button {
+                open(file)  // linked for the viewer first: the core drops the file next
+                actions.viewOnce()
+            } label: {
+                label
+            }
+            .buttonStyle(.bordered)
+        case .download(let id):
+            Button {
+                download(id)
+            } label: {
+                label
+            }.buttonStyle(.bordered)
+        case .sent, .viewed, .downloading:
+            label.italic()
         }
     }
 

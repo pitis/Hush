@@ -86,6 +86,10 @@ pub enum Job {
         seconds: u32,
         at: u64,
     },
+    /// Tell our other devices we opened this view-once media (`view_once_open_sync`).
+    ViewOnceOpen {
+        key: MessageKey,
+    },
     /// A call signaling envelope, sent at `at`; the outcome goes back through `done` (RingRTC
     /// retries or fails the call on it).
     Call {
@@ -317,6 +321,20 @@ pub fn request_response_sync(conversation_id: &str, response: RequestResponse) -
     })
 }
 
+/// Tells our other devices we opened `target`'s view-once media (they drop it too). None if its
+/// author isn't an ACI.
+pub fn view_once_open_sync(target: &MessageKey) -> Option<SyncMessage> {
+    let uuid = Uuid::parse_str(&target.author).ok()?;
+    Some(SyncMessage {
+        content: Some(sync_message::Content::ViewOnceOpen(sync_message::ViewOnceOpen {
+            sender_aci: Some(uuid.to_string()),
+            sender_aci_binary: Some(uuid.as_bytes().to_vec()),
+            timestamp: Some(target.sent_at as u64),
+        })),
+        ..Default::default()
+    })
+}
+
 /// Our whole block list for our other devices: contacts by ACI (both encodings), groups by
 /// identifier. PNI chats can't be named here and are left out.
 pub fn blocked_sync(blocked: &[String]) -> SyncMessage {
@@ -504,6 +522,12 @@ pub async fn sender(
                 if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
                     let what = format!("telling the phone about the request from {conversation_id}");
                     report(l.as_ref(), &what, &e);
+                }
+            }
+            Job::ViewOnceOpen { key } => {
+                let Some(sm) = view_once_open_sync(&key) else { continue };
+                if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
+                    report(l.as_ref(), "telling the phone a view-once message was opened", &e);
                 }
             }
             Job::BlockedList => match db.blocked_chats().await {
@@ -864,6 +888,17 @@ mod tests {
                 if f.r#type == Some(sync_message::fetch_latest::Type::StorageManifest as i32)
         ));
         assert!(sm.read.is_empty());
+    }
+
+    #[test]
+    fn an_opened_view_once_tells_our_phone_which_one_as_its_own_sync_would() {
+        let target = key(U, 461);
+        let sm = view_once_open_sync(&target).unwrap();
+        assert_eq!(
+            own_ops(ME, &format!("c:{U}"), ContentBody::SynchronizeMessage(sm)),
+            vec![Op::ViewOnceOpened { target }]
+        );
+        assert!(view_once_open_sync(&key("not-an-aci", 1)).is_none());
     }
 
     #[test]

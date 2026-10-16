@@ -14,6 +14,39 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertNil(Placeholder.text(.normal))
     }
 
+    func testViewOnceMediaOffersOneLookThenSaysViewed() {
+        let file = { (state: AttachmentState, type: String) in
+            Attachment(
+                id: 7, message: MessageKey(author: "a", sentAt: 1), contentType: type, fileName: nil, size: 1,
+                width: nil, height: nil, isVoiceNote: false, path: state == .ready ? "/x" : nil, state: state)
+        }
+        var m = message("c:a", "a", 1)
+        m.kind = .viewOnce(viewed: false)
+        XCTAssertEqual(ViewOnce.state(m, files: [file(.ready, "image/jpeg")]), .open(file(.ready, "image/jpeg")))
+        XCTAssertEqual(ViewOnce.label(.open(file(.ready, "image/jpeg"))), "View photo")
+        XCTAssertEqual(ViewOnce.label(.open(file(.ready, "video/mp4"))), "View video")
+        XCTAssertEqual(ViewOnce.state(m, files: [file(.pending, "image/jpeg")]), .download(7))
+        XCTAssertEqual(ViewOnce.state(m, files: [file(.failed, "image/jpeg")]), .download(7))
+        XCTAssertEqual(ViewOnce.state(m, files: [file(.downloading, "image/jpeg")]), .downloading)
+        XCTAssertEqual(ViewOnce.state(m, files: []), .viewed, "nothing left to open")
+        m.kind = .viewOnce(viewed: true)
+        XCTAssertEqual(ViewOnce.state(m, files: [file(.ready, "image/jpeg")]), .viewed)
+        XCTAssertEqual(ViewOnce.label(.viewed), "Viewed")
+        m.isOutgoing = true
+        XCTAssertEqual(ViewOnce.state(m, files: []), .sent)
+        XCTAssertEqual(Placeholder.text(.viewOnce(viewed: false)), "View-once media")
+    }
+
+    @MainActor func testOpeningViewOnceMediaTellsTheCore() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        var m = message("c:a", "a", 9)
+        m.kind = .viewOnce(viewed: false)
+        await store.viewOnceOpened(m)
+        XCTAssertEqual(fake.viewedOnce, [MessageKey(author: "a", sentAt: 9)])
+    }
+
     func testTheChatListAndNotificationsUseTheirWords() {
         var c = conversation("c:a")
         c.lastMessageKind = .poll(question: "Pizza?")

@@ -1214,6 +1214,37 @@ impl ProjectionDb {
                 self.remove_files(&files);
                 Ok(changed(m))
             }
+            Op::ViewOnceOpened { target } => {
+                let mut tx = self.pool.begin().await?;
+                let target = &resolve(&mut tx, target).await?;
+                let (unviewed, _) = MessageKind::ViewOnce { viewed: false }.to_row();
+                let (_, viewed) = MessageKind::ViewOnce { viewed: true }.to_row();
+                let res = sqlx::query(
+                    "UPDATE messages SET kind_text = ?4
+                     WHERE author = ?1 AND sent_at = ?2 AND kind = ?3 AND kind_text IS NULL",
+                )
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .bind(unviewed)
+                .bind(viewed)
+                .execute(&mut *tx)
+                .await?;
+                let files: Vec<Option<String>> = if res.rows_affected() == 1 {
+                    sqlx::query_scalar(
+                        "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file",
+                    )
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .fetch_all(&mut *tx)
+                    .await?
+                } else {
+                    vec![]
+                };
+                let m = finish_update(&mut tx, target, res.rows_affected()).await?;
+                tx.commit().await?;
+                self.remove_files(&files.into_iter().flatten().collect::<Vec<_>>());
+                Ok(changed(m))
+            }
             Op::AddAttachments {
                 message,
                 attachments,
@@ -3995,6 +4026,44 @@ mod tests {
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
         db.set_group_members(&g, &["carol".into()]).await.unwrap();
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["carol"]);
+    }
+
+    #[tokio::test]
+    async fn opened_view_once_media_is_marked_viewed_and_its_files_go() {
+        let db = db().await;
+        let m = Message {
+            kind: MessageKind::ViewOnce { viewed: false },
+            body: None,
+            ..msg("alice", 1, "")
+        };
+        db.insert_message(&m).await.unwrap();
+        db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 10, false)], None))
+            .await
+            .unwrap();
+        assert_eq!(db.attachments(&k("alice", 1)).await.unwrap().len(), 1);
+        assert_eq!(
+            db.apply(&Op::ViewOnceOpened { target: k("alice", 1) }).await.unwrap(),
+            changed("c:alice", "alice", 1)
+        );
+        let opened = db.message(&k("alice", 1)).await.unwrap().unwrap();
+        assert_eq!(opened.kind, MessageKind::ViewOnce { viewed: true });
+        assert!(db.attachments(&k("alice", 1)).await.unwrap().is_empty());
+        // again, or on a message that isn't view-once: nothing
+        assert!(db
+            .apply(&Op::ViewOnceOpened { target: k("alice", 1) })
+            .await
+            .unwrap()
+            .is_empty());
+        db.insert_message(&msg("alice", 2, "hi")).await.unwrap();
+        assert!(db
+            .apply(&Op::ViewOnceOpened { target: k("alice", 2) })
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.message(&k("alice", 2)).await.unwrap().unwrap().kind,
+            MessageKind::Normal
+        );
     }
 
     #[tokio::test]
