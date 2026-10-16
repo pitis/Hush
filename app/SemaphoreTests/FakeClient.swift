@@ -122,6 +122,9 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let changeError { throw changeError }
         lock.withLock { flagCalls.append(call) }
     }
+    func setDisappearingTimer(conversationId: String, seconds: UInt32) async throws {
+        try await flag("timer \(conversationId) \(seconds)")
+    }
     func setArchived(conversationId: String, archived: Bool) async throws {
         try await flag("archived \(conversationId) \(archived)")
     }

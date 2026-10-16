@@ -177,6 +177,17 @@ pub fn reaction(conversation_id: &str, target: &MessageKey, emoji: String, remov
     }
 }
 
+/// Sets a direct chat's disappearing-message timer (0: off). presage adds the timer's version.
+pub fn timer_update(conversation_id: &str, seconds: u32, at: u64) -> DataMessage {
+    DataMessage {
+        timestamp: Some(at),
+        flags: Some(data_message::Flags::ExpirationTimerUpdate as u32),
+        expire_timer: Some(seconds),
+        group_v2: group_context(conversation_id),
+        ..Default::default()
+    }
+}
+
 /// Deletes our own message sent at `target_sent_at` for everyone.
 pub fn delete(conversation_id: &str, target_sent_at: i64, at: u64) -> DataMessage {
     DataMessage {
@@ -1057,6 +1068,24 @@ mod tests {
                 emoji: None
             }]
         );
+    }
+
+    #[test]
+    fn own_timer_change_applies_like_an_incoming_one() {
+        let conv = format!("c:{U}");
+        for seconds in [3600, 0] {
+            let dm = timer_update(&conv, seconds, 900);
+            assert_eq!(dm.expire_timer, Some(seconds), "off is sent as 0, not left out");
+            assert_eq!(
+                own_ops(ME, &conv, dm.into()),
+                vec![Op::SetTimer {
+                    conversation_id: conv.clone(),
+                    author: ME.into(),
+                    seconds,
+                    at: 900
+                }]
+            );
+        }
     }
 
     #[test]

@@ -517,6 +517,13 @@ final class AppStore {
         }
     }
 
+    /// Sets a direct chat's disappearing-message timer (0: off).
+    func setTimer(_ conversationId: String, seconds: UInt32) {
+        change(conversationId, "set the disappearing timer") {
+            try await $0.setDisappearingTimer(conversationId: conversationId, seconds: seconds)
+        }
+    }
+
     func setPinned(_ conversationId: String, _ pinned: Bool) {
         change(conversationId, pinned ? "pin the chat" : "unpin the chat") {
             try await $0.setPinned(conversationId: conversationId, pinned: pinned)

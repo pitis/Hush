@@ -21,6 +21,13 @@ enum Placeholder {
         }
     }
 
+    /// The timers offered, as in Desktop (seconds; 0: off).
+    static let timerChoices: [UInt32] = [0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200]
+
+    static func timerChoice(_ seconds: UInt32) -> String {
+        seconds == 0 ? "Off" : duration(Int64(seconds))
+    }
+
     /// A timer length in its largest whole unit: "30 seconds", "8 hours", "1 week".
     static func duration(_ seconds: Int64) -> String {
         let units: [(Int64, String)] = [(604_800, "week"), (86_400, "day"), (3_600, "hour"), (60, "minute")]
