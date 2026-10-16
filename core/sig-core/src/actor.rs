@@ -986,6 +986,22 @@ async fn sweep(store: &mut SqliteStore, db: &ProjectionDb, l: &dyn EventListener
             first_error.get_or_insert(format!("deleting a stored copy: {e}"));
         }
     }
+    for conversation_id in db.presage_forget_threads().await.map_err(|e| e.to_string())? {
+        let done = match crate::send::thread(&conversation_id) {
+            Some(thread) => store.clear_thread(&thread).await.map_err(|e| e.to_string()),
+            None => Err("not a conversation id".to_string()),
+        };
+        let done = match done {
+            Ok(()) => db
+                .presage_thread_forgotten(&conversation_id)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
+            first_error.get_or_insert(format!("deleting a stored chat: {e}"));
+        }
+    }
     first_error.map_or(Ok(()), Err)
 }
 
@@ -1277,6 +1293,17 @@ async fn handle(
             }
         }
         Received::Content(content) => {
+            match drop_blocked(db, &content, me).await {
+                Ok(true) => {
+                    tracing::info!(kind = content_kind(&content.body), "dropped: blocked");
+                    return;
+                }
+                Ok(false) => {}
+                // shown rather than dropped: losing a message is worse than showing a blocked one
+                Err(e) => l.on_event(CoreEvent::Error {
+                    message: format!("checking whether a sender is blocked failed: {e}"),
+                }),
+            }
             if let presage::libsignal_service::content::ContentBody::CallMessage(cm) = &content.body {
                 let _ = queues.calls.send(crate::calls::IncomingEnvelope {
                     sender: content.metadata.sender,
@@ -1307,6 +1334,53 @@ async fn handle(
             }
         }
     }
+}
+
+/// Whether content comes from a blocked person, or belongs to a blocked group (messages, edits,
+/// typing), so nothing should see it. A dropped message's copy in presage's store (saved before
+/// we see it) is queued for the sweep to delete. Our own devices are never blocked.
+async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<bool, sqlx::Error> {
+    use presage::libsignal_service::content::ContentBody;
+    let sender = &content.metadata.sender;
+    if sender.raw_uuid().to_string() == me {
+        return Ok(false);
+    }
+    let group = match &content.body {
+        ContentBody::DataMessage(dm) => dm
+            .group_v2
+            .as_ref()
+            .and_then(|g| g.master_key.as_deref())
+            .map(hex_group),
+        ContentBody::EditMessage(em) => em
+            .data_message
+            .as_ref()
+            .and_then(|dm| dm.group_v2.as_ref())
+            .and_then(|g| g.master_key.as_deref())
+            .map(hex_group),
+        ContentBody::TypingMessage(tm) => match &tm.group_id {
+            Some(identifier) => db.group_by_identifier(identifier).await?,
+            None => None,
+        },
+        _ => None,
+    };
+    let blocked = db.is_blocked(&direct_id(sender)).await?
+        || match &group {
+            Some(g) => db.is_blocked(g).await?,
+            None => false,
+        };
+    if blocked && matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
+        if let Ok(thread) = Thread::try_from(content) {
+            let at = content.metadata.client_timestamp.timestamp_millis();
+            db.queue_presage_forget(&crate::projection::conversation_id(&thread), at)
+                .await?;
+        }
+    }
+    Ok(blocked)
+}
+
+/// `g:<hex>` for a master key as messages carry it.
+fn hex_group(key: &[u8]) -> String {
+    format!("g:{}", hex::encode(key))
 }
 
 /// Where the receive loop hands work on to.
@@ -1379,6 +1453,10 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
                 match contact {
                     Ok(c) => {
                         let id = direct_id(&Aci::from(c.uuid).into());
+                        // in the phone's address book: never a message request
+                        if let Err(e) = db.set_phone_contact(&id).await {
+                            problems.push(format!("storing a contact: {e}"));
+                        }
                         if !c.name.is_empty() {
                             if let Err(e) = db.upsert_conversation_title(&id, &c.name).await {
                                 problems.push(format!("storing a contact name: {e}"));
@@ -1668,6 +1746,146 @@ mod tests {
         );
         assert!(super::sweep(&mut store, &db, &Quiet).await.is_err(), "retried");
         assert_eq!(db.presage_forget_queue().await.unwrap(), left);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn content_from(
+        sender: &str,
+        ms: u64,
+        body: presage::libsignal_service::content::ContentBody,
+    ) -> presage::libsignal_service::content::Content {
+        use presage::libsignal_service::content::{Content, Metadata};
+        use presage::libsignal_service::protocol::{Aci, DeviceId, ServiceId};
+        let sid = ServiceId::from(Aci::from(
+            presage::libsignal_service::prelude::Uuid::parse_str(sender).unwrap(),
+        ));
+        let at = chrono::DateTime::from_timestamp_millis(ms as i64).unwrap();
+        Content {
+            metadata: Metadata {
+                sender: sid,
+                destination: sid,
+                sender_device: DeviceId::new(1).unwrap(),
+                pni_verified: None,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+            body,
+        }
+    }
+
+    /// Whatever a blocked person sends, and what anyone sends in a blocked group, is dropped
+    /// before it reaches the chat, the call UI or a notification; presage's copy is queued to go.
+    #[tokio::test]
+    async fn what_blocked_senders_and_groups_send_is_dropped() {
+        use crate::projection::ProjectionDb;
+        use presage::libsignal_service::content::ContentBody;
+        use presage::proto::{typing_message, CallMessage, DataMessage, GroupContextV2, SyncMessage, TypingMessage};
+        const ME: &str = "11111111-1111-1111-1111-111111111111";
+        const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+        const BOB: &str = "33333333-3333-3333-3333-333333333333";
+        let key = [7u8; 32];
+        let group = crate::projection::ids::group_id(&key);
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let text = |ms: u64, group: Option<Vec<u8>>| {
+            ContentBody::DataMessage(DataMessage {
+                body: Some("x".into()),
+                timestamp: Some(ms),
+                group_v2: group.map(|k| GroupContextV2 {
+                    master_key: Some(k),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let typing = |group_id: Option<Vec<u8>>| {
+            ContentBody::TypingMessage(TypingMessage {
+                timestamp: Some(1),
+                action: Some(typing_message::Action::Started as i32),
+                group_id,
+            })
+        };
+        for id in [format!("c:{ALICE}"), group.clone()] {
+            db.set_phone_contact(&id).await.unwrap(); // makes the chat's row
+            db.block(&id).await.unwrap();
+        }
+        let dropped = |c| {
+            let db = &db;
+            async move { super::drop_blocked(db, &c, ME).await.unwrap() }
+        };
+        assert!(dropped(content_from(ALICE, 100, text(100, None))).await);
+        assert!(dropped(content_from(ALICE, 2, typing(None))).await);
+        assert!(dropped(content_from(ALICE, 3, ContentBody::CallMessage(CallMessage::default()))).await);
+        assert!(dropped(content_from(BOB, 200, text(200, Some(key.to_vec())))).await);
+        let identifier = crate::projection::ids::group_identifier(&group);
+        assert!(dropped(content_from(BOB, 4, typing(identifier))).await);
+        assert!(
+            !dropped(content_from(BOB, 300, text(300, None))).await,
+            "bob alone isn't blocked"
+        );
+        assert!(
+            !dropped(content_from(
+                ME,
+                5,
+                ContentBody::SynchronizeMessage(SyncMessage::default())
+            ))
+            .await,
+            "our own devices are never blocked"
+        );
+        let mut queued = db.presage_forget_queue().await.unwrap();
+        queued.sort();
+        assert_eq!(
+            queued,
+            vec![(format!("c:{ALICE}"), 100), (group, 200)],
+            "presage's copies of the dropped messages go too"
+        );
+    }
+
+    /// A deleted chat's messages leave presage's store too.
+    #[tokio::test]
+    async fn a_deleted_chat_leaves_presages_store_too() {
+        use presage::libsignal_service::content::ContentBody;
+        use presage::libsignal_service::protocol::{Aci, ServiceId};
+        use presage::model::identity::OnNewIdentity;
+        use presage::proto::DataMessage;
+        use presage::store::{ContentsStore, Thread};
+        use presage_store_sqlite::SqliteStore;
+
+        const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+        let dir = std::env::temp_dir().join(format!("sig-core-delete-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = SqliteStore::open_with_options(
+            super::sqlite_options(&dir.join("presage.db"), &"00".repeat(32)).unwrap(),
+            OnNewIdentity::Trust,
+        )
+        .await
+        .unwrap();
+        let alice = ServiceId::from(Aci::from(
+            presage::libsignal_service::prelude::Uuid::parse_str(ALICE).unwrap(),
+        ));
+        let thread = Thread::Contact(alice);
+        for ms in [100, 200] {
+            let body = ContentBody::DataMessage(DataMessage {
+                timestamp: Some(ms),
+                ..Default::default()
+            });
+            store
+                .save_message(&thread, content_from(ALICE, ms, body))
+                .await
+                .unwrap();
+        }
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        db.set_phone_contact(&format!("c:{ALICE}")).await.unwrap();
+        db.delete_chat(&format!("c:{ALICE}")).await.unwrap();
+        super::sweep(&mut store, &db, &Quiet).await.unwrap();
+        assert!(store.message(&thread, 100).await.unwrap().is_none());
+        assert!(store.message(&thread, 200).await.unwrap().is_none());
+        assert!(db.presage_forget_threads().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

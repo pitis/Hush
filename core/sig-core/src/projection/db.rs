@@ -416,7 +416,8 @@ impl ProjectionDb {
         })
     }
 
-    async fn group_by_identifier(&self, identifier: &[u8]) -> Result<Option<String>, sqlx::Error> {
+    /// The group chat with this identifier (how typing messages and block lists name groups).
+    pub async fn group_by_identifier(&self, identifier: &[u8]) -> Result<Option<String>, sqlx::Error> {
         let groups: Vec<String> = sqlx::query_scalar("SELECT id FROM conversations WHERE kind = 1")
             .fetch_all(&self.pool)
             .await?;
