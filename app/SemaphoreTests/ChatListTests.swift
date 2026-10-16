@@ -82,9 +82,24 @@ final class ChatListTests: XCTestCase {
     }
 
     func testTheMenuBarListsTheChatsWithUnreadMessagesNewestFirst() {
+        let now = Date(timeIntervalSince1970: 1_000)
         let list = [conversation("c:1", unread: 2), conversation("c:2"), conversation("c:3", unread: 1)]
-        XCTAssertEqual(ChatList.unreadChats(list, limit: 5).map(\.id), ["c:1", "c:3"])
-        XCTAssertEqual(ChatList.unreadChats(list, limit: 1).map(\.id), ["c:1"])
+        XCTAssertEqual(ChatList.unreadChats(list, now: now, limit: 5).map(\.id), ["c:1", "c:3"])
+        XCTAssertEqual(ChatList.unreadChats(list, now: now, limit: 1).map(\.id), ["c:1"])
+    }
+
+    func testTheMenuBarSkipsWhatTheBadgeSkipsAndCountsOnlyMessages() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        var muted = conversation("c:m", unread: 1)
+        muted.muteUntil = Int64.max
+        var archived = conversation("c:x", unread: 1)
+        archived.archived = true
+        var marked = conversation("c:u")
+        marked.markedUnread = true
+        let list = [muted, archived, marked, conversation("c:a", unread: 2)]
+        XCTAssertEqual(ChatList.unreadChats(list, now: now, limit: 5).map(\.id), ["c:u", "c:a"])
+        XCTAssertEqual(ChatList.menuTitle("Alice", marked), "Alice")
+        XCTAssertEqual(ChatList.menuTitle("Alice", conversation("c:a", unread: 2)), "Alice (2)")
     }
 
     func testDockBadgeIsTheTotalUnread() {
@@ -103,6 +118,10 @@ final class ChatListTests: XCTestCase {
         marked.markedUnread = true
         XCTAssertEqual(ChatList.badge([conversation("c:a", unread: 2), muted, archived, marked], now: now), "3")
         XCTAssertNil(ChatList.badge([muted, archived], now: now))
+        // marked unread with unread messages too: the messages count, not an extra one
+        var both = conversation("c:b", unread: 3)
+        both.markedUnread = true
+        XCTAssertEqual(ChatList.badge([both], now: now), "3")
         // a mute that ran out no longer hides anything
         muted.muteUntil = 999_999
         XCTAssertEqual(ChatList.badge([muted], now: now), "4")
@@ -137,7 +156,7 @@ final class ChatListTests: XCTestCase {
         XCTAssertFalse(ChatList.isUnread(conversation("c:a")))
         XCTAssertTrue(ChatList.isUnread(conversation("c:a", unread: 1)))
         let list = [conversation("c:a"), marked]
-        XCTAssertEqual(ChatList.unreadChats(list, limit: 5).map(\.id), ["c:u"])
+        XCTAssertEqual(ChatList.unreadChats(list, now: Date(), limit: 5).map(\.id), ["c:u"])
         XCTAssertEqual(ChatList.neighbor(in: list, of: "c:a", step: 1, unreadOnly: true), "c:u")
     }
 
@@ -280,7 +299,82 @@ final class AppStoreChatListTests: XCTestCase {
         fake.changeError = TestError(description: "up to 4 chats can be pinned")
         store.setPinned("c:a", true)
         await eventually { store.lastError != nil }
-        XCTAssertEqual(store.lastError, "Couldn't change the chat: up to 4 chats can be pinned")
+        XCTAssertEqual(store.lastError, "Couldn't pin the chat: up to 4 chats can be pinned")
+        // the next change that works takes the message away
+        fake.changeError = nil
+        store.setArchived("c:a", true)
+        await eventually { store.lastError == nil }
+    }
+
+    func testFlagChangesRunInTheOrderTheyWereMade() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a")])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 1 }
+        fake.slowFirstFlag = .milliseconds(100)
+        store.mute("c:a", for: .always)
+        store.unmute("c:a")
+        await eventually { fake.flagCalls.count == 2 }
+        XCTAssertEqual(fake.flagCalls, ["mute c:a \(Int64.max)", "mute c:a 0"])
+    }
+
+    func testAWhitespaceSearchKeepsTheInbox() async {
+        let fake = FakeClient(linked: true)
+        var archived = conversation("c:x")
+        archived.archived = true
+        fake.conversationAnswers = [.success([conversation("c:a"), archived])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 2 }
+        store.searchQuery = "  "
+        XCTAssertFalse(store.isSearching)
+        XCTAssertEqual(store.visibleConversations.map(\.id), ["c:a"])
+        store.searchQuery = " c:x "
+        XCTAssertTrue(store.isSearching)
+        XCTAssertEqual(store.visibleConversations.map(\.id), ["c:x"])
+    }
+
+    func testMarkingTheOpenChatUnreadClosesIt() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 2 }
+        store.select("c:a")
+        store.setMarkedUnread("c:b", true)
+        XCTAssertEqual(store.selectedId, "c:a", "another chat: nothing closes")
+        store.setMarkedUnread("c:a", true)
+        XCTAssertNil(store.selectedId, "the open chat would be read again at once")
+        await eventually { fake.flagCalls.count == 2 }
+    }
+
+    func testTheBadgeRecountsWhenAMuteRunsOut() async {
+        let fake = FakeClient(linked: true)
+        var muted = conversation("c:m", unread: 2)
+        muted.muteUntil = Int64(Date().timeIntervalSince1970 * 1000) + 150
+        fake.conversationAnswers = [.success([muted])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 1 }
+        XCTAssertNil(store.badge)
+        await eventually { store.badge == "2" }
+    }
+
+    func testTheArchiveClosesWhenItsLastChatComesBack() async {
+        let fake = FakeClient(linked: true)
+        var archived = conversation("c:x")
+        archived.archived = true
+        fake.conversationAnswers = [.success([archived]), .success([conversation("c:x")])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 1 }
+        store.showArchive(true)
+        XCTAssertEqual(store.visibleConversations.map(\.id), ["c:x"])
+        store.handle(.conversationsChanged)
+        await eventually { !store.showingArchive }
+        XCTAssertEqual(store.visibleConversations.map(\.id), ["c:x"])
+        XCTAssertEqual(store.archivedCount, 0)
     }
 
     func testTheArchiveIsItsOwnListExceptWhenSearching() async {

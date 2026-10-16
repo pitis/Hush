@@ -101,9 +101,9 @@ final class AppStoreNotificationTests: XCTestCase {
 
     func testAMutedChatPostsNoNotification() async {
         let fake = FakeClient(linked: true)
-        var muted = conversation("c:m")
-        muted.muteUntil = Int64.max
-        fake.conversationAnswers = [.success([muted, conversation("c:alice")])]
+        // the core is asked at the time (the app's list can lag a mute by a moment)
+        fake.muted = ["c:m"]
+        fake.conversationAnswers = [.success([conversation("c:m"), conversation("c:alice")])]
         fake.messageAnswers["c:m"] = [message("c:m", "m", 1, "psst")]
         fake.messageAnswers["c:alice"] = [message("c:alice", "alice", 1, "hi")]
         let notifier = FakeNotifier()

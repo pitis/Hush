@@ -63,6 +63,17 @@ impl Client {
         })
     }
 
+    /// A conversation id that is well-formed and in the projection.
+    async fn known_conversation(&self, id: &str) -> Result<(), CoreError> {
+        check_conversation(id)?;
+        if !self.db.has_conversation(id).await? {
+            return Err(CoreError::InvalidInput {
+                message: format!("no such chat: {id}"),
+            });
+        }
+        Ok(())
+    }
+
     /// Queues a reaction, edit or delete of `conversation_id`'s message sent at `at`.
     fn send_mutation(
         &self,
@@ -630,17 +641,6 @@ impl Client {
     /// notification, so a mute set a moment ago counts even before the app's list caught up.
     pub async fn is_muted(&self, conversation_id: String) -> Result<bool, CoreError> {
         Ok(self.db.is_muted(&conversation_id, now_ms()).await?)
-    }
-
-    /// A conversation id that is well-formed and in the projection.
-    async fn known_conversation(&self, id: &str) -> Result<(), CoreError> {
-        check_conversation(id)?;
-        if !self.db.has_conversation(id).await? {
-            return Err(CoreError::InvalidInput {
-                message: format!("no such chat: {id}"),
-            });
-        }
-        Ok(())
     }
 
     /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).

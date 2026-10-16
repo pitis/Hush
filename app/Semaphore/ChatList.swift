@@ -63,10 +63,19 @@ enum ChatList {
         return total > 0 ? "\(total)" : nil
     }
 
-    /// The chats with unread messages, in list order (newest first), for the menu bar.
-    static func unreadChats(_ list: [Conversation], limit: Int) -> [Conversation] {
-        Array(list.filter(isUnread).prefix(limit))
+    /// The chats with unread messages, in list order (newest first), for the menu bar: the ones
+    /// the badge counts.
+    static func unreadChats(_ list: [Conversation], now: Date, limit: Int) -> [Conversation] {
+        Array(list.filter { !$0.archived && !isMuted($0, now: now) && isUnread($0) }.prefix(limit))
     }
+
+    /// A menu bar entry: the name, with the unread count when there is one.
+    static func menuTitle(_ title: String, _ c: Conversation) -> String {
+        c.unreadCount > 0 ? "\(title) (\(c.unreadCount))" : title
+    }
+
+    /// How many chats can be pinned (the phone's limit; the core refuses more).
+    static let maxPinned = 4
 
     /// The open chat is read once its newest message is on screen in the key window, and the
     /// window is actually visible (not while the screen is locked or asleep).

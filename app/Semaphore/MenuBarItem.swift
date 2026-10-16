@@ -49,12 +49,12 @@ final class MenuBarItem: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         menu.addItem(action("Open Semaphore") { [weak self] in self?.show(nil) })
-        let unread = ChatList.unreadChats(store.conversations, limit: MenuBar.unreadChatsShown)
+        let unread = ChatList.unreadChats(store.conversations, now: Date(), limit: MenuBar.unreadChatsShown)
         if !unread.isEmpty {
             menu.addItem(.separator())
             for c in unread {
                 let id = c.id
-                menu.addItem(action("\(store.title(c)) (\(c.unreadCount))") { [weak self] in self?.show(id) })
+                menu.addItem(action(ChatList.menuTitle(store.title(c), c)) { [weak self] in self?.show(id) })
             }
         }
         menu.addItem(.separator())

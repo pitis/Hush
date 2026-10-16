@@ -101,22 +101,28 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func setTyping(conversationId: String, started: Bool) throws {}
     /// Chat flag changes, in order ("archived c:a true", "mute c:a 0"…); fail with `changeError`.
     private(set) var flagCalls: [String] = []
-    private func flag(_ call: String) throws {
+    /// The next flag call waits this long first (once), to test ordering.
+    var slowFirstFlag: Duration?
+    private func flag(_ call: String) async throws {
+        if let delay = lock.withLock({ slowFirstFlag.take() }) { try? await Task.sleep(for: delay) }
         if let changeError { throw changeError }
         lock.withLock { flagCalls.append(call) }
     }
     func setArchived(conversationId: String, archived: Bool) async throws {
-        try flag("archived \(conversationId) \(archived)")
+        try await flag("archived \(conversationId) \(archived)")
     }
     func setPinned(conversationId: String, pinned: Bool) async throws {
-        try flag("pinned \(conversationId) \(pinned)")
+        try await flag("pinned \(conversationId) \(pinned)")
     }
     func setMuteUntil(conversationId: String, untilMs: Int64) async throws {
-        try flag("mute \(conversationId) \(untilMs)")
+        try await flag("mute \(conversationId) \(untilMs)")
     }
     func setMarkedUnread(conversationId: String, marked: Bool) async throws {
-        try flag("markedUnread \(conversationId) \(marked)")
+        try await flag("markedUnread \(conversationId) \(marked)")
     }
+    /// What the core answers to "is this chat muted now?".
+    var muted: Set<String> = []
+    func isMuted(conversationId: String) async throws -> Bool { lock.withLock { muted.contains(conversationId) } }
     private(set) var downloads: [Int64] = []
     private(set) var sentFiles: [(conversationId: String, files: [OutgoingFile], caption: String?)] = []
     var attachmentAnswers: [MessageKey: [Attachment]] = [:]

@@ -65,6 +65,7 @@ final class AppStore {
         didSet {
             badge = ChatList.badge(conversations, now: Date())
             NSApp?.dockTile.badgeLabel = badge
+            recountWhenAMuteEnds()
             // an archive that emptied (the last chat unarchived, or written in) closes
             if showingArchive, ChatList.archived(conversations).isEmpty { showingArchive = false }
             // a chat read here or on the phone takes its message notifications with it
@@ -266,7 +267,7 @@ final class AppStore {
                 screen = .chats
             }
         case .ready, .conversationsChanged:
-            Self.logger.notice("\(event == .ready ? "caught up" : "names synced", privacy: .public)")
+            Self.logger.notice("\(event == .ready ? "caught up" : "chat list changed", privacy: .public)")
             refreshConversations()
         case .messageChanged(let conversationId, let key):
             append("message \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
@@ -506,34 +507,79 @@ final class AppStore {
     }
 
     func setArchived(_ conversationId: String, _ archived: Bool) {
-        change(conversationId) { try await $0.setArchived(conversationId: conversationId, archived: archived) }
+        change(conversationId, archived ? "archive the chat" : "unarchive the chat") {
+            try await $0.setArchived(conversationId: conversationId, archived: archived)
+        }
     }
 
     func setPinned(_ conversationId: String, _ pinned: Bool) {
-        change(conversationId) { try await $0.setPinned(conversationId: conversationId, pinned: pinned) }
+        change(conversationId, pinned ? "pin the chat" : "unpin the chat") {
+            try await $0.setPinned(conversationId: conversationId, pinned: pinned)
+        }
     }
 
     func mute(_ conversationId: String, for option: ChatList.MuteOption) {
         let until = option.until(now: Date())
-        change(conversationId) { try await $0.setMuteUntil(conversationId: conversationId, untilMs: until) }
+        change(conversationId, "mute the chat") {
+            try await $0.setMuteUntil(conversationId: conversationId, untilMs: until)
+        }
     }
 
     func unmute(_ conversationId: String) {
-        change(conversationId) { try await $0.setMuteUntil(conversationId: conversationId, untilMs: 0) }
+        change(conversationId, "unmute the chat") {
+            try await $0.setMuteUntil(conversationId: conversationId, untilMs: 0)
+        }
     }
 
     func setMarkedUnread(_ conversationId: String, _ marked: Bool) {
-        change(conversationId) { try await $0.setMarkedUnread(conversationId: conversationId, marked: marked) }
+        // the open chat would count as read again at once: it closes, as on Desktop
+        if marked, selectedId == conversationId { select(nil) }
+        change(conversationId, marked ? "mark the chat unread" : "mark the chat read") {
+            try await $0.setMarkedUnread(conversationId: conversationId, marked: marked)
+        }
     }
 
+    /// The chat flag changes run one after the other, so two quick ones land in order.
+    private var lastChange: Task<Void, Never>?
+    /// The failure on show, if the last change failed (the next one that works takes it away).
+    private var changeFailure: String?
+
     /// A chat flag change: the core announces the list when it is done; a failure is shown.
-    private func change(_ conversationId: String, _ call: @escaping (any ClientProtocol) async throws -> Void) {
+    private func change(
+        _ conversationId: String, _ action: String, _ call: @escaping (any ClientProtocol) async throws -> Void
+    ) {
         guard let client else { return }
-        Task {
-            do { try await call(client) } catch {
-                lastError = "Couldn't change the chat: \(Self.describe(error))"
-                append("chat change failed for \(conversationId): \(error)")
+        let previous = lastChange
+        lastChange = Task {
+            await previous?.value
+            do {
+                try await call(client)
+                if let shown = changeFailure, lastError == shown { lastError = nil }
+                changeFailure = nil
+            } catch {
+                changeFailure = "Couldn't \(action): \(Self.describe(error))"
+                lastError = changeFailure
+                append("couldn't \(action) \(conversationId): \(error)")
             }
+        }
+    }
+
+    func dismissError() { lastError = nil }
+
+    private var muteEndTask: Task<Void, Never>?
+
+    /// A timed mute that runs out changes the badge and the row's bell without any event: the
+    /// list is re-read then.
+    private func recountWhenAMuteEnds() {
+        muteEndTask?.cancel()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        guard let next = conversations.map(\.muteUntil).filter({ $0 > nowMs && $0 < Int64.max }).min() else {
+            return
+        }
+        muteEndTask = Task {
+            try? await Task.sleep(for: .milliseconds(next - nowMs + 1))
+            guard !Task.isCancelled else { return }
+            conversations = conversations
         }
     }
 
@@ -575,10 +621,9 @@ final class AppStore {
         guard let notifier, let client, !isAppActive() else { return }
         let setting = NotificationContent.current()
         guard setting != .off else { return }
-        if let c = conversations.first(where: { $0.id == conversationId }), ChatList.isMuted(c, now: Date()) {
-            return
-        }
         do {
+            // asked of the core now: the list here can lag a mute by a moment
+            if try await client.isMuted(conversationId: conversationId) { return }
             guard let m = try await client.message(key: key), !m.deleted else { return }
             // a message with files reads "📷 Photo" (or "📷 caption"), as in Desktop
             var text = Placeholder.text(m.kind) ?? m.body
@@ -1061,9 +1106,12 @@ final class AppStore {
     }
 
     /// The chats the list shows: all, or those matching the search.
+    /// A search is on (spaces alone aren't one).
+    var isSearching: Bool { !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty }
+
     /// The chats the sidebar lists: the inbox or the archive, or every match while searching.
     var visibleConversations: [Conversation] {
-        if !searchQuery.isEmpty {
+        if isSearching {
             return conversations.filter { Formatting.matches(title($0), query: searchQuery) }
         }
         return showingArchive ? ChatList.archived(conversations) : ChatList.inbox(conversations)

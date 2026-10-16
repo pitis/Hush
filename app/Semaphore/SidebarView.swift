@@ -7,7 +7,9 @@ struct SidebarView: View {
     /// The message result picked with the arrows while browsing results.
     @State private var resultIndex: Int?
 
-    private var searching: Bool { !store.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty }
+    private var searching: Bool { store.isSearching }
+    /// The archive is on show (a search covers every chat, so it counts as the inbox).
+    private var inArchive: Bool { store.showingArchive && !searching }
     /// Arrows step through message results (in a chat search, or when no chat matches) rather
     /// than chats.
     private var browsingResults: Bool {
@@ -17,7 +19,7 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                if store.showingArchive {
+                if inArchive {
                     Button {
                         store.showArchive(false)
                     } label: {
@@ -26,7 +28,7 @@ struct SidebarView: View {
                     .buttonStyle(.plain).font(.system(size: 16, weight: .semibold))
                     .accessibilityLabel("Back to chats")
                 }
-                Text(store.showingArchive ? "Archived" : "Chats").font(.system(size: 22, weight: .bold))
+                Text(inArchive ? "Archived" : "Chats").font(.system(size: 22, weight: .bold))
                 Spacer()
             }
             .padding(.horizontal, 18)
@@ -188,7 +190,9 @@ struct SidebarView: View {
     /// Right-click on a chat: Desktop's chat actions.
     @ViewBuilder private func chatMenu(_ c: Conversation) -> some View {
         if c.pinnedOrder == nil {
+            // the core refuses a fifth pin; better not to offer it
             Button("Pin chat") { store.setPinned(c.id, true) }
+                .disabled(store.conversations.filter { $0.pinnedOrder != nil }.count >= ChatList.maxPinned)
         } else {
             Button("Unpin chat") { store.setPinned(c.id, false) }
         }
