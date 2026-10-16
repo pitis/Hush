@@ -440,6 +440,14 @@ impl Importer {
                         .and_then(|st| st.emoji.clone())
                         .filter(|e| !e.is_empty()),
                 };
+                // its image is its file (most are WebP, often stored untyped)
+                if let Some(data) = s.sticker.as_ref().and_then(|st| st.data.as_ref()) {
+                    let mut image = self.attachment_of(0, Some(data), false);
+                    if !image.content_type.starts_with("image/") {
+                        image.content_type = "image/webp".into();
+                    }
+                    attachments = vec![image];
+                }
                 reactions = self.latest_reactions(&s.reactions);
             }
             Some(Item::RemoteDeletedMessage(_)) | Some(Item::AdminDeletedMessage(_)) => deleted = true,
@@ -1084,6 +1092,30 @@ mod tests {
                 ended: true,
                 votes: vec![(ME.into(), 1, vec![1]), (ALICE.into(), 3, vec![0, 1])],
             })
+        );
+    }
+
+    #[test]
+    fn a_stickers_image_comes_along_typed_as_an_image() {
+        let mut imp = with_alice();
+        imp.add(frame(backup::frame::Item::ChatItem(chat_item(
+            10,
+            1,
+            1,
+            backup::chat_item::Item::StickerMessage(backup::StickerMessage {
+                sticker: MessageField::some(backup::Sticker {
+                    emoji: Some("🦊".into()),
+                    data: MessageField::some(backup::FilePointer::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        ))));
+        let (batch, _, _) = imp.finish();
+        let files = &batch.messages[0].attachments;
+        assert_eq!(
+            files.iter().map(|a| a.content_type.as_str()).collect::<Vec<_>>(),
+            ["image/webp"]
         );
     }
 

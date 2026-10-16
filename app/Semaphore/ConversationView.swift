@@ -489,7 +489,7 @@ struct MessageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
-            if !message.deleted && !isViewOnce {
+            if !message.deleted && !isViewOnce && !isSticker {
                 AttachmentList(files: files, download: download, open: { _ = open($0) })
                 if let preview { LinkPreviewCard(preview: preview) }
             }
@@ -499,6 +499,9 @@ struct MessageRow: View {
                         Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
                     } else if isViewOnce {
                         viewOnce
+                    } else if let sticker = stickerImage {
+                        ThumbnailImage(path: sticker).scaledToFit().frame(maxWidth: 160, maxHeight: 160)
+                            .accessibilityLabel(Placeholder.text(message.kind) ?? "Sticker")
                     } else if case .poll(let question) = message.kind, let poll {
                         PollCard(
                             question: question, poll: poll, me: actions.me, mine: message.author == actions.me,
@@ -528,11 +531,24 @@ struct MessageRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .foregroundStyle(.white)
-        .background(outgoing ? Theme.outgoing : Theme.incoming, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+        // as Desktop: a sticker stands on its own, without a bubble
+        .background(
+            stickerImage != nil ? .clear : outgoing ? Theme.outgoing : Theme.incoming,
+            in: RoundedRectangle(cornerRadius: Theme.bubbleRadius)
+        )
         .overlay {
             RoundedRectangle(cornerRadius: Theme.bubbleRadius).stroke(.yellow, lineWidth: highlighted ? 3 : 0)
                 .animation(.easeOut(duration: 0.4), value: highlighted)
         }
+    }
+
+    private var isSticker: Bool {
+        if case .sticker = message.kind { return true }
+        return false
+    }
+
+    private var stickerImage: String? {
+        message.deleted ? nil : Placeholder.stickerImage(message, files: files)
     }
 
     private var isViewOnce: Bool {

@@ -58,6 +58,21 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(fake.viewedOnce, [MessageKey(author: "a", sentAt: 9)])
     }
 
+    func testAStickerShowsItsImageOnceItsHere() {
+        let file = { (state: AttachmentState) in
+            Attachment(
+                id: 3, message: MessageKey(author: "a", sentAt: 1), contentType: "image/webp", fileName: nil, size: 1,
+                width: nil, height: nil, isVoiceNote: false, path: state == .ready ? "/s.webp" : nil, state: state)
+        }
+        var m = message("c:a", "a", 1)
+        m.kind = .sticker(emoji: "🦊")
+        XCTAssertEqual(Placeholder.stickerImage(m, files: [file(.ready)]), "/s.webp")
+        XCTAssertNil(Placeholder.stickerImage(m, files: [file(.downloading)]), "the placeholder until it's here")
+        XCTAssertNil(Placeholder.stickerImage(m, files: []))
+        m.kind = .normal
+        XCTAssertNil(Placeholder.stickerImage(m, files: [file(.ready)]))
+    }
+
     func testTheChatListAndNotificationsUseTheirWords() {
         var c = conversation("c:a")
         c.lastMessageKind = .poll(question: "Pizza?")
