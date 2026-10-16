@@ -29,11 +29,11 @@ The feasibility spike (2026-10-16) retired the ticket's "largest risk":
   zkgroup types cross ringrtc's public API, so the duplication costs build time, not
   correctness. RingRTC is AGPL-3.0, same as Semaphore.
 
-## Decisions (proposed — the owner's call)
-1. **Stage the milestone.** M3a: 1:1 voice calls, shippable alone. M3b: 1:1 video. M3c: group
-   calls, its own spec once 1:1 is real. Each stage is one PR series; this spec covers M3a and
-   M3b and stakes out where M3c plugs in. (The alternative — everything at once — is a
-   multi-week PR nobody can review.)
+## Decisions (owner, 2026-10-16)
+1. **Voice only for now.** M3 ships 1:1 voice calls; video is deferred to its own later stage
+   (M3b), group calls later still (M3c, its own spec). The owner's words: "lets do JUST voice
+   for now. we can put video for later." This spec's build scope is therefore M3a; the M3b
+   notes stay as the agreed direction for later.
 2. **Use the `ringrtc` crate with Signal's prebuilt WebRTC**, pinned by tag (v2.72.1), like
    presage is pinned by rev. The prebuilt is fetched at build time from Signal's artifact
    bucket and checksum-verified by ringrtc's own build script. Bumps happen in their own PR.
@@ -61,8 +61,8 @@ The feasibility spike (2026-10-16) retired the ticket's "largest risk":
 - TURN/STUN relay fetch from the chat server.
 - Mic permission flow (`NSMicrophoneUsageDescription`, TCC prompt on first call).
 
-**M3b (in, second PR series):** 1:1 video — camera capture, incoming rendering, camera
-toggle, camera permission.
+**Out for now — M3b (later, agreed direction):** 1:1 video — camera capture, incoming
+rendering, camera toggle, camera permission.
 
 **Out (M3c and later):** group calls, call links, screen share, call history sync
 (`SyncMessage::CallEvent` beyond timeline events), stories. Also out: ringing multiple linked
