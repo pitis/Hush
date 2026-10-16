@@ -73,6 +73,14 @@ enum ViewOnce: Equatable {
         }
     }
 
+    /// Opens `file` with `open`, and only if it opened spends the one look (`then`): a failed
+    /// open keeps it for another try.
+    static func open(_ file: Attachment, with open: (Attachment) -> Bool, then spend: () -> Void) -> Bool {
+        guard open(file) else { return false }
+        spend()
+        return true
+    }
+
     static func label(_ state: ViewOnce) -> String {
         switch state {
         case .sent: "View-once media"

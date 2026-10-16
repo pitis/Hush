@@ -37,6 +37,17 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(Placeholder.text(.viewOnce(viewed: false)), "View-once media")
     }
 
+    func testViewOnceMediaIsSpentOnlyOnceItOpened() {
+        let file = Attachment(
+            id: 7, message: MessageKey(author: "a", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
+            width: nil, height: nil, isVoiceNote: false, path: "/x", state: .ready)
+        var spent = 0
+        XCTAssertFalse(ViewOnce.open(file, with: { _ in false }, then: { spent += 1 }))
+        XCTAssertEqual(spent, 0, "a failed open keeps it for another try")
+        XCTAssertTrue(ViewOnce.open(file, with: { _ in true }, then: { spent += 1 }))
+        XCTAssertEqual(spent, 1)
+    }
+
     @MainActor func testOpeningViewOnceMediaTellsTheCore() async {
         let fake = FakeClient(linked: true)
         let store = AppStore(open: { _ in fake })

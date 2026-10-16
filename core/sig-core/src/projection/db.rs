@@ -1107,6 +1107,10 @@ impl ProjectionDb {
         };
         match op {
             Op::InsertMessage(m) => Ok(if self.insert_message(m).await? {
+                // ours, view-once: presage's copy (the media's key, the caption) is all that's left
+                if m.is_outgoing && m.kind == (MessageKind::ViewOnce { viewed: true }) {
+                    self.queue_presage_forget(&m.conversation_id, m.sent_at).await?;
+                }
                 vec![Applied::MessageChanged {
                     conversation_id: m.conversation_id.clone(),
                     key: m.key(),
@@ -1230,6 +1234,7 @@ impl ProjectionDb {
                 .execute(&mut *tx)
                 .await?;
                 let files: Vec<Option<String>> = if res.rows_affected() == 1 {
+                    forget_in_presage(&mut tx, target).await?;
                     sqlx::query_scalar(
                         "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file",
                     )
@@ -2205,6 +2210,19 @@ async fn is_deleted(conn: &mut SqliteConnection, key: &MessageKey) -> Result<boo
 
 /// Drops what other rows still hold of a deleted message: its reactions and quotes of its text.
 /// Returns the attachment files to remove once the transaction is committed.
+/// Queues presage's copy of the message `key` for the sweep to delete (`presage_forget`).
+async fn forget_in_presage(conn: &mut SqliteConnection, key: &MessageKey) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO presage_forget(conversation_id, sent_at)
+         SELECT conversation_id, sent_at FROM messages WHERE author = ?1 AND sent_at = ?2",
+    )
+    .bind(&key.author)
+    .bind(key.sent_at)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 async fn forget_deleted_text(conn: &mut SqliteConnection, key: &MessageKey) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query("DELETE FROM reactions WHERE target_author = ?1 AND target_sent_at = ?2")
         .bind(&key.author)
@@ -4048,6 +4066,11 @@ mod tests {
         let opened = db.message(&k("alice", 1)).await.unwrap().unwrap();
         assert_eq!(opened.kind, MessageKind::ViewOnce { viewed: true });
         assert!(db.attachments(&k("alice", 1)).await.unwrap().is_empty());
+        // presage's copy holds the media's key and the caption: it goes too
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 1)]
+        );
         // again, or on a message that isn't view-once: nothing
         assert!(db
             .apply(&Op::ViewOnceOpened { target: k("alice", 1) })
@@ -4063,6 +4086,23 @@ mod tests {
         assert_eq!(
             db.message(&k("alice", 2)).await.unwrap().unwrap().kind,
             MessageKind::Normal
+        );
+        assert_eq!(db.presage_forget_queue().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn our_view_once_from_the_phone_leaves_nothing_in_presage() {
+        let db = db().await;
+        let ours = Message {
+            kind: MessageKind::ViewOnce { viewed: true },
+            body: None,
+            is_outgoing: true,
+            ..msg("me", 3, "")
+        };
+        db.apply(&Op::InsertMessage(ours)).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 3)]
         );
     }
 
