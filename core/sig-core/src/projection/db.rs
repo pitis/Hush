@@ -1212,6 +1212,10 @@ impl ProjectionDb {
                 .bind(target.sent_at)
                 .execute(&mut *tx)
                 .await?;
+                if res.rows_affected() == 1 {
+                    // presage keeps the whole message (text, file keys): it goes too
+                    forget_in_presage(&mut tx, target).await?;
+                }
                 let files = forget_deleted_text(&mut tx, target).await?;
                 let m = finish_update(&mut tx, target, res.rows_affected()).await?;
                 tx.commit().await?;
@@ -2210,11 +2214,15 @@ async fn is_deleted(conn: &mut SqliteConnection, key: &MessageKey) -> Result<boo
 
 /// Drops what other rows still hold of a deleted message: its reactions and quotes of its text.
 /// Returns the attachment files to remove once the transaction is committed.
-/// Queues presage's copy of the message `key` for the sweep to delete (`presage_forget`).
+/// Queues presage's copies of the message `key` for the sweep to delete (`presage_forget`): the
+/// original and each edit, which presage keeps under its own timestamp.
 async fn forget_in_presage(conn: &mut SqliteConnection, key: &MessageKey) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT OR IGNORE INTO presage_forget(conversation_id, sent_at)
-         SELECT conversation_id, sent_at FROM messages WHERE author = ?1 AND sent_at = ?2",
+         SELECT conversation_id, sent_at FROM messages WHERE author = ?1 AND sent_at = ?2
+         UNION SELECT m.conversation_id, r.sent_at FROM message_revisions r
+           JOIN messages m ON m.author = r.author AND m.sent_at = r.original_sent_at
+           WHERE r.author = ?1 AND r.original_sent_at = ?2",
     )
     .bind(&key.author)
     .bind(key.sent_at)
@@ -2445,6 +2453,7 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
         .rows_affected()
         == 1;
     if deleted {
+        forget_in_presage(&mut *conn, key).await?;
         sqlx::query(
             "UPDATE messages SET body = NULL, quote_text = NULL, body_ranges = NULL, quote_ranges = NULL, deleted = 1 WHERE author = ?1 AND sent_at = ?2",
         )
@@ -4186,6 +4195,44 @@ mod tests {
             edited_at: 9,
         };
         assert!(db.apply(&edit).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_message_leaves_presages_store_too_whichever_came_first() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "secret")).await.unwrap();
+        db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 1)]
+        );
+        // the delete before the message
+        db.apply(&Op::Delete { target: k("alice", 2) }).await.unwrap();
+        db.insert_message(&msg("alice", 2, "secret too")).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 1), ("c:alice".to_string(), 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_edited_message_takes_its_edits_out_of_presage_too() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "secret")).await.unwrap();
+        db.apply(&Op::Edit {
+            target: k("alice", 1),
+            new_body: Some("secret v2".into()),
+            new_ranges: vec![],
+            edited_at: 5,
+        })
+        .await
+        .unwrap();
+        // presage keeps each revision under its own timestamp
+        db.apply(&Op::Delete { target: k("alice", 5) }).await.unwrap();
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![("c:alice".to_string(), 1), ("c:alice".to_string(), 5)]
+        );
     }
 
     #[tokio::test]
