@@ -203,10 +203,14 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     private(set) var retryHistoryCalls = 0
     private(set) var relinkCalls = 0
     var relinkError: Error?
+    var retryHistoryError: Error?
 
     func historyPending() async throws -> Bool { lock.withLock { historyPendingAnswer } }
     func cancelHistory() throws { lock.withLock { cancelHistoryCalls += 1 } }
-    func retryHistory() throws { lock.withLock { retryHistoryCalls += 1 } }
+    func retryHistory() throws {
+        lock.withLock { retryHistoryCalls += 1 }
+        if let retryHistoryError { throw retryHistoryError }
+    }
     func relink() async throws {
         lock.withLock { relinkCalls += 1 }
         if let relinkError { throw relinkError }

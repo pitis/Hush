@@ -24,6 +24,25 @@ final class AppStoreHistoryTests: XCTestCase {
         XCTAssertNil(store.history, "done dismisses the overlay")
     }
 
+    func testDoneRefreshesTheChatList() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:imported")])]
+        let store = await linkedStore(fake)
+        let before = fake.conversationCalls
+        store.handle(.historyProgress(stage: .done, done: 1, total: 0))
+        await eventually { fake.conversationCalls > before }
+        await eventually { store.conversations.map(\.id) == ["c:imported"] }
+    }
+
+    func testFailedRetrySendRestoresTheFailedOverlay() async {
+        let fake = FakeClient(linked: true)
+        fake.retryHistoryError = TestError(description: "closed")
+        let store = await linkedStore(fake)
+        store.handle(.historyProgress(stage: .failed, done: 0, total: 0))
+        store.retryHistory()
+        XCTAssertEqual(store.history?.stage, .failed, "no progress was started, so none is promised")
+    }
+
     func testNoHistoryDismissesAndFailureStays() async {
         let store = await linkedStore(FakeClient(linked: true))
         store.handle(.historyProgress(stage: .waiting, done: 0, total: 0))

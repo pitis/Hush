@@ -24,6 +24,9 @@ const RETRY: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_millis(20);
 /// How often download progress is persisted and reported (bytes).
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
+/// Consecutive failed (or fruitless) rounds before the transfer gives up and shows Failed;
+/// Retry starts it over from the saved state.
+const MAX_RETRIES: u32 = 30;
 
 /// One answer of `GET /v1/devices/transfer_archive`.
 pub(crate) enum Polled {
@@ -33,7 +36,9 @@ pub(crate) enum Polled {
         key: String,
     },
     /// The phone gave up (CONTINUE_WITHOUT_UPLOAD) or wants a fresh relink (RELINK_REQUESTED).
-    NoUpload,
+    NoUpload {
+        relink_requested: bool,
+    },
 }
 
 pub(crate) struct DownloadStart {
@@ -52,9 +57,10 @@ pub(crate) trait ArchiveServer {
     async fn download(&mut self, cdn: u32, key: &str, offset: u64) -> Result<Option<DownloadStart>, HistoryError>;
 }
 
+#[derive(Debug)]
 pub(crate) enum Fetched {
     File,
-    NoUpload,
+    NoUpload { relink_requested: bool },
     Cancelled,
 }
 
@@ -77,6 +83,7 @@ pub(crate) async fn fetch_archive(
         .history_state()
         .await?
         .ok_or_else(|| HistoryError::Server("no import state".into()))?;
+    let mut failures: u32 = 0;
     // Wait for the phone's upload, unless a previous run already learned where it is.
     while state.cdn.is_none() {
         l.on_event(CoreEvent::HistoryProgress {
@@ -98,9 +105,13 @@ pub(crate) async fn fetch_archive(
                 state.cdn_key = Some(key);
                 db.set_history_state(&state).await?;
             }
-            Ok(Polled::NoUpload) => return Ok(Fetched::NoUpload),
-            Ok(Polled::NotYet) => {}
+            Ok(Polled::NoUpload { relink_requested }) => return Ok(Fetched::NoUpload { relink_requested }),
+            Ok(Polled::NotYet) => failures = 0,
             Err(e) => {
+                failures += 1;
+                if matches!(e, HistoryError::Unauthorized) || failures >= MAX_RETRIES {
+                    return Err(e);
+                }
                 tracing::warn!("waiting for the archive failed: {e}; retrying");
                 if pause(RETRY, cancel).await {
                     return Ok(Fetched::Cancelled);
@@ -108,7 +119,11 @@ pub(crate) async fn fetch_archive(
             }
         }
     }
-    let (cdn, key) = (state.cdn.unwrap(), state.cdn_key.clone().unwrap_or_default());
+    let cdn = state.cdn.unwrap();
+    let key = state
+        .cdn_key
+        .clone()
+        .ok_or_else(|| HistoryError::Server("the saved import state names no archive".into()))?;
     // Download, resuming, until the file is complete.
     loop {
         if state.total_bytes.is_some_and(|t| t > 0 && state.bytes_done >= t) {
@@ -119,11 +134,30 @@ pub(crate) async fn fetch_archive(
         if *cancel.borrow() {
             return Ok(Fetched::Cancelled);
         }
+        let before = state.bytes_done;
         match download_once(server, db, tmp, l, cancel, &mut state, cdn, &key).await {
-            Ok(Once::Progressed) => {}
+            Ok(Once::Progressed) if state.bytes_done > before => failures = 0,
+            // nothing arrived (an empty answer): retrying right away would spin
+            Ok(Once::Progressed) => {
+                failures += 1;
+                if failures >= MAX_RETRIES {
+                    return Err(HistoryError::Download("the server keeps answering with no data".into()));
+                }
+                if pause(RETRY, cancel).await {
+                    return Ok(Fetched::Cancelled);
+                }
+            }
             Ok(Once::Cancelled) => return Ok(Fetched::Cancelled),
-            Ok(Once::Gone) => return Ok(Fetched::NoUpload),
+            Ok(Once::Gone) => {
+                return Ok(Fetched::NoUpload {
+                    relink_requested: false,
+                })
+            }
             Err(e) => {
+                failures += 1;
+                if matches!(e, HistoryError::Unauthorized) || failures >= MAX_RETRIES {
+                    return Err(e);
+                }
                 tracing::warn!("downloading the archive failed: {e}; retrying");
                 if pause(RETRY, cancel).await {
                     return Ok(Fetched::Cancelled);
@@ -156,10 +190,12 @@ async fn download_once(
         .open(tmp)
         .map_err(io)?;
     if start.offset != state.bytes_done {
-        // the server ignored the resume: whatever is on disk is stale
-        file.set_len(start.offset).map_err(io)?;
+        // the server ignored (or moved) the resume point: what is on disk past it is stale
         state.bytes_done = start.offset;
     }
+    // a leftover file longer than this download must not keep its tail: those bytes were never
+    // asked for and would fail the HMAC
+    file.set_len(start.offset).map_err(io)?;
     file.seek(SeekFrom::Start(start.offset)).map_err(io)?;
     if start.total.is_some() {
         state.total_bytes = start.total;
@@ -251,6 +287,8 @@ impl ArchiveServer for SignalServer {
         use presage::libsignal_service::configuration::Endpoint;
         use presage::libsignal_service::push_service::HttpAuthOverride;
         let err = |m: String| HistoryError::Server(m);
+        // reqwest's error text contains the URL; keep it out of logs and the Core Log
+        let net = |e: reqwest::Error| err(e.without_url().to_string());
         let resp = self
             .push
             .request(
@@ -261,15 +299,17 @@ impl ArchiveServer for SignalServer {
             .map_err(|e| err(e.to_string()))?
             .send()
             .await
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(net)?;
         match resp.status().as_u16() {
             204 => Ok(Polled::NotYet),
             200 => {
-                let v: serde_json::Value = resp.json().await.map_err(|e| err(e.to_string()))?;
+                let v: serde_json::Value = resp.json().await.map_err(net)?;
                 if let Some(error) = v["error"].as_str() {
-                    // RELINK_REQUESTED or CONTINUE_WITHOUT_UPLOAD: either way, no archive comes
+                    // the phone gave up, or wants this device linked afresh first
                     tracing::warn!(error, "the phone didn't upload the archive");
-                    return Ok(Polled::NoUpload);
+                    return Ok(Polled::NoUpload {
+                        relink_requested: error == "RELINK_REQUESTED",
+                    });
                 }
                 match (v["cdn"].as_u64(), v["key"].as_str()) {
                     (Some(cdn), Some(key)) => Ok(Polled::Ready {
@@ -279,6 +319,8 @@ impl ArchiveServer for SignalServer {
                     _ => Err(err("unexpected transfer_archive answer".into())),
                 }
             }
+            // this device's credentials are gone (unlinked on the phone?): retrying can't help
+            401 | 403 => Err(HistoryError::Unauthorized),
             s => Err(err(format!("transfer_archive: HTTP {s}"))),
         }
     }
@@ -299,17 +341,18 @@ impl ArchiveServer for SignalServer {
             .header(reqwest::header::RANGE, format!("bytes={offset}-"))
             .send()
             .await
-            .map_err(|e| err(e.to_string()))?;
+            .map_err(|e| err(e.without_url().to_string()))?;
         let (starts_at, total) = match resp.status().as_u16() {
-            // Content-Range: `bytes <from>-<to>/<total>`
             206 => {
-                let total = resp
+                let range = resp
                     .headers()
                     .get(reqwest::header::CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.rsplit('/').next())
-                    .and_then(|t| t.parse().ok());
-                (offset, total)
+                    .map(content_range)
+                    .unwrap_or((None, None));
+                // trust the answered range over the asked-for one: a server that starts
+                // elsewhere is handled like one that ignored the resume
+                (range.0.unwrap_or(offset), range.1)
             }
             200 => (0, resp.content_length()),
             // we asked past the end: it is already fully here
@@ -331,6 +374,17 @@ impl ArchiveServer for SignalServer {
             body: Box::pin(body),
         }))
     }
+}
+
+/// `Content-Range: bytes <from>-<to>/<total>` → (from, total); `*` parts come back as None.
+fn content_range(header: &str) -> (Option<u64>, Option<u64>) {
+    let rest = header.trim_start_matches("bytes").trim();
+    let (range, total) = match rest.split_once('/') {
+        Some((r, t)) => (r, t.parse().ok()),
+        None => (rest, None),
+    };
+    let from = range.split_once('-').and_then(|(f, _)| f.parse().ok());
+    (from, total)
 }
 
 /// Waits until cancellation is asked for (a closed channel counts: the core is going away).
@@ -542,12 +596,17 @@ mod tests {
     async fn the_phone_giving_up_ends_the_wait() {
         let db = db().await;
         db.set_history_state(&state()).await.unwrap();
-        let mut fake = Fake::new(vec![Ok(Polled::NoUpload)], vec![]);
+        let mut fake = Fake::new(
+            vec![Ok(Polled::NoUpload {
+                relink_requested: false,
+            })],
+            vec![],
+        );
         let (_keep, mut cancel) = watch::channel(false);
         let got = fetch_archive(&mut fake, &db, &tmp("noupload"), &Quiet, &mut cancel)
             .await
             .unwrap();
-        assert!(matches!(got, Fetched::NoUpload));
+        assert!(matches!(got, Fetched::NoUpload { .. }));
     }
 
     #[tokio::test]
@@ -566,7 +625,7 @@ mod tests {
         let got = fetch_archive(&mut fake, &db, &tmp("gone"), &Quiet, &mut cancel)
             .await
             .unwrap();
-        assert!(matches!(got, Fetched::NoUpload));
+        assert!(matches!(got, Fetched::NoUpload { .. }));
     }
 
     #[tokio::test]
@@ -588,5 +647,101 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(got, Fetched::Cancelled));
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::test_support::{Fake, Quiet};
+    use super::*;
+    use crate::projection::ProjectionDb;
+
+    async fn waiting_db() -> ProjectionDb {
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        db.set_history_state(&HistoryImportState {
+            stage: HistoryDbStage::Waiting,
+            key: vec![1u8; 32],
+            aci: "22222222-2222-2222-2222-222222222222".into(),
+            cdn: None,
+            cdn_key: None,
+            bytes_done: 0,
+            total_bytes: None,
+        })
+        .await
+        .unwrap();
+        db
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sig-fetch-hard-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.tmp");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[tokio::test]
+    async fn lost_credentials_fail_at_once_instead_of_retrying() {
+        let db = waiting_db().await;
+        let mut fake = Fake::new(vec![Err(HistoryError::Unauthorized)], vec![]);
+        let (_keep, mut cancel) = watch::channel(false);
+        let got = fetch_archive(&mut fake, &db, &tmp("auth"), &Quiet, &mut cancel).await;
+        assert!(matches!(got, Err(HistoryError::Unauthorized)), "got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn endless_errors_give_up_eventually() {
+        let db = waiting_db().await;
+        let waits = (0..MAX_RETRIES)
+            .map(|_| Err(HistoryError::Server("boom".into())))
+            .collect();
+        let mut fake = Fake::new(waits, vec![]);
+        let (_keep, mut cancel) = watch::channel(false);
+        let got = fetch_archive(&mut fake, &db, &tmp("giveup"), &Quiet, &mut cancel).await;
+        assert!(matches!(got, Err(HistoryError::Server(_))), "got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn a_leftover_longer_file_is_truncated() {
+        let db = waiting_db().await;
+        let path = tmp("leftover");
+        // a crash left a longer stale file, but the state starts over at byte 0
+        std::fs::write(&path, vec![9u8; 50_000]).unwrap();
+        let mut fake = Fake::new(
+            vec![Ok(Polled::Ready {
+                cdn: 3,
+                key: "k".into(),
+            })],
+            vec![7u8; 10_000],
+        );
+        let (_keep, mut cancel) = watch::channel(false);
+        let got = fetch_archive(&mut fake, &db, &path, &Quiet, &mut cancel).await.unwrap();
+        assert!(matches!(got, Fetched::File));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 10_000], "no stale tail");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_sends_nothing_gives_up_eventually() {
+        let db = waiting_db().await;
+        // 200 answers with an empty body and a total of 0, forever
+        let mut fake = Fake::new(
+            vec![Ok(Polled::Ready {
+                cdn: 3,
+                key: "k".into(),
+            })],
+            vec![],
+        );
+        let (_keep, mut cancel) = watch::channel(false);
+        let got = fetch_archive(&mut fake, &db, &tmp("empty"), &Quiet, &mut cancel).await;
+        assert!(matches!(got, Err(HistoryError::Download(_))), "got {got:?}");
+    }
+
+    #[test]
+    fn content_range_parses_from_and_total() {
+        assert_eq!(content_range("bytes 100-999/5000"), (Some(100), Some(5000)));
+        assert_eq!(content_range("bytes 0-0/1"), (Some(0), Some(1)));
+        assert_eq!(content_range("bytes */5000"), (None, Some(5000)));
+        assert_eq!(content_range("bytes 100-999/*"), (Some(100), None));
+        assert_eq!(content_range("garbage"), (None, None));
     }
 }

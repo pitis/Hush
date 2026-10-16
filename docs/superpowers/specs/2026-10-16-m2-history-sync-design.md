@@ -103,8 +103,10 @@ All new core code is in `core/sig-core/src/history/`.
 
   projection.db is SQLCipher-encrypted, so the key is encrypted at rest. The row is deleted
   when the import finishes or is abandoned.
-- **Relink (`client.rs`).** `relink_for_history()` stops receiving, closes and deletes presage.db,
-  keeps projection.db, and starts linking with history wanted.
+- **Relink (`client.rs`).** `Client::relink()` stops the core (after a best-effort unlink of the
+  old registration), deletes presage.db and the history leftovers, and keeps projection.db and
+  the attachments. The app then opens a fresh client and links again; every link asks for
+  history.
 - **App.**
   - Settings gets "Relink to transfer history…", with a confirmation that explains the Mac becomes
     a new linked device.

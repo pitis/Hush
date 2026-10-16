@@ -53,10 +53,15 @@ pub(crate) async fn run(
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Outcome, HistoryError> {
     match fetch::fetch_archive(server, db, tmp, l, cancel).await? {
-        fetch::Fetched::NoUpload => {
+        fetch::Fetched::NoUpload { relink_requested } => {
             cleanup(db, tmp).await?;
             l.on_event(CoreEvent::Error {
-                message: "Your phone didn't send message history.".into(),
+                message: if relink_requested {
+                    "Your phone wants this Mac relinked before sending history. Use Transfer                      Message History in Settings to try again."
+                        .into()
+                } else {
+                    "Your phone didn't send message history.".into()
+                },
             });
             no_history(l);
             return Ok(Outcome::NoHistory);
@@ -92,12 +97,16 @@ pub(crate) async fn run(
             no_history(l);
             return Ok(Outcome::Cancelled);
         }
-        let Some(next) = frames.recv().await else { break };
+        let next = tokio::select! {
+            n = frames.recv() => n,
+            _ = cancel.changed() => continue, // re-check the flag at the top
+        };
+        let Some(next) = next else { break };
         let frame = match next {
             Ok(f) => f,
             Err(e) => {
                 // nothing of a bad archive is kept, and Retry downloads it again
-                let _ = std::fs::remove_file(tmp);
+                remove_tmp(tmp);
                 let mut reset = state.clone();
                 reset.stage = HistoryDbStage::Downloading;
                 reset.bytes_done = 0;
@@ -119,17 +128,27 @@ pub(crate) async fn run(
     let (rest, seed, counts) = importer.finish();
     items += rest.len() as u64;
     db.import_history(&rest).await?;
-    // What presage needs to send: contacts with profile keys, group master keys. Failures are
-    // logged, not fatal: the phone's contact sync fills the same gap.
+    // What presage needs to send: contacts with profile keys, group master keys. Failures
+    // don't stop the import, but they must reach the user: nothing re-syncs group keys, so a
+    // group that failed here can't be sent to until a message arrives in it.
+    let mut seed_problems: Vec<String> = vec![];
     for contact in &seed.contacts {
         if let Err(e) = store.save_contact(contact).await {
-            tracing::warn!("seeding a contact failed: {e}");
+            seed_problems.push(format!("a contact: {e}"));
         }
     }
     for (master_key, group) in seed.groups {
         if let Err(e) = store.save_group(master_key, group).await {
-            tracing::warn!("seeding a group failed: {e}");
+            seed_problems.push(format!("a group: {e}"));
         }
+    }
+    if let Some(first) = seed_problems.first() {
+        l.on_event(CoreEvent::Error {
+            message: format!(
+                "{} imported chats couldn't be prepared for sending (first: {first})",
+                seed_problems.len()
+            ),
+        });
     }
     tracing::info!(
         messages = counts.messages,
@@ -139,7 +158,12 @@ pub(crate) async fn run(
         unavailable_files = counts.unavailable_files,
         "history imported"
     );
-    cleanup(db, tmp).await?;
+    // everything imported: a cleanup failure must not present success as failure
+    if let Err(e) = cleanup(db, tmp).await {
+        l.on_event(CoreEvent::Error {
+            message: format!("the finished import couldn't be cleaned up: {e}"),
+        });
+    }
     l.on_event(CoreEvent::HistoryProgress {
         stage: HistoryStage::Done,
         done: items,
@@ -150,8 +174,18 @@ pub(crate) async fn run(
 }
 
 async fn cleanup(db: &ProjectionDb, tmp: &Path) -> Result<(), sqlx::Error> {
-    let _ = std::fs::remove_file(tmp);
+    remove_tmp(tmp);
     db.clear_history_state().await
+}
+
+/// Deleting the archive never carries content, so a failure is loggable — and matters: an
+/// undeletable bad archive would fail the HMAC again on every retry.
+fn remove_tmp(tmp: &Path) {
+    if let Err(e) = std::fs::remove_file(tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("removing the archive file failed: {e}");
+        }
+    }
 }
 
 fn no_history(l: &dyn EventListener) {
@@ -168,6 +202,9 @@ pub(crate) enum HistoryError {
     /// The chat server refused or couldn't be reached.
     #[error("server: {0}")]
     Server(String),
+    /// The server no longer accepts this device's credentials: retrying can't help.
+    #[error("the server no longer accepts this device's credentials")]
+    Unauthorized,
     /// The archive download failed.
     #[error("download: {0}")]
     Download(String),
@@ -398,13 +435,81 @@ mod driver_tests {
     async fn no_upload_cleans_up_and_reports_no_history() {
         let (dir, db, mut store) = setup("noupload").await;
         db.set_history_state(&waiting_state()).await.unwrap();
-        let mut fake = Fake::new(vec![Ok(Polled::NoUpload)], vec![]);
+        let mut fake = Fake::new(
+            vec![Ok(Polled::NoUpload {
+                relink_requested: false,
+            })],
+            vec![],
+        );
         let sink = Sink(Default::default());
         let tmp = dir.0.join("history.tmp");
         let (_keep, mut cancel) = no_cancel();
         let out = run(&db, &mut store, &mut fake, &tmp, &sink, &mut cancel).await.unwrap();
         assert!(matches!(out, Outcome::NoHistory));
         assert_eq!(db.history_state().await.unwrap(), None);
+        assert_eq!(sink.stages().last(), Some(&HistoryStage::NoHistory));
+        let said = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::Error { message } if message.contains("didn't send")));
+        assert!(said, "the user learns why there is no history");
+    }
+
+    /// A quit mid-download resumes: the saved state and partial file finish into a full import.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_download_finishes_the_import() {
+        let (dir, db, mut store) = setup("resume").await;
+        let archive = dir.0.join("archive.bin");
+        test_archive::write(&archive, &KEY, Uuid::parse_str(ME).unwrap(), &frames());
+        let bytes = std::fs::read(&archive).unwrap();
+        let tmp = dir.0.join("history.tmp");
+        std::fs::write(&tmp, &bytes[..1_000.min(bytes.len() / 2)]).unwrap();
+        let mut state = waiting_state();
+        state.stage = HistoryDbStage::Downloading;
+        state.cdn = Some(3);
+        state.cdn_key = Some("k".into());
+        state.bytes_done = std::fs::metadata(&tmp).unwrap().len();
+        state.total_bytes = Some(bytes.len() as u64);
+        db.set_history_state(&state).await.unwrap();
+        let mut fake = Fake::new(vec![], bytes);
+        let (_keep, mut cancel) = no_cancel();
+        let out = run(&db, &mut store, &mut fake, &tmp, &Quiet, &mut cancel)
+            .await
+            .unwrap();
+        assert!(matches!(out, Outcome::Done));
+        assert_eq!(
+            *fake.offsets_seen.lock().unwrap(),
+            vec![state.bytes_done],
+            "resumed, not restarted"
+        );
+        assert_eq!(db.conversations().await.unwrap().len(), 1);
+        assert_eq!(db.history_state().await.unwrap(), None);
+    }
+
+    /// Cancelling once the archive is already here still stops cleanly: what was imported so
+    /// far stays, the state and file go, and receiving may start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_mid_import_cleans_up() {
+        let (dir, db, mut store) = setup("cancel-import").await;
+        let tmp = dir.0.join("history.tmp");
+        test_archive::write(&tmp, &KEY, Uuid::parse_str(ME).unwrap(), &frames());
+        let mut state = waiting_state();
+        state.stage = HistoryDbStage::Importing;
+        state.cdn = Some(3);
+        state.cdn_key = Some("k".into());
+        state.bytes_done = std::fs::metadata(&tmp).unwrap().len();
+        state.total_bytes = Some(state.bytes_done);
+        db.set_history_state(&state).await.unwrap();
+        let mut fake = Fake::new(vec![], vec![]);
+        let sink = Sink(Default::default());
+        let (keep, mut cancel) = no_cancel();
+        keep.send(true).unwrap();
+        let out = run(&db, &mut store, &mut fake, &tmp, &sink, &mut cancel).await.unwrap();
+        assert!(matches!(out, Outcome::Cancelled));
+        assert_eq!(db.history_state().await.unwrap(), None);
+        assert!(!tmp.exists());
         assert_eq!(sink.stages().last(), Some(&HistoryStage::NoHistory));
     }
 

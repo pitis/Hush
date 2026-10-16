@@ -83,7 +83,7 @@ impl HistoryDbStage {
 }
 
 /// The one in-flight history import, surviving quits and crashes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HistoryImportState {
     pub stage: HistoryDbStage,
     /// The 32-byte ephemeral backup key from the provisioning message.
@@ -94,6 +94,21 @@ pub struct HistoryImportState {
     pub cdn_key: Option<String>,
     pub bytes_done: u64,
     pub total_bytes: Option<u64>,
+}
+
+/// The key decrypts the whole archive: it never goes to a log, not even through `{:?}`.
+impl std::fmt::Debug for HistoryImportState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoryImportState")
+            .field("stage", &self.stage)
+            .field("key", &"<redacted>")
+            .field("aci", &self.aci)
+            .field("cdn", &self.cdn)
+            .field("cdn_key", &self.cdn_key)
+            .field("bytes_done", &self.bytes_done)
+            .field("total_bytes", &self.total_bytes)
+            .finish()
+    }
 }
 
 /// Images and voice notes up to this size download as they arrive; anything else on request.
@@ -1242,8 +1257,8 @@ impl ProjectionDb {
             sqlx::query(
                 "INSERT INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
                    status, edited, deleted, quote_author, quote_sent_at, quote_text, kind, kind_text,
-                   expires_in, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                   expires_in, expires_at, edited_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(author, sent_at) DO UPDATE SET
                    status = MAX(messages.status, excluded.status),
                    expires_at = COALESCE(MIN(messages.expires_at, excluded.expires_at),
@@ -1265,8 +1280,19 @@ impl ProjectionDb {
             .bind(kind_text)
             .bind(i64::from(msg.expires_in))
             .bind(msg.expires_at)
+            .bind(m.edited_at)
             .execute(&mut *tx)
             .await?;
+            for revision_sent_at in &m.revisions {
+                // live edits, deletes and reactions may target the message by any revision's
+                // timestamp; map them all to the original
+                sqlx::query("INSERT OR IGNORE INTO message_revisions VALUES (?1, ?2, ?3)")
+                    .bind(&msg.author)
+                    .bind(revision_sent_at)
+                    .bind(msg.sent_at)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             for (reactor, emoji) in &m.reactions {
                 sqlx::query(
                     // never onto a message deleted here: the archive predates the deletion
@@ -1847,6 +1873,22 @@ mod tests {
         assert_eq!(db.history_state().await.unwrap(), None);
     }
 
+    #[test]
+    fn the_archive_key_never_prints() {
+        let s = HistoryImportState {
+            stage: HistoryDbStage::Waiting,
+            key: vec![0xAB; 32],
+            aci: "a".into(),
+            cdn: None,
+            cdn_key: None,
+            bytes_done: 0,
+            total_bytes: None,
+        };
+        let printed = format!("{s:?}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(!printed.contains("171"), "no key bytes: {printed}");
+    }
+
     mod import_history {
         use super::*;
         use crate::history::import::{HistoryBatch, ImportAttachment, ImportConversation, ImportEvent, ImportMessage};
@@ -1860,6 +1902,8 @@ mod tests {
                 reactions: vec![],
                 attachments: vec![],
                 preview: None,
+                revisions: vec![],
+                edited_at: 0,
             }
         }
 
@@ -2068,6 +2112,123 @@ mod tests {
             }
             eprintln!("100k messages imported in {:?}", started.elapsed());
             assert_eq!(db.conversations().await.unwrap().len(), 50);
+        }
+
+        /// Live clients target an edited message by any revision's timestamp: the import maps
+        /// them all to the original, or reactions and edits after the import would miss it.
+        #[tokio::test]
+        async fn live_ops_target_imported_edits_by_any_revision() {
+            let db = db().await;
+            let mut m = imported("c:alice", "alice", 1_000, "newest", MessageStatus::Read);
+            m.revisions = vec![2_000, 3_000];
+            m.edited_at = 3_000;
+            m.message.edited = true;
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            // a live reaction names the newest revision's timestamp
+            db.apply(&Op::React {
+                target: key("alice", 3_000),
+                reactor: "bob".into(),
+                emoji: Some("👍".into()),
+            })
+            .await
+            .unwrap();
+            assert_eq!(db.reactions(&key("alice", 1_000)).await.unwrap().len(), 1);
+            // and a live edit after the import still wins
+            db.apply(&Op::Edit {
+                target: key("alice", 3_000),
+                new_body: Some("even newer".into()),
+                edited_at: 4_000,
+            })
+            .await
+            .unwrap();
+            let stored = db.message(&key("alice", 1_000)).await.unwrap().unwrap();
+            assert_eq!(stored.body.as_deref(), Some("even newer"));
+        }
+
+        /// The importer and the live projector must produce the same keys, or a relink
+        /// duplicates every conversation and message instead of merging.
+        #[tokio::test]
+        async fn imported_and_live_keys_agree() {
+            use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+            use presage::libsignal_service::prelude::Uuid;
+            use presage::libsignal_service::protocol::{Aci, DeviceId, ServiceId};
+            use presage::proto::DataMessage;
+
+            const ME: &str = "11111111-1111-1111-1111-111111111111";
+            const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+            let db = db().await;
+            // the live path: one incoming message from Alice, projected and applied
+            let alice = ServiceId::from(Aci::from(Uuid::parse_str(ALICE).unwrap()));
+            let content = Content {
+                metadata: Metadata {
+                    sender: alice,
+                    destination: alice,
+                    sender_device: DeviceId::new(1).unwrap(),
+                    pni_verified: None,
+                    client_timestamp: chrono::DateTime::from_timestamp_millis(5_000).unwrap(),
+                    server_timestamp: chrono::DateTime::from_timestamp_millis(5_000).unwrap(),
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    was_plaintext: false,
+                    server_guid: None,
+                },
+                body: ContentBody::DataMessage(DataMessage {
+                    timestamp: Some(5_000),
+                    body: Some("live".into()),
+                    ..Default::default()
+                }),
+            };
+            for op in crate::projection::project(&content, ME) {
+                db.apply(&op).await.unwrap();
+            }
+            // the import path: the same logical message out of an archive
+            use libsignal_message_backup::proto::backup;
+            let frame = |item| backup::Frame {
+                item: Some(item),
+                ..Default::default()
+            };
+            let mut importer = crate::history::import::Importer::new(ME, 1_000_000_000);
+            importer.add(frame(backup::frame::Item::Recipient(backup::Recipient {
+                id: 1,
+                destination: Some(backup::recipient::Destination::Contact(backup::Contact {
+                    aci: Some(Uuid::parse_str(ALICE).unwrap().as_bytes().to_vec()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })));
+            importer.add(frame(backup::frame::Item::Chat(backup::Chat {
+                id: 10,
+                recipientId: 1,
+                ..Default::default()
+            })));
+            importer.add(frame(backup::frame::Item::ChatItem(backup::ChatItem {
+                chatId: 10,
+                authorId: 1,
+                dateSent: 5_000,
+                directionalDetails: Some(backup::chat_item::DirectionalDetails::Incoming(
+                    backup::chat_item::IncomingMessageDetails {
+                        dateReceived: 5_000,
+                        read: true,
+                        ..Default::default()
+                    },
+                )),
+                item: Some(backup::chat_item::Item::StandardMessage(backup::StandardMessage {
+                    text: protobuf::MessageField::some(backup::Text {
+                        body: "archived".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })));
+            let (batch, _, _) = importer.finish();
+            db.import_history(&batch).await.unwrap();
+            let conversations = db.conversations().await.unwrap();
+            assert_eq!(conversations.len(), 1, "one chat, not a duplicate: {conversations:?}");
+            assert_eq!(conversations[0].id, format!("c:{ALICE}"));
+            let page = db.messages(&format!("c:{ALICE}"), None, 10).await.unwrap();
+            assert_eq!(page.len(), 1, "one message, not a duplicate");
+            assert_eq!(page[0].body.as_deref(), Some("live"), "what was here is kept");
         }
 
         /// A message deleted here must not grow imported files, reactions or previews: the

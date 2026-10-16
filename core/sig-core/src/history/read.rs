@@ -28,11 +28,25 @@ pub(crate) fn message_backup_key(key: &[u8; 32], aci: Uuid) -> MessageBackupKey 
 /// first frame is sent. An `Err` item reports a failure (HMAC, decryption, gzip, protobuf) and
 /// ends the stream; a closed channel without one is the end of the archive.
 pub(crate) fn stream(path: PathBuf, key: [u8; 32], aci: Uuid) -> mpsc::Receiver<Result<Frame, String>> {
-    let (tx, rx) = mpsc::channel(CHANNEL);
     // AES + gzip are CPU work: keep them off the core thread.
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = futures::executor::block_on(read_all(&path, &key, aci, &tx)) {
+    spawn_reader(move |tx| futures::executor::block_on(read_all(&path, &key, aci, tx)))
+}
+
+/// Runs `read` on a blocking thread. Its `Err` — and a panic, which would otherwise just close
+/// the channel and look like a clean end of the archive — arrives as an `Err` item.
+fn spawn_reader(
+    read: impl FnOnce(&mpsc::Sender<Result<Frame, String>>) -> Result<(), String> + Send + 'static,
+) -> mpsc::Receiver<Result<Frame, String>> {
+    let (tx, rx) = mpsc::channel(CHANNEL);
+    let failed = tx.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        if let Err(e) = read(&tx) {
             let _ = tx.blocking_send(Err(e));
+        }
+    });
+    tokio::spawn(async move {
+        if reader.await.is_err() {
+            let _ = failed.send(Err("the archive reader stopped unexpectedly".into())).await;
         }
     });
     rx
@@ -135,6 +149,14 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
         let mut rx = stream(path, KEY, aci());
+        assert!(matches!(rx.recv().await, Some(Err(_))));
+    }
+
+    /// A reader that dies (a panic in the decoding stack) must not look like a clean end of
+    /// the archive, or a partial import would be reported as done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_reader_is_an_error_not_an_end() {
+        let mut rx = super::spawn_reader(|_tx| panic!("decoder bug"));
         assert!(matches!(rx.recv().await, Some(Err(_))));
     }
 

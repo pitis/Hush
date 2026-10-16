@@ -337,9 +337,19 @@ async fn run(
                             continue;
                         }
                         Ok(None) => {}
-                        Err(e) => listener.on_event(CoreEvent::Error {
-                            message: format!("checking the history import failed: {e}"),
-                        }),
+                        Err(e) => {
+                            // receiving must not start over a pending import: the user can
+                            // Retry (Start) or Continue Without History
+                            listener.on_event(CoreEvent::Error {
+                                message: format!("checking the history import failed: {e}"),
+                            });
+                            listener.on_event(CoreEvent::HistoryProgress {
+                                stage: crate::history::HistoryStage::Failed,
+                                done: 0,
+                                total: 0,
+                            });
+                            continue;
+                        }
                     }
                     receiving.set(true);
                     if !sending {
@@ -452,11 +462,11 @@ async fn run(
                 return;
             }
             Command::CancelHistory => {
-                if history_running.get() {
-                    // the task cleans up and starts receiving itself
-                    let _ = history_cancel.borrow().send(true);
-                } else {
-                    // a failed (or never started) import: clear it here
+                // a send fails exactly when the task died: fall through and clean up here;
+                // a live task cleans up and starts receiving itself
+                let task_listens = history_running.get() && history_cancel.borrow().send(true).is_ok();
+                if !task_listens {
+                    // a failed, dead, or never started import: clear it here
                     if let Err(e) = projection.clear_history_state().await {
                         listener.on_event(CoreEvent::Error {
                             message: format!("clearing the history import failed: {e}"),
@@ -477,13 +487,17 @@ async fn run(
             }
             Command::Relink { done } => {
                 if let Some(m) = &manager {
-                    // Best effort: the phone lists the old entry until it is removed there, and
-                    // the new link works either way.
+                    // Best effort: the new link works either way, but each failure leaves a
+                    // ghost entry on the account (Signal caps linked devices), so say so.
                     if tokio::time::timeout(Duration::from_secs(10), Box::pin(m.unlink_self()))
                         .await
                         .map_or(true, |r| r.is_err())
                     {
                         tracing::warn!("the server couldn't be told about the relink");
+                        listener.on_event(CoreEvent::Error {
+                            message: "The old link couldn't be removed; if linking ever fails, remove                                       this Mac's old entry on your phone under Linked Devices."
+                                .into(),
+                        });
                     }
                 }
                 linked.store(false, Ordering::SeqCst);
@@ -546,6 +560,7 @@ fn start_history(
     running.set(true);
     let (tx, mut rx) = watch::channel(false);
     *cancel.borrow_mut() = tx;
+    let running2 = running.clone();
     let (m, db, l, commands, running) = (
         m.clone(),
         projection.clone(),
@@ -554,7 +569,9 @@ fn start_history(
         running.clone(),
     );
     let tmp = dir.join("history.tmp");
-    tokio::task::spawn_local(async move {
+    // (A CancelHistory racing the task's end can emit NoHistory after Done and a second Start;
+    // both are harmless: the app ignores stage order after a terminal one, Start is idempotent.)
+    let task = tokio::task::spawn_local(async move {
         let mut store = m.store().clone();
         let outcome = async {
             let mut server = crate::history::fetch::SignalServer::from_registration(m.registration_data())?;
@@ -580,6 +597,22 @@ fn start_history(
                     total: 0,
                 });
             }
+        }
+    });
+    // Supervise: a panic in the import must not leave the overlay stuck and receiving gated
+    // forever with no way out.
+    let (running, l) = (running2, listener.clone());
+    tokio::task::spawn_local(async move {
+        if task.await.is_err() {
+            running.set(false);
+            l.on_event(CoreEvent::Error {
+                message: "the history import stopped unexpectedly".into(),
+            });
+            l.on_event(CoreEvent::HistoryProgress {
+                stage: crate::history::HistoryStage::Failed,
+                done: 0,
+                total: 0,
+            });
         }
     });
 }

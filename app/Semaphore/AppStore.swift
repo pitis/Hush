@@ -183,10 +183,13 @@ final class AppStore {
                 ownAci = client.ownAci()
                 notifier?.authorize()
                 screen = .chats
+                // before start(): a fast import could otherwise finish in between, and the
+                // overlay set afterwards would have no event left to dismiss it
+                let pending = (try? await client.historyPending()) == true
                 try client.start()
                 refreshConversations()
-                // resuming an interrupted transfer: show it right away, before its first event
-                if (try? await client.historyPending()) == true, history == nil {
+                if pending, history == nil {
+                    // resuming an interrupted transfer: show it before its first event arrives
                     history = HistoryProgress(stage: .waiting, done: 0, total: 0)
                 }
             } else {
@@ -641,13 +644,20 @@ final class AppStore {
 
     /// "Continue without history": stops the transfer; chats keep working and new messages flow.
     func cancelHistory() {
-        do { try client?.cancelHistory() } catch { showError("Couldn't stop the transfer: \(Self.describe(error))") }
+        guard let client else { return showError("Semaphore isn't running.") }
+        do { try client.cancelHistory() } catch { showError("Couldn't stop the transfer: \(Self.describe(error))") }
     }
 
     /// After a failed transfer: picks it up from where it stopped.
     func retryHistory() {
+        guard let client else { return showError("Semaphore isn't running.") }
+        let before = history
         history = HistoryProgress(stage: .waiting, done: 0, total: 0)
-        do { try client?.retryHistory() } catch { showError("Couldn't retry the transfer: \(Self.describe(error))") }
+        do { try client.retryHistory() } catch {
+            // the overlay must not promise progress that was never asked for
+            history = before
+            showError("Couldn't retry the transfer: \(Self.describe(error))")
+        }
     }
 
     /// Settings ▸ Transfer Message History…: this Mac relinks as a new device; everything shown
