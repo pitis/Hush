@@ -206,7 +206,7 @@ struct TimelineList: View {
         let visible = NSApp.keyWindow?.occlusionState.contains(.visible) ?? false
         if ChatList.shouldMarkRead(
             atBottom: atBottom, windowKey: activeState == .key, windowVisible: visible,
-            unread: conversation.unreadCount)
+            unread: ChatList.isUnread(conversation))
         {
             store.markRead(conversation.id)
         }

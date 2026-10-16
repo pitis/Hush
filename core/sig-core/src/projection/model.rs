@@ -39,6 +39,14 @@ pub struct Conversation {
     /// The latest thing in the chat is a message that couldn't be decrypted (the preview says
     /// so; the other `last_message_*` fields are then empty).
     pub last_message_undecryptable: bool,
+    /// Out of the chat list, behind "Archived".
+    pub archived: bool,
+    /// Pinned chats list first, in ascending order; None: not pinned.
+    pub pinned_order: Option<u32>,
+    /// No notifications until this time (ms since the epoch); 0: not muted; `i64::MAX`: always.
+    pub mute_until: i64,
+    /// Shown unread although every message is read ("Mark as unread").
+    pub marked_unread: bool,
 }
 
 /// What kind of file a message has (its first one).

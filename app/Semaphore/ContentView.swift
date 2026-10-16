@@ -21,6 +21,7 @@ struct ContentView: View {
                     NavigationSplitView {
                         VStack(spacing: 0) {
                             ConnectionBanner(store: core)
+                            ErrorBanner(store: core)
                             SidebarView(store: core)
                         }
                         .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
@@ -34,10 +35,7 @@ struct ContentView: View {
                                     : "Select a chat",
                                 systemImage: "bubble.left.and.bubble.right",
                                 description: Text(
-                                    core.lastError
-                                        ?? (core.conversations.isEmpty
-                                            ? "New messages appear here as they arrive."
-                                            : "")))
+                                    core.conversations.isEmpty ? "New messages appear here as they arrive." : ""))
                         }
                     }
                     .navigationTitle("")
@@ -93,6 +91,26 @@ struct ConnectionBanner: View {
             }
             .padding(10)
             .background(Color.orange.opacity(0.25))
+        }
+    }
+}
+
+/// The last thing that failed (a pin, a mute, marking a chat read, a core error), over the chat
+/// list until dismissed or until the next change works.
+struct ErrorBanner: View {
+    let store: AppStore
+
+    var body: some View {
+        if let error = store.lastError {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                Text(error).font(.system(size: 12)).lineLimit(3)
+                Spacer(minLength: 4)
+                Button(action: store.dismissError) { Image(systemName: "xmark") }
+                    .buttonStyle(.plain).accessibilityLabel("Dismiss")
+            }
+            .padding(10)
+            .background(Color.yellow.opacity(0.2))
         }
     }
 }

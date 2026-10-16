@@ -63,6 +63,17 @@ impl Client {
         })
     }
 
+    /// A conversation id that is well-formed and in the projection.
+    async fn known_conversation(&self, id: &str) -> Result<(), CoreError> {
+        check_conversation(id)?;
+        if !self.db.has_conversation(id).await? {
+            return Err(CoreError::InvalidInput {
+                message: format!("no such chat: {id}"),
+            });
+        }
+        Ok(())
+    }
+
     /// Queues a reaction, edit or delete of `conversation_id`'s message sent at `at`.
     fn send_mutation(
         &self,
@@ -565,6 +576,9 @@ impl Client {
     /// sending runs (retried until sent). Returns how many were unread.
     pub async fn mark_read(&self, conversation_id: String) -> Result<u32, CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
+        if self.db.clear_marked_unread(&conversation_id).await? {
+            self.listener.on_event(CoreEvent::ConversationsChanged);
+        }
         let targets = self.db.unread(&conversation_id).await?;
         if targets.is_empty() {
             return Ok(0);
@@ -578,6 +592,55 @@ impl Client {
         // if the core is closing, the stored receipts go out on the next start
         let _ = self.send(Command::Send(Job::Receipts));
         Ok(targets.len() as u32)
+    }
+
+    /// Archives a chat (out of the list, behind "Archived") or brings it back.
+    pub async fn set_archived(&self, conversation_id: String, archived: bool) -> Result<(), CoreError> {
+        self.known_conversation(&conversation_id).await?;
+        self.db.set_archived(&conversation_id, archived).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Pins a chat at the top of the list (after the pinned ones, at most four, like the phone),
+    /// or unpins it.
+    pub async fn set_pinned(&self, conversation_id: String, pinned: bool) -> Result<(), CoreError> {
+        self.known_conversation(&conversation_id).await?;
+        if !self.db.set_pinned(&conversation_id, pinned).await? {
+            return Err(CoreError::InvalidInput {
+                message: format!("up to {} chats can be pinned", ProjectionDb::MAX_PINNED),
+            });
+        }
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Mutes a chat's notifications until `until_ms` (ms since the epoch; `i64::MAX` for good),
+    /// or unmutes it (0).
+    pub async fn set_mute_until(&self, conversation_id: String, until_ms: i64) -> Result<(), CoreError> {
+        self.known_conversation(&conversation_id).await?;
+        if until_ms < 0 {
+            return Err(CoreError::InvalidInput {
+                message: "a mute ends at a time, or never".into(),
+            });
+        }
+        self.db.set_mute_until(&conversation_id, until_ms).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Shows a chat as unread although its messages are read (until it is opened), or not.
+    pub async fn set_marked_unread(&self, conversation_id: String, marked: bool) -> Result<(), CoreError> {
+        self.known_conversation(&conversation_id).await?;
+        self.db.set_marked_unread(&conversation_id, marked).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
+    /// Whether the chat's notifications are off right now. Asked by the app for each
+    /// notification, so a mute set a moment ago counts even before the app's list caught up.
+    pub async fn is_muted(&self, conversation_id: String) -> Result<bool, CoreError> {
+        Ok(self.db.is_muted(&conversation_id, now_ms()).await?)
     }
 
     /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).
@@ -620,6 +683,23 @@ impl Client {
     pub async fn reactions(&self, key: MessageKey) -> Result<Vec<Reaction>, CoreError> {
         Ok(self.db.reactions(&key).await?)
     }
+}
+
+/// Milliseconds since the epoch (the unit of chat mutes).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Rejects anything that isn't a conversation id (`c:<aci>` or `g:<master key>`).
+fn check_conversation(id: &str) -> Result<(), CoreError> {
+    if send::recipient(id).is_none() {
+        return Err(CoreError::InvalidInput {
+            message: format!("not a conversation: {id}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1043,6 +1123,111 @@ mod tests {
             .filter(|e| matches!(e, CoreEvent::MessageChanged { conversation_id, .. } if *conversation_id == conv))
             .count();
         assert_eq!(changed, 2);
+    }
+
+    fn announced(sink: &Sink, e: fn(&CoreEvent) -> bool) -> usize {
+        sink.0.lock().unwrap().iter().filter(|x| e(x)).count()
+    }
+
+    #[test]
+    fn chat_flags_announce_the_list_and_refuse_bad_ids() {
+        let (_dir, sink, client, rt) = as_me("client-flags");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client.set_archived(conv.clone(), true).await.unwrap();
+            client.set_pinned(conv.clone(), true).await.unwrap();
+            client.set_mute_until(conv.clone(), i64::MAX).await.unwrap();
+            client.set_marked_unread(conv.clone(), true).await.unwrap();
+            let c = &client.conversations().await.unwrap()[0];
+            assert_eq!(
+                (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
+                (false, Some(1), i64::MAX, true)
+            );
+            assert!(invalid(client.set_archived("nope".into(), true).await));
+            assert!(invalid(client.set_mute_until(conv.clone(), -1).await));
+        });
+        assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 4);
+    }
+
+    #[test]
+    fn a_fifth_pin_is_refused() {
+        let (_dir, _sink, client, rt) = as_me("client-pins");
+        let chat = |n: u8| format!("c:00000000-0000-4000-8000-00000000000{n}");
+        rt.block_on(async {
+            for n in 1..=5 {
+                let m = Message {
+                    conversation_id: chat(n),
+                    ..stored(ALICE, i64::from(n))
+                };
+                client.db.insert_message(&m).await.unwrap();
+            }
+            for n in 1..=4 {
+                client.set_pinned(chat(n), true).await.unwrap();
+            }
+            assert!(invalid(client.set_pinned(chat(5), true).await));
+        });
+    }
+
+    #[test]
+    fn mark_read_clears_marked_unread_even_without_unread_messages() {
+        let (_dir, sink, client, rt) = as_me("client-marked-unread");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            let seen = Message {
+                status: MessageStatus::Read,
+                ..stored(ALICE, 1)
+            };
+            client.db.insert_message(&seen).await.unwrap();
+            client.set_marked_unread(conv.clone(), true).await.unwrap();
+            assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 0);
+            assert!(!client.conversations().await.unwrap()[0].marked_unread);
+            // already clear: nothing to announce
+            assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 0);
+        });
+        assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 2);
+    }
+
+    #[test]
+    fn mark_read_clears_the_mark_and_the_messages_together() {
+        let (_dir, _sink, client, rt) = as_me("client-marked-and-unread");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client.set_marked_unread(conv.clone(), true).await.unwrap();
+            assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 1);
+            let c = &client.conversations().await.unwrap()[0];
+            assert_eq!((c.unread_count, c.marked_unread), (0, false));
+        });
+    }
+
+    #[test]
+    fn a_chat_that_is_not_there_cannot_be_flagged() {
+        let (_dir, sink, client, rt) = as_me("client-unknown-chat");
+        let nobody = "c:00000000-0000-4000-8000-000000000009".to_string();
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            let refused = client.set_pinned(nobody.clone(), true).await;
+            assert!(invalid(refused), "an unknown chat is not the pin limit");
+            assert!(invalid(client.set_archived(nobody.clone(), true).await));
+            assert!(invalid(client.set_mute_until(nobody.clone(), 1).await));
+            assert!(invalid(client.set_marked_unread(nobody.clone(), true).await));
+        });
+        assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 0);
+    }
+
+    #[test]
+    fn the_app_can_ask_whether_a_chat_is_muted_now() {
+        let (_dir, _sink, client, rt) = as_me("client-is-muted");
+        let conv = format!("c:{ALICE}");
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            assert!(!client.is_muted(conv.clone()).await.unwrap());
+            client.set_mute_until(conv.clone(), i64::MAX).await.unwrap();
+            assert!(client.is_muted(conv.clone()).await.unwrap());
+            client.set_mute_until(conv.clone(), 1).await.unwrap(); // long over
+            assert!(!client.is_muted(conv.clone()).await.unwrap());
+        });
     }
 
     #[test]
