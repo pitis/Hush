@@ -198,6 +198,21 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         lock.withLock { (eventAnswers[conversationId] ?? []).filter { $0.at >= since } }
     }
 
+    var historyPendingAnswer = false
+    private(set) var cancelHistoryCalls = 0
+    private(set) var retryHistoryCalls = 0
+    private(set) var relinkCalls = 0
+    var relinkError: Error?
+
+    func historyPending() async throws -> Bool { lock.withLock { historyPendingAnswer } }
+    func cancelHistory() throws { lock.withLock { cancelHistoryCalls += 1 } }
+    func retryHistory() throws { lock.withLock { retryHistoryCalls += 1 } }
+    func relink() async throws {
+        lock.withLock { relinkCalls += 1 }
+        if let relinkError { throw relinkError }
+        setLinked(false)
+    }
+
     func countNewer(conversationId: String, key: MessageKey) async throws -> UInt32 {
         if let delay = lock.withLock({ countDelays[key] }) { try? await Task.sleep(for: delay) }
         return lock.withLock { newerCounts[key] ?? 0 }

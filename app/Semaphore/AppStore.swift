@@ -28,8 +28,17 @@ final class AppStore {
     /// App state for Console.app (subsystem dev.pitis.semaphore). Never URLs or message content.
     private static let logger = Logger(subsystem: "dev.pitis.semaphore", category: "app")
 
+    /// The history transfer's state, for the overlay over the chats.
+    struct HistoryProgress: Equatable {
+        var stage: HistoryStage
+        var done: UInt64
+        var total: UInt64
+    }
+
     private(set) var screen: Screen = .starting
     private(set) var linkURL: String?
+    /// Non-nil while the phone's message history is on its way (or failed): the overlay shows.
+    private(set) var history: HistoryProgress?
     private(set) var connection: ConnectionState = .offline
     private(set) var conversations: [Conversation] = [] {
         didSet {
@@ -176,6 +185,10 @@ final class AppStore {
                 screen = .chats
                 try client.start()
                 refreshConversations()
+                // resuming an interrupted transfer: show it right away, before its first event
+                if (try? await client.historyPending()) == true, history == nil {
+                    history = HistoryProgress(stage: .waiting, done: 0, total: 0)
+                }
             } else {
                 screen = .link
                 try client.link(deviceName: Self.deviceName)
@@ -261,6 +274,17 @@ final class AppStore {
         case .chatEventAdded(let conversationId):
             refreshConversations()
             if conversationId == selectedId { reloadEvents() }
+        case .historyProgress(let stage, let done, let total):
+            Self.logger.notice("history \(String(describing: stage), privacy: .public)")
+            switch stage {
+            case .done:
+                history = nil
+                refreshConversations()
+            case .noHistory:
+                history = nil
+            default:
+                history = HistoryProgress(stage: stage, done: done, total: total)
+            }
         case .error(let message):
             // error text can mention ids or numbers: keep it out of the system log
             Self.logger.error("core error: \(message, privacy: .private)")
@@ -615,6 +639,30 @@ final class AppStore {
         if let failed = await unlinkThisMac(tellServer: false) { showError(failed) }
     }
 
+    /// "Continue without history": stops the transfer; chats keep working and new messages flow.
+    func cancelHistory() {
+        do { try client?.cancelHistory() } catch { showError("Couldn't stop the transfer: \(Self.describe(error))") }
+    }
+
+    /// After a failed transfer: picks it up from where it stopped.
+    func retryHistory() {
+        history = HistoryProgress(stage: .waiting, done: 0, total: 0)
+        do { try client?.retryHistory() } catch { showError("Couldn't retry the transfer: \(Self.describe(error))") }
+    }
+
+    /// Settings ▸ Transfer Message History…: this Mac relinks as a new device; everything shown
+    /// here is kept and the phone's history merges in. Returns why it couldn't start, or nil:
+    /// the QR code is on its way.
+    func relinkForHistory() async -> String? {
+        guard let client else { return "Semaphore isn't running." }
+        do { try await client.relink() } catch {
+            Self.logger.error("relink failed: \(Self.describe(error), privacy: .private)")
+            return Self.describe(error)
+        }
+        await restart(keepKey: true)
+        return nil
+    }
+
     /// Unlinks this Mac and removes all its data, telling the server first if `tellServer`.
     /// Returns why the server couldn't be told (nothing is removed then: the caller can offer to
     /// unlink anyway), or nil: done and a new linking code is on its way, or the core stopped but
@@ -638,13 +686,17 @@ final class AppStore {
         return nil
     }
 
-    /// Starts over with a fresh, unlinked core: everything shown is forgotten, and the key goes
-    /// with the data it protected.
-    private func restart() async {
+    /// Starts over with a fresh, unlinked core: everything shown is forgotten. The key goes
+    /// with the data it protected, except when relinking (`keepKey`): the data stays, so its
+    /// key and the shown notifications stay too.
+    private func restart(keepKey: Bool = false) async {
         listenerGeneration += 1
         client = nil
-        forgetKey()
-        notifier?.removeAll()  // message previews go with the data
+        if !keepKey {
+            forgetKey()
+            notifier?.removeAll()  // message previews go with the data
+        }
+        history = nil
         refreshing = false
         refreshAgain = false
         conversations = []

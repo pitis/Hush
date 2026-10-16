@@ -16,7 +16,12 @@ use crate::projection::{HistoryDbStage, HistoryImportState, ProjectionDb};
 /// One long poll's server-side wait (the HTTP client's reads time out at 65 s).
 const POLL_SECS: u32 = 60;
 /// After a failed poll or a cut download, wait this long before trying again.
+/// (Short in tests: they run on real time, because tokio's paused clock can outrun sqlx's
+/// pool-acquire timeout and fail spuriously.)
+#[cfg(not(test))]
 const RETRY: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RETRY: Duration = Duration::from_millis(20);
 /// How often download progress is persisted and reported (bytes).
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
 
@@ -573,10 +578,10 @@ mod tests {
             vec![Err(HistoryError::Server("boom".into())), Ok(Polled::NotYet)],
             vec![],
         );
-        // paused only now: the pool's connection is already open, so no sqlx timer races the clock
-        tokio::time::pause();
+        // real time throughout (RETRY is milliseconds in tests): tokio's paused clock can
+        // outrun sqlx's pool-acquire timer and fail spuriously under load
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = cancel_tx.send(true);
         });
         let got = fetch_archive(&mut fake, &db, &tmp("cancel"), &Quiet, &mut cancel)

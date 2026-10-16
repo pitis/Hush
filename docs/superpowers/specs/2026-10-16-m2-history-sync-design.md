@@ -60,16 +60,18 @@ All new core code is in `core/sig-core/src/history/`.
 - **QR code (`actor.rs` link path).** When history is wanted, append `capabilities=backup5` to the
   URL presage sends over its provisioning channel, before it reaches the app.
 - **Fetcher (`history/fetch.rs`).**
-  - Long-polls `transfer_archive` in 5-minute requests within a 1-hour budget, through
-    `PushService::request` with the device's credentials.
+  - Long-polls `transfer_archive` in 60-second requests (the HTTP client's reads time out at
+    65 s), looping until the archive comes, the phone gives up, or the user cancels — Cancel
+    and Continue Without History are always on screen, so there is no separate time budget.
   - Downloads the archive to `Application Support/Semaphore/history.tmp`, resuming from the bytes
     it already has.
   - HTTP sits behind a small trait (`ArchiveServer`) so tests can play the server's answers.
 - **Reader (`history/read.rs`).**
   - Uses `libsignal-message-backup` (same libsignal tag as our lock) for `MessageBackupKey` and
     `FramesReader` (HMAC check, AES-CBC, gzip) and for `VarintDelimitedReader`.
-  - Decodes frames with our own prost types generated from a copy of `backup.proto`, pinned to
-    that tag (libsignal's own `proto` module is crate-private).
+  - Decodes frames with the same crate's own protobuf types: its `proto` module (and the
+    `export` helpers the tests write archives with) is public behind its `test-util` feature,
+    so no proto copy is needed.
   - Runs on a blocking thread and streams frames over a bounded channel.
   - The whole file's HMAC is verified before the first frame is handed on.
 - **Importer (`history/import.rs`).** It maps frames to rows in batches of about 1,000 items per
@@ -110,7 +112,8 @@ All new core code is in `core/sig-core/src/history/`.
     "Importing…". It offers Cancel, and Retry or Continue without history on failure.
 
 ## Data flow
-1. **Ask.** First link, or Relink, shows the QR code with `capabilities=backup5`.
+1. **Ask.** Every link — the first one, and Relink — shows the QR code with
+   `capabilities=backup5`; declining on the phone is simply a normal link.
 2. **Link.** presage links. With no ephemeral key (declined on the phone), finish as in M1.
 3. **Save.** Store the `history_import` row (`waiting`). **Receiving does not start** until step 7.
    New messages wait in the server queue and arrive after the history, in order.
@@ -134,12 +137,12 @@ All new core code is in `core/sig-core/src/history/`.
 | Declined on the phone (no key) | Normal link |
 | `CONTINUE_WITHOUT_UPLOAD`, or 404 on the archive | "Your phone didn't send message history"; continue linked |
 | `RELINK_REQUESTED` | Same as above; if the phone also removed the device, M1's unlinked screen takes over |
-| No archive within 1 hour | Keep waiting, or Continue without history |
-| Download error | Retry (resumes), or Continue without history |
-| HMAC, decryption or parse failure | Nothing imported; "Message history couldn't be read"; continue; error in the Core Log |
+| The archive takes long | Keep waiting (60 s polls), with Continue Without History always offered |
+| Download error | Retried automatically with resume; Continue Without History stays available |
+| HMAC, decryption or parse failure | Nothing imported; the download state resets so Retry fetches the archive afresh; error in the Core Log |
 | Unknown frame or item kind | Skipped; per-kind counts logged (never content) |
 | Quit or crash | On launch, resume from the state row: re-download if incomplete, then re-import (idempotent) |
-| Cancel | Stop, delete the temp file and the state row, continue linked without history |
+| Cancel / Continue without history | Stop, delete the temp file and the state row, start receiving |
 
 Where this differs from Desktop:
 - Desktop unlinks on cancel and on fatal errors. We stay linked, since existing data is kept.
@@ -184,12 +187,11 @@ removes them on time.
 
 ## Open questions (checked during implementation)
 - Whether the phone still sends the contacts and groups sync after link-and-sync. If not, the
-  importer's contacts and groups are the only source.
-- Which libsignal validation `Purpose` matches link-and-sync archives (Android uses transfer).
-  Validation is optional; we parse leniently.
-- Whether `libsignal-message-backup` unifies cleanly with our workspace's dependency versions. It
-  builds standalone with no OpenSSL or BoringSSL. If it doesn't fit, fall back to about 100 lines
-  of our own HMAC, AES and gzip code.
+  importer's contacts and groups are the only source. (Checked on the owner's phone.)
+- ~~Whether `libsignal-message-backup` unifies cleanly with our workspace~~ — it does: the same
+  tag libsignal-service pins, no OpenSSL or BoringSSL, and its `test-util` feature exposes the
+  proto types and archive-writing helpers, so the fallback (own crypto code, proto copy) was
+  never needed. Validation (`Purpose`) is skipped; we parse leniently.
 
 ## Estimate
 About 1.5–2.5 weeks:
