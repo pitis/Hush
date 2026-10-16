@@ -1579,7 +1579,7 @@ impl ProjectionDb {
     pub async fn queue_receipts(&self, targets: &[MessageKey]) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         for t in targets {
-            sqlx::query("INSERT OR IGNORE INTO unsent_receipts VALUES (?1, ?2)")
+            sqlx::query("INSERT OR IGNORE INTO unsent_receipts(author, sent_at) VALUES (?1, ?2)")
                 .bind(&t.author)
                 .bind(t.sent_at)
                 .execute(&mut *tx)
@@ -1588,13 +1588,39 @@ impl ProjectionDb {
         tx.commit().await
     }
 
-    /// Read receipts still to send, by sender then time, except those of message requests and
-    /// blocked chats.
+    /// Reads not yet told to our other devices (whatever the chat), by sender then time.
+    pub async fn unsynced_reads(&self) -> Result<Vec<MessageKey>, sqlx::Error> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT author, sent_at FROM unsent_receipts WHERE synced = 0 ORDER BY author, sent_at")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(author, sent_at)| MessageKey { author, sent_at })
+            .collect())
+    }
+
+    /// Our other devices know these were read.
+    pub async fn reads_synced(&self, targets: &[MessageKey]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for t in targets {
+            sqlx::query("UPDATE unsent_receipts SET synced = 1 WHERE author = ?1 AND sent_at = ?2")
+                .bind(&t.author)
+                .bind(t.sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Read receipts still to send to their senders, by sender then time: only once our other
+    /// devices know (so removing a row never loses a read sync), and not those of message
+    /// requests and blocked chats.
     pub async fn unsent_receipts(&self) -> Result<Vec<MessageKey>, sqlx::Error> {
         // a request's or blocked chat's wait until it is accepted (or unblocked)
         let rows: Vec<(String, i64)> = sqlx::query_as(concat!(
             "SELECT u.author, u.sent_at FROM unsent_receipts u
-             WHERE NOT EXISTS (SELECT 1 FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE u.synced = 1 AND NOT EXISTS (SELECT 1 FROM messages m JOIN conversations c ON c.id = m.conversation_id
                WHERE m.author = u.author AND m.sent_at = u.sent_at AND (c.blocked OR ",
             is_request!(),
             ")) ORDER BY u.author, u.sent_at"
@@ -4317,6 +4343,12 @@ mod tests {
         assert!(db.unsent_receipts().await.unwrap().is_empty());
         db.queue_receipts(&[k("bob", 3), k("alice", 1)]).await.unwrap();
         db.queue_receipts(&[k("alice", 1), k("alice", 2)]).await.unwrap();
+        assert!(db.unsent_receipts().await.unwrap().is_empty(), "the phone hears first");
+        assert_eq!(db.unsynced_reads().await.unwrap().len(), 3);
+        db.reads_synced(&[k("alice", 1), k("alice", 2), k("bob", 3)])
+            .await
+            .unwrap();
+        assert!(db.unsynced_reads().await.unwrap().is_empty());
         assert_eq!(
             db.unsent_receipts().await.unwrap(),
             vec![k("alice", 1), k("alice", 2), k("bob", 3)]
@@ -5232,6 +5264,12 @@ mod tests {
         db.accept("c:bob").await.unwrap();
         db.block("c:bob").await.unwrap();
         db.queue_receipts(&[k("alice", 1), k("bob", 2)]).await.unwrap();
+        assert_eq!(
+            db.unsynced_reads().await.unwrap(),
+            vec![k("alice", 1), k("bob", 2)],
+            "the phone still learns they were read"
+        );
+        db.reads_synced(&[k("alice", 1), k("bob", 2)]).await.unwrap();
         assert!(db.unsent_receipts().await.unwrap().is_empty());
         db.accept("c:alice").await.unwrap();
         db.accept("c:bob").await.unwrap();

@@ -1225,7 +1225,7 @@ mod tests {
             assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 2);
             // stored until sent, so a quit or a failed send can't lose them
             assert_eq!(
-                client.db.unsent_receipts().await.unwrap(),
+                client.db.unsynced_reads().await.unwrap(),
                 vec![
                     MessageKey {
                         author: ALICE.into(),

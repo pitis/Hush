@@ -606,6 +606,34 @@ async fn record_mutation(
 /// read state to our phone. A receipt stays queued until it went out (a repeat is harmless), and
 /// while the setting is unknown.
 async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener) {
+    let at = now_ms();
+    // our other devices learn every read at once, a message request's too; the receipts to the
+    // senders may wait (requests, blocked chats, the setting not known yet)
+    match db.unsynced_reads().await {
+        Ok(reads) if !reads.is_empty() => {
+            // Sent to our own account; libsignal-service delivers a sync message to self twice (harmless).
+            let me = m.registration_data().service_ids.aci();
+            if let Err(e) = timed(Box::pin(m.send_message(me, read_sync(&reads), at))).await {
+                l.on_event(CoreEvent::Error {
+                    message: format!("couldn't tell your phone what you read; it will be retried: {e}"),
+                });
+                return;
+            }
+            if let Err(e) = db.reads_synced(&reads).await {
+                l.on_event(CoreEvent::Error {
+                    message: format!("recording what your phone was told failed: {e}"),
+                });
+                return;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            l.on_event(CoreEvent::Error {
+                message: format!("reading unsent read receipts failed: {e}"),
+            });
+            return;
+        }
+    }
     let (targets, settings) = match (db.unsent_receipts().await, db.settings().await) {
         (Ok(t), _) if t.is_empty() => return,
         (Ok(t), Ok(s)) => (t, s),
@@ -616,7 +644,6 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
             return;
         }
     };
-    let at = now_ms();
     let allowed = receipts_allowed(settings.read_receipts, &targets);
     let mut done = vec![];
     let mut failed = 0;
@@ -641,14 +668,6 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
         l.on_event(CoreEvent::Error {
             message: format!("read receipts to {failed} people weren't sent; they will be retried"),
         });
-    }
-    // Sent to our own account; libsignal-service delivers a sync message to self twice (harmless).
-    let me = m.registration_data().service_ids.aci();
-    if let Err(e) = timed(Box::pin(m.send_message(me, read_sync(&targets), at))).await {
-        l.on_event(CoreEvent::Error {
-            message: format!("couldn't tell your phone what you read; it will be retried: {e}"),
-        });
-        return;
     }
     if allowed.is_some_and(|r| r.is_empty()) {
         done = targets; // read receipts are off: nothing to send to anyone
