@@ -28,6 +28,27 @@ final class ChatListTests: XCTestCase {
         XCTAssertEqual(line(last("c:a", preview: "")), .message("Attachment", tick: nil))
     }
 
+    func testRequestsAndBlockedChatsSaySoInsteadOfTheMessage() {
+        var request = last("c:a")
+        request.messageRequest = true
+        XCTAssertEqual(line(request), .message("Message request", tick: nil))
+        var blocked = last("g:00")
+        blocked.blocked = true
+        XCTAssertEqual(line(blocked), .message("Blocked", tick: nil))
+        XCTAssertEqual(line(request, typing: true), .typing)
+    }
+
+    func testTheRequestBarNamesThePersonOrTheGroup() {
+        var person = conversation("c:a")
+        XCTAssertTrue(RequestBar.prompt(person, name: "Alice").hasPrefix("Let Alice message you?"))
+        person.blocked = true
+        XCTAssertEqual(RequestBar.prompt(person, name: "Alice"), "You blocked Alice.")
+        XCTAssertEqual(RequestBar.blockTitle(person, name: "Alice"), "Block Alice?")
+        let group = conversation("g:00")
+        XCTAssertTrue(RequestBar.prompt(group, name: "G").hasPrefix("Join this group?"))
+        XCTAssertTrue(RequestBar.blockMessage(group).contains("You stay a member"))
+    }
+
     func testGroupsNameTheAuthorLikeDesktop() {
         XCTAssertEqual(line(last("g:00")), .message("Alice: hi", tick: nil))
         XCTAssertEqual(line(last("g:00", outgoing: true, status: .pending)), .message("You: hi", tick: .clock))
@@ -304,6 +325,22 @@ final class AppStoreChatListTests: XCTestCase {
         fake.changeError = nil
         store.setArchived("c:a", true)
         await eventually { store.lastError == nil }
+    }
+
+    func testBlockingAndAnsweringRequestsGoToTheCore() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await eventually { store.conversations.count == 2 }
+        store.block("c:a")
+        store.acceptRequest("c:a")
+        await eventually { fake.flagCalls.count == 2 }
+        store.select("c:b")
+        store.deleteChat("c:b")
+        XCTAssertNil(store.selectedId, "a deleted chat closes")
+        await eventually { fake.flagCalls.count == 3 }
+        XCTAssertEqual(fake.flagCalls, ["block c:a", "accept c:a", "delete c:b"])
     }
 
     func testTheStorageWritesSwitchReadsAndWritesTheCore() async {

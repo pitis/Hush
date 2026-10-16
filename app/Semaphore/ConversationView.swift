@@ -16,7 +16,11 @@ struct ConversationView: View {
                     store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
                 }
             }
-            ComposerView(store: store, conversationId: conversation.id)
+            if conversation.blocked || conversation.messageRequest {
+                RequestBar(store: store, conversation: conversation)
+            } else {
+                ComposerView(store: store, conversationId: conversation.id)
+            }
         }
         .background(Theme.window)
         .quickLookPreview($quickLook)
@@ -25,6 +29,7 @@ struct ConversationView: View {
         .onDisappear { if let quickLook { Files.close(quickLook) } }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
+            guard !conversation.blocked, !conversation.messageRequest else { return false }
             let files = Files.attachable(urls).map(Files.outgoing)
             store.addFiles(files)
             return !files.isEmpty
@@ -40,13 +45,92 @@ struct ConversationView: View {
     }
 }
 
+/// In place of the composer, as Desktop's: a message request's Accept, Delete and Block, or a
+/// blocked chat's Unblock and Delete. Block and Delete ask first.
+struct RequestBar: View {
+    let store: AppStore
+    let conversation: Conversation
+    @State private var confirming: Confirm?
+
+    private enum Confirm: Identifiable {
+        case block, delete
+        var id: Self { self }
+    }
+
+    private var isGroup: Bool { conversation.kind == .group }
+
+    var body: some View {
+        let name = store.title(conversation)
+        VStack(spacing: 10) {
+            Text(RequestBar.prompt(conversation, name: name))
+                .font(.system(size: 13)).multilineTextAlignment(.center)
+                .foregroundStyle(Theme.secondaryText)
+            HStack(spacing: 10) {
+                if conversation.blocked {
+                    Button("Delete") { confirming = .delete }
+                    Button("Unblock") { store.acceptRequest(conversation.id) }
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Block") { confirming = .block }
+                    Button("Delete") { confirming = .delete }
+                    Button("Accept") { store.acceptRequest(conversation.id) }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 18).padding(.vertical, 14)
+        .confirmationDialog(
+            confirming == .block ? RequestBar.blockTitle(conversation, name: name) : "Delete this chat?",
+            isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+            presenting: confirming
+        ) { c in
+            switch c {
+            case .block: Button("Block", role: .destructive) { store.block(conversation.id) }
+            case .delete: Button("Delete", role: .destructive) { store.deleteChat(conversation.id) }
+            }
+        } message: { c in
+            switch c {
+            case .block: Text(RequestBar.blockMessage(conversation))
+            case .delete:
+                Text(
+                    isGroup
+                        ? "Its messages are deleted from this Mac."
+                        : "Its messages are deleted from this Mac and your phone.")
+            }
+        }
+    }
+
+    /// What the bar says above its buttons.
+    nonisolated static func prompt(_ c: Conversation, name: String) -> String {
+        if c.blocked {
+            return c.kind == .group ? "You blocked this group." : "You blocked \(name)."
+        }
+        return c.kind == .group
+            ? "Join this group? They won't know you've seen their messages until you accept."
+            : "Let \(name) message you? They won't know you've seen their messages until you accept."
+    }
+
+    nonisolated static func blockTitle(_ c: Conversation, name: String) -> String {
+        c.kind == .group ? "Block this group?" : "Block \(name)?"
+    }
+
+    nonisolated static func blockMessage(_ c: Conversation) -> String {
+        c.kind == .group
+            ? "You won't get its messages or updates. You stay a member: leave it from your phone."
+            : "They won't be able to message or call you."
+    }
+}
+
 /// Header in its own view so typing/connection changes don't re-render the timeline.
 struct ConversationHeader: View {
     let store: AppStore
     let conversation: Conversation
 
     private var canCall: Bool {
-        conversation.kind == .direct && !conversation.id.hasPrefix("c:PNI:")
+        conversation.kind == .direct && !conversation.blocked && !conversation.messageRequest
+            && !conversation.id.hasPrefix("c:PNI:")
             && conversation.id != store.ownAci.map { "c:\($0)" }
     }
 

@@ -544,6 +544,22 @@ final class AppStore {
         }
     }
 
+    /// Nothing the chat sends shows from now on (a group isn't left); the phone follows.
+    func block(_ conversationId: String) {
+        change(conversationId, "block the chat") { try await $0.block(conversationId: conversationId) }
+    }
+
+    /// Accepts the chat's message request, or unblocks it.
+    func acceptRequest(_ conversationId: String) {
+        change(conversationId, "accept the chat") { try await $0.acceptRequest(conversationId: conversationId) }
+    }
+
+    /// Deletes the chat's messages here and, for a person, on the phone too. It closes.
+    func deleteChat(_ conversationId: String) {
+        if selectedId == conversationId { select(nil) }
+        change(conversationId, "delete the chat") { try await $0.deleteChat(conversationId: conversationId) }
+    }
+
     /// The chat flag changes run one after the other, so two quick ones land in order.
     private var lastChange: Task<Void, Never>?
     /// The failure on show, if the last change failed (the next one that works takes it away).
