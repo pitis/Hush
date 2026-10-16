@@ -7,7 +7,7 @@ use libsignal_message_backup::proto::backup;
 use presage::libsignal_service::prelude::{ProfileKey, ProtobufMessage as _, Timer, Uuid};
 use presage::libsignal_service::protocol::{Aci, Pni, ServiceId};
 
-use crate::projection::{Message, MessageKind, MessageStatus, Quote};
+use crate::projection::{BodyRange, Message, MessageKind, MessageStatus, Quote, TextStyle};
 
 /// How many rows go into one transaction.
 pub(crate) const BATCH: usize = 1_000;
@@ -385,6 +385,7 @@ impl Importer {
             }
         };
         let mut body = None;
+        let mut ranges = vec![];
         let mut quote = None;
         let mut kind = MessageKind::Normal;
         let mut deleted = false;
@@ -394,6 +395,7 @@ impl Importer {
         match &item.item {
             Some(Item::StandardMessage(m)) => {
                 body = m.text.as_ref().map(|t| t.body.clone()).filter(|b| !b.is_empty());
+                ranges = m.text.as_ref().map(|t| text_ranges(&t.bodyRanges)).unwrap_or_default();
                 quote = m.quote.as_ref().and_then(|q| self.quote_of(q));
                 reactions = self.latest_reactions(&m.reactions);
                 attachments = m
@@ -451,6 +453,7 @@ impl Importer {
                 sent_at: original_sent_at,
                 received_at,
                 body,
+                ranges,
                 is_outgoing,
                 status,
                 edited: !item.revisions.is_empty(),
@@ -510,6 +513,7 @@ impl Importer {
         Some(Quote {
             author,
             sent_at,
+            ranges: q.text.as_ref().map(|t| text_ranges(&t.bodyRanges)).unwrap_or_default(),
             text: q.text.as_ref().map(|t| t.body.clone()).filter(|b| !b.is_empty()),
         })
     }
@@ -619,6 +623,29 @@ fn blob_description(b: &backup::group::GroupAttributeBlob) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The archive's body ranges as ours; unknown styles and unreadable mentions are left out.
+fn text_ranges(ranges: &[backup::BodyRange]) -> Vec<BodyRange> {
+    use backup::body_range::AssociatedValue;
+    ranges
+        .iter()
+        .filter_map(|r| {
+            let style = match r.associatedValue.as_ref()? {
+                AssociatedValue::Style(s) => TextStyle::from_proto(s.value())?,
+                AssociatedValue::MentionAci(a) => TextStyle::Mention {
+                    aci: crate::projection::ids::aci(None, Some(a))?,
+                },
+                // the oneof is non-exhaustive
+                _ => return None,
+            };
+            Some(BodyRange {
+                start: r.start,
+                length: r.length,
+                style,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1220,11 +1247,29 @@ mod tests {
     }
 
     #[test]
-    fn quotes_come_along() {
+    fn quotes_and_text_styles_come_along() {
+        use backup::body_range::{AssociatedValue, Style};
+        let range = |start, length, v| backup::BodyRange {
+            start,
+            length,
+            associatedValue: Some(v),
+            ..Default::default()
+        };
         let mut imp = with_alice();
         let sm = backup::StandardMessage {
             text: MessageField::some(backup::Text {
-                body: "answer".into(),
+                body: "\u{fffc} answer".into(),
+                bodyRanges: vec![
+                    range(
+                        0,
+                        1,
+                        AssociatedValue::MentionAci(Uuid::parse_str(ME).unwrap().as_bytes().to_vec()),
+                    ),
+                    range(2, 6, AssociatedValue::Style(Style::MONOSPACE.into())),
+                    // unknown: left out
+                    range(2, 6, AssociatedValue::Style(Style::NONE.into())),
+                    range(2, 6, AssociatedValue::MentionAci(vec![1, 2])),
+                ],
                 ..Default::default()
             }),
             quote: MessageField::some(backup::Quote {
@@ -1232,6 +1277,7 @@ mod tests {
                 authorId: 2,
                 text: MessageField::some(backup::Text {
                     body: "question".into(),
+                    bodyRanges: vec![range(0, 8, AssociatedValue::Style(Style::STRIKETHROUGH.into()))],
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1245,11 +1291,32 @@ mod tests {
             backup::chat_item::Item::StandardMessage(sm),
         ))));
         let (batch, _, _) = imp.finish();
+        let m = &batch.messages[0].message;
         assert_eq!(
-            batch.messages[0].message.quote,
+            m.ranges,
+            vec![
+                BodyRange {
+                    start: 0,
+                    length: 1,
+                    style: TextStyle::Mention { aci: ME.into() }
+                },
+                BodyRange {
+                    start: 2,
+                    length: 6,
+                    style: TextStyle::Monospace
+                },
+            ]
+        );
+        assert_eq!(
+            m.quote,
             Some(Quote {
                 author: ME.into(),
                 sent_at: 500,
+                ranges: vec![BodyRange {
+                    start: 0,
+                    length: 8,
+                    style: TextStyle::Strikethrough
+                }],
                 text: Some("question".into())
             })
         );

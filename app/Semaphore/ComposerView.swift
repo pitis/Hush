@@ -21,8 +21,12 @@ struct ComposerView: View {
                             reply.isOutgoing ? "Replying to yourself" : "Replying to \(store.senderName(reply.author))"
                         )
                         .font(.system(size: 11, weight: .semibold))
-                        Text(reply.body ?? "Attachment").font(.system(size: 12)).lineLimit(1)
-                            .foregroundStyle(Theme.secondaryText)
+                        Text(
+                            reply.body.map { MessageText.plain($0, ranges: reply.ranges, name: store.mentionName) }
+                                ?? "Attachment"
+                        )
+                        .font(.system(size: 12)).lineLimit(1)
+                        .foregroundStyle(Theme.secondaryText)
                     }
                     Spacer()
                     Button {
@@ -41,8 +45,12 @@ struct ComposerView: View {
                     Rectangle().fill(Theme.outgoing).frame(width: 3)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Editing message").font(.system(size: 11, weight: .semibold))
-                        Text(editing.body ?? "").font(.system(size: 12)).lineLimit(1)
-                            .foregroundStyle(Theme.secondaryText)
+                        Text(
+                            editing.body.map { MessageText.plain($0, ranges: editing.ranges, name: store.mentionName) }
+                                ?? ""
+                        )
+                        .font(.system(size: 12)).lineLimit(1)
+                        .foregroundStyle(Theme.secondaryText)
                     }
                     Spacer()
                     Button(action: store.cancelEditing) { Image(systemName: "xmark.circle.fill") }

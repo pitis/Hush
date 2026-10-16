@@ -22,7 +22,9 @@ use presage_store_sqlite::SqliteStore;
 use tokio::sync::{mpsc, watch};
 
 use crate::events::{from_applied, CoreEvent, EventListener};
-use crate::projection::{project, Message, MessageKey, MessageStatus, Op, ProjectionDb, Quote, RequestResponse};
+use crate::projection::{
+    project, BodyRange, Message, MessageKey, MessageStatus, Op, ProjectionDb, Quote, RequestResponse, TextStyle,
+};
 use crate::typing::TYPING_IDLE;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,11 +130,32 @@ fn data_message(job: &SendJob, attachments: Vec<AttachmentPointer>) -> DataMessa
             id: Some(q.sent_at as u64),
             author_aci: Some(q.author.clone()),
             text: q.text.clone(),
+            body_ranges: body_ranges(&q.ranges),
             ..Default::default()
         }),
         group_v2: group_context(&job.conversation_id),
         ..Default::default()
     }
+}
+
+/// Our ranges as Signal's body ranges.
+fn body_ranges(ranges: &[BodyRange]) -> Vec<presage::proto::BodyRange> {
+    use presage::proto::body_range::{AssociatedValue, Style};
+    ranges
+        .iter()
+        .map(|r| presage::proto::BodyRange {
+            start: Some(r.start),
+            length: Some(r.length),
+            associated_value: Some(match &r.style {
+                TextStyle::Mention { aci } => AssociatedValue::MentionAci(aci.clone()),
+                TextStyle::Bold => AssociatedValue::Style(Style::Bold as i32),
+                TextStyle::Italic => AssociatedValue::Style(Style::Italic as i32),
+                TextStyle::Spoiler => AssociatedValue::Style(Style::Spoiler as i32),
+                TextStyle::Strikethrough => AssociatedValue::Style(Style::Strikethrough as i32),
+                TextStyle::Monospace => AssociatedValue::Style(Style::Monospace as i32),
+            }),
+        })
+        .collect()
 }
 
 /// Our reaction to `target` (`remove` takes back our reaction `emoji`).
@@ -912,7 +935,19 @@ mod tests {
             quote: Some(Quote {
                 author: U.into(),
                 sent_at: 7,
-                text: Some("orig".into()),
+                ranges: vec![
+                    BodyRange {
+                        start: 0,
+                        length: 1,
+                        style: TextStyle::Mention { aci: U.into() },
+                    },
+                    BodyRange {
+                        start: 2,
+                        length: 4,
+                        style: TextStyle::Bold,
+                    },
+                ],
+                text: Some("\u{fffc} orig".into()),
             }),
         };
         let dm = data_message(&job, vec![]);
@@ -920,7 +955,24 @@ mod tests {
         let q = dm.quote.unwrap();
         assert_eq!(
             (q.id, q.author_aci.as_deref(), q.text.as_deref()),
-            (Some(7), Some(U), Some("orig"))
+            (Some(7), Some(U), Some("\u{fffc} orig"))
+        );
+        // the quoted text's mention and style go along, so it reads the same there
+        use presage::proto::body_range::{AssociatedValue, Style};
+        assert_eq!(
+            q.body_ranges,
+            vec![
+                presage::proto::BodyRange {
+                    start: Some(0),
+                    length: Some(1),
+                    associated_value: Some(AssociatedValue::MentionAci(U.into())),
+                },
+                presage::proto::BodyRange {
+                    start: Some(2),
+                    length: Some(4),
+                    associated_value: Some(AssociatedValue::Style(Style::Bold as i32)),
+                },
+            ]
         );
     }
 
@@ -941,6 +993,7 @@ mod tests {
             author: ME.into(),
             sent_at,
             received_at: sent_at,
+            ranges: vec![],
             body: Some("orig".into()),
             is_outgoing: true,
             status: MessageStatus::Sent,
@@ -949,6 +1002,7 @@ mod tests {
             quote: Some(Quote {
                 author: U.into(),
                 sent_at: 5,
+                ranges: vec![],
                 text: Some("q".into()),
             }),
             kind: crate::projection::MessageKind::Normal,
@@ -1011,6 +1065,7 @@ mod tests {
                 vec![Op::Edit {
                     target: key(ME, 100),
                     new_body: Some("fixed".into()),
+                    new_ranges: vec![],
                     edited_at: 800
                 }]
             );

@@ -12,7 +12,11 @@ enum ChatList {
         case message(String, tick: Timeline.Tick?)
     }
 
-    static func line(_ c: Conversation, selected: Bool, typing: Bool, draft: String, authorName: String) -> Line {
+    /// `name` gives a mentioned person's name.
+    static func line(
+        _ c: Conversation, selected: Bool, typing: Bool, draft: String, authorName: String,
+        name: (String) -> String = { String($0.prefix(8)) }
+    ) -> Line {
         if typing { return .typing }
         // as Desktop: what the chat is, not what was said in it
         if c.blocked { return .message("Blocked", tick: nil) }
@@ -22,14 +26,15 @@ enum ChatList {
         // the core's notice; the older message's author, ticks and files don't belong to it
         if c.lastMessageUndecryptable { return .message(c.lastMessagePreview, tick: nil) }
         let author = c.lastMessageOutgoing ? "You" : authorName
+        let preview = MessageText.plain(c.lastMessagePreview, ranges: c.lastMessageRanges, name: name)
         if c.lastMessageDeleted { return .message("\(author) deleted this message", tick: nil) }
         let text =
             if let placeholder = Placeholder.text(c.lastMessageKind) {
                 placeholder
             } else if let file = c.lastMessageFile {
-                oneLine(Files.describe(file, body: c.lastMessagePreview))
+                oneLine(Files.describe(file, body: preview))
             } else {
-                c.lastMessagePreview.isEmpty ? "Attachment" : oneLine(c.lastMessagePreview)
+                preview.isEmpty ? "Attachment" : oneLine(preview)
             }
         let tick = c.lastMessageOutgoing ? Timeline.tick(for: c.lastMessageStatus) : nil
         return .message(c.kind == .group ? "\(author): \(text)" : text, tick: tick)

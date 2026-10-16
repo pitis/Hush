@@ -855,7 +855,7 @@ impl ProjectionDb {
             " AS message_request, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
                m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
                a.is_voice_note AS file_voice, m.sent_at AS last_sent_at, m.kind AS last_kind,
-               m.kind_text AS last_kind_text,
+               m.kind_text AS last_kind_text, m.body_ranges AS last_ranges,
                (SELECT MAX(at) FROM chat_events e WHERE e.conversation_id = c.id AND e.kind = 0) AS failed_at
              FROM conversations c LEFT JOIN messages m ON m.id = (SELECT id FROM messages
                WHERE conversation_id = c.id ORDER BY sent_at DESC, author DESC LIMIT 1)
@@ -1133,18 +1133,20 @@ impl ProjectionDb {
             Op::Edit {
                 target,
                 new_body,
+                new_ranges,
                 edited_at,
             } => {
                 let mut tx = self.pool.begin().await?;
                 let target = &resolve(&mut tx, target).await?;
                 let res = sqlx::query(
-                    "UPDATE messages SET body = ?3, edited = 1, edited_at = ?4
+                    "UPDATE messages SET body = ?3, body_ranges = ?5, edited = 1, edited_at = ?4
                      WHERE author = ?1 AND sent_at = ?2 AND deleted = 0 AND edited_at < ?4",
                 )
                 .bind(&target.author)
                 .bind(target.sent_at)
                 .bind(new_body)
                 .bind(edited_at)
+                .bind(ranges_to_row(new_ranges))
                 .execute(&mut *tx)
                 .await?;
                 if res.rows_affected() == 1 {
@@ -1174,7 +1176,7 @@ impl ProjectionDb {
                     return Ok(vec![]);
                 }
                 let res = sqlx::query(
-                    "UPDATE messages SET body = NULL, quote_text = NULL, deleted = 1
+                    "UPDATE messages SET body = NULL, quote_text = NULL, body_ranges = NULL, quote_ranges = NULL, deleted = 1
                      WHERE author = ?1 AND sent_at = ?2 AND deleted = 0",
                 )
                 .bind(&target.author)
@@ -1966,17 +1968,22 @@ impl ProjectionDb {
                 .execute(&mut *tx)
                 .await?;
             let quote = msg.quote.as_ref();
-            let (body, quote_text) = if msg.deleted {
-                (None, None)
+            let (body, quote_text, body_ranges, quote_ranges) = if msg.deleted {
+                (None, None, None, None)
             } else {
-                (msg.body.as_ref(), quote.and_then(|q| q.text.as_ref()))
+                (
+                    msg.body.as_ref(),
+                    quote.and_then(|q| q.text.as_ref()),
+                    ranges_to_row(&msg.ranges),
+                    quote.and_then(|q| ranges_to_row(&q.ranges)),
+                )
             };
             let (msg_kind, kind_text) = msg.kind.to_row();
             sqlx::query(
                 "INSERT INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
                    status, edited, deleted, quote_author, quote_sent_at, quote_text, kind, kind_text,
-                   expires_in, expires_at, edited_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                   expires_in, expires_at, edited_at, body_ranges, quote_ranges)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                  ON CONFLICT(author, sent_at) DO UPDATE SET
                    status = MAX(messages.status, excluded.status),
                    expires_at = COALESCE(MIN(messages.expires_at, excluded.expires_at),
@@ -1999,6 +2006,8 @@ impl ProjectionDb {
             .bind(i64::from(msg.expires_in))
             .bind(msg.expires_at)
             .bind(m.edited_at)
+            .bind(body_ranges)
+            .bind(quote_ranges)
             .execute(&mut *tx)
             .await?;
             for revision_sent_at in &m.revisions {
@@ -2146,11 +2155,13 @@ async fn forget_deleted_text(conn: &mut SqliteConnection, key: &MessageKey) -> R
         .bind(key.sent_at)
         .execute(&mut *conn)
         .await?;
-    sqlx::query("UPDATE messages SET quote_text = NULL WHERE quote_author = ?1 AND quote_sent_at = ?2")
-        .bind(&key.author)
-        .bind(key.sent_at)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "UPDATE messages SET quote_text = NULL, quote_ranges = NULL WHERE quote_author = ?1 AND quote_sent_at = ?2",
+    )
+    .bind(&key.author)
+    .bind(key.sent_at)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query("DELETE FROM link_previews WHERE message_author = ?1 AND message_sent_at = ?2")
         .bind(&key.author)
         .bind(key.sent_at)
@@ -2231,17 +2242,22 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
         .execute(&mut *conn)
         .await?;
     let quote = m.quote.as_ref();
-    let (body, quote_text) = if m.deleted {
-        (None, None)
+    let (body, quote_text, body_ranges, quote_ranges) = if m.deleted {
+        (None, None, None, None)
     } else {
-        (m.body.as_ref(), quote.and_then(|q| q.text.as_ref()))
+        (
+            m.body.as_ref(),
+            quote.and_then(|q| q.text.as_ref()),
+            ranges_to_row(&m.ranges),
+            quote.and_then(|q| ranges_to_row(&q.ranges)),
+        )
     };
     let (kind, kind_text) = m.kind.to_row();
     let res = sqlx::query(
         "INSERT OR IGNORE INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
            status, edited, deleted, quote_author, quote_sent_at, quote_text, kind, kind_text, expires_in,
-           expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+           expires_at, body_ranges, quote_ranges)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )
     .bind(&m.conversation_id)
     .bind(&m.author)
@@ -2259,6 +2275,8 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     .bind(kind_text)
     .bind(i64::from(m.expires_in))
     .bind(m.expires_at)
+    .bind(body_ranges)
+    .bind(quote_ranges)
     .execute(&mut *conn)
     .await?;
     let inserted = res.rows_affected() == 1;
@@ -2354,7 +2372,7 @@ async fn apply_pending(conn: &mut SqliteConnection, key: &MessageKey) -> Result<
         == 1;
     if deleted {
         sqlx::query(
-            "UPDATE messages SET body = NULL, quote_text = NULL, deleted = 1 WHERE author = ?1 AND sent_at = ?2",
+            "UPDATE messages SET body = NULL, quote_text = NULL, body_ranges = NULL, quote_ranges = NULL, deleted = 1 WHERE author = ?1 AND sent_at = ?2",
         )
         .bind(&key.author)
         .bind(key.sent_at)
@@ -2505,6 +2523,11 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         title: r.try_get("title")?,
         last_message_at: r.try_get("last_message_at")?,
         last_message_preview: r.try_get("last_message_preview")?,
+        last_message_ranges: if undecryptable {
+            vec![]
+        } else {
+            ranges_from_row(r.try_get("last_ranges")?)
+        },
         unread_count: u32::try_from(unread).map_err(|_| decode_err(format!("unread_count {unread}")))?,
         archived: r.try_get("archived")?,
         pinned_order: r
@@ -2530,6 +2553,7 @@ fn row_to_message(r: &SqliteRow) -> Result<Message, sqlx::Error> {
         sent_at: r.try_get("sent_at")?,
         received_at: r.try_get("received_at")?,
         body: r.try_get("body")?,
+        ranges: ranges_from_row(r.try_get("body_ranges")?),
         is_outgoing: r.try_get("is_outgoing")?,
         status: MessageStatus::from_i64(status).ok_or_else(|| decode_err(format!("message status {status}")))?,
         edited: r.try_get("edited")?,
@@ -2539,6 +2563,7 @@ fn row_to_message(r: &SqliteRow) -> Result<Message, sqlx::Error> {
                 author,
                 sent_at,
                 text: r.try_get("quote_text")?,
+                ranges: ranges_from_row(r.try_get("quote_ranges")?),
             }),
             _ => None,
         },
@@ -2566,6 +2591,7 @@ mod tests {
             author: author.into(),
             sent_at,
             received_at: sent_at,
+            ranges: vec![],
             body: Some(body.into()),
             is_outgoing: false,
             status: MessageStatus::Delivered,
@@ -2717,6 +2743,27 @@ mod tests {
             .unwrap();
             let m = db.message(&key("alice", 5)).await.unwrap().unwrap();
             assert_eq!((m.body.as_deref(), m.status), (Some("live"), MessageStatus::Read));
+        }
+
+        #[tokio::test]
+        async fn imported_styles_and_mentions_are_kept() {
+            let db = db().await;
+            let mut m = imported("c:alice", "alice", 5, "hi", MessageStatus::Read);
+            let range = |style| BodyRange {
+                start: 0,
+                length: 2,
+                style,
+            };
+            m.message.ranges = vec![range(TextStyle::Italic)];
+            m.message.quote = Some(Quote {
+                author: "me".into(),
+                sent_at: 1,
+                text: Some("q".into()),
+                ranges: vec![range(TextStyle::Spoiler)],
+            });
+            let want = m.message.clone();
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            assert_eq!(db.message(&key("alice", 5)).await.unwrap().unwrap(), want);
         }
 
         #[tokio::test]
@@ -2954,6 +3001,7 @@ mod tests {
             db.apply(&Op::Edit {
                 target: key("alice", 3_000),
                 new_body: Some("even newer".into()),
+                new_ranges: vec![],
                 edited_at: 4_000,
             })
             .await
@@ -3209,6 +3257,7 @@ mod tests {
             quote: Some(Quote {
                 author: "bob".into(),
                 sent_at: 9,
+                ranges: vec![],
                 text: Some("q".into()),
             }),
             ..msg("me", 10, "hi")
@@ -3217,6 +3266,7 @@ mod tests {
             quote: Some(Quote {
                 author: "bob".into(),
                 sent_at: 8,
+                ranges: vec![],
                 text: None,
             }),
             ..msg("me", 11, "a")
@@ -3255,6 +3305,7 @@ mod tests {
             quote: Some(Quote {
                 author: "b".into(),
                 sent_at: 1,
+                ranges: vec![],
                 text: Some("quoted secret".into()),
             }),
             ..msg("alice", 1, "secret plan")
@@ -3867,12 +3918,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn styles_and_mentions_are_kept_replaced_by_edits_and_gone_with_a_delete() {
+        let db = db().await;
+        let bold = |start, length| BodyRange {
+            start,
+            length,
+            style: TextStyle::Bold,
+        };
+        let mention = BodyRange {
+            start: 0,
+            length: 1,
+            style: TextStyle::Mention { aci: "bob".into() },
+        };
+        let m = Message {
+            ranges: vec![mention.clone(), bold(2, 3)],
+            quote: Some(Quote {
+                author: "me".into(),
+                sent_at: 1,
+                text: Some("orig".into()),
+                ranges: vec![bold(0, 4)],
+            }),
+            ..msg("alice", 2, "\u{fffc} hey")
+        };
+        db.insert_message(&m).await.unwrap();
+        assert_eq!(db.messages("c:alice", None, 10).await.unwrap(), vec![m.clone()]);
+        assert_eq!(conv(&db, "c:alice").await.last_message_ranges, m.ranges);
+
+        db.apply(&Op::Edit {
+            target: k("alice", 2),
+            new_body: Some("hey".into()),
+            new_ranges: vec![bold(0, 3)],
+            edited_at: 3,
+        })
+        .await
+        .unwrap();
+        let edited = db.message(&k("alice", 2)).await.unwrap().unwrap();
+        assert_eq!(edited.ranges, vec![bold(0, 3)]);
+        assert_eq!(conv(&db, "c:alice").await.last_message_ranges, vec![bold(0, 3)]);
+
+        db.apply(&Op::Delete { target: k("alice", 2) }).await.unwrap();
+        let deleted = db.message(&k("alice", 2)).await.unwrap().unwrap();
+        assert_eq!((deleted.ranges, deleted.quote.unwrap().ranges), (vec![], vec![]));
+    }
+
+    #[tokio::test]
     async fn edit_replaces_body_keeps_latest_and_updates_search_and_preview() {
         let db = db().await;
         db.insert_message(&msg("alice", 1, "orignal typo")).await.unwrap();
         let edit = |body: &str, at| Op::Edit {
             target: k("alice", 1),
             new_body: Some(body.into()),
+            new_ranges: vec![],
             edited_at: at,
         };
         assert_eq!(
@@ -3895,6 +3991,7 @@ mod tests {
         let edit = Op::Edit {
             target: k("bob", 1),
             new_body: Some("hacked".into()),
+            new_ranges: vec![],
             edited_at: 5,
         };
         assert!(db.apply(&edit).await.unwrap().is_empty());
@@ -3913,6 +4010,7 @@ mod tests {
             quote: Some(Quote {
                 author: "me".into(),
                 sent_at: 0,
+                ranges: vec![],
                 text: Some("quoted".into()),
             }),
             ..msg("alice", 2, "secret")
@@ -3939,6 +4037,7 @@ mod tests {
         let edit = Op::Edit {
             target: k("alice", 2),
             new_body: Some("back".into()),
+            new_ranges: vec![],
             edited_at: 9,
         };
         assert!(db.apply(&edit).await.unwrap().is_empty());
@@ -4021,6 +4120,7 @@ mod tests {
         let edit = |target, body: &str, at| Op::Edit {
             target: k("alice", target),
             new_body: Some(body.into()),
+            new_ranges: vec![],
             edited_at: at,
         };
         db.apply(&edit(100, "v2", 200)).await.unwrap();
@@ -4076,6 +4176,7 @@ mod tests {
         db.apply(&Op::Edit {
             target: k("me", 10),
             new_body: Some("b".into()),
+            new_ranges: vec![],
             edited_at: 20,
         })
         .await
@@ -4150,6 +4251,7 @@ mod tests {
             quote: Some(Quote {
                 author: "alice".into(),
                 sent_at: 1,
+                ranges: vec![],
                 text: Some("secret".into()),
             }),
             ..msg("bob", 2, "replying")
@@ -4163,6 +4265,7 @@ mod tests {
             Some(Quote {
                 author: "alice".into(),
                 sent_at: 1,
+                ranges: vec![],
                 text: None
             })
         );
@@ -4175,6 +4278,7 @@ mod tests {
         db.apply(&Op::Edit {
             target: k("alice", 1),
             new_body: None,
+            new_ranges: vec![],
             edited_at: 5,
         })
         .await
@@ -4193,6 +4297,7 @@ mod tests {
         let edit = Op::Edit {
             target: k("alice", 1),
             new_body: Some("y".into()),
+            new_ranges: vec![],
             edited_at: 5,
         };
         let react = Op::React {
@@ -5044,6 +5149,7 @@ mod tests {
         db.apply(&Op::Edit {
             target: k("alice", 1),
             new_body: Some("secret plan v2".into()),
+            new_ranges: vec![],
             edited_at: 7,
         })
         .await

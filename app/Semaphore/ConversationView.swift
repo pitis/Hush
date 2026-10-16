@@ -201,7 +201,7 @@ struct TimelineList: View {
                             let key = MessageKey(author: m.author, sentAt: m.sentAt)
                             MessageRow(
                                 message: m, first: first, last: last, isGroup: isGroup,
-                                senderName: store.senderName(m.author),
+                                senderName: store.senderName(m.author), mentionName: store.mentionName,
                                 reactions: store.reactions[key] ?? [],
                                 files: store.attachments[key] ?? [], preview: store.previews[key],
                                 highlighted: store.highlighted == key,
@@ -308,6 +308,8 @@ struct MessageRow: View {
     let last: Bool
     let isGroup: Bool
     let senderName: String
+    /// A mentioned person's name.
+    var mentionName: (String) -> String = { String($0.prefix(8)) }
     let reactions: [Reaction]
     let files: [Attachment]
     let preview: LinkPreview?
@@ -322,6 +324,7 @@ struct MessageRow: View {
     @State private var picking = false
     @State private var showingReactors = false
     @State private var confirmingDelete = false
+    @State private var spoilersRevealed = false
 
     /// React, edit, delete (after Signal Desktop).
     struct Actions {
@@ -381,7 +384,9 @@ struct MessageRow: View {
             if let body = message.body, !message.deleted {
                 Button("Copy") {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(body, forType: .string)
+                    let text = MessageText.plain(
+                        body, ranges: message.ranges, name: mentionName, revealSpoilers: true)
+                    NSPasteboard.general.setString(text, forType: .string)
                 }
             }
             if message.status == .failed { Button("Retry", action: retry) }
@@ -424,7 +429,15 @@ struct MessageRow: View {
             if let q = message.quote, !message.deleted {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(q.author == message.author ? "Reply" : "Quoted").font(.system(size: 11, weight: .semibold))
-                    Text(q.text ?? "Attachment").font(.system(size: 12)).lineLimit(2)
+                    Group {
+                        if let text = q.text {
+                            MessageText.text(
+                                MessageText.attributed(text, ranges: q.ranges, name: mentionName), size: 12)
+                        } else {
+                            Text("Attachment")
+                        }
+                    }
+                    .font(.system(size: 12)).lineLimit(2)
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -442,7 +455,16 @@ struct MessageRow: View {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
                         Text(placeholder).italic()
                     } else if let body = message.body, !body.isEmpty {
-                        Text(body).textSelection(.enabled)
+                        let text = MessageText.text(
+                            MessageText.attributed(
+                                body, ranges: message.ranges, name: mentionName, revealSpoilers: spoilersRevealed),
+                            size: 14)
+                        if MessageText.hasSpoiler(message.ranges) && !spoilersRevealed {
+                            // as Desktop: a click shows what the spoilers hide
+                            text.onTapGesture { spoilersRevealed = true }.help("Click to reveal")
+                        } else {
+                            text.textSelection(.enabled)
+                        }
                     } else if files.isEmpty {
                         Text("Attachment")
                     }

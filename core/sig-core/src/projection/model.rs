@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversationKind {
     Direct,
@@ -23,6 +25,8 @@ pub struct Conversation {
     pub title: String,
     pub last_message_at: i64,
     pub last_message_preview: String,
+    /// The preview's styles and mentions (the last message's `ranges`).
+    pub last_message_ranges: Vec<BodyRange>,
     pub unread_count: u32,
     /// The last message's author (empty without messages).
     pub last_message_author: String,
@@ -151,6 +155,53 @@ pub struct Quote {
     pub author: String,
     pub sent_at: i64,
     pub text: Option<String>,
+    /// Styles and mentions in `text`.
+    pub ranges: Vec<BodyRange>,
+}
+
+/// A style or a mention over part of a message's text (Signal's `BodyRange`). `start` and
+/// `length` count UTF-16 code units, as Signal sends them. A mention covers a placeholder
+/// character (U+FFFC) that the app shows as "@name".
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BodyRange {
+    pub start: u32,
+    pub length: u32,
+    pub style: TextStyle,
+}
+
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextStyle {
+    Bold,
+    Italic,
+    Spoiler,
+    Strikethrough,
+    Monospace,
+    Mention { aci: String },
+}
+
+impl TextStyle {
+    /// A style by its number in Signal's protos (the service's and the backup's agree); `None`
+    /// for NONE and unknown ones.
+    pub(crate) fn from_proto(style: i32) -> Option<Self> {
+        Some(match style {
+            1 => Self::Bold,
+            2 => Self::Italic,
+            3 => Self::Spoiler,
+            4 => Self::Strikethrough,
+            5 => Self::Monospace,
+            _ => return None,
+        })
+    }
+}
+
+/// How ranges are stored: JSON, NULL when there are none.
+pub(crate) fn ranges_to_row(ranges: &[BodyRange]) -> Option<String> {
+    (!ranges.is_empty()).then(|| serde_json::to_string(ranges).expect("ranges serialize"))
+}
+
+/// A row's ranges; unreadable JSON reads as none (the text still shows, unstyled).
+pub(crate) fn ranges_from_row(row: Option<String>) -> Vec<BodyRange> {
+    row.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
@@ -213,6 +264,8 @@ pub struct Message {
     pub sent_at: i64,
     pub received_at: i64,
     pub body: Option<String>,
+    /// Styles and mentions in `body`.
+    pub ranges: Vec<BodyRange>,
     pub is_outgoing: bool,
     pub status: MessageStatus,
     pub edited: bool,
