@@ -668,6 +668,27 @@ impl Client {
         self.send_mutation(m.conversation_id, body, at as u64)
     }
 
+    /// Sets a direct chat's disappearing-message timer in seconds (0: off), for both sides. It
+    /// shows here once sent. A group's timer changes with the group, which only the phone can
+    /// change.
+    pub async fn set_disappearing_timer(&self, conversation_id: String, seconds: u32) -> Result<(), CoreError> {
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        if !matches!(
+            crate::send::recipient(&conversation_id),
+            Some(crate::send::Recipient::Direct(_))
+        ) {
+            return Err(CoreError::InvalidInput {
+                message: format!("the timer can be set here in direct chats only, not {conversation_id}"),
+            });
+        }
+        let at = self.next_sent_at() as u64;
+        self.send(Command::Send(Job::Timer {
+            conversation_id,
+            seconds,
+            at,
+        }))
+    }
+
     /// Deletes our own message (sent, under 24 hours old) for everyone. It shows here once sent.
     pub async fn delete_for_everyone(&self, key: MessageKey) -> Result<(), CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
@@ -1194,6 +1215,21 @@ mod tests {
             ));
         });
         assert!(matches!(client.set_typing(conv, true), Err(CoreError::NotLinked)));
+    }
+
+    #[test]
+    fn the_disappearing_timer_is_set_in_direct_chats_only() {
+        let (_dir, _sink, client, rt) = as_me("client-timer-set");
+        rt.block_on(async {
+            // a group's timer changes with the group (the phone does that)
+            assert!(invalid(
+                client
+                    .set_disappearing_timer(format!("g:{}", "ab".repeat(32)), 60)
+                    .await
+            ));
+            assert!(invalid(client.set_disappearing_timer("c:nope".into(), 60).await));
+            client.set_disappearing_timer(format!("c:{ALICE}"), 3600).await.unwrap();
+        });
     }
 
     #[test]

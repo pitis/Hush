@@ -22,6 +22,23 @@ final class PlaceholderTests: XCTestCase {
             .message("📊 Poll: Pizza?", tick: nil))
     }
 
+    func testTheTimerChoicesAreDesktops() {
+        XCTAssertEqual(
+            Placeholder.timerChoices.map(Placeholder.timerChoice),
+            ["Off", "30 seconds", "5 minutes", "1 hour", "8 hours", "1 day", "1 week", "4 weeks"])
+        // a custom timer from the phone is offered too, in its place
+        XCTAssertEqual(Placeholder.timerChoices(current: 172_800).filter { $0 > 86_400 && $0 < 604_800 }, [172_800])
+        XCTAssertEqual(Placeholder.timerChoices(current: 3_600), Placeholder.timerChoices)
+    }
+
+    @MainActor func testSettingTheTimerAsksTheCore() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        store.setTimer("c:a", seconds: 3600)
+        await eventually { fake.flagCalls == ["timer c:a 3600"] }
+    }
+
     func testTimerLengthsReadLikeSignals() {
         XCTAssertEqual(Placeholder.duration(30), "30 seconds")
         XCTAssertEqual(Placeholder.duration(60), "1 minute")

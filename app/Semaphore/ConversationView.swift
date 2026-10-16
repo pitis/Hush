@@ -128,6 +128,13 @@ struct ConversationHeader: View {
     let store: AppStore
     let conversation: Conversation
 
+    /// A group's timer changes with the group (from the phone); a blocked or unaccepted chat
+    /// has nothing to send it to.
+    private var canSetTimer: Bool {
+        conversation.kind == .direct && !conversation.blocked && !conversation.messageRequest
+            && !conversation.id.hasPrefix("c:PNI:")
+    }
+
     private var canCall: Bool {
         conversation.kind == .direct && !conversation.blocked && !conversation.messageRequest
             && !conversation.id.hasPrefix("c:PNI:")
@@ -154,6 +161,28 @@ struct ConversationHeader: View {
                 }
             }
             Spacer()
+            if canSetTimer {
+                Menu {
+                    Picker(
+                        "Disappearing messages",
+                        selection: Binding(
+                            get: { conversation.expireTimer },
+                            set: { store.setTimer(conversation.id, seconds: $0) })
+                    ) {
+                        ForEach(Placeholder.timerChoices(current: conversation.expireTimer), id: \.self) {
+                            Text(Placeholder.timerChoice($0)).tag($0)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    Image(systemName: conversation.expireTimer > 0 ? "hourglass.circle.fill" : "hourglass")
+                        .font(.system(size: 15))
+                }
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Disappearing messages")
+                .accessibilityLabel("Disappearing messages")
+            }
             if canCall {
                 let inCall = store.call != nil && store.call?.phase != .ended
                 Button {
