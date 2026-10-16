@@ -68,7 +68,7 @@ enum MessageText {
         // a mention a hidden spoiler covers goes with it
         let mentions = ranges.filter { r in
             guard case .mention = r.style else { return false }
-            return !spoilers.contains { $0.start < r.start + r.length && r.start < $0.start + $0.length }
+            return !spoilers.contains { overlap($0, r) }
         }
         // last first; a range overlapping one already replaced is skipped
         for r in (spoilers + mentions).sorted(by: { $0.start > $1.start }) {
@@ -110,7 +110,13 @@ enum MessageText {
     /// `r` cut to a text `length` long; nil if it starts past the end.
     private static func clamped(_ r: BodyRange, to length: Int) -> BodyRange? {
         guard Int(r.start) < length else { return nil }
-        return BodyRange(start: r.start, length: min(r.length, UInt32(length) - r.start), style: r.style)
+        return BodyRange(start: r.start, length: UInt32(min(Int(r.length), length - Int(r.start))), style: r.style)
+    }
+
+    /// Whether two ranges share a character. In `Int`: a sender's start and length can add up past
+    /// `UInt32.max`, which would trap.
+    private static func overlap(_ a: BodyRange, _ b: BodyRange) -> Bool {
+        Int(a.start) < Int(b.start) + Int(b.length) && Int(b.start) < Int(a.start) + Int(a.length)
     }
 
     private static func span(_ r: BodyRange?, in text: AttributedString) -> Range<AttributedString.Index>? {

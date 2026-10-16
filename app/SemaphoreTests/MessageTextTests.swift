@@ -129,4 +129,18 @@ final class MessageTextTests: XCTestCase {
         XCTAssertEqual(runs(text).map { $0.0 }, ["👍 ", "hi"])
         XCTAssertEqual(runs(text).map { $0.1 }, [[], [.bold]])
     }
+
+    /// Ranges come from the sender: no values may crash the app.
+    func testHostileRangesDontCrash() {
+        let max = UInt32.max
+        let hostile = [
+            range(max, max, .spoiler), range(max, 2, .mention(aci: "bob")), range(1, max, .mention(aci: "bob")),
+            range(max - 1, 2, .bold), range(0, max, .spoiler), range(2, max, .italic),
+        ]
+        XCTAssertEqual(MessageText.plain("hi \u{FFFC}", ranges: hostile, name: name), "■■■■")
+        XCTAssertEqual(
+            MessageText.plain("hi \u{FFFC}", ranges: hostile, name: name, revealSpoilers: true), "hi \u{FFFC}")
+        XCTAssertEqual(
+            String(MessageText.attributed("hi \u{FFFC}", ranges: hostile, name: name).characters), "hi \u{FFFC}")
+    }
 }
