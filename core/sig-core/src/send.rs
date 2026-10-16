@@ -67,6 +67,16 @@ pub struct SendJob {
     pub quote: Option<Quote>,
     /// Ids of its stored files, uploaded before it is sent.
     pub attachments: Vec<i64>,
+    /// Its link preview (the image by its stored file's id); boxed, as most messages have none.
+    pub preview: Option<Box<SendPreview>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image: Option<i64>,
 }
 
 /// Everything the sender sends, in order.
@@ -134,8 +144,23 @@ fn group_context(conversation_id: &str) -> Option<GroupContextV2> {
     }
 }
 
-fn data_message(job: &SendJob, attachments: Vec<AttachmentPointer>) -> DataMessage {
+fn data_message(
+    job: &SendJob,
+    attachments: Vec<AttachmentPointer>,
+    preview_image: Option<AttachmentPointer>,
+) -> DataMessage {
     DataMessage {
+        preview: job
+            .preview
+            .iter()
+            .map(|p| presage::proto::Preview {
+                url: Some(p.url.clone()),
+                title: p.title.clone(),
+                description: p.description.clone(),
+                image: preview_image.clone(),
+                ..Default::default()
+            })
+            .collect(),
         body: job.body.clone(),
         body_ranges: body_ranges(&job.ranges),
         attachments,
@@ -249,6 +274,7 @@ pub fn delete(conversation_id: &str, target_sent_at: i64, at: u64) -> DataMessag
 /// Replaces the text of our own `original`; the new revision keeps its quote.
 pub fn edit(original: &Message, new_body: String, ranges: Vec<BodyRange>, at: u64) -> EditMessage {
     let revision = SendJob {
+        preview: None,
         key: MessageKey {
             author: original.author.clone(),
             sent_at: at as i64,
@@ -261,7 +287,7 @@ pub fn edit(original: &Message, new_body: String, ranges: Vec<BodyRange>, at: u6
     };
     EditMessage {
         target_sent_timestamp: Some(original.sent_at as u64),
-        data_message: Some(data_message(&revision, vec![])),
+        data_message: Some(data_message(&revision, vec![], None)),
     }
 }
 
@@ -633,12 +659,23 @@ async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, 
             });
         }
     }
+    // a preview image that won't upload is left off: the preview still says what the link is
+    let preview_image = match job.preview.as_ref().and_then(|p| p.image) {
+        Some(id) => match upload(m, db, &[id]).await {
+            Ok(mut pointers) => pointers.pop(),
+            Err(e) => {
+                tracing::warn!(error = %e, "a link preview's image wasn't uploaded");
+                None
+            }
+        },
+        None => None,
+    };
     let result = match upload(m, db, &job.attachments).await {
         Ok(pointers) => {
             send_to(
                 m,
                 &job.conversation_id,
-                data_message(&job, pointers).into(),
+                data_message(&job, pointers, preview_image).into(),
                 job.key.sent_at as u64,
             )
             .await
@@ -1019,8 +1056,47 @@ mod tests {
     }
 
     #[test]
+    fn a_link_preview_goes_with_its_message() {
+        let job = SendJob {
+            key: MessageKey {
+                author: "me".into(),
+                sent_at: 42,
+            },
+            conversation_id: format!("c:{U}"),
+            body: Some("see https://example.com/a".into()),
+            ranges: vec![],
+            attachments: vec![],
+            preview: Some(Box::new(SendPreview {
+                url: "https://example.com/a".into(),
+                title: Some("A page".into()),
+                description: None,
+                image: Some(3),
+            })),
+            quote: None,
+        };
+        let image = AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            ..Default::default()
+        };
+        let dm = data_message(&job, vec![], Some(image.clone()));
+        assert_eq!(dm.preview.len(), 1);
+        assert_eq!(
+            (
+                dm.preview[0].url.as_deref(),
+                dm.preview[0].title.as_deref(),
+                dm.preview[0].image.as_ref()
+            ),
+            (Some("https://example.com/a"), Some("A page"), Some(&image))
+        );
+        assert!(data_message(&SendJob { preview: None, ..job }, vec![], None)
+            .preview
+            .is_empty());
+    }
+
+    #[test]
     fn group_text_names_its_group_so_members_dont_get_it_as_a_direct_message() {
         let job = SendJob {
+            preview: None,
             key: MessageKey {
                 author: "me".into(),
                 sent_at: 42,
@@ -1031,18 +1107,19 @@ mod tests {
             attachments: vec![],
             quote: None,
         };
-        let g = data_message(&job, vec![]).group_v2.expect("group context");
+        let g = data_message(&job, vec![], None).group_v2.expect("group context");
         assert_eq!(g.master_key, Some(vec![0xab; 32]));
         let direct = SendJob {
             conversation_id: format!("c:{U}"),
             ..job
         };
-        assert_eq!(data_message(&direct, vec![]).group_v2, None);
+        assert_eq!(data_message(&direct, vec![], None).group_v2, None);
     }
 
     #[test]
     fn files_go_out_in_order_with_their_caption() {
         let job = SendJob {
+            preview: None,
             key: MessageKey {
                 author: "me".into(),
                 sent_at: 42,
@@ -1057,7 +1134,7 @@ mod tests {
             file_name: Some(name.into()),
             ..Default::default()
         };
-        let dm = data_message(&job, vec![pointer("a"), pointer("b")]);
+        let dm = data_message(&job, vec![pointer("a"), pointer("b")], None);
         assert_eq!(dm.body, None);
         assert_eq!(dm.attachments, vec![pointer("a"), pointer("b")]);
         let captioned = SendJob {
@@ -1065,7 +1142,7 @@ mod tests {
             ..job
         };
         assert_eq!(
-            data_message(&captioned, vec![pointer("a")]).body.as_deref(),
+            data_message(&captioned, vec![pointer("a")], None).body.as_deref(),
             Some("look")
         );
     }
@@ -1073,6 +1150,7 @@ mod tests {
     #[test]
     fn data_message_carries_body_timestamp_and_quote() {
         let job = SendJob {
+            preview: None,
             key: MessageKey {
                 author: "me".into(),
                 sent_at: 42,
@@ -1103,7 +1181,7 @@ mod tests {
                 text: Some("\u{fffc} orig".into()),
             }),
         };
-        let dm = data_message(&job, vec![]);
+        let dm = data_message(&job, vec![], None);
         assert_eq!((dm.body.as_deref(), dm.timestamp), (Some("hi"), Some(42)));
         use presage::proto::body_range::{AssociatedValue, Style};
         assert_eq!(

@@ -3831,6 +3831,7 @@ dependencies = [
  "reqwest",
  "reqwest-websocket",
  "ringrtc",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3842,6 +3843,7 @@ dependencies = [
  "tracing-oslog",
  "tracing-subscriber",
  "uniffi",
+ "url",
 ]
 
 [[package]]

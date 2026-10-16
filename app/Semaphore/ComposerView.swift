@@ -10,10 +10,13 @@ struct ComposerView: View {
     /// What was typed before editing started; back once the edit is saved or cancelled.
     @State private var draftBeforeEdit: NSAttributedString?
     @State private var mentions = MentionPicker()
+    /// Waits for a pause in typing before asking for a link preview.
+    @State private var previewWait: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 6) {
             if mentions.isOpen { MentionList(picker: mentions) }
+            if let draft = store.previewDraft { PreviewDraftCard(draft: draft, dismiss: store.dismissPreview) }
             if let reply = store.replyTo {
                 HStack {
                     Rectangle().fill(Theme.outgoing).frame(width: 3)
@@ -112,6 +115,12 @@ struct ComposerView: View {
         .onChange(of: text) { _, new in
             // drafts keep the words, not their styles
             if store.editing == nil { Composer.saveDraft(new.string, for: conversationId) }
+            previewWait?.cancel()
+            previewWait = Task {
+                try? await Task.sleep(for: .milliseconds(700))
+                guard !Task.isCancelled else { return }
+                await store.composerChanged(new.string)
+            }
         }
         .onChange(of: store.editing?.sentAt) { _, _ in
             if let editing = store.editing {
@@ -206,6 +215,37 @@ enum Composer {
         } else {
             defaults.removeObject(forKey: "draft.\(conversationId)")
         }
+    }
+}
+
+/// The link preview that will go with the message, with ✕ to leave it off.
+struct PreviewDraftCard: View {
+    let draft: PreviewDraft
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let image = draft.image {
+                ThumbnailImage(path: image.path).frame(width: 44, height: 44)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(draft.title ?? URL(string: draft.url)?.host() ?? draft.url)
+                    .font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                if let description = draft.description {
+                    Text(description).font(.system(size: 11)).lineLimit(2).foregroundStyle(Theme.secondaryText)
+                }
+                Text(URL(string: draft.url)?.host() ?? draft.url).font(.system(size: 11))
+                    .foregroundStyle(Theme.secondaryText).lineLimit(1)
+            }
+            Spacer()
+            Button(action: dismiss) { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
+                .accessibilityLabel("Remove the link preview")
+        }
+        .padding(8)
+        .background(Theme.field, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 14)
     }
 }
 

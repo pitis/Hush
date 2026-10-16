@@ -24,6 +24,9 @@ serde_json = "1"
 # the history fetcher talks through libsignal-service's PushService, whose request builder and
 # answers are reqwest types (already in the tree through libsignal-service)
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+url = "2"
+# link previews fetch pages with the ring provider presage uses
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
 tokio = { version = "1.48", features = ["rt", "sync", "time", "macros"] }
 hex = "0.4"

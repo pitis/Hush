@@ -890,14 +890,21 @@ impl ProjectionDb {
     /// Our own message with files: the message, and a copy of each file in the attachments
     /// folder (Ready to upload), all or nothing. False (and nothing stored) if a message with the
     /// same key exists.
-    pub async fn insert_outgoing(&self, m: &Message, files: &[OutgoingFile]) -> Result<bool, sqlx::Error> {
+    pub async fn insert_outgoing(
+        &self,
+        m: &Message,
+        files: &[OutgoingFile],
+        preview: Option<&PreviewDraft>,
+    ) -> Result<bool, sqlx::Error> {
         let dir = self
             .files
             .clone()
             .ok_or_else(|| sqlx::Error::Configuration("no attachments folder".into()))?;
         // Copies can be slow (large files, files still in iCloud): made before the transaction,
         // off the async threads, so the one database connection isn't held meanwhile.
-        let sources: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        // the preview's image is copied last, as position -1 (a preview image's place)
+        let preview_image = preview.and_then(|p| p.image.as_ref());
+        let sources: Vec<String> = files.iter().chain(preview_image).map(|f| f.path.clone()).collect();
         let (copy_dir, sent_at) = (dir.clone(), m.sent_at);
         let staged = tokio::task::spawn_blocking(move || stage_copies(&copy_dir, sent_at, &sources))
             .await
@@ -908,14 +915,25 @@ impl ProjectionDb {
             if !insert_message_in(&mut tx, m).await? {
                 return Ok(false);
             }
-            for (i, f) in files.iter().enumerate() {
-                let id = add_outgoing_file(&mut tx, m, f, i as i64, staged[i].1).await?;
+            let positioned = files.iter().zip(0i64..).chain(preview_image.map(|f| (f, -1)));
+            for (i, (f, position)) in positioned.enumerate() {
+                let id = add_outgoing_file(&mut tx, m, f, position, staged[i].1).await?;
                 let file = id.to_string();
                 std::fs::rename(dir.join(&names[i]), dir.join(&file))?;
                 names[i] = file.clone();
                 sqlx::query("UPDATE attachments SET file = ?2 WHERE id = ?1")
                     .bind(id)
                     .bind(&file)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if let Some(p) = preview {
+                sqlx::query("INSERT OR IGNORE INTO link_previews VALUES (?1, ?2, ?3, ?4, ?5)")
+                    .bind(&m.author)
+                    .bind(m.sent_at)
+                    .bind(&p.url)
+                    .bind(&p.title)
+                    .bind(&p.description)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -1447,11 +1465,13 @@ impl ProjectionDb {
             Op::Settings {
                 read_receipts,
                 typing_indicators,
+                link_previews,
             } => {
                 let mut tx = self.pool.begin().await?;
                 for (key, value) in [
                     ("read_receipts", read_receipts),
                     ("typing_indicators", typing_indicators),
+                    ("link_previews", link_previews),
                 ] {
                     if let Some(v) = value {
                         sqlx::query(
@@ -1797,6 +1817,7 @@ impl ProjectionDb {
         Ok(Settings {
             read_receipts: get("read_receipts"),
             typing_indicators: get("typing_indicators"),
+            link_previews: get("link_previews"),
         })
     }
 
@@ -5073,25 +5094,28 @@ mod tests {
     async fn settings_are_unknown_until_the_phone_sends_them_and_merge() {
         let db = db().await;
         assert_eq!(db.settings().await.unwrap(), Settings::default());
-        let set = |read_receipts, typing_indicators| Op::Settings {
+        let set = |read_receipts, typing_indicators, link_previews| Op::Settings {
             read_receipts,
             typing_indicators,
+            link_previews,
         };
-        assert!(db.apply(&set(Some(false), None)).await.unwrap().is_empty());
-        db.apply(&set(None, Some(true))).await.unwrap();
+        assert!(db.apply(&set(Some(false), None, None)).await.unwrap().is_empty());
+        db.apply(&set(None, Some(true), None)).await.unwrap();
         assert_eq!(
             db.settings().await.unwrap(),
             Settings {
                 read_receipts: Some(false),
-                typing_indicators: Some(true)
+                typing_indicators: Some(true),
+                link_previews: None,
             }
         );
-        db.apply(&set(Some(true), Some(false))).await.unwrap();
+        db.apply(&set(Some(true), Some(false), Some(true))).await.unwrap();
         assert_eq!(
             db.settings().await.unwrap(),
             Settings {
                 read_receipts: Some(true),
-                typing_indicators: Some(false)
+                typing_indicators: Some(false),
+                link_previews: Some(true),
             }
         );
     }
@@ -5377,16 +5401,61 @@ mod tests {
             is_voice_note: false,
         };
         let result = db
-            .insert_outgoing(&mine, &[file(&first), file(&src.0.join("gone.jpg"))])
+            .insert_outgoing(&mine, &[file(&first), file(&src.0.join("gone.jpg"))], None)
             .await;
         assert!(result.is_err());
         assert!(db.message(&k("me", 5)).await.unwrap().is_none());
         assert_eq!(std::fs::read_dir(&files.0).unwrap().count(), 0, "no copies left behind");
         // and with the file there, everything is stored
-        assert!(db.insert_outgoing(&mine, &[file(&first)]).await.unwrap());
+        assert!(db.insert_outgoing(&mine, &[file(&first)], None).await.unwrap());
         let stored = db.attachments(&k("me", 5)).await.unwrap();
         assert_eq!((stored.len(), stored[0].size), (1, 1));
         assert_eq!(std::fs::read(stored[0].path.as_ref().unwrap()).unwrap(), b"1");
+    }
+
+    #[tokio::test]
+    async fn a_sent_messages_link_preview_is_kept_with_its_image() {
+        let files = TempFiles::new("preview");
+        let src = TempFiles::new("preview-src");
+        std::fs::create_dir_all(&src.0).unwrap();
+        let image = src.0.join("cover.jpg");
+        std::fs::write(&image, b"jpg").unwrap();
+        let db = db().await.with_files(files.0.clone());
+        let mine = Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            ..msg("me", 6, "see https://example.com/a")
+        };
+        let preview = PreviewDraft {
+            url: "https://example.com/a".into(),
+            title: Some("A page".into()),
+            description: Some("About it".into()),
+            image: Some(OutgoingFile {
+                path: image.to_string_lossy().into(),
+                content_type: "image/jpeg".into(),
+                width: None,
+                height: None,
+                is_voice_note: false,
+            }),
+        };
+        assert!(db.insert_outgoing(&mine, &[], Some(&preview)).await.unwrap());
+        // the image is the preview's, not one of the message's files
+        assert!(db.attachments(&k("me", 6)).await.unwrap().is_empty());
+        let stored = db.link_preview(&k("me", 6)).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                stored.url.as_str(),
+                stored.title.as_deref(),
+                stored.description.as_deref()
+            ),
+            ("https://example.com/a", Some("A page"), Some("About it"))
+        );
+        let img = stored.image.unwrap();
+        assert_eq!(
+            (img.state, img.content_type.as_str()),
+            (AttachmentState::Ready, "image/jpeg")
+        );
+        assert_eq!(std::fs::read(img.path.unwrap()).unwrap(), b"jpg");
     }
 
     #[tokio::test]

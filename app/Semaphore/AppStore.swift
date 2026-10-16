@@ -136,6 +136,12 @@ final class AppStore {
     /// Files and link previews of the loaded messages.
     private(set) var attachments: [MessageKey: [Attachment]] = [:]
     private(set) var previews: [MessageKey: LinkPreview] = [:]
+    /// The link preview for the composer's text, to go with the next message.
+    private(set) var previewDraft: PreviewDraft?
+    /// The link `previewDraft` is (or will be) for.
+    private var previewLink: String?
+    private var fetchingPreview: String?
+    private var dismissedPreviews: Set<String> = []
     /// The polls of the open chat's loaded messages, as their votes stand.
     private(set) var polls: [MessageKey: Poll] = [:]
     /// Files chosen, dropped or pasted for the open chat, sent with the next message.
@@ -348,6 +354,9 @@ final class AppStore {
         attachments = [:]
         previews = [:]
         polls = [:]
+        previewDraft = nil
+        previewLink = nil
+        dismissedPreviews = []
         outgoingFiles = []
         changedKeys = []
         hasOlder = false
@@ -385,10 +394,15 @@ final class AppStore {
         // taken out of the tray now, so a second ↩ while this one is busy can't send them again
         outgoingFiles = []
         let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body, ranges: $0.ranges) }
+        // only a preview of a link still in the text
+        let preview = previewDraft.flatMap { body.contains($0.url) ? $0 : nil }
         do {
             // the core announces the new pending message itself
             if files.isEmpty {
-                _ = try await client.sendText(conversationId: id, body: body, ranges: ranges, quote: quote)
+                _ = try await client.sendText(
+                    conversationId: id, body: body, ranges: ranges, quote: quote, preview: preview)
+                previewDraft = nil
+                previewLink = nil
             } else {
                 // the text goes with the files, as their caption
                 _ = try await client.sendAttachments(
@@ -403,6 +417,32 @@ final class AppStore {
             append("send failed: \(error)")
             return false
         }
+    }
+
+    /// The composer's text changed (the composer waits for a pause in typing): fetches a preview
+    /// for its first https link, and drops one whose link is gone. A preview is extra: a failed
+    /// fetch shows nothing.
+    func composerChanged(_ text: String) async {
+        guard editing == nil else { return }
+        let link = PreviewLink.first(in: text)
+        if link != previewLink {
+            previewDraft = nil
+            previewLink = link
+        }
+        guard let link, previewDraft == nil, fetchingPreview != link, !dismissedPreviews.contains(link), let client
+        else { return }
+        fetchingPreview = link
+        defer { if fetchingPreview == link { fetchingPreview = nil } }
+        do {
+            let draft = try await client.linkPreviewFor(text: text)
+            if previewLink == link { previewDraft = draft }
+        } catch { append("link preview failed: \(error)") }
+    }
+
+    /// ✕ on the preview: none for that link in this chat.
+    func dismissPreview() {
+        if let previewLink { dismissedPreviews.insert(previewLink) }
+        previewDraft = nil
     }
 
     /// Something the user tried didn't work; the reason shows in the window.
@@ -755,7 +795,8 @@ final class AppStore {
             return replyFailed(conversationId, because: "Semaphore wasn't ready")
         }
         do {
-            _ = try await client.sendText(conversationId: conversationId, body: body, ranges: [], quote: nil)
+            _ = try await client.sendText(
+                conversationId: conversationId, body: body, ranges: [], quote: nil, preview: nil)
             markRead(conversationId)
         } catch {
             replyFailed(conversationId, because: Self.describe(error))
@@ -1425,4 +1466,17 @@ final class Listener: EventListener {
     }
 
     func onEvent(event: CoreEvent) { deliver(event) }
+}
+
+/// The link a preview is for: the first https link, as typed (as the core finds it).
+enum PreviewLink {
+    static func first(in text: String) -> String? {
+        for word in text.split(whereSeparator: \.isWhitespace) {
+            guard let start = word.range(of: "https://") else { continue }
+            let link = String(word[start.lowerBound...]).trimmingCharacters(
+                in: CharacterSet(charactersIn: ".,;:!?)]>\"'"))
+            if let url = URL(string: link), url.host() != nil { return link }
+        }
+        return nil
+    }
 }

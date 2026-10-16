@@ -90,6 +90,8 @@ pub enum Op {
     Settings {
         read_receipts: Option<bool>,
         typing_indicators: Option<bool>,
+        /// "Generate link previews": whether we may fetch a link's page to show what it is.
+        link_previews: Option<bool>,
     },
     /// Our phone's whole block list (`SyncMessage.Blocked`): it replaces ours. `groups` are
     /// group identifiers. Phone numbers aren't kept here.
@@ -133,11 +135,12 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
             let mut ops = match &sm.content {
                 Some(sync_message::Content::Sent(sent)) => sent_transcript(sent, me, received_at),
                 Some(sync_message::Content::Configuration(c))
-                    if c.read_receipts.is_some() || c.typing_indicators.is_some() =>
+                    if c.read_receipts.is_some() || c.typing_indicators.is_some() || c.link_previews.is_some() =>
                 {
                     vec![Op::Settings {
                         read_receipts: c.read_receipts,
                         typing_indicators: c.typing_indicators,
+                        link_previews: c.link_previews,
                     }]
                 }
                 Some(sync_message::Content::Blocked(b)) => vec![blocked_list(b)],
@@ -1373,6 +1376,7 @@ mod tests {
                 content: Some(sync_message::Content::Configuration(sync_message::Configuration {
                     read_receipts: read,
                     typing_indicators: typing,
+                    link_previews: read.map(|r| !r),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -1382,14 +1386,16 @@ mod tests {
             project(&content(ME, 1, config(Some(false), Some(true))), ME),
             vec![Op::Settings {
                 read_receipts: Some(false),
-                typing_indicators: Some(true)
+                typing_indicators: Some(true),
+                link_previews: Some(true),
             }]
         );
         assert_eq!(
             project(&content(ME, 2, config(Some(true), None)), ME),
             vec![Op::Settings {
                 read_receipts: Some(true),
-                typing_indicators: None
+                typing_indicators: None,
+                link_previews: Some(false),
             }]
         );
         assert!(project(&content(ME, 3, config(None, None)), ME).is_empty());

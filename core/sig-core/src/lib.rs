@@ -7,6 +7,7 @@ mod download;
 mod error;
 mod events;
 mod history;
+mod link_preview;
 mod logging;
 mod net;
 pub mod projection;

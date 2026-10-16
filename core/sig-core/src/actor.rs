@@ -1638,6 +1638,7 @@ mod tests {
         let off = Op::Settings {
             read_receipts: Some(false),
             typing_indicators: None,
+            link_previews: None,
         };
         assert!(
             super::apply_received(&db, &Quiet, &[off], "me", "me", true)
@@ -1659,7 +1660,8 @@ mod tests {
             db.settings().await.unwrap(),
             Settings {
                 read_receipts: Some(false),
-                typing_indicators: None
+                typing_indicators: None,
+                link_previews: None,
             }
         );
     }
