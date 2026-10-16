@@ -120,6 +120,9 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func setMarkedUnread(conversationId: String, marked: Bool) async throws {
         try await flag("markedUnread \(conversationId) \(marked)")
     }
+    func block(conversationId: String) async throws { try await flag("block \(conversationId)") }
+    func acceptRequest(conversationId: String) async throws { try await flag("accept \(conversationId)") }
+    func deleteChat(conversationId: String) async throws { try await flag("delete \(conversationId)") }
     var storageWritesAnswer = true
     private(set) var storageWritesSet: [Bool] = []
     func storageWrites() async throws -> Bool { lock.withLock { storageWritesAnswer } }
@@ -290,7 +293,7 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
         lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
         blocked: false,
-        whitelisted: false)
+        whitelisted: false, messageRequest: false)
 }
 
 final class Counter: @unchecked Sendable {

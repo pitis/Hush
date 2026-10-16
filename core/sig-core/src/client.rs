@@ -10,8 +10,8 @@ use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
-    Attachment, ChatEvent, Conversation, LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile,
-    ProjectionDb, Quote, Reaction, SearchHit,
+    Attachment, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey, MessageKind,
+    MessageStatus, OutgoingFile, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
 };
 use crate::send::{self, Job, SendJob};
 
@@ -36,6 +36,9 @@ pub struct Client {
     /// How many storage syncs were asked for (tests can't see the core's commands).
     #[cfg(test)]
     storage_sync_requests: std::sync::atomic::AtomicUsize,
+    /// The block and request jobs queued, by name (tests can't see the core's commands).
+    #[cfg(test)]
+    sent_jobs: Mutex<Vec<String>>,
 }
 
 impl Drop for Client {
@@ -112,6 +115,34 @@ impl Client {
         let _ = self.send(Command::StorageSync);
     }
 
+    /// Queues a block or request job. If the core is closing it is lost: the storage record
+    /// still carries a block or accept at the next start, but not a deletion or our profile key.
+    fn queue(&self, job: Job) {
+        #[cfg(test)]
+        self.sent_jobs.lock().unwrap().push(match &job {
+            Job::RequestResponse { response, .. } => format!("RequestResponse({response:?})"),
+            Job::BlockedList => "BlockedList".into(),
+            Job::ProfileKey { .. } => "ProfileKey".into(),
+            Job::Receipts => "Receipts".into(),
+            _ => "other".into(),
+        });
+        if let Err(e) = self.send(Command::Send(job)) {
+            tracing::warn!(error = %e, "a block or request job was dropped");
+        }
+    }
+
+    /// A chat that can be blocked or deleted: known, and not Note to Self.
+    async fn other_chat(&self, id: &str) -> Result<(), CoreError> {
+        let me = self.own_aci().ok_or(CoreError::NotLinked)?;
+        self.known_conversation(id).await?;
+        if id == format!("c:{me}") {
+            return Err(CoreError::InvalidInput {
+                message: "Note to Self can't be blocked or deleted".into(),
+            });
+        }
+        Ok(())
+    }
+
     fn send(&self, cmd: Command) -> Result<(), CoreError> {
         let commands = self.commands.lock().map_err(|_| CoreError::Closed)?;
         commands
@@ -153,6 +184,8 @@ impl Client {
             last_sent_at: Mutex::new(0),
             #[cfg(test)]
             storage_sync_requests: Default::default(),
+            #[cfg(test)]
+            sent_jobs: Default::default(),
         }))
     }
 
@@ -672,6 +705,56 @@ impl Client {
         Ok(())
     }
 
+    /// Blocks a person or group: nothing they send shows from now on (a group is not left).
+    /// Our other devices and the storage record follow.
+    pub async fn block(&self, conversation_id: String) -> Result<(), CoreError> {
+        self.other_chat(&conversation_id).await?;
+        self.db.block(&conversation_id).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
+        self.queue(Job::RequestResponse {
+            conversation_id,
+            response: RequestResponse::Block,
+        });
+        self.queue(Job::BlockedList);
+        Ok(())
+    }
+
+    /// Accepts a message request, or unblocks (the same on Signal): a contact gets our profile
+    /// key, read receipts held back go out, and our other devices and the storage record follow.
+    pub async fn accept_request(&self, conversation_id: String) -> Result<(), CoreError> {
+        self.other_chat(&conversation_id).await?;
+        let was_blocked = self.db.accept(&conversation_id).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
+        self.queue(Job::RequestResponse {
+            conversation_id: conversation_id.clone(),
+            response: RequestResponse::Accept,
+        });
+        if was_blocked {
+            self.queue(Job::BlockedList);
+        }
+        if ConversationKind::from_id(&conversation_id) == Some(ConversationKind::Direct) {
+            self.queue(Job::ProfileKey { conversation_id });
+        }
+        self.queue(Job::Receipts);
+        Ok(())
+    }
+
+    /// Deletes a chat here (messages, files, and presage's copies); a contact's is deleted on our
+    /// other devices too. It comes back with the next message, as a request.
+    pub async fn delete_chat(&self, conversation_id: String) -> Result<(), CoreError> {
+        self.other_chat(&conversation_id).await?;
+        self.db.delete_chat(&conversation_id).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        self.request_storage_sync();
+        self.queue(Job::RequestResponse {
+            conversation_id,
+            response: RequestResponse::Delete,
+        });
+        Ok(())
+    }
+
     /// Whether chat settings changed here are written to the Storage Service (the phone sees
     /// them). On unless turned off; the phone's changes are read either way.
     pub async fn storage_writes(&self) -> Result<bool, CoreError> {
@@ -1144,7 +1227,7 @@ mod tests {
             assert_eq!(client.mark_read(conv.clone()).await.unwrap(), 2);
             // stored until sent, so a quit or a failed send can't lose them
             assert_eq!(
-                client.db.unsent_receipts().await.unwrap(),
+                client.db.unsynced_reads().await.unwrap(),
                 vec![
                     MessageKey {
                         author: ALICE.into(),
@@ -1199,6 +1282,75 @@ mod tests {
             assert!(invalid(client.set_mute_until(conv.clone(), -1).await));
         });
         assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 4);
+    }
+
+    fn jobs(client: &Client) -> Vec<String> {
+        std::mem::take(&mut *client.sent_jobs.lock().unwrap())
+    }
+
+    #[test]
+    fn blocking_and_answering_requests_tell_the_phone_and_the_contact() {
+        let (_dir, sink, client, rt) = as_me("client-block");
+        let conv = format!("c:{ALICE}");
+        let requests = || client.storage_sync_requests.load(Ordering::SeqCst);
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client.block(conv.clone()).await.unwrap();
+            assert!(client.conversations().await.unwrap()[0].blocked);
+            assert_eq!(jobs(&client), ["RequestResponse(Block)", "BlockedList"]);
+            client.accept_request(conv.clone()).await.unwrap();
+            let c = &client.conversations().await.unwrap()[0];
+            assert!(!c.blocked && c.whitelisted);
+            assert_eq!(
+                jobs(&client),
+                ["RequestResponse(Accept)", "BlockedList", "ProfileKey", "Receipts"],
+                "unblocking is accepting; the block list changed too"
+            );
+            client.accept_request(conv.clone()).await.unwrap();
+            assert_eq!(
+                jobs(&client),
+                ["RequestResponse(Accept)", "ProfileKey", "Receipts"],
+                "the block list didn't change"
+            );
+            client.delete_chat(conv.clone()).await.unwrap();
+            assert!(client.conversations().await.unwrap().is_empty());
+            assert_eq!(jobs(&client), ["RequestResponse(Delete)"]);
+            assert_eq!(requests(), 4, "each one goes to the storage record too");
+            // Note to Self and unknown chats can't be blocked or deleted
+            client
+                .db
+                .insert_message(&Message {
+                    conversation_id: format!("c:{ME}"),
+                    ..stored(ME, 2)
+                })
+                .await
+                .unwrap();
+            assert!(invalid(client.block(format!("c:{ME}")).await));
+            assert!(invalid(client.delete_chat(format!("c:{ME}")).await));
+            assert!(invalid(client.block("c:nope".into()).await));
+            assert!(jobs(&client).is_empty());
+        });
+        assert_eq!(announced(&sink, |e| matches!(e, CoreEvent::ConversationsChanged)), 4);
+    }
+
+    #[test]
+    fn a_groups_request_answers_go_without_a_profile_key() {
+        let (_dir, _sink, client, rt) = as_me("client-block-group");
+        let group = format!("g:{}", "ab".repeat(32));
+        rt.block_on(async {
+            client
+                .db
+                .insert_message(&Message {
+                    conversation_id: group.clone(),
+                    ..stored(ALICE, 1)
+                })
+                .await
+                .unwrap();
+            client.accept_request(group.clone()).await.unwrap();
+            assert_eq!(jobs(&client), ["RequestResponse(Accept)", "Receipts"]);
+            client.block(group.clone()).await.unwrap();
+            assert_eq!(jobs(&client), ["RequestResponse(Block)", "BlockedList"]);
+        });
     }
 
     #[test]

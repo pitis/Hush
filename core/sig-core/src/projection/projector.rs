@@ -65,6 +65,17 @@ pub enum Op {
         read_receipts: Option<bool>,
         typing_indicators: Option<bool>,
     },
+    /// Our phone's whole block list (`SyncMessage.Blocked`): it replaces ours. `groups` are
+    /// group identifiers. Phone numbers aren't kept here.
+    BlockedList {
+        acis: Vec<String>,
+        groups: Vec<Vec<u8>>,
+    },
+    /// Our phone answered a message request.
+    RequestResponse {
+        thread: RequestThread,
+        response: RequestResponse,
+    },
 }
 
 /// The ops one received (or locally sent) `Content` produces. `me` is our own ACI as a canonical
@@ -103,6 +114,8 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
                         typing_indicators: c.typing_indicators,
                     }]
                 }
+                Some(sync_message::Content::Blocked(b)) => vec![blocked_list(b)],
+                Some(sync_message::Content::MessageRequestResponse(r)) => request_response(r).into_iter().collect(),
                 _ => vec![],
             };
             let read: Vec<_> = sm
@@ -125,6 +138,37 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
         }
         _ => vec![],
     }
+}
+
+/// The phone's block list, ACIs from both encodings (phone numbers aren't kept).
+fn blocked_list(b: &sync_message::Blocked) -> Op {
+    let acis = b
+        .acis
+        .iter()
+        .filter_map(|a| aci(Some(a), None))
+        .chain(b.acis_binary.iter().filter_map(|a| aci(None, Some(a))))
+        .collect();
+    Op::BlockedList {
+        acis,
+        groups: b.group_ids.clone(),
+    }
+}
+
+/// The phone's answer to a message request; reporting spam alone changes nothing here.
+fn request_response(r: &sync_message::MessageRequestResponse) -> Option<Op> {
+    use sync_message::message_request_response::Type;
+    let response = match Type::try_from(r.r#type?).ok()? {
+        Type::Accept => RequestResponse::Accept,
+        Type::Delete => RequestResponse::Delete,
+        Type::Block | Type::BlockAndSpam => RequestResponse::Block,
+        Type::BlockAndDelete => RequestResponse::BlockAndDelete,
+        Type::Spam | Type::Unknown => return None,
+    };
+    let thread = match &r.group_id {
+        Some(g) => RequestThread::Group(g.clone()),
+        None => RequestThread::Aci(aci(r.thread_aci.as_deref(), r.thread_aci_binary.as_deref())?),
+    };
+    Some(Op::RequestResponse { thread, response })
 }
 
 fn sent_transcript(sent: &sync_message::Sent, me: &str, received_at: i64) -> Vec<Op> {
@@ -999,6 +1043,69 @@ mod tests {
         );
         assert!(project(&content(ME, 3, config(None, None)), ME).is_empty());
         assert!(project(&content(ALICE, 4, config(Some(true), Some(true))), ME).is_empty());
+    }
+
+    fn sync_body(c: sync_message::Content) -> ContentBody {
+        ContentBody::SynchronizeMessage(SyncMessage {
+            content: Some(c),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn the_phones_block_list_comes_whole_with_acis_in_either_form() {
+        let blocked = sync_body(sync_message::Content::Blocked(sync_message::Blocked {
+            numbers: vec!["+40700000000".into()],
+            acis: vec![ALICE.to_uppercase()],
+            acis_binary: vec![uuid(BOB).as_bytes().to_vec(), vec![1, 2]],
+            group_ids: vec![vec![9; 32]],
+        }));
+        assert_eq!(
+            project(&content(ME, 1, blocked.clone()), ME),
+            vec![Op::BlockedList {
+                acis: vec![ALICE.into(), BOB.into()],
+                groups: vec![vec![9; 32]],
+            }]
+        );
+        assert!(
+            project(&content(ALICE, 2, blocked), ME).is_empty(),
+            "only from my phone"
+        );
+    }
+
+    #[test]
+    fn the_phones_request_answers_name_a_contact_or_a_group() {
+        use sync_message::message_request_response::Type;
+        let mrr = |aci: Option<&str>, group: Option<Vec<u8>>, t: Type| {
+            sync_body(sync_message::Content::MessageRequestResponse(
+                sync_message::MessageRequestResponse {
+                    thread_aci: aci.map(String::from),
+                    thread_aci_binary: None,
+                    group_id: group,
+                    r#type: Some(t as i32),
+                },
+            ))
+        };
+        let op = |thread, response| vec![Op::RequestResponse { thread, response }];
+        assert_eq!(
+            project(&content(ME, 1, mrr(Some(ALICE), None, Type::Accept)), ME),
+            op(RequestThread::Aci(ALICE.into()), RequestResponse::Accept)
+        );
+        assert_eq!(
+            project(&content(ME, 1, mrr(None, Some(vec![9; 32]), Type::BlockAndDelete)), ME),
+            op(RequestThread::Group(vec![9; 32]), RequestResponse::BlockAndDelete)
+        );
+        assert_eq!(
+            project(&content(ME, 1, mrr(Some(ALICE), None, Type::BlockAndSpam)), ME),
+            op(RequestThread::Aci(ALICE.into()), RequestResponse::Block)
+        );
+        assert_eq!(
+            project(&content(ME, 1, mrr(Some(ALICE), None, Type::Delete)), ME),
+            op(RequestThread::Aci(ALICE.into()), RequestResponse::Delete)
+        );
+        assert!(project(&content(ME, 1, mrr(Some(ALICE), None, Type::Spam)), ME).is_empty());
+        assert!(project(&content(ME, 1, mrr(None, None, Type::Accept)), ME).is_empty());
+        assert!(project(&content(ALICE, 1, mrr(Some(BOB), None, Type::Accept)), ME).is_empty());
     }
 
     fn pointer(content_type: &str, size: u32, flags: u32) -> AttachmentPointer {

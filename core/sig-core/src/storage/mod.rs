@@ -23,8 +23,13 @@ pub(crate) const KIND_ACCOUNT: i32 = 4;
 /// What a storage record means to us.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Remote {
-    /// A contact's or group's chat and its flags.
-    Chat { conversation_id: String, flags: ChatFlags },
+    /// A contact's or group's chat and its flags; `phone_contact`: a contact in the phone's
+    /// address book (the record has system names).
+    Chat {
+        conversation_id: String,
+        flags: ChatFlags,
+        phone_contact: bool,
+    },
     /// The account: the pinned list, and Note to Self's (archived, marked unread).
     Account { pins: Vec<Pin>, note_to_self: (bool, bool) },
     /// A record we don't interpret (a contact without an ACI, an unknown type…): kept as is.

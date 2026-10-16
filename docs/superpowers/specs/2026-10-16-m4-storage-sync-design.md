@@ -58,7 +58,8 @@ What exists (verified 2026-10-16 on the pinned revisions):
 - Contact names, profile keys, usernames, avatars, nicknames, notes from `ContactRecord`.
 - Account settings (link previews, read receipts…), chat folders, notification profiles, story
   settings, call links.
-- Blocking/unblocking and accepting message requests from the Mac (read only here).
+- Blocking/unblocking and accepting message requests from the Mac (read only here; since
+  added, with `blocked`/`whitelisted` now written: `2026-10-16-m4-block-requests-design.md`).
 - Requesting the storage key from the phone when it is missing (logged; the key arrives at link
   time on current phones).
 

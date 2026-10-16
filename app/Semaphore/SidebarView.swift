@@ -6,6 +6,8 @@ struct SidebarView: View {
     @FocusState private var listFocused: Bool
     /// The message result picked with the arrows while browsing results.
     @State private var resultIndex: Int?
+    /// The chat whose "Block…" waits for confirmation.
+    @State private var blocking: Conversation?
 
     private var searching: Bool { store.isSearching }
     /// The archive is on show (a search covers every chat, so it counts as the inbox).
@@ -57,6 +59,15 @@ struct SidebarView: View {
                     if let id, !browsingResults { proxy.scrollTo(id) }
                 }
                 .onChange(of: resultIndex) { _, i in if let i { proxy.scrollTo("result-\(i)") } }
+            }
+            .confirmationDialog(
+                blocking.map { RequestBar.blockTitle($0, name: store.title($0)) } ?? "",
+                isPresented: Binding(get: { blocking != nil }, set: { if !$0 { blocking = nil } }),
+                presenting: blocking
+            ) { c in
+                Button("Block", role: .destructive) { store.block(c.id) }
+            } message: { c in
+                Text(RequestBar.blockMessage(c))
             }
         }
         .background(Theme.sidebar)
@@ -215,6 +226,13 @@ struct SidebarView: View {
             Button("Unarchive chat") { store.setArchived(c.id, false) }
         } else {
             Button("Archive chat") { store.setArchived(c.id, true) }
+        }
+        if c.id != store.ownAci.map({ "c:\($0)" }) {
+            if c.blocked {
+                Button("Unblock") { store.acceptRequest(c.id) }
+            } else {
+                Button("Block…", role: .destructive) { blocking = c }
+            }
         }
     }
 

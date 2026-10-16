@@ -15,9 +15,10 @@ use presage::libsignal_service::proto::{
 const OUTER_CONTACT: u32 = 1;
 const OUTER_GROUPV2: u32 = 3;
 const OUTER_ACCOUNT: u32 = 4;
-/// archived, markedUnread, mutedUntilTimestamp in `ContactRecord` and `GroupV2Record`.
-const CONTACT_FLAGS: [u32; 3] = [11, 12, 13];
-const GROUP_FLAGS: [u32; 3] = [4, 5, 6];
+/// archived, markedUnread, mutedUntilTimestamp, blocked, whitelisted in `ContactRecord` and
+/// `GroupV2Record`.
+const CONTACT_FLAGS: [u32; 5] = [11, 12, 13, 9, 10];
+const GROUP_FLAGS: [u32; 5] = [4, 5, 6, 2, 3];
 /// `AccountRecord`: noteToSelfArchived, noteToSelfMarkedUnread, pinnedConversations.
 const ACCOUNT_NOTE_ARCHIVED: u32 = 5;
 const ACCOUNT_NOTE_MARKED_UNREAD: u32 = 10;
@@ -37,6 +38,9 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                     c.blocked,
                     c.whitelisted,
                 ),
+                phone_contact: !(c.system_given_name.is_empty()
+                    && c.system_family_name.is_empty()
+                    && c.system_nickname.is_empty()),
             },
             None => Remote::Other,
         },
@@ -49,6 +53,7 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                 g.blocked,
                 g.whitelisted,
             ),
+            phone_contact: false,
         },
         Some(Record::Account(a)) => Remote::Account {
             pins: a.pinned_conversations.iter().map(pin_of).collect(),
@@ -101,8 +106,8 @@ fn pin_of(p: &PinnedConversation) -> Pin {
     }
 }
 
-/// A contact's or group's record with our three flags in place of its own; every other byte
-/// as it was. `blocked` and `whitelisted` are never written.
+/// A contact's or group's record with our flags in place of its own; every other byte as it
+/// was.
 pub(crate) fn patch_chat(plaintext: &[u8], f: &ChatFlags) -> Result<Vec<u8>, String> {
     let (outer, inner) = wire::first_field(plaintext)?;
     let fields = match outer {
@@ -120,6 +125,12 @@ pub(crate) fn patch_chat(plaintext: &[u8], f: &ChatFlags) -> Result<Vec<u8>, Str
     }
     if f.mute_until > 0 {
         wire::append_varint(&mut inner, fields[2], f.mute_until as u64);
+    }
+    if f.blocked {
+        wire::append_varint(&mut inner, fields[3], 1);
+    }
+    if f.whitelisted {
+        wire::append_varint(&mut inner, fields[4], 1);
     }
     Ok(wrap(outer, &inner))
 }
@@ -299,7 +310,10 @@ mod tests {
 
     #[test]
     fn a_contact_record_gives_the_chat_and_its_flags() {
-        let Remote::Chat { conversation_id, flags } = decode(&contact(ALICE)).unwrap() else {
+        let Remote::Chat {
+            conversation_id, flags, ..
+        } = decode(&contact(ALICE)).unwrap()
+        else {
             panic!()
         };
         assert_eq!(conversation_id, format!("c:{ALICE}"));
@@ -344,7 +358,10 @@ mod tests {
             whitelisted: true,
             ..Default::default()
         }));
-        let Remote::Chat { conversation_id, flags } = decode(&g).unwrap() else {
+        let Remote::Chat {
+            conversation_id, flags, ..
+        } = decode(&g).unwrap()
+        else {
             panic!()
         };
         assert_eq!(conversation_id, format!("g:{}", "ab".repeat(32)));
@@ -428,17 +445,18 @@ mod tests {
                 c.marked_unread,
                 c.muted_until_timestamp,
                 c.given_name.as_str(),
-                c.blocked
+                c.blocked,
+                c.whitelisted
             ),
-            (false, true, 1_000, "A", true),
-            "blocked is never written"
+            (false, true, 1_000, "A", false, true),
+            "the fixture's blocked is replaced too"
         );
         let (_, inner2) = wire::first_field(&patched).unwrap();
         assert!(inner2.windows(6).any(|w| w == b"future"), "the unknown field survived");
         // the owned fields occur once each: stripping them again removes exactly those bytes
-        let stripped = wire::strip_fields(inner2, &[11, 12, 13]).unwrap();
-        // archived=false is absent (2 bytes saved), markedUnread 2 bytes, mute 1_000 = tag + 2 bytes
-        assert_eq!(stripped.len(), inner2.len() - (2 + 3));
+        let stripped = wire::strip_fields(inner2, &[11, 12, 13, 9, 10]).unwrap();
+        // false values are absent; markedUnread 2 bytes, mute 1_000 = tag + 2 bytes, whitelisted 2
+        assert_eq!(stripped.len(), inner2.len() - (2 + 3 + 2));
     }
 
     #[test]
@@ -446,12 +464,14 @@ mod tests {
         let g = wrap(Record::GroupV2(GroupV2Record {
             master_key: vec![1; 32],
             archived: true,
+            whitelisted: true,
             ..Default::default()
         }));
         let p = patch_chat(
             &g,
             &ChatFlags {
                 mute_until: i64::MAX,
+                blocked: true,
                 ..Default::default()
             },
         )
@@ -460,8 +480,14 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            (g2.archived, g2.muted_until_timestamp, g2.master_key.len()),
-            (false, i64::MAX as u64, 32)
+            (
+                g2.archived,
+                g2.muted_until_timestamp,
+                g2.blocked,
+                g2.whitelisted,
+                g2.master_key.len()
+            ),
+            (false, i64::MAX as u64, true, false, 32)
         );
         let acct = wrap(Record::Account(Default::default()));
         assert!(patch_chat(&acct, &ChatFlags::default()).is_err());

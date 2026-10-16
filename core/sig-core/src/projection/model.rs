@@ -47,10 +47,32 @@ pub struct Conversation {
     pub mute_until: i64,
     /// Shown unread although every message is read ("Mark as unread").
     pub marked_unread: bool,
-    /// Blocked on the phone (as its Storage Service record says; read-only here).
+    /// Blocked: nothing it sends is shown.
     pub blocked: bool,
-    /// The message request was accepted / profile sharing is on (as the phone says; read-only).
+    /// The message request was accepted / profile sharing is on.
     pub whitelisted: bool,
+    /// Not accepted yet: the app offers Accept, Delete and Block instead of the composer, and no
+    /// read receipts go out. Only once the phone's account state has been read (before that,
+    /// every chat counts as accepted).
+    pub message_request: bool,
+}
+
+/// An answer to a message request, ours or one our phone reports
+/// (`SyncMessage.MessageRequestResponse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestResponse {
+    Accept,
+    Delete,
+    Block,
+    BlockAndDelete,
+}
+
+/// The chat a request response names: a contact's ACI, or a group by its identifier (derived
+/// from the master key; see `ids::group_identifier`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestThread {
+    Aci(String),
+    Group(Vec<u8>),
 }
 
 /// The per-chat values the Storage Service carries, in our units (`mute_until` ms; `i64::MAX`
