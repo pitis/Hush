@@ -177,21 +177,37 @@ pub enum ChatEventKind {
     SessionReset,
     /// `author` set the disappearing-message timer to `value` seconds (0: off).
     TimerChanged,
+    /// We called `author`; `value` is the call's seconds (NULL: never answered).
+    OutgoingCall,
+    /// `author` called us and we talked; `value` is the call's seconds.
+    IncomingCall,
+    /// `author` called us and we never connected (unanswered or declined).
+    MissedCall,
 }
 
 impl ChatEventKind {
+    pub const ALL: [Self; 6] = [
+        Self::DecryptionFailed,
+        Self::SessionReset,
+        Self::TimerChanged,
+        Self::OutgoingCall,
+        Self::IncomingCall,
+        Self::MissedCall,
+    ];
+
     pub fn to_i64(self) -> i64 {
         match self {
             Self::DecryptionFailed => 0,
             Self::SessionReset => 1,
             Self::TimerChanged => 2,
+            Self::OutgoingCall => 3,
+            Self::IncomingCall => 4,
+            Self::MissedCall => 5,
         }
     }
 
     pub fn from_i64(v: i64) -> Option<Self> {
-        [Self::DecryptionFailed, Self::SessionReset, Self::TimerChanged]
-            .into_iter()
-            .find(|k| k.to_i64() == v)
+        Self::ALL.into_iter().find(|k| k.to_i64() == v)
     }
 }
 
@@ -323,6 +339,18 @@ mod tests {
         }
         assert_eq!(MessageStatus::from_i64(4), None);
         assert_eq!(MessageStatus::from_i64(-2), None);
+    }
+
+    #[test]
+    fn call_event_kinds_round_trip() {
+        for (kind, n) in [
+            (ChatEventKind::OutgoingCall, 3),
+            (ChatEventKind::IncomingCall, 4),
+            (ChatEventKind::MissedCall, 5),
+        ] {
+            assert_eq!(kind.to_i64(), n);
+            assert_eq!(ChatEventKind::from_i64(n), Some(kind));
+        }
     }
 
     #[test]

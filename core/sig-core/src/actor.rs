@@ -428,7 +428,7 @@ async fn run(
                         }
                         let author = to.raw_uuid().to_string();
                         match db
-                            .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author)
+                            .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author, None)
                             .await
                         {
                             Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
@@ -982,7 +982,7 @@ async fn handle(
             let at = chrono::Utc::now().timestamp_millis();
             let author = sender.raw_uuid().to_string();
             match db
-                .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author)
+                .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author, None)
                 .await
             {
                 Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
