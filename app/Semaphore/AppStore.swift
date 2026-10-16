@@ -28,6 +28,19 @@ final class AppStore {
     /// App state for Console.app (subsystem dev.pitis.semaphore). Never URLs or message content.
     private static let logger = Logger(subsystem: "dev.pitis.semaphore", category: "app")
 
+    /// The one active (or just-ended) call, driving the call window.
+    struct ActiveCall: Equatable {
+        var conversationId: String
+        var title: String
+        var phase: CallPhase
+        var incoming: Bool
+        /// Set on the first `.connected`; drives the duration ticker.
+        var connectedAt: Date?
+        var muted: Bool = false
+        /// Why it ended ("hung up", "no answer", …), shown briefly.
+        var endedReason: String?
+    }
+
     /// The history transfer's state, for the overlay over the chats.
     struct HistoryProgress: Equatable {
         var stage: HistoryStage
@@ -39,6 +52,8 @@ final class AppStore {
     private(set) var linkURL: String?
     /// Non-nil while the phone's message history is on its way (or failed): the overlay shows.
     private(set) var history: HistoryProgress?
+    /// Non-nil while a call rings or runs (or just ended): the call window shows it.
+    private(set) var call: ActiveCall?
     private(set) var connection: ConnectionState = .offline
     private(set) var conversations: [Conversation] = [] {
         didSet {
@@ -277,6 +292,9 @@ final class AppStore {
         case .chatEventAdded(let conversationId):
             refreshConversations()
             if conversationId == selectedId { reloadEvents() }
+        case .callChanged(let conversationId, let phase, let reason):
+            Self.logger.notice("call \(String(describing: phase), privacy: .public)")
+            callChanged(conversationId, phase: phase, reason: reason, now: now)
         case .historyProgress(let stage, let done, let total):
             Self.logger.notice("history \(String(describing: stage), privacy: .public)")
             switch stage {
@@ -642,6 +660,94 @@ final class AppStore {
         if let failed = await unlinkThisMac(tellServer: false) { showError(failed) }
     }
 
+    // MARK: Calls
+
+    /// A `CallChanged` event: keeps `call` current, rings, and notes missed calls.
+    private func callChanged(_ conversationId: String, phase: CallPhase, reason: String?, now: Date) {
+        let title =
+            conversations.first { $0.id == conversationId }?.title
+            ?? call?.title
+            ?? "Call"
+        switch phase {
+        case .ended:
+            notifier?.remove(ids: [Notifications.callId(conversationId)])
+            let wasConnected = call?.connectedAt != nil
+            let wasIncoming = call?.incoming ?? false
+            if wasIncoming && !wasConnected {
+                notifier?.post(Notifications.missedCall(conversationId: conversationId, title: title, at: now))
+            }
+            guard var ended = call, ended.conversationId == conversationId else { return }
+            ended.phase = .ended
+            ended.endedReason = reason
+            call = ended
+        case .incoming:
+            call = ActiveCall(
+                conversationId: conversationId, title: title, phase: .incoming, incoming: true, connectedAt: nil)
+            if !isAppActive() {
+                notifier?.post(Notifications.incomingCall(conversationId: conversationId, title: title))
+            }
+        case .outgoing:
+            if call == nil {
+                call = ActiveCall(
+                    conversationId: conversationId, title: title, phase: .outgoing, incoming: false, connectedAt: nil)
+            } else {
+                call?.phase = .outgoing
+            }
+        case .ringing, .connecting, .connected:
+            guard call?.conversationId == conversationId else { return }
+            call?.phase = phase
+            if phase == .connected {
+                notifier?.remove(ids: [Notifications.callId(conversationId)])
+                if call?.connectedAt == nil { call?.connectedAt = now }
+            }
+        }
+    }
+
+    /// Starts a voice call in a direct chat (the call window opens on the event).
+    func startCall(_ conversationId: String) {
+        guard call == nil || call?.phase == .ended else { return showError("You're already in a call.") }
+        guard let client else { return showError("Semaphore isn't running.") }
+        do { try client.startCall(conversationId: conversationId) } catch {
+            showError("Couldn't start the call: \(Self.describe(error))")
+        }
+    }
+
+    func acceptCall() {
+        do { try client?.acceptCall() } catch { showError("Couldn't accept the call: \(Self.describe(error))") }
+    }
+
+    /// Hangs up — or declines, while it still rings.
+    func hangupCall() {
+        if let id = call?.conversationId { notifier?.remove(ids: [Notifications.callId(id)]) }
+        do { try client?.hangupCall() } catch { showError("Couldn't hang up: \(Self.describe(error))") }
+    }
+
+    func toggleCallMuted() {
+        guard var current = call else { return }
+        current.muted.toggle()
+        do {
+            try client?.setCallMuted(muted: current.muted)
+            call = current
+        } catch { showError("Couldn't change the microphone: \(Self.describe(error))") }
+    }
+
+    /// The ended state was shown long enough: close the call window.
+    func dismissEndedCall() {
+        if call?.phase == .ended { call = nil }
+    }
+
+    func callAudioDevices() async -> AudioDevices? {
+        try? await client?.callAudioDevices()
+    }
+
+    func setCallAudioInput(_ id: String) {
+        do { try client?.setCallAudioInput(id: id) } catch { showError(Self.describe(error)) }
+    }
+
+    func setCallAudioOutput(_ id: String) {
+        do { try client?.setCallAudioOutput(id: id) } catch { showError(Self.describe(error)) }
+    }
+
     /// "Continue without history": stops the transfer; chats keep working and new messages flow.
     func cancelHistory() {
         guard let client else { return showError("Semaphore isn't running.") }
@@ -707,6 +813,7 @@ final class AppStore {
             notifier?.removeAll()  // message previews go with the data
         }
         history = nil
+        call = nil
         refreshing = false
         refreshAgain = false
         conversations = []

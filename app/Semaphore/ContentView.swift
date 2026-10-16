@@ -53,6 +53,9 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .task { await core.boot() }
         .onAppear { WindowOpener.open = openWindow }
+        .onChange(of: core.call?.conversationId) { _, id in
+            if id != nil { openWindow(id: "call") }
+        }
         .task {
             // "Today" separators become "Yesterday" at midnight
             var day = Calendar.current.startOfDay(for: .now)
