@@ -826,6 +826,11 @@ impl Client {
         Ok(self.db.title(&conversation_id).await?)
     }
 
+    /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
+    pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
+        Ok(self.db.group_members(&conversation_id).await?)
+    }
+
     pub async fn conversations(&self) -> Result<Vec<Conversation>, CoreError> {
         Ok(self.db.conversations().await?)
     }

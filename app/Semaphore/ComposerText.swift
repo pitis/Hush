@@ -6,6 +6,11 @@ enum ComposerText {
     typealias Styles = MessageText.Styles
 
     static let stylesKey = NSAttributedString.Key("semaphore.styles")
+    /// A mention token: "@name" in the field, the mentioned ACI under this key.
+    static let mentionKey = NSAttributedString.Key("semaphore.mention")
+    /// The token's text as inserted; once it differs, the token is just text.
+    static let mentionTextKey = NSAttributedString.Key("semaphore.mentionText")
+    static let mentionColor = NSColor.controlAccentColor
     static let size: CGFloat = 14
 
     /// Each style once, with Signal's name for it.
@@ -14,8 +19,10 @@ enum ComposerText {
         (.spoiler, .spoiler),
     ]
 
-    /// The text to send, trimmed, and its ranges (in UTF-16 units, as `NSString` counts).
-    static func message(from text: NSAttributedString) -> (body: String, ranges: [BodyRange]) {
+    /// The text to send, trimmed, and its ranges (in UTF-16 units, as `NSString` counts). Each
+    /// mention token becomes Signal's placeholder (U+FFFC) under a mention range.
+    static func message(from styled: NSAttributedString) -> (body: String, ranges: [BodyRange]) {
+        let text = placeholders(styled)
         let whole = text.string as NSString
         let kept = whole.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !kept.isEmpty else { return ("", []) }
@@ -34,18 +41,121 @@ enum ComposerText {
                 }
             }
         }
+        text.enumerateAttribute(mentionKey, in: NSRange(location: start, length: length)) { value, run, _ in
+            guard let aci = value as? String else { return }
+            for i in 0..<run.length {
+                ranges.append(
+                    BodyRange(start: UInt32(run.location - start + i), length: 1, style: .mention(aci: aci)))
+            }
+        }
         return (kept, ranges)
     }
 
-    /// `body` with its styles, to edit (mentions aren't kept: they can't be edited here yet).
-    static func attributed(_ body: String, ranges: [BodyRange]) -> NSMutableAttributedString {
+    /// `text` with each mention token shrunk to one placeholder character, keeping its styles.
+    private static func placeholders(_ text: NSAttributedString) -> NSAttributedString {
+        let out = NSMutableAttributedString(attributedString: text)
+        var tokens: [NSRange] = []
+        text.enumerateAttribute(mentionKey, in: NSRange(location: 0, length: text.length)) { value, run, _ in
+            if value != nil { tokens.append(run) }
+        }
+        for run in tokens.reversed() {
+            let attributes = out.attributes(at: run.location, effectiveRange: nil)
+            out.replaceCharacters(in: run, with: NSAttributedString(string: "\u{FFFC}", attributes: attributes))
+        }
+        return out
+    }
+
+    /// The "@word" being typed just before `caret` (at the start or after a space), and the word.
+    static func mentionQuery(in text: NSString, caret: Int) -> (range: NSRange, query: String)? {
+        var i = caret
+        while i > 0 {
+            let c = text.character(at: i - 1)
+            if c == 0x40 {  // "@"
+                let before = i - 1
+                if before > 0, let prev = UnicodeScalar(text.character(at: before - 1)),
+                    !CharacterSet.whitespacesAndNewlines.contains(prev)
+                {
+                    return nil
+                }
+                let range = NSRange(location: before, length: caret - before)
+                return (range, text.substring(with: NSRange(location: i, length: caret - i)))
+            }
+            if let scalar = UnicodeScalar(c), CharacterSet.whitespacesAndNewlines.contains(scalar) { return nil }
+            i -= 1
+        }
+        return nil
+    }
+
+    /// Puts a token for `aci`, shown as "@name", and a space in place of `range`, styled like
+    /// the text there. Returns where the caret goes.
+    @discardableResult
+    static func insertMention(aci: String, name: String, in text: NSMutableAttributedString, replacing range: NSRange)
+        -> Int
+    {
+        let styles =
+            range.location < text.length
+            ? Styles(rawValue: text.attribute(stylesKey, at: range.location, effectiveRange: nil) as? Int ?? 0) : []
+        let shown = "@\(name)"
+        var attributes = display(styles)
+        attributes[mentionKey] = aci
+        attributes[mentionTextKey] = shown
+        attributes[.foregroundColor] = mentionColor
+        let token = NSMutableAttributedString(string: shown, attributes: attributes)
+        token.append(NSAttributedString(string: " ", attributes: display(styles)))
+        text.replaceCharacters(in: range, with: token)
+        return range.location + token.length
+    }
+
+    /// Turns tokens whose text was changed back into plain text. True if any was.
+    @discardableResult
+    static func repairMentions(_ text: NSMutableAttributedString) -> Bool {
+        var broken: [NSRange] = []
+        text.enumerateAttribute(mentionKey, in: NSRange(location: 0, length: text.length)) { value, run, _ in
+            guard value != nil else { return }
+            let shown = text.attribute(mentionTextKey, at: run.location, effectiveRange: nil) as? String
+            if (text.string as NSString).substring(with: run) != shown { broken.append(run) }
+        }
+        for run in broken {
+            text.removeAttribute(mentionKey, range: run)
+            text.removeAttribute(mentionTextKey, range: run)
+            text.addAttribute(.foregroundColor, value: NSColor.labelColor, range: run)
+        }
+        return !broken.isEmpty
+    }
+
+    /// The members whose name has a word starting with `query`, by name.
+    static func matches(_ members: [(String, String)], query: String) -> [(String, String)] {
+        let q = query.lowercased()
+        return
+            members
+            .filter { q.isEmpty || $0.1.lowercased().split(separator: " ").contains { $0.hasPrefix(q) } }
+            .sorted { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+    }
+
+    /// `body` with its styles and mentions (named by `name`), to edit.
+    static func attributed(
+        _ body: String, ranges: [BodyRange], name: (String) -> String = { _ in "" }
+    ) -> NSMutableAttributedString {
         let text = NSMutableAttributedString(string: body, attributes: display([]))
         let length = text.length
-        for r in ranges {
-            guard let style = all.first(where: { $0.1 == r.style })?.0,
-                Int(r.start) + Int(r.length) <= length, r.length > 0
-            else { continue }
+        let fit = { (r: BodyRange) in r.length > 0 && Int(r.start) + Int(r.length) <= length }
+        for r in ranges where fit(r) {
+            guard let style = all.first(where: { $0.1 == r.style })?.0 else { continue }
             add(style, in: text, range: NSRange(location: Int(r.start), length: Int(r.length)))
+        }
+        // last first, so the earlier offsets hold
+        let mentions = ranges.filter(fit).compactMap { r -> (Int, String)? in
+            guard case .mention(let aci) = r.style, r.length == 1 else { return nil }
+            return (Int(r.start), aci)
+        }
+        for (at, aci) in mentions.sorted(by: { $0.0 > $1.0 }) {
+            let shown = "@\(name(aci))"
+            var attributes = text.attributes(at: at, effectiveRange: nil)
+            attributes[mentionKey] = aci
+            attributes[mentionTextKey] = shown
+            attributes[.foregroundColor] = mentionColor
+            text.replaceCharacters(
+                in: NSRange(location: at, length: 1), with: NSAttributedString(string: shown, attributes: attributes))
         }
         return text
     }

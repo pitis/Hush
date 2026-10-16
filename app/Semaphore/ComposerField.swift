@@ -14,6 +14,8 @@ struct ComposerField: NSViewRepresentable {
     let onUpInEmpty: () -> Bool
     let onPasteFiles: ([URL]) -> Void
     let onPasteError: (Error) -> Void
+    /// The group's mention picker; nil in a direct chat.
+    var mentions: MentionPicker?
 
     static let maxLines: CGFloat = 6
 
@@ -35,6 +37,7 @@ struct ComposerField: NSViewRepresentable {
         view.typingAttributes = ComposerText.display([])
         view.setAccessibilityLabel("Message")
         view.textStorage?.setAttributedString(text)
+        mentions?.view = view
         let scroll = NSScrollView()
         scroll.documentView = view
         scroll.drawsBackground = false
@@ -47,6 +50,7 @@ struct ComposerField: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let view = scroll.documentView as? ComposerTextView else { return }
+        mentions?.view = view
         if !view.attributedString().isEqual(to: text) {
             view.textStorage?.setAttributedString(text)
             // typing undone now would land in text that's gone (sent, another chat's draft)
@@ -73,13 +77,13 @@ struct ComposerField: NSViewRepresentable {
         return CGSize(width: width, height: min(max(used, line), line * Self.maxLines).rounded(.up))
     }
 
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ComposerField
         var focusRequest: Int
         /// The field's own: cleared when its text is replaced, without touching the window's.
         let undo: UndoManager
 
-        @MainActor init(_ parent: ComposerField) {
+        init(_ parent: ComposerField) {
             self.parent = parent
             focusRequest = parent.focusRequest
             undo = UndoManager()
@@ -89,10 +93,43 @@ struct ComposerField: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
+            // a mention typed into stops being one
+            if let storage = view.textStorage, !view.hasMarkedText() { ComposerText.repairMentions(storage) }
             parent.text = NSAttributedString(attributedString: view.attributedString())
+            findMention(in: view)
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let view = notification.object as? NSTextView else { return }
+            // what's typed next to a mention isn't part of it
+            if view.typingAttributes[ComposerText.mentionKey] != nil {
+                view.typingAttributes[ComposerText.mentionKey] = nil
+                view.typingAttributes[ComposerText.mentionTextKey] = nil
+            }
+            findMention(in: view)
+        }
+
+        /// Opens, narrows or closes the picker for the "@word" before the caret.
+        private func findMention(in view: NSTextView) {
+            guard let mentions = parent.mentions else { return }
+            let caret = view.selectedRange()
+            let found =
+                caret.length == 0 && !view.hasMarkedText()
+                ? ComposerText.mentionQuery(in: view.string as NSString, caret: caret.location) : nil
+            mentions.update(found)
         }
 
         func textView(_ view: NSTextView, doCommandBy selector: Selector) -> Bool {
+            if let mentions = parent.mentions, mentions.isOpen {
+                switch selector {
+                case #selector(NSResponder.moveUp(_:)): return mentions.move(-1)
+                case #selector(NSResponder.moveDown(_:)): return mentions.move(1)
+                case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)):
+                    return mentions.pick()
+                case #selector(NSResponder.cancelOperation(_:)): return mentions.dismiss()
+                default: break
+                }
+            }
             switch selector {
             case #selector(NSResponder.insertNewline(_:)):
                 switch Composer.action(for: NSApp.currentEvent?.modifierFlags ?? []) {
@@ -106,6 +143,57 @@ struct ComposerField: NSViewRepresentable {
                 return false
             }
         }
+    }
+}
+
+/// The group members matching the "@word" being typed, one of them selected.
+@MainActor @Observable
+final class MentionPicker {
+    /// (ACI, name) of who can be mentioned.
+    var members: [(String, String)] = []
+    private(set) var query: String?
+    private(set) var range = NSRange()
+    private(set) var selected = 0
+    /// Esc closes it until another "@word" is typed.
+    private var dismissedAt: Int?
+    @ObservationIgnored weak var view: ComposerTextView?
+
+    var matches: [(String, String)] { query.map { ComposerText.matches(members, query: $0) } ?? [] }
+    var isOpen: Bool { !matches.isEmpty }
+
+    func update(_ found: (range: NSRange, query: String)?) {
+        guard let found, found.range.location != dismissedAt else {
+            query = nil
+            if found == nil { dismissedAt = nil }
+            return
+        }
+        if found.query != query { selected = 0 }
+        query = found.query
+        range = found.range
+    }
+
+    func move(_ step: Int) -> Bool {
+        let count = matches.count
+        guard count > 0 else { return false }
+        selected = (selected + step + count) % count
+        return true
+    }
+
+    /// Puts the selected (or `index`th) member in the field.
+    @discardableResult
+    func pick(_ index: Int? = nil) -> Bool {
+        let all = matches
+        let i = index ?? selected
+        guard all.indices.contains(i), let view else { return false }
+        view.insertMention(aci: all[i].0, name: all[i].1, replacing: range)
+        query = nil
+        return true
+    }
+
+    func dismiss() -> Bool {
+        dismissedAt = range.location
+        query = nil
+        return true
     }
 }
 
@@ -123,6 +211,16 @@ final class ComposerTextView: NSTextView {
         else { return super.performKeyEquivalent(with: event) }
         toggle(style)
         return true
+    }
+
+    /// Replaces the "@word" at `range` with a mention token, undoably.
+    func insertMention(aci: String, name: String, replacing range: NSRange) {
+        guard let storage = textStorage, shouldChangeText(in: range, replacementString: "@\(name) ") else { return }
+        storage.beginEditing()
+        let caret = ComposerText.insertMention(aci: aci, name: name, in: storage, replacing: range)
+        storage.endEditing()
+        didChangeText()
+        setSelectedRange(NSRange(location: caret, length: 0))
     }
 
     /// Styles the selection, or what's typed next when nothing is selected.

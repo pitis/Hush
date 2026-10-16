@@ -1486,6 +1486,14 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
                         if let Err(e) = db.upsert_conversation_title(&group_id(&key), &g.title).await {
                             problems.push(format!("storing a group title: {e}"));
                         }
+                        let members: Vec<String> = g
+                            .members
+                            .iter()
+                            .map(|m| ServiceId::from(m.aci).raw_uuid().to_string())
+                            .collect();
+                        if let Err(e) = db.set_group_members(&group_id(&key), &members).await {
+                            problems.push(format!("storing a group's members: {e}"));
+                        }
                         let timer = g.disappearing_messages_timer.map_or(0, |t| t.duration);
                         if let Err(e) = db.set_chat_timer(&group_id(&key), timer).await {
                             problems.push(format!("storing a chat's timer: {e}"));
