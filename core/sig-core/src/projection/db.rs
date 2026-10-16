@@ -170,12 +170,18 @@ impl ProjectionDb {
     /// How many chats can be pinned (the phone's limit).
     pub const MAX_PINNED: u32 = 4;
 
+    /// Archiving also unpins (as Desktop): an archived chat holds no pin slot and comes back
+    /// unpinned.
     pub async fn set_archived(&self, id: &str, archived: bool) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE conversations SET archived = ?2 WHERE id = ?1")
-            .bind(id)
-            .bind(archived)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE conversations SET archived = ?2,
+               pinned_order = CASE WHEN ?2 THEN NULL ELSE pinned_order END
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(archived)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -220,6 +226,24 @@ impl ProjectionDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn has_conversation(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
+    }
+
+    /// Whether the chat's notifications are off at `now_ms` (false for a chat that isn't here).
+    pub async fn is_muted(&self, id: &str, now_ms: i64) -> Result<bool, sqlx::Error> {
+        let muted: Option<bool> = sqlx::query_scalar("SELECT mute_until > ?2 FROM conversations WHERE id = ?1")
+            .bind(id)
+            .bind(now_ms)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(muted.unwrap_or(false))
     }
 
     /// The chat was read: "marked unread" goes away. True if it was set.
@@ -2163,7 +2187,12 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            db.import_history(&flagged(true, None, 5_000, true)).await.unwrap();
+            // our own message in the backup doesn't unarchive (only a live one does)
+            let mut batch = flagged(true, None, 5_000, true);
+            let mut mine = imported("c:alice", "me", 2, "mine", MessageStatus::Sent);
+            mine.message.is_outgoing = true;
+            batch.messages.push(mine);
+            db.import_history(&batch).await.unwrap();
             let c = conv(&db, "c:alice").await;
             assert_eq!(
                 (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
@@ -2729,8 +2758,9 @@ mod tests {
         }
         assert!(!db.set_pinned("c:e", true).await.unwrap());
         assert_eq!(conv(&db, "c:e").await.pinned_order, None);
-        // pinning a pinned chat is fine, and unpinning makes room
+        // pinning a pinned chat keeps its place, and unpinning makes room
         assert!(db.set_pinned("c:a", true).await.unwrap());
+        assert_eq!(conv(&db, "c:a").await.pinned_order, Some(1));
         assert!(db.set_pinned("c:a", false).await.unwrap());
         assert!(db.set_pinned("c:e", true).await.unwrap());
     }
@@ -2768,6 +2798,35 @@ mod tests {
         db.set_marked_unread("c:alice", true).await.unwrap();
         assert!(db.clear_marked_unread("c:alice").await.unwrap());
         assert!(!conv(&db, "c:alice").await.marked_unread);
+    }
+
+    #[tokio::test]
+    async fn archiving_a_pinned_chat_unpins_it() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        db.set_pinned("c:alice", true).await.unwrap();
+        db.set_pinned("c:bob", true).await.unwrap();
+        db.set_archived("c:alice", true).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.archived, c.pinned_order), (true, None));
+        // the other pin keeps its place, and unarchiving doesn't bring the pin back
+        assert_eq!(conv(&db, "c:bob").await.pinned_order, Some(2));
+        db.set_archived("c:alice", false).await.unwrap();
+        assert_eq!(conv(&db, "c:alice").await.pinned_order, None);
+    }
+
+    #[tokio::test]
+    async fn a_chat_is_muted_while_its_time_has_not_come() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        assert!(!db.is_muted("c:alice", 5_000).await.unwrap());
+        db.set_mute_until("c:alice", 5_000).await.unwrap();
+        assert!(!db.is_muted("c:alice", 5_000).await.unwrap());
+        assert!(db.is_muted("c:alice", 4_999).await.unwrap());
+        db.set_mute_until("c:alice", i64::MAX).await.unwrap();
+        assert!(db.is_muted("c:alice", i64::MAX - 1).await.unwrap());
+        assert!(!db.is_muted("c:nobody", 0).await.unwrap());
     }
 
     #[tokio::test]

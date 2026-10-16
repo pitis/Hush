@@ -758,6 +758,25 @@ mod tests {
     }
 
     #[test]
+    fn odd_backup_flags_are_read_safely() {
+        let mut imp = Importer::new(ME, NOW);
+        assert!(imp.add(contact_frame(1, ALICE, "Alice")).is_none());
+        assert!(imp.add(self_frame(2)).is_none());
+        assert!(imp
+            .add(frame(backup::frame::Item::Chat(backup::Chat {
+                id: 10,
+                recipientId: 1,
+                pinnedOrder: Some(0),        // a pin order of 0 is a pin
+                muteUntilMs: Some(u64::MAX), // past INT64_MAX: as good as "always"
+                ..Default::default()
+            })))
+            .is_none());
+        let (batch, _, _) = imp.finish();
+        let c = &batch.conversations[0];
+        assert_eq!((c.pinned_order, c.mute_until), (Some(0), i64::MAX));
+    }
+
+    #[test]
     fn chat_flags_come_from_the_backup() {
         let mut imp = Importer::new(ME, NOW);
         assert!(imp.add(contact_frame(1, ALICE, "Alice")).is_none());
