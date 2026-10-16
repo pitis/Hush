@@ -443,7 +443,7 @@ impl Importer {
                 // its image is its file (most are WebP, often stored untyped)
                 if let Some(data) = s.sticker.as_ref().and_then(|st| st.data.as_ref()) {
                     let mut image = self.attachment_of(0, Some(data), false);
-                    if !image.content_type.starts_with("image/") {
+                    if image.content_type.is_empty() || image.content_type == "application/octet-stream" {
                         image.content_type = "image/webp".into();
                     }
                     attachments = vec![image];

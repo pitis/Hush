@@ -36,8 +36,18 @@ enum Placeholder {
 
     /// The image a sticker shows once its file is here (else its placeholder words).
     static func stickerImage(_ m: Message, files: [Attachment]) -> String? {
-        guard case .sticker = m.kind, let file = files.first, file.state == .ready else { return nil }
+        guard case .sticker = m.kind, let file = files.first, file.state == .ready, file.contentType.hasPrefix("image/")
+        else { return nil }
         return file.path
+    }
+
+    /// A sticker's file still to fetch (pending or failed: its placeholder offers the download).
+    static func stickerFile(_ m: Message, files: [Attachment]) -> Attachment? {
+        // an animated (Lottie) sticker can't be drawn here: its words stay
+        guard case .sticker = m.kind, let file = files.first, [.pending, .failed].contains(file.state),
+            file.contentType.hasPrefix("image/")
+        else { return nil }
+        return file
     }
 
     /// A timer length in its largest whole unit: "30 seconds", "8 hours", "1 week".

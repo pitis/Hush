@@ -440,7 +440,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     // a sticker's image is its file (most are WebP, often sent untyped)
     if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.as_ref()) {
         let mut image = new_attachment(data);
-        if !image.content_type.starts_with("image/") {
+        if image.content_type.is_empty() || image.content_type == "application/octet-stream" {
             image.content_type = "image/webp".into();
         }
         attachments.push(image);

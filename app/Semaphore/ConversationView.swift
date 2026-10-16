@@ -508,7 +508,13 @@ struct MessageRow: View {
                             vote: actions.vote, end: actions.endPoll)
                     } else if let placeholder = Placeholder.text(message.kind) {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
-                        Text(placeholder).italic()
+                        HStack(spacing: 6) {
+                            Text(placeholder).italic()
+                            // a sticker whose image didn't come: fetch it again
+                            if let file = Placeholder.stickerFile(message, files: files) {
+                                DownloadState(state: file.state, download: { download(file.id) })
+                            }
+                        }
                     } else if let body = message.body, !body.isEmpty {
                         let text = MessageText.text(
                             MessageText.attributed(
