@@ -21,6 +21,8 @@ pub enum CoreEvent {
     /// The server queue is drained: the app is caught up.
     Ready,
     ConversationsChanged,
+    /// A story came, or its file changed: reload `stories`.
+    StoriesChanged,
     MessageChanged {
         conversation_id: String,
         key: MessageKey,
@@ -108,6 +110,7 @@ pub fn from_applied(a: Applied) -> CoreEvent {
         },
         Applied::ChatEvent { conversation_id } => CoreEvent::ChatEventAdded { conversation_id },
         Applied::ConversationsChanged => CoreEvent::ConversationsChanged,
+        Applied::StoriesChanged => CoreEvent::StoriesChanged,
     }
 }
 
@@ -119,7 +122,8 @@ pub fn alert(op: &Op, applied: &[Applied], me: &str) -> Option<CoreEvent> {
         Applied::Typing { .. }
         | Applied::AttachmentChanged { .. }
         | Applied::ChatEvent { .. }
-        | Applied::ConversationsChanged => None,
+        | Applied::ConversationsChanged
+        | Applied::StoriesChanged => None,
     })?;
     match op {
         Op::InsertMessage(m) if !m.is_outgoing && m.author != me => Some(CoreEvent::NewMessage {

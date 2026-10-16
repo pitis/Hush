@@ -52,6 +52,8 @@ pub enum Op {
         conversation_id: String,
         target: MessageKey,
     },
+    /// A story (someone's, or ours from the phone).
+    InsertStory(NewStory),
     /// View-once media was opened (here or on another of our devices): it's gone.
     ViewOnceOpened {
         target: MessageKey,
@@ -127,6 +129,17 @@ pub fn project(content: &Content, me: &str) -> Vec<Op> {
             data_message(dm, &conv, &sender, received_at, outgoing)
         }
         ContentBody::EditMessage(em) => edit(em, &sender).into_iter().collect(),
+        ContentBody::StoryMessage(sm) if sender != me => {
+            let sent_at = content.metadata.client_timestamp.timestamp_millis();
+            let conv = match sm.group.as_ref().and_then(|g| g.master_key.as_deref()) {
+                Some(key) => match <[u8; 32]>::try_from(key) {
+                    Ok(k) => group_id(&k),
+                    Err(_) => return vec![],
+                },
+                None => direct_id(&content.metadata.sender),
+            };
+            story(sm, conv, &sender, sent_at, received_at, false)
+        }
         ContentBody::ReceiptMessage(rm) if sender != me => receipt(rm, me).into_iter().collect(),
         ContentBody::TypingMessage(tm) if sender != me => typing(tm, &content.metadata.sender).into_iter().collect(),
         // libsignal-service already drops sync messages that aren't from our account; checked
@@ -214,6 +227,18 @@ fn sent_transcript(sent: &sync_message::Sent, me: &str, received_at: i64) -> Vec
     if let Some(em) = &sent.edit_message {
         return edit(em, me).into_iter().collect();
     }
+    // our story, posted from the phone: in a group, or to our lists (shown as ours)
+    if let Some(sm) = &sent.story_message {
+        let sent_at = sent.timestamp.and_then(|t| i64::try_from(t).ok()).unwrap_or(0);
+        let conv = match sm.group.as_ref().and_then(|g| g.master_key.as_deref()) {
+            Some(key) => match <[u8; 32]>::try_from(key) {
+                Ok(k) => group_id(&k),
+                Err(_) => return vec![],
+            },
+            None => format!("c:{me}"),
+        };
+        return story(sm, conv, me, sent_at, received_at, true);
+    }
     let Some(dm) = &sent.message else { return vec![] };
     let conv = match group_of(dm) {
         Some(group) => group,
@@ -259,6 +284,70 @@ fn text_ranges(ranges: &[presage::proto::BodyRange]) -> Vec<BodyRange> {
             })
         })
         .collect()
+}
+
+/// A story's ops: the story, and its file to fetch when it's a photo or video.
+fn story(
+    sm: &presage::proto::StoryMessage,
+    conversation_id: String,
+    author: &str,
+    sent_at: i64,
+    received_at: i64,
+    outgoing: bool,
+) -> Vec<Op> {
+    use presage::proto::story_message::Attachment;
+    use presage::proto::text_attachment::Background;
+    if sent_at <= 0 {
+        return vec![];
+    }
+    let key = MessageKey {
+        author: author.to_string(),
+        sent_at,
+    };
+    let (text, file) = match &sm.attachment {
+        Some(Attachment::TextAttachment(t)) => {
+            let (background, angle) = match &t.background {
+                Some(Background::Color(c)) => (vec![*c], 0),
+                Some(Background::Gradient(g)) => {
+                    let colors = if g.colors.is_empty() {
+                        g.start_color.into_iter().chain(g.end_color).collect()
+                    } else {
+                        g.colors.clone()
+                    };
+                    (colors, g.angle.unwrap_or(0))
+                }
+                None => (vec![], 0),
+            };
+            let text = StoryText {
+                text: t.text.clone().unwrap_or_default(),
+                style: t.text_style.map_or(0, |s| s as u32),
+                foreground: t.text_foreground_color,
+                text_background: t.text_background_color,
+                background,
+                angle,
+                link: t.preview.as_ref().and_then(|p| p.url.clone()),
+            };
+            (Some(text), None)
+        }
+        Some(Attachment::FileAttachment(p)) => (None, Some(new_attachment(p))),
+        None => return vec![],
+    };
+    let mut ops = vec![Op::InsertStory(NewStory {
+        conversation_id,
+        author: author.to_string(),
+        sent_at,
+        received_at,
+        text,
+        outgoing,
+    })];
+    if let Some(file) = file {
+        ops.push(Op::AddAttachments {
+            message: key,
+            attachments: vec![file],
+            preview: None,
+        });
+    }
+    ops
 }
 
 /// A receipt from a recipient about messages we sent.
@@ -943,6 +1032,65 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn stories_come_from_people_groups_and_our_phone() {
+        use presage::proto::{story_message, text_attachment, StoryMessage, TextAttachment};
+        let text = StoryMessage {
+            attachment: Some(story_message::Attachment::TextAttachment(TextAttachment {
+                text: Some("hello".into()),
+                text_style: Some(text_attachment::Style::Bold as i32),
+                text_foreground_color: Some(0xFFFFFFFF),
+                background: Some(text_attachment::Background::Gradient(text_attachment::Gradient {
+                    colors: vec![0xFF0000FF, 0xFF00FF00],
+                    angle: Some(90),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut c = content(ALICE, 910, ContentBody::StoryMessage(text.clone()));
+        c.metadata.client_timestamp = chrono::DateTime::from_timestamp_millis(900).unwrap();
+        let ops = project(&c, ME);
+        let Op::InsertStory(s) = &ops[0] else { panic!("{ops:?}") };
+        assert_eq!(
+            (s.conversation_id.as_str(), s.author.as_str(), s.sent_at),
+            (format!("c:{ALICE}").as_str(), ALICE, 900)
+        );
+        let t = s.text.as_ref().unwrap();
+        assert_eq!(
+            (t.text.as_str(), t.style, t.background.clone(), t.angle),
+            ("hello", 2, vec![0xFF0000FF, 0xFF00FF00], 90)
+        );
+        // a photo story brings its file; a group story belongs to the group
+        let photo = StoryMessage {
+            group: Some(presage::proto::GroupContextV2 {
+                master_key: Some(KEY.to_vec()),
+                ..Default::default()
+            }),
+            attachment: Some(story_message::Attachment::FileAttachment(AttachmentPointer {
+                content_type: Some("image/jpeg".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut c = content(BOB, 920, ContentBody::StoryMessage(photo.clone()));
+        c.metadata.client_timestamp = chrono::DateTime::from_timestamp_millis(905).unwrap();
+        let ops = project(&c, ME);
+        assert!(matches!(&ops[..], [Op::InsertStory(s), Op::AddAttachments { .. }]
+            if s.conversation_id == format!("g:{}", hex::encode(KEY)) && s.text.is_none()));
+        // ours, from the phone
+        let sent = sync_message::Sent {
+            timestamp: Some(930),
+            story_message: Some(text),
+            ..Default::default()
+        };
+        let ops = project(&content(ME, 940, sync(sent)), ME);
+        assert!(
+            matches!(&ops[..], [Op::InsertStory(s)] if s.author == ME && s.conversation_id == format!("c:{ME}") && s.sent_at == 930)
+        );
     }
 
     #[test]

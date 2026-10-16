@@ -1011,6 +1011,17 @@ impl Client {
         Ok(self.db.title(&conversation_id).await?)
     }
 
+    /// The stories of the last day to show (from chats that aren't blocked or message requests,
+    /// and ours), oldest first.
+    pub async fn stories(&self) -> Result<Vec<crate::projection::Story>, CoreError> {
+        Ok(self.db.stories(now_ms()).await?)
+    }
+
+    /// A story was seen here.
+    pub async fn story_viewed(&self, key: MessageKey) -> Result<(), CoreError> {
+        Ok(self.db.story_viewed(&key).await?)
+    }
+
     /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
     pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
         Ok(self.db.group_members(&conversation_id).await?)
