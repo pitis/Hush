@@ -265,6 +265,21 @@ impl MessageKind {
     }
 }
 
+/// A poll as its votes stand: each option with who chose it.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct Poll {
+    pub options: Vec<PollOption>,
+    pub allow_multiple: bool,
+    pub ended: bool,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PollOption {
+    pub text: String,
+    /// ACIs, sorted.
+    pub voters: Vec<String>,
+}
+
 /// Identity of a message, and the paging cursor for `messages`.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct MessageKey {

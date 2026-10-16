@@ -189,6 +189,71 @@ impl ProjectionDb {
         tx.commit().await
     }
 
+    /// The poll in message `key` as its votes stand; None if it isn't (or no longer) here. A
+    /// single-choice poll counts each voter's first pick; picks it doesn't have don't count.
+    pub async fn poll(&self, key: &MessageKey) -> Result<Option<Poll>, sqlx::Error> {
+        let Some(row) =
+            sqlx::query("SELECT options, allow_multiple, ended FROM polls WHERE author = ?1 AND sent_at = ?2")
+                .bind(&key.author)
+                .bind(key.sent_at)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let texts: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("options")?)
+            .map_err(|e| decode_err(format!("poll options: {e}")))?;
+        if texts.is_empty() {
+            return Ok(None); // only its end is here
+        }
+        let allow_multiple: bool = row.try_get("allow_multiple")?;
+        let mut options: Vec<PollOption> = texts
+            .into_iter()
+            .map(|text| PollOption { text, voters: vec![] })
+            .collect();
+        let votes = sqlx::query(
+            "SELECT voter, options FROM poll_votes WHERE target_author = ?1 AND target_sent_at = ?2 ORDER BY voter",
+        )
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .fetch_all(&self.pool)
+        .await?;
+        for v in votes {
+            let voter: String = v.try_get("voter")?;
+            let picks: Vec<u32> = serde_json::from_str(&v.try_get::<String, _>("options")?).unwrap_or_default();
+            let counted = if allow_multiple {
+                &picks[..]
+            } else {
+                &picks[..picks.len().min(1)]
+            };
+            for &i in counted {
+                if let Some(o) = options.get_mut(i as usize) {
+                    if !o.voters.contains(&voter) {
+                        o.voters.push(voter.clone());
+                    }
+                }
+            }
+        }
+        Ok(Some(Poll {
+            options,
+            allow_multiple,
+            ended: row.try_get("ended")?,
+        }))
+    }
+
+    /// The `vote_count` of `voter`'s latest vote on the poll `key` (0: none yet).
+    pub async fn my_poll_vote_count(&self, key: &MessageKey, voter: &str) -> Result<u32, sqlx::Error> {
+        let n: Option<i64> = sqlx::query_scalar(
+            "SELECT vote_count FROM poll_votes WHERE target_author = ?1 AND target_sent_at = ?2 AND voter = ?3",
+        )
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .bind(voter)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(n.and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
+    }
+
     /// A group's members (ACIs), as last synced from presage's group store.
     pub async fn group_members(&self, conversation_id: &str) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar("SELECT aci FROM group_members WHERE conversation_id = ?1 ORDER BY aci")
@@ -1222,6 +1287,67 @@ impl ProjectionDb {
                 self.remove_files(&files);
                 Ok(changed(m))
             }
+            Op::PollCreated {
+                message,
+                options,
+                allow_multiple,
+            } => {
+                let mut tx = self.pool.begin().await?;
+                let options = serde_json::to_string(options).expect("strings serialize");
+                // an end that came first stays
+                let res = sqlx::query(
+                    "INSERT INTO polls(author, sent_at, options, allow_multiple) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(author, sent_at) DO UPDATE SET options = ?3, allow_multiple = ?4",
+                )
+                .bind(&message.author)
+                .bind(message.sent_at)
+                .bind(options)
+                .bind(allow_multiple)
+                .execute(&mut *tx)
+                .await?;
+                let m = finish_poll(&mut tx, message, res.rows_affected()).await?;
+                tx.commit().await?;
+                Ok(changed(m))
+            }
+            Op::PollVote {
+                target,
+                voter,
+                vote_count,
+                options,
+            } => {
+                let mut tx = self.pool.begin().await?;
+                let options = serde_json::to_string(options).expect("indexes serialize");
+                let res = sqlx::query(
+                    "INSERT INTO poll_votes(target_author, target_sent_at, voter, vote_count, options)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(target_author, target_sent_at, voter) DO UPDATE
+                       SET vote_count = ?4, options = ?5 WHERE ?4 > poll_votes.vote_count",
+                )
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .bind(voter)
+                .bind(i64::from(*vote_count))
+                .bind(options)
+                .execute(&mut *tx)
+                .await?;
+                let m = finish_poll(&mut tx, target, res.rows_affected()).await?;
+                tx.commit().await?;
+                Ok(changed(m))
+            }
+            Op::PollEnded { target } => {
+                let mut tx = self.pool.begin().await?;
+                let res = sqlx::query(
+                    "INSERT INTO polls(author, sent_at, ended) VALUES (?1, ?2, 1)
+                     ON CONFLICT(author, sent_at) DO UPDATE SET ended = 1 WHERE ended = 0",
+                )
+                .bind(&target.author)
+                .bind(target.sent_at)
+                .execute(&mut *tx)
+                .await?;
+                let m = finish_poll(&mut tx, target, res.rows_affected()).await?;
+                tx.commit().await?;
+                Ok(changed(m))
+            }
             Op::ViewOnceOpened { target } => {
                 let mut tx = self.pool.begin().await?;
                 let target = &resolve(&mut tx, target).await?;
@@ -2085,6 +2211,36 @@ impl ProjectionDb {
                     .execute(&mut *tx)
                     .await?;
             }
+            if let Some(p) = &m.poll {
+                sqlx::query(
+                    "INSERT INTO polls(author, sent_at, options, allow_multiple, ended) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(author, sent_at) DO UPDATE SET options = ?3, allow_multiple = ?4,
+                       ended = MAX(ended, ?5)",
+                )
+                .bind(&msg.author)
+                .bind(msg.sent_at)
+                .bind(serde_json::to_string(&p.options).expect("strings serialize"))
+                .bind(p.allow_multiple)
+                .bind(p.ended)
+                .execute(&mut *tx)
+                .await?;
+                for (voter, count, picks) in &p.votes {
+                    // a newer vote that came live stays
+                    sqlx::query(
+                        "INSERT INTO poll_votes(target_author, target_sent_at, voter, vote_count, options)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(target_author, target_sent_at, voter) DO UPDATE
+                           SET vote_count = ?4, options = ?5 WHERE ?4 > poll_votes.vote_count",
+                    )
+                    .bind(&msg.author)
+                    .bind(msg.sent_at)
+                    .bind(voter)
+                    .bind(i64::from(*count))
+                    .bind(serde_json::to_string(picks).expect("indexes serialize"))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
             for (reactor, emoji) in &m.reactions {
                 sqlx::query(
                     // never onto a message deleted here: the archive predates the deletion
@@ -2214,6 +2370,18 @@ async fn is_deleted(conn: &mut SqliteConnection, key: &MessageKey) -> Result<boo
 
 /// Drops what other rows still hold of a deleted message: its reactions and quotes of its text.
 /// Returns the attachment files to remove once the transaction is committed.
+/// The poll message's chat, if a change to it took and the message is shown (not deleted).
+async fn finish_poll(
+    conn: &mut SqliteConnection,
+    key: &MessageKey,
+    rows: u64,
+) -> Result<Option<(String, MessageKey)>, sqlx::Error> {
+    if rows == 0 || is_deleted(conn, key).await? {
+        return Ok(None);
+    }
+    conversation_of(conn, key).await
+}
+
 /// Queues presage's copies of the message `key` for the sweep to delete (`presage_forget`): the
 /// original and each edit, which presage keeps under its own timestamp.
 async fn forget_in_presage(conn: &mut SqliteConnection, key: &MessageKey) -> Result<(), sqlx::Error> {
@@ -2244,6 +2412,16 @@ async fn forget_deleted_text(conn: &mut SqliteConnection, key: &MessageKey) -> R
     .bind(key.sent_at)
     .execute(&mut *conn)
     .await?;
+    sqlx::query("DELETE FROM polls WHERE author = ?1 AND sent_at = ?2")
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM poll_votes WHERE target_author = ?1 AND target_sent_at = ?2")
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM link_previews WHERE message_author = ?1 AND message_sent_at = ?2")
         .bind(&key.author)
         .bind(key.sent_at)
@@ -2791,6 +2969,7 @@ mod tests {
                 preview: None,
                 revisions: vec![],
                 edited_at: 0,
+                poll: None,
             }
         }
 
@@ -2847,6 +3026,37 @@ mod tests {
             let want = m.message.clone();
             db.import_history(&batch_with(vec![m])).await.unwrap();
             assert_eq!(db.message(&key("alice", 5)).await.unwrap().unwrap(), want);
+        }
+
+        #[tokio::test]
+        async fn an_imported_poll_keeps_its_votes_and_newer_live_ones_win() {
+            let db = db().await;
+            let mut m = imported("c:alice", "alice", 5, "", MessageStatus::Read);
+            m.message.body = None;
+            m.message.kind = MessageKind::Poll {
+                question: Some("Lunch?".into()),
+            };
+            m.poll = Some(crate::history::import::ImportPoll {
+                options: vec!["A".into(), "B".into()],
+                allow_multiple: false,
+                ended: false,
+                votes: vec![("bob".into(), 2, vec![0])],
+            });
+            // a newer vote that arrived live first
+            db.apply(&Op::PollVote {
+                target: key("alice", 5),
+                voter: "carol".into(),
+                vote_count: 4,
+                options: vec![1],
+            })
+            .await
+            .unwrap();
+            db.import_history(&batch_with(vec![m])).await.unwrap();
+            let p = db.poll(&key("alice", 5)).await.unwrap().unwrap();
+            assert_eq!(
+                p.options.iter().map(|o| o.voters.clone()).collect::<Vec<_>>(),
+                vec![vec!["bob".to_string()], vec!["carol".to_string()]]
+            );
         }
 
         #[tokio::test]
@@ -4113,6 +4323,76 @@ mod tests {
             db.presage_forget_queue().await.unwrap(),
             vec![("c:alice".to_string(), 3)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_poll_counts_each_voters_latest_vote_and_its_end_sticks() {
+        let db = db().await;
+        let poll = |sent_at| Message {
+            kind: MessageKind::Poll {
+                question: Some("Lunch?".into()),
+            },
+            body: None,
+            ..msg("alice", sent_at, "")
+        };
+        let created = |sent_at, allow_multiple| Op::PollCreated {
+            message: k("alice", sent_at),
+            options: vec!["A".into(), "B".into(), "C".into()],
+            allow_multiple,
+        };
+        let vote = |voter: &str, vote_count, options: Vec<u32>| Op::PollVote {
+            target: k("alice", 1),
+            voter: voter.into(),
+            vote_count,
+            options,
+        };
+        db.insert_message(&poll(1)).await.unwrap();
+        db.apply(&created(1, false)).await.unwrap();
+        assert_eq!(
+            db.apply(&vote("bob", 1, vec![0])).await.unwrap(),
+            changed("c:alice", "alice", 1)
+        );
+        db.apply(&vote("bob", 3, vec![2])).await.unwrap();
+        // an older vote arriving late doesn't count
+        assert!(db.apply(&vote("bob", 2, vec![1])).await.unwrap().is_empty());
+        // a single-choice poll counts the first pick; picks it doesn't have don't count
+        db.apply(&vote("carol", 1, vec![0, 1])).await.unwrap();
+        db.apply(&vote("dave", 1, vec![9])).await.unwrap();
+        // a vote taken back
+        db.apply(&vote("erin", 1, vec![1])).await.unwrap();
+        db.apply(&vote("erin", 2, vec![])).await.unwrap();
+        let p = db.poll(&k("alice", 1)).await.unwrap().unwrap();
+        assert_eq!(
+            p.options
+                .iter()
+                .map(|o| (o.text.as_str(), o.voters.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("A", vec!["carol".to_string()]),
+                ("B", vec![]),
+                ("C", vec!["bob".to_string()])
+            ]
+        );
+        assert!(!p.allow_multiple && !p.ended);
+        assert_eq!(db.my_poll_vote_count(&k("alice", 1), "bob").await.unwrap(), 3);
+        assert_eq!(
+            db.apply(&Op::PollEnded { target: k("alice", 1) }).await.unwrap(),
+            changed("c:alice", "alice", 1)
+        );
+        assert!(db.poll(&k("alice", 1)).await.unwrap().unwrap().ended);
+
+        // the end before the poll itself
+        db.apply(&Op::PollEnded { target: k("alice", 2) }).await.unwrap();
+        db.insert_message(&poll(2)).await.unwrap();
+        db.apply(&created(2, true)).await.unwrap();
+        let p = db.poll(&k("alice", 2)).await.unwrap().unwrap();
+        assert!(p.ended && p.allow_multiple);
+        assert_eq!(p.options.len(), 3);
+
+        // deleted for everyone: nothing of it is left
+        db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
+        assert_eq!(db.poll(&k("alice", 1)).await.unwrap(), None);
+        assert_eq!(db.my_poll_vote_count(&k("alice", 1), "bob").await.unwrap(), 0);
     }
 
     #[tokio::test]

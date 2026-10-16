@@ -136,6 +136,8 @@ final class AppStore {
     /// Files and link previews of the loaded messages.
     private(set) var attachments: [MessageKey: [Attachment]] = [:]
     private(set) var previews: [MessageKey: LinkPreview] = [:]
+    /// The polls of the open chat's loaded messages, as their votes stand.
+    private(set) var polls: [MessageKey: Poll] = [:]
     /// Files chosen, dropped or pasted for the open chat, sent with the next message.
     private(set) var outgoingFiles: [OutgoingFile] = []
     var replyTo: Message?
@@ -470,6 +472,22 @@ final class AppStore {
         guard let client else { return }
         do { try await client.viewOnceOpened(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
             showError("Couldn't mark the view-once media opened: \(Self.describe(error))")
+        }
+    }
+
+    /// Votes on a poll (none takes our vote back); it shows once sent.
+    func vote(_ m: Message, options: [UInt32]) async {
+        guard let client else { return }
+        do { try await client.vote(key: MessageKey(author: m.author, sentAt: m.sentAt), options: options) } catch {
+            showError("Couldn't vote: \(Self.describe(error))")
+        }
+    }
+
+    /// Ends our own poll.
+    func endPoll(_ m: Message) async {
+        guard let client else { return }
+        do { try await client.endPoll(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
+            showError("Couldn't end the poll: \(Self.describe(error))")
         }
     }
 
@@ -1299,6 +1317,12 @@ final class AppStore {
                 let preview = try await client.linkPreview(key: key)
                 if generation == selectionGeneration { previews[key] = preview }
             } catch { append("query failed: \(error)") }
+            if case .poll = m.kind {
+                do {
+                    let poll = try await client.poll(key: key)
+                    if generation == selectionGeneration { polls[key] = poll }
+                } catch { append("query failed: \(error)") }
+            }
             if isGroup, !m.isOutgoing { await loadName(m.author) }
             for aci in MessageText.mentioned(m.ranges + (m.quote?.ranges ?? [])) { await loadName(aci) }
         }
