@@ -24,6 +24,11 @@ enum Placeholder {
     /// The timers offered, as in Desktop (seconds; 0: off).
     static let timerChoices: [UInt32] = [0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200]
 
+    /// The choices, with `current` among them when the phone set another (2 days, say).
+    static func timerChoices(current: UInt32) -> [UInt32] {
+        timerChoices.contains(current) ? timerChoices : (timerChoices + [current]).sorted()
+    }
+
     static func timerChoice(_ seconds: UInt32) -> String {
         seconds == 0 ? "Off" : duration(Int64(seconds))
     }

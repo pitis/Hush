@@ -79,6 +79,13 @@ pub enum Job {
         body: Box<ContentBody>,
         at: u64,
     },
+    /// A direct chat's disappearing-message timer (0: off), sent at `at`. Applied here only once
+    /// presage holds it for our next messages (see `set_timer`).
+    Timer {
+        conversation_id: String,
+        seconds: u32,
+        at: u64,
+    },
     /// A call signaling envelope, sent at `at`; the outcome goes back through `done` (RingRTC
     /// retries or fails the call on it).
     Call {
@@ -459,6 +466,11 @@ pub async fn sender(
                 body,
                 at,
             } => send_mutation(&mut m, &db, l.as_ref(), &conversation_id, *body, at).await,
+            Job::Timer {
+                conversation_id,
+                seconds,
+                at,
+            } => set_timer(&mut m, &db, l.as_ref(), &conversation_id, seconds, at).await,
             Job::Call {
                 conversation_id,
                 body,
@@ -614,6 +626,55 @@ async fn send_mutation(
     let sent = send_to(m, conversation_id, body.clone(), at).await;
     let me = m.registration_data().service_ids.aci.to_string();
     record_mutation(db, l, &me, conversation_id, body, sent).await;
+}
+
+/// Sends a direct chat's timer. presage gives it a version above the one it holds and keeps it
+/// for our next messages, but only for a contact it knows: without one the version would be 1,
+/// which a phone with a later one ignores. So it needs a known contact, and shows here only once
+/// presage holds it; otherwise both sides keep the old timer and the user is told.
+async fn set_timer(
+    m: &mut Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    conversation_id: &str,
+    seconds: u32,
+    at: u64,
+) {
+    let fail = |why: String| CoreEvent::Error {
+        message: format!("the disappearing timer of {conversation_id} wasn't changed: {why}"),
+    };
+    let Some(Recipient::Direct(sid)) = recipient(conversation_id) else {
+        return;
+    };
+    let thread = Thread::Contact(sid);
+    match m.store().contact_by_id(&sid).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return l.on_event(fail(
+                "change it from your phone until they've written to you here".into(),
+            ))
+        }
+        Err(e) => return l.on_event(fail(format!("their contact couldn't be read: {e}"))),
+    }
+    let body: ContentBody = timer_update(conversation_id, seconds, at).into();
+    let sent = send_to(m, conversation_id, body.clone(), at).await;
+    let stored = m.store().expire_timer(&thread).await.ok().flatten().map(|(t, _)| t);
+    match timer_took(&sent, stored, seconds) {
+        Ok(()) => {
+            let me = m.registration_data().service_ids.aci.to_string();
+            record_mutation(db, l, &me, conversation_id, body, Ok(())).await;
+        }
+        Err(why) => l.on_event(fail(why)),
+    }
+}
+
+/// Whether a timer change took: sent, and presage now holds it for our next messages.
+fn timer_took(sent: &Result<(), String>, stored: Option<u32>, seconds: u32) -> Result<(), String> {
+    sent.clone()?;
+    match stored {
+        Some(t) if t == seconds => Ok(()),
+        _ => Err("it couldn't be kept for the next messages".into()),
+    }
 }
 
 /// Applies our sent reaction, edit or delete here, even if sending reported an error: presage
@@ -1067,6 +1128,21 @@ mod tests {
                 reactor: ME.into(),
                 emoji: None
             }]
+        );
+    }
+
+    #[test]
+    fn a_timer_change_counts_only_once_sent_and_stored_for_the_next_messages() {
+        assert_eq!(timer_took(&Ok(()), Some(3600), 3600), Ok(()));
+        assert_eq!(timer_took(&Ok(()), Some(0), 0), Ok(()), "off");
+        assert!(
+            timer_took(&Err("offline".into()), Some(3600), 3600).is_err(),
+            "not sent"
+        );
+        assert!(timer_took(&Ok(()), Some(60), 3600).is_err(), "presage kept the old one");
+        assert!(
+            timer_took(&Ok(()), None, 3600).is_err(),
+            "presage doesn't know the contact"
         );
     }
 

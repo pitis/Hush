@@ -169,7 +169,9 @@ struct ConversationHeader: View {
                             get: { conversation.expireTimer },
                             set: { store.setTimer(conversation.id, seconds: $0) })
                     ) {
-                        ForEach(Placeholder.timerChoices, id: \.self) { Text(Placeholder.timerChoice($0)).tag($0) }
+                        ForEach(Placeholder.timerChoices(current: conversation.expireTimer), id: \.self) {
+                            Text(Placeholder.timerChoice($0)).tag($0)
+                        }
                     }
                     .pickerStyle(.inline)
                 } label: {

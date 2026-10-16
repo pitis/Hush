@@ -682,8 +682,11 @@ impl Client {
             });
         }
         let at = self.next_sent_at() as u64;
-        let body = send::timer_update(&conversation_id, seconds, at);
-        self.send_mutation(conversation_id, body, at)
+        self.send(Command::Send(Job::Timer {
+            conversation_id,
+            seconds,
+            at,
+        }))
     }
 
     /// Deletes our own message (sent, under 24 hours old) for everyone. It shows here once sent.
