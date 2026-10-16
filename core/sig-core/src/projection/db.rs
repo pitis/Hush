@@ -5065,9 +5065,16 @@ mod tests {
     #[tokio::test]
     async fn a_chat_with_only_an_undecryptable_message_is_listed_and_moves_up() {
         let db = db().await;
-        db.insert_message(&in_conv("c:bob", msg("bob", 50, "hi")))
-            .await
-            .unwrap();
+        db.insert_message(&Message {
+            ranges: vec![BodyRange {
+                start: 0,
+                length: 2,
+                style: TextStyle::Spoiler,
+            }],
+            ..in_conv("c:bob", msg("bob", 50, "hi"))
+        })
+        .await
+        .unwrap();
         db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice", None)
             .await
             .unwrap();
@@ -5095,7 +5102,13 @@ mod tests {
         db.add_chat_event("c:bob", 60, ChatEventKind::DecryptionFailed, "bob", None)
             .await
             .unwrap();
-        assert_eq!(db.conversations().await.unwrap()[0].id, "c:bob", "moved up");
+        let c = db.conversations().await.unwrap().remove(0);
+        assert_eq!(c.id, "c:bob", "moved up");
+        // the older message's ranges don't apply to the notice
+        assert_eq!(
+            (c.last_message_preview.as_str(), c.last_message_ranges),
+            (UNDECRYPTABLE_PREVIEW, vec![])
+        );
         // a later message takes over the preview; our own session reset doesn't count
         db.insert_message(&in_conv("c:bob", msg("bob", 70, "back")))
             .await

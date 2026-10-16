@@ -214,7 +214,8 @@ fn text_ranges(ranges: &[presage::proto::BodyRange]) -> Vec<BodyRange> {
                 },
             };
             Some(BodyRange {
-                start: r.start?,
+                // proto2: a start left out is 0
+                start: r.start.unwrap_or(0),
                 length: r.length?,
                 style,
             })
@@ -651,6 +652,12 @@ mod tests {
             range(5, 4, AssociatedValue::Style(Style::Bold as i32)),
             // none, an unknown style and an unreadable mention are left out
             range(0, 2, AssociatedValue::Style(Style::None as i32)),
+            // a start left out is 0 (proto2's default)
+            presage::proto::BodyRange {
+                start: None,
+                length: Some(2),
+                associated_value: Some(AssociatedValue::Style(Style::Spoiler as i32)),
+            },
             range(0, 2, AssociatedValue::Style(99)),
             range(0, 2, AssociatedValue::MentionAci("nope".into())),
         ];
@@ -674,6 +681,11 @@ mod tests {
                     start: 5,
                     length: 4,
                     style: TextStyle::Bold
+                },
+                BodyRange {
+                    start: 0,
+                    length: 2,
+                    style: TextStyle::Spoiler
                 },
             ]
         );

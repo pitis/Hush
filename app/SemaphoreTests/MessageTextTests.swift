@@ -89,4 +89,44 @@ final class MessageTextTests: XCTestCase {
             ChatList.line(c, selected: false, typing: false, draft: "", authorName: "A", name: name),
             .message("@Bob ■■■■", tick: nil))
     }
+
+    func testAMentionInsideASpoilerStaysHiddenInPlainText() {
+        // inside, and sharing the spoiler's start
+        XCTAssertEqual(
+            MessageText.plain(
+                "a \u{FFFC} b", ranges: [range(0, 5, .spoiler), range(2, 1, .mention(aci: "bob"))], name: name),
+            "■■■■")
+        XCTAssertEqual(
+            MessageText.plain(
+                "\u{FFFC} b", ranges: [range(0, 1, .mention(aci: "bob")), range(0, 3, .spoiler)], name: name),
+            "■■■■")
+        // revealed (Copy): the mention reads as usual
+        XCTAssertEqual(
+            MessageText.plain(
+                "a \u{FFFC} b", ranges: [range(0, 5, .spoiler), range(2, 1, .mention(aci: "bob"))], name: name,
+                revealSpoilers: true),
+            "a @Bob b")
+    }
+
+    func testAMentionInsideAHiddenSpoilerIsCoveredAndKeepsTheStylesAroundIt() {
+        let text = MessageText.attributed(
+            "a \u{FFFC} b", ranges: [range(0, 5, .spoiler), range(0, 5, .italic), range(2, 1, .mention(aci: "bob"))],
+            name: name)
+        XCTAssertEqual(String(text.characters), "a @Bob b")
+        XCTAssertTrue(text.runs.allSatisfy { $0.backgroundColor != nil })
+        XCTAssertEqual(runs(text).map { $0.1 }, [[.italic], [.italic, .bold], [.italic]])
+    }
+
+    func testASpoilerRunningPastTheTextStillHidesToTheEnd() {
+        XCTAssertEqual(MessageText.plain("hi there", ranges: [range(3, 50, .spoiler)], name: name), "hi ■■■■")
+        let text = MessageText.attributed("hi there", ranges: [range(3, 50, .spoiler)], name: name)
+        XCTAssertEqual(
+            text.runs.compactMap { $0.backgroundColor == nil ? nil : String(text[$0.range].characters) }, ["there"])
+    }
+
+    func testStylesCountUTF16InBubblesToo() {
+        let text = MessageText.attributed("👍 hi", ranges: [range(3, 2, .bold)], name: name)
+        XCTAssertEqual(runs(text).map { $0.0 }, ["👍 ", "hi"])
+        XCTAssertEqual(runs(text).map { $0.1 }, [[], [.bold]])
+    }
 }

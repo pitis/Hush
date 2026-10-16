@@ -21,8 +21,8 @@ the backup's `Text.bodyRanges` (message and quote).
 5. A reply quotes the styled text with its ranges, so the quote reads the same on the other side.
 
 ## Non-goals (next slices of #53)
-- Composing styles or mentions on the Mac (keyboard shortcuts, the @ picker); an edit sent from
-  the Mac sends no ranges.
+- Composing styles or mentions on the Mac (keyboard shortcuts, the @ picker). Until then a
+  message with styles or mentions can't be edited on the Mac (the edit would strip them).
 - Story ranges.
 
 ## Design
@@ -36,7 +36,9 @@ the backup's `Text.bodyRanges` (message and quote).
 - App (`MessageText`): ranges become an `AttributedString` with each run's styles under a key
   of ours; `MessageText.text` draws one `Text` piece per run in its font. Mentioned names are
   looked up like group authors' (`loadName`), for messages, the chat list and notifications.
-  A range that doesn't fit the text is ignored.
+  A range that doesn't fit the text is ignored, except a spoiler, which hides to the end of the
+  text; a mention inside a hidden spoiler stays covered (in the bubble and in plain text). A
+  range without a start starts at 0 (proto2's default).
 
 ## Testing
 - projector: body, quote and edit ranges; NONE, unknown styles and bad mentions dropped.

@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// Signal's text styles and mentions (the core's `BodyRange`s), shown as Desktop shows them.
-/// Ranges count UTF-16 code units; one that doesn't fit the text is ignored.
+/// Ranges count UTF-16 code units; one that doesn't fit the text is ignored, except a spoiler,
+/// which hides up to the end of the text.
 enum MessageText {
     /// A run's styles, kept on the text; `text(_:size:)` draws them.
     struct Styles: OptionSet, Hashable {
@@ -26,8 +27,9 @@ enum MessageText {
         _ body: String, ranges: [BodyRange], name: (String) -> String, revealSpoilers: Bool = false
     ) -> AttributedString {
         var text = AttributedString(body)
+        let length = (body as NSString).length
         for r in ranges {
-            guard let span = span(r, in: text) else { continue }
+            guard let span = span(r.style == .spoiler ? clamped(r, to: length) : r, in: text) else { continue }
             switch r.style {
             case .bold: add(.bold, to: span, in: &text)
             case .italic: add(.italic, to: span, in: &text)
@@ -42,8 +44,10 @@ enum MessageText {
         // last first, so the offsets of the earlier ones still hold
         for r in mentions(ranges) {
             guard case .mention(let aci) = r.style, let span = span(r, in: text) else { continue }
-            var mention = AttributedString("@\(name(aci))")
-            mention[StylesKey.self] = .bold
+            // it takes the placeholder's look: the styles and a spoiler's cover around it
+            let around = text[span].runs.first?.attributes ?? AttributeContainer()
+            var mention = AttributedString("@\(name(aci))", attributes: around)
+            mention[StylesKey.self] = (around[StylesKey.self] ?? []).union(.bold)
             text.replaceSubrange(span, with: mention)
         }
         let struck = text.runs.compactMap { run in
@@ -59,12 +63,15 @@ enum MessageText {
     ) -> String {
         let text = NSMutableString(string: body)
         var end = text.length
-        // last first; a range overlapping one already replaced is skipped
-        let replaced = ranges.filter {
-            if case .mention = $0.style { return true }
-            return $0.style == .spoiler && !revealSpoilers
+        let spoilers =
+            revealSpoilers ? [] : ranges.filter { $0.style == .spoiler }.compactMap { clamped($0, to: end) }
+        // a mention a hidden spoiler covers goes with it
+        let mentions = ranges.filter { r in
+            guard case .mention = r.style else { return false }
+            return !spoilers.contains { $0.start < r.start + r.length && r.start < $0.start + $0.length }
         }
-        for r in replaced.sorted(by: { $0.start > $1.start }) {
+        // last first; a range overlapping one already replaced is skipped
+        for r in (spoilers + mentions).sorted(by: { $0.start > $1.start }) {
             let start = Int(r.start)
             let length = Int(r.length)
             guard start + length <= end, length > 0 else { continue }
@@ -100,8 +107,14 @@ enum MessageText {
         .sorted { $0.start > $1.start }
     }
 
-    private static func span(_ r: BodyRange, in text: AttributedString) -> Range<AttributedString.Index>? {
-        guard r.length > 0 else { return nil }
+    /// `r` cut to a text `length` long; nil if it starts past the end.
+    private static func clamped(_ r: BodyRange, to length: Int) -> BodyRange? {
+        guard Int(r.start) < length else { return nil }
+        return BodyRange(start: r.start, length: min(r.length, UInt32(length) - r.start), style: r.style)
+    }
+
+    private static func span(_ r: BodyRange?, in text: AttributedString) -> Range<AttributedString.Index>? {
+        guard let r, r.length > 0 else { return nil }
         return Range(NSRange(location: Int(r.start), length: Int(r.length)), in: text)
     }
 

@@ -199,9 +199,14 @@ pub(crate) fn ranges_to_row(ranges: &[BodyRange]) -> Option<String> {
     (!ranges.is_empty()).then(|| serde_json::to_string(ranges).expect("ranges serialize"))
 }
 
-/// A row's ranges; unreadable JSON reads as none (the text still shows, unstyled).
+/// A row's ranges; unreadable JSON reads as none (the text still shows, unstyled), logged.
 pub(crate) fn ranges_from_row(row: Option<String>) -> Vec<BodyRange> {
-    row.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    let Some(row) = row else { return vec![] };
+    serde_json::from_str(&row).unwrap_or_else(|e| {
+        // the error names a JSON position or variant, never message text
+        tracing::warn!("stored text ranges unreadable, shown unstyled: {e}");
+        vec![]
+    })
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
@@ -448,6 +453,27 @@ pub struct Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows already stored must keep reading: a renamed variant or field breaks this, not history.
+    #[test]
+    fn stored_ranges_keep_their_format() {
+        let stored = r#"[{"start":0,"length":1,"style":{"Mention":{"aci":"a"}}},{"start":1,"length":2,"style":"Bold"},{"start":3,"length":1,"style":"Italic"},{"start":4,"length":1,"style":"Spoiler"},{"start":5,"length":1,"style":"Strikethrough"},{"start":6,"length":1,"style":"Monospace"}]"#;
+        let ranges = ranges_from_row(Some(stored.into()));
+        assert_eq!(
+            ranges.iter().map(|r| r.style.clone()).collect::<Vec<_>>(),
+            vec![
+                TextStyle::Mention { aci: "a".into() },
+                TextStyle::Bold,
+                TextStyle::Italic,
+                TextStyle::Spoiler,
+                TextStyle::Strikethrough,
+                TextStyle::Monospace
+            ]
+        );
+        assert_eq!(ranges_to_row(&ranges).as_deref(), Some(stored));
+        assert_eq!(ranges_from_row(Some("not json".into())), vec![]);
+        assert_eq!(ranges_to_row(&[]), None);
+    }
 
     #[test]
     fn status_order_matches_stored_integers_and_round_trips() {

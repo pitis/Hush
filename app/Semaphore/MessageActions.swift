@@ -15,9 +15,10 @@ enum MessageActions {
         return now.timeIntervalSince1970 * 1000 - Double(m.sentAt) <= changeWindow * 1000
     }
 
-    /// As `canDelete`, and it has text to edit.
+    /// As `canDelete`, and it has text to edit, without styles or mentions: the composer can't
+    /// write those yet, so an edit would strip them.
     static func canEdit(_ m: Message, me: String?, now: Date = .now) -> Bool {
-        canDelete(m, me: me, now: now) && !(m.body ?? "").isEmpty
+        canDelete(m, me: me, now: now) && !(m.body ?? "").isEmpty && m.ranges.isEmpty
     }
 
     /// A picked character that can be a reaction: an emoji, not a digit or symbol that only has
