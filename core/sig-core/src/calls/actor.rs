@@ -260,6 +260,9 @@ fn run(
                 if active.call_id_u64 != call_id_u64 {
                     continue; // fetched for a call that is already over
                 }
+                // No relays (fetch failed or timed out) is not fatal: with hide_ip=false, Signal's
+                // default, a call tries a direct connection anyway, relays or not. When "Always
+                // relay calls" lands (M4), an empty relay list must fail the call instead.
                 engine.audio_track.set_enabled(true);
                 let context = NativeCallContext::new(
                     // hide_ip=false is Signal's own default: a 1:1 call may connect peer-to-peer,

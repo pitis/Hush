@@ -11,6 +11,8 @@ pub fn init() {
     ONCE.call_once(|| {
         // sqlx statements stay off even if someone raises the level: they can carry key pragmas.
         // RingRTC's warnings come through the `log` bridge (its info level narrates every call).
+        // Warnings only: they carry call ids and states, which is what debugging a failed call
+        // needs; nothing finer, which could carry network addresses, reaches the log.
         let filter = EnvFilter::new("warn,sig_core=info,sqlx=off,ringrtc=warn");
         let subscriber = tracing_subscriber::registry()
             .with(filter)
