@@ -27,10 +27,16 @@ settings, hiding someone's stories.
   `conversation_of` falls back to stories, so it is listed, downloaded and announced like a
   message's file.
 - `Op::InsertStory` (→ `CoreEvent::StoriesChanged`); `ProjectionDb::stories(now)` (a day, the
-  chat filter, each with its file); `story_viewed`. `delete_expired` drops stories older than a
-  day with their files and queues presage's copies; deleting a chat takes its stories.
-- App: `StoryList` (grouping, unseen count, ARGB colours), `StoriesView`, `StoryCard`; the store
-  reloads stories on `StoriesChanged`, catch-up and a story file's change, and names authors.
+  chat filter, each with its file); `story_viewed`. `expire_stories` (run by the sweep, which
+  then announces `StoriesChanged`) drops stories older than a day with their files; deleting a
+  chat takes its stories; a story deleted for everyone (a `delete` aimed at its timestamp, also
+  one that came first) goes whole. presage doesn't keep stories, so nothing is queued there.
+- A story's file is fetched only when the story is opened (never automatically: not every story
+  is looked at, and those from strangers or blocked groups never show). Stories posted in a
+  blocked group are dropped like its messages.
+- App: `StoryList` (grouping, unseen count, ARGB colours, the order frozen while the window is
+  open), `StoriesView`, `StoryCard`, `StoryVideo` (one player per story); the store reloads
+  stories on `StoriesChanged`, catch-up and a story file's change, and names authors.
 
 ## Testing
 - projector: text (style, gradient), a group photo story with its file, ours from the phone.

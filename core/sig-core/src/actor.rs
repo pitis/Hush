@@ -973,6 +973,14 @@ async fn sweep(store: &mut SqliteStore, db: &ProjectionDb, l: &dyn EventListener
     if !gone.is_empty() {
         l.on_event(CoreEvent::ConversationsChanged);
     }
+    // a day-old story leaves the list (and an open viewer)
+    if db
+        .expire_stories(chrono::Utc::now().timestamp_millis())
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        l.on_event(CoreEvent::StoriesChanged);
+    }
     let mut first_error = None;
     for (conversation_id, sent_at) in db.presage_forget_queue().await.map_err(|e| e.to_string())? {
         let done = match forget_in_presage(store, &conversation_id, sent_at).await {
@@ -1362,6 +1370,7 @@ async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<
             Some(identifier) => db.group_by_identifier(identifier).await?,
             None => None,
         },
+        ContentBody::StoryMessage(sm) => sm.group.as_ref().and_then(|g| g.master_key.as_deref()).map(hex_group),
         _ => None,
     };
     let blocked = db.is_blocked(&direct_id(sender)).await?
@@ -1848,6 +1857,15 @@ mod tests {
         assert!(dropped(content_from(BOB, 201, edit(201, Some(key.to_vec())))).await);
         let identifier = crate::projection::ids::group_identifier(&group);
         assert!(dropped(content_from(BOB, 4, typing(identifier))).await);
+        // a story posted in a blocked group
+        let story = ContentBody::StoryMessage(presage::proto::StoryMessage {
+            group: Some(GroupContextV2 {
+                master_key: Some(key.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(dropped(content_from(BOB, 6, story)).await);
         assert!(
             !dropped(content_from(BOB, 300, text(300, None))).await,
             "bob alone isn't blocked"

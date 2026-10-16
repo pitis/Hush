@@ -314,6 +314,23 @@ impl ProjectionDb {
         Ok(stories)
     }
 
+    /// Removes stories older than a day, with their files. True if any went.
+    pub async fn expire_stories(&self, now_ms: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let old: Vec<(String, i64)> =
+            sqlx::query_as("DELETE FROM stories WHERE sent_at <= ?1 RETURNING author, sent_at")
+                .bind(now_ms - STORY_LIFETIME_MS)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut files = vec![];
+        for (author, sent_at) in &old {
+            files.extend(forget_story_files(&mut tx, author, *sent_at).await?);
+        }
+        tx.commit().await?;
+        self.remove_files(&files);
+        Ok(!old.is_empty())
+    }
+
     /// Marks a story seen here.
     pub async fn story_viewed(&self, key: &MessageKey) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE stories SET viewed = 1 WHERE author = ?1 AND sent_at = ?2")
@@ -534,14 +551,7 @@ impl ProjectionDb {
                 .fetch_all(&mut *tx)
                 .await?;
         for (author, sent_at) in stories {
-            let story_files: Vec<Option<String>> = sqlx::query_scalar(
-                "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file",
-            )
-            .bind(&author)
-            .bind(sent_at)
-            .fetch_all(&mut *tx)
-            .await?;
-            files.extend(story_files.into_iter().flatten());
+            files.extend(forget_story_files(&mut tx, &author, sent_at).await?);
         }
         sqlx::query("INSERT OR IGNORE INTO presage_forget_threads(conversation_id) VALUES (?1)")
             .bind(id)
@@ -1361,6 +1371,18 @@ impl ProjectionDb {
             }
             Op::Delete { target } => {
                 let mut tx = self.pool.begin().await?;
+                // a story deleted for everyone goes whole
+                let story = sqlx::query("DELETE FROM stories WHERE author = ?1 AND sent_at = ?2")
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .execute(&mut *tx)
+                    .await?;
+                if story.rows_affected() == 1 {
+                    let files = forget_story_files(&mut tx, &target.author, target.sent_at).await?;
+                    tx.commit().await?;
+                    self.remove_files(&files);
+                    return Ok(vec![Applied::StoriesChanged]);
+                }
                 let target = &resolve(&mut tx, target).await?;
                 if conversation_of(&mut tx, target).await?.is_none() {
                     // the delete arrived first: remember it so the message is never shown
@@ -1463,6 +1485,17 @@ impl ProjectionDb {
                 Ok(changed(m))
             }
             Op::InsertStory(s) => {
+                let mut tx = self.pool.begin().await?;
+                // deleted for everyone before it came
+                let deleted = sqlx::query("DELETE FROM pending_deletes WHERE author = ?1 AND sent_at = ?2")
+                    .bind(&s.author)
+                    .bind(s.sent_at)
+                    .execute(&mut *tx)
+                    .await?;
+                if deleted.rows_affected() == 1 {
+                    tx.commit().await?;
+                    return Ok(vec![]);
+                }
                 let text = s.text.as_ref();
                 let res = sqlx::query(
                     "INSERT OR IGNORE INTO stories(author, sent_at, conversation_id, received_at, text, text_style,
@@ -1484,8 +1517,9 @@ impl ProjectionDb {
                 .bind(text.map_or(0, |t| i64::from(t.angle)))
                 .bind(text.and_then(|t| t.link.as_ref()))
                 .bind(s.outgoing)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 Ok(if res.rows_affected() == 1 {
                     vec![Applied::StoriesChanged]
                 } else {
@@ -1796,28 +1830,6 @@ impl ProjectionDb {
     /// (`presage_forget`) in the same transaction, so none is forgotten if deleting there fails.
     pub async fn delete_expired(&self, now_ms: i64) -> Result<Vec<Expired>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        // stories last a day, their files and presage's copies with them
-        let old_stories: Vec<(String, String, i64)> =
-            sqlx::query_as("DELETE FROM stories WHERE sent_at <= ?1 RETURNING conversation_id, author, sent_at")
-                .bind(now_ms - STORY_LIFETIME_MS)
-                .fetch_all(&mut *tx)
-                .await?;
-        let mut story_files: Vec<String> = vec![];
-        for (conversation_id, author, sent_at) in &old_stories {
-            let files: Vec<Option<String>> = sqlx::query_scalar(
-                "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file",
-            )
-            .bind(author)
-            .bind(sent_at)
-            .fetch_all(&mut *tx)
-            .await?;
-            story_files.extend(files.into_iter().flatten());
-            sqlx::query("INSERT OR IGNORE INTO presage_forget(conversation_id, sent_at) VALUES (?1, ?2)")
-                .bind(conversation_id)
-                .bind(sent_at)
-                .execute(&mut *tx)
-                .await?;
-        }
         let expired: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT conversation_id, author, sent_at FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
         )
@@ -1860,7 +1872,6 @@ impl ProjectionDb {
             refresh_summary(&mut tx, c).await?;
         }
         tx.commit().await?;
-        files.extend(story_files);
         self.remove_files(&files);
         Ok(out)
     }
@@ -2077,8 +2088,11 @@ impl ProjectionDb {
     /// Not yet downloaded images and voice notes up to `AUTO_DOWNLOAD_MAX`, oldest first.
     pub async fn auto_downloads(&self) -> Result<Vec<i64>, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT id FROM attachments WHERE state = ?1 AND pointer IS NOT NULL AND size <= ?2
-               AND (content_type LIKE 'image/%' OR is_voice_note = 1) ORDER BY id",
+            "SELECT id FROM attachments a WHERE state = ?1 AND pointer IS NOT NULL AND size <= ?2
+               AND (content_type LIKE 'image/%' OR is_voice_note = 1)
+               -- a story's file is fetched when the story is opened, not before
+               AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.author = a.message_author AND s.sent_at = a.message_sent_at)
+             ORDER BY id",
         )
         .bind(AttachmentState::Pending.to_i64())
         .bind(AUTO_DOWNLOAD_MAX as i64)
@@ -2569,6 +2583,21 @@ async fn finish_poll(
         return Ok(None);
     }
     conversation_of(conn, key).await
+}
+
+/// Deletes a story's file rows; returns the files to remove once committed.
+async fn forget_story_files(
+    conn: &mut SqliteConnection,
+    author: &str,
+    sent_at: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let files: Vec<Option<String>> =
+        sqlx::query_scalar("DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file")
+            .bind(author)
+            .bind(sent_at)
+            .fetch_all(conn)
+            .await?;
+    Ok(files.into_iter().flatten().collect())
 }
 
 /// Queues presage's copies of the message `key` for the sweep to delete (`presage_forget`): the
@@ -4722,15 +4751,49 @@ mod tests {
         assert!(db.start_download(file.id).await.unwrap().is_some());
         // seen, and a day later gone with its file
         db.story_viewed(&k("alice", day)).await.unwrap();
+        // story files wait to be opened: none is fetched on its own (not from strangers either)
+        assert!(!db.auto_downloads().await.unwrap().contains(&file.id));
         assert!(db.stories(day + 10).await.unwrap()[0].viewed);
         // a deleted chat takes its stories along
         db.insert_message(&msg("bob", 2, "hey")).await.unwrap();
         db.apply(&story("bob", "c:bob", day, Some("bye"))).await.unwrap();
         db.delete_chat("c:bob").await.unwrap();
         assert!(db.stories(day + 10).await.unwrap().iter().all(|s| s.author != "bob"));
-        db.delete_expired(2 * day + 1).await.unwrap();
+        assert!(!db.expire_stories(day + 10).await.unwrap(), "none old enough");
+        assert!(db.expire_stories(2 * day + 1).await.unwrap());
         assert_eq!(db.stories(2 * day + 1).await.unwrap().len(), 0);
         assert!(db.attachment(file.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_story_deleted_for_everyone_goes_with_its_file_whichever_came_first() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        let story = |sent_at| {
+            Op::InsertStory(NewStory {
+                conversation_id: "c:alice".into(),
+                author: "alice".into(),
+                sent_at,
+                received_at: sent_at,
+                text: None,
+                outgoing: false,
+            })
+        };
+        db.apply(&story(5)).await.unwrap();
+        db.apply(&add(k("alice", 5), vec![new_attachment("image/jpeg", 10, false)], None))
+            .await
+            .unwrap();
+        let file = db.stories(10).await.unwrap()[0].file.clone().unwrap();
+        assert_eq!(
+            db.apply(&Op::Delete { target: k("alice", 5) }).await.unwrap(),
+            vec![Applied::StoriesChanged]
+        );
+        assert!(db.stories(10).await.unwrap().is_empty());
+        assert!(db.attachment(file.id).await.unwrap().is_none());
+        // the delete before the story
+        db.apply(&Op::Delete { target: k("alice", 7) }).await.unwrap();
+        assert!(db.apply(&story(7)).await.unwrap().is_empty());
+        assert!(db.stories(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

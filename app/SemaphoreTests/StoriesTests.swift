@@ -20,6 +20,15 @@ final class StoriesTests: XCTestCase {
         XCTAssertEqual(StoryList.unseenCount(stories, me: "me"), 2, "ours never count")
     }
 
+    func testSeeingAStoryDoesntMoveItsChatWhileTheWindowIsOpen() {
+        let before = StoryList.groups([story("a", "c:a", 1), story("b", "c:b", 2)], me: "me")
+        XCTAssertEqual(before.map(\.id), ["c:b", "c:a"])
+        // b's seen now (it would sort after a), and c came meanwhile
+        let after = StoryList.groups(
+            [story("a", "c:a", 1), story("b", "c:b", 2, viewed: true), story("c", "c:c", 3)], me: "me")
+        XCTAssertEqual(StoryList.ordered(after, as: before.map(\.id)).map(\.id), ["c:b", "c:a", "c:c"])
+    }
+
     func testAColourComesFromItsARGBNumber() {
         let c = StoryList.rgba(0x80FF_0010)
         XCTAssertEqual(c.alpha, 128.0 / 255, accuracy: 0.001)

@@ -24,6 +24,15 @@ enum StoryList {
             }
     }
 
+    /// `groups` in the order `order` gives (chats that came since go last, in their own order).
+    static func ordered(_ groups: [Group], as order: [String]) -> [Group] {
+        let place = { (id: String) in order.firstIndex(of: id) ?? Int.max }
+        return groups.enumerated().sorted { a, b in
+            place(a.element.id) != place(b.element.id) ? place(a.element.id) < place(b.element.id) : a.offset < b.offset
+        }
+        .map(\.element)
+    }
+
     /// Others' stories not seen yet.
     static func unseenCount(_ stories: [Story], me: String?) -> Int {
         stories.filter { !$0.viewed && $0.author != me }.count
@@ -46,9 +55,13 @@ struct StoriesView: View {
     let store: AppStore
     @State private var selected: String?
     @State private var index = 0
+    /// The chats' order as the window opened: seeing a story doesn't move its chat under ←/→.
+    @State private var order: [String] = []
     @Environment(\.dismiss) private var dismiss
 
-    private var groups: [StoryList.Group] { StoryList.groups(store.stories, me: store.ownAci) }
+    private var groups: [StoryList.Group] {
+        StoryList.ordered(StoryList.groups(store.stories, me: store.ownAci), as: order)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -70,7 +83,10 @@ struct StoriesView: View {
             viewer
         }
         .frame(minWidth: 720, minHeight: 520)
-        .onAppear { selected = selected ?? groups.first?.conversationId }
+        .onAppear {
+            order = StoryList.groups(store.stories, me: store.ownAci).map(\.id)
+            selected = selected ?? order.first
+        }
         .onChange(of: selected) { _, _ in index = 0 }
         .onKeyPress(.leftArrow) { step(-1) ? .handled : .ignored }
         .onKeyPress(.rightArrow) { step(1) ? .handled : .ignored }
@@ -177,16 +193,18 @@ struct StoryCard: View {
             case .ready:
                 if let path = file.path {
                     if file.contentType.hasPrefix("video/") {
-                        VideoPlayer(player: AVPlayer(url: URL(fileURLWithPath: path)))
-                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                        StoryVideo(path: path).clipShape(RoundedRectangle(cornerRadius: 14))
                     } else {
                         ThumbnailImage(path: path).scaledToFit().clipShape(RoundedRectangle(cornerRadius: 14))
                     }
                 }
             case .downloading:
                 ProgressView()
-            case .pending, .failed:
-                Button(file.state == .failed ? "Retry" : "Download") { download(file.id) }
+            case .pending:
+                // fetched when opened (never before: not every story is looked at)
+                ProgressView().task(id: file.id) { download(file.id) }
+            case .failed:
+                Button("Retry") { download(file.id) }
             }
         } else {
             Text("This story can't be shown").foregroundStyle(Theme.secondaryText)
@@ -216,5 +234,20 @@ struct StoryCard: View {
         case 5: .system(size: 28, weight: .semibold).width(.condensed)
         default: .system(size: 28)
         }
+    }
+}
+
+/// A story's video, with one player for as long as it shows (a redraw doesn't restart it).
+struct StoryVideo: View {
+    let path: String
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        VideoPlayer(player: player)
+            .task(id: path) {
+                player?.pause()
+                player = AVPlayer(url: URL(fileURLWithPath: path))
+            }
+            .onDisappear { player?.pause() }
     }
 }
