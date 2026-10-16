@@ -8,6 +8,7 @@ struct SidebarView: View {
     @State private var resultIndex: Int?
     /// The chat whose "Block…" waits for confirmation.
     @State private var blocking: Conversation?
+    @State private var showingStories = false
 
     private var searching: Bool { store.isSearching }
     /// The archive is on show (a search covers every chat, so it counts as the inbox).
@@ -32,7 +33,26 @@ struct SidebarView: View {
                 }
                 Text(inArchive ? "Archived" : "Chats").font(.system(size: 22, weight: .bold))
                 Spacer()
+                if !inArchive && !store.stories.isEmpty {
+                    let unseen = StoryList.unseenCount(store.stories, me: store.ownAci)
+                    Button {
+                        showingStories = true
+                    } label: {
+                        Image(systemName: unseen > 0 ? "circle.dashed.inset.filled" : "circle.dashed")
+                            .font(.system(size: 17))
+                            .overlay(alignment: .topTrailing) {
+                                if unseen > 0 {
+                                    Text("\(unseen)").font(.system(size: 9, weight: .bold)).padding(3)
+                                        .background(Theme.outgoing, in: Circle()).offset(x: 6, y: -6)
+                                }
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stories")
+                    .accessibilityLabel(unseen > 0 ? "Stories, \(unseen) new" : "Stories")
+                }
             }
+            .sheet(isPresented: $showingStories) { StoriesView(store: store) }
             .padding(.horizontal, 18)
             .padding(.top, 14)
             .padding(.bottom, 10)

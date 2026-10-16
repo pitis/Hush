@@ -143,6 +143,8 @@ final class AppStore {
     private var fetchingPreview: String?
     /// Links already asked about (or dismissed) in this chat: not fetched again.
     private var dismissedPreviews: Set<String> = []
+    /// The stories of the last day (see `Client.stories`).
+    private(set) var stories: [Story] = []
     /// The polls of the open chat's loaded messages, as their votes stand.
     private(set) var polls: [MessageKey: Poll] = [:]
     /// Files chosen, dropped or pasted for the open chat, sent with the next message.
@@ -283,6 +285,9 @@ final class AppStore {
         case .ready, .conversationsChanged:
             Self.logger.notice("\(event == .ready ? "caught up" : "chat list changed", privacy: .public)")
             refreshConversations()
+            Task { await refreshStories() }
+        case .storiesChanged:
+            Task { await refreshStories() }
         case .messageChanged(let conversationId, let key):
             append("message \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
             refreshConversations()
@@ -304,6 +309,10 @@ final class AppStore {
         case .newMessage(let conversationId, let key):
             Task { await notify(conversationId, about: key, reaction: nil) }
         case .attachmentChanged(let conversationId, let message, _):
+            // a story's file, maybe
+            if stories.contains(where: { $0.author == message.author && $0.sentAt == message.sentAt }) {
+                Task { await refreshStories() }
+            }
             // a download finished (or started, or failed): its message in the open chat updates
             if conversationId == selectedId {
                 changedKeys.insert(message)
@@ -517,6 +526,25 @@ final class AppStore {
         do { try await client.viewOnceOpened(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
             showError("Couldn't mark the view-once media opened: \(Self.describe(error))")
         }
+    }
+
+    func refreshStories() async {
+        guard let client else { return }
+        do {
+            stories = try await client.stories()
+            for author in Set(stories.map(\.author)) where author != ownAci { await loadName(author) }
+        } catch { append("query failed: \(error)") }
+    }
+
+    /// A story was shown: seen here from now on.
+    func storyViewed(_ story: Story) async {
+        guard let client else { return }
+        do {
+            try await client.storyViewed(key: MessageKey(author: story.author, sentAt: story.sentAt))
+            if let i = stories.firstIndex(where: { $0.author == story.author && $0.sentAt == story.sentAt }) {
+                stories[i].viewed = true
+            }
+        } catch { append("couldn't mark a story seen: \(error)") }
     }
 
     /// Votes on a poll (none takes our vote back); it shows once sent.

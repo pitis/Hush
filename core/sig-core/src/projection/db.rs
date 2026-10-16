@@ -31,7 +31,12 @@ pub enum Applied {
     },
     /// Chats' flags changed, or a chat went (blocks and request answers from our phone).
     ConversationsChanged,
+    /// A story came (or went).
+    StoriesChanged,
 }
+
+/// How long a story shows.
+pub const STORY_LIFETIME_MS: i64 = 24 * 3600 * 1000;
 
 /// SQL: the chat `c` is a message request (see `Conversation::message_request`). A macro so
 /// queries stay static strings (`concat!`).
@@ -254,6 +259,71 @@ impl ProjectionDb {
         Ok(n.and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
     }
 
+    /// The stories of the last day from chats that aren't blocked or message requests (ours too),
+    /// oldest first, each with its file when it's a photo or video.
+    pub async fn stories(&self, now_ms: i64) -> Result<Vec<Story>, sqlx::Error> {
+        let rows = sqlx::query(concat!(
+            "SELECT s.* FROM stories s LEFT JOIN conversations c ON c.id = s.conversation_id
+             WHERE s.sent_at > ?1 AND (s.outgoing OR (c.id IS NOT NULL AND NOT c.blocked AND NOT ",
+            is_request!(),
+            ")) ORDER BY s.sent_at, s.author"
+        ))
+        .bind(now_ms - STORY_LIFETIME_MS)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut stories = vec![];
+        for r in rows {
+            let author: String = r.try_get("author")?;
+            let sent_at: i64 = r.try_get("sent_at")?;
+            let text = match r.try_get::<Option<String>, _>("text")? {
+                Some(text) => Some(StoryText {
+                    text,
+                    style: u32::try_from(r.try_get::<i64, _>("text_style")?).unwrap_or(0),
+                    foreground: r
+                        .try_get::<Option<i64>, _>("text_foreground")?
+                        .and_then(|c| u32::try_from(c).ok()),
+                    text_background: r
+                        .try_get::<Option<i64>, _>("text_background")?
+                        .and_then(|c| u32::try_from(c).ok()),
+                    background: serde_json::from_str(&r.try_get::<String, _>("background")?).unwrap_or_default(),
+                    angle: u32::try_from(r.try_get::<i64, _>("angle")?).unwrap_or(0),
+                    link: r.try_get("link")?,
+                }),
+                None => None,
+            };
+            let file_id: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 AND position = 0",
+            )
+            .bind(&author)
+            .bind(sent_at)
+            .fetch_optional(&self.pool)
+            .await?;
+            let file = match file_id {
+                Some(id) => self.attachment(id).await?,
+                None => None,
+            };
+            stories.push(Story {
+                conversation_id: r.try_get("conversation_id")?,
+                author,
+                sent_at,
+                text,
+                file,
+                viewed: r.try_get("viewed")?,
+            });
+        }
+        Ok(stories)
+    }
+
+    /// Marks a story seen here.
+    pub async fn story_viewed(&self, key: &MessageKey) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE stories SET viewed = 1 WHERE author = ?1 AND sent_at = ?2")
+            .bind(&key.author)
+            .bind(key.sent_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// A group's members (ACIs), as last synced from presage's group store.
     pub async fn group_members(&self, conversation_id: &str) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar("SELECT aci FROM group_members WHERE conversation_id = ?1 ORDER BY aci")
@@ -458,6 +528,21 @@ impl ProjectionDb {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        let stories: Vec<(String, i64)> =
+            sqlx::query_as("DELETE FROM stories WHERE conversation_id = ?1 RETURNING author, sent_at")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (author, sent_at) in stories {
+            let story_files: Vec<Option<String>> = sqlx::query_scalar(
+                "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file",
+            )
+            .bind(&author)
+            .bind(sent_at)
+            .fetch_all(&mut *tx)
+            .await?;
+            files.extend(story_files.into_iter().flatten());
+        }
         sqlx::query("INSERT OR IGNORE INTO presage_forget_threads(conversation_id) VALUES (?1)")
             .bind(id)
             .execute(&mut *tx)
@@ -1377,6 +1462,36 @@ impl ProjectionDb {
                 tx.commit().await?;
                 Ok(changed(m))
             }
+            Op::InsertStory(s) => {
+                let text = s.text.as_ref();
+                let res = sqlx::query(
+                    "INSERT OR IGNORE INTO stories(author, sent_at, conversation_id, received_at, text, text_style,
+                       text_foreground, text_background, background, angle, link, outgoing)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                )
+                .bind(&s.author)
+                .bind(s.sent_at)
+                .bind(&s.conversation_id)
+                .bind(s.received_at)
+                .bind(text.map(|t| &t.text))
+                .bind(text.map_or(0, |t| i64::from(t.style)))
+                .bind(text.and_then(|t| t.foreground).map(i64::from))
+                .bind(text.and_then(|t| t.text_background).map(i64::from))
+                .bind(
+                    serde_json::to_string(&text.map(|t| t.background.clone()).unwrap_or_default())
+                        .expect("colours serialize"),
+                )
+                .bind(text.map_or(0, |t| i64::from(t.angle)))
+                .bind(text.and_then(|t| t.link.as_ref()))
+                .bind(s.outgoing)
+                .execute(&self.pool)
+                .await?;
+                Ok(if res.rows_affected() == 1 {
+                    vec![Applied::StoriesChanged]
+                } else {
+                    vec![]
+                })
+            }
             Op::ViewOnceOpened { target } => {
                 let mut tx = self.pool.begin().await?;
                 let target = &resolve(&mut tx, target).await?;
@@ -1681,6 +1796,28 @@ impl ProjectionDb {
     /// (`presage_forget`) in the same transaction, so none is forgotten if deleting there fails.
     pub async fn delete_expired(&self, now_ms: i64) -> Result<Vec<Expired>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        // stories last a day, their files and presage's copies with them
+        let old_stories: Vec<(String, String, i64)> =
+            sqlx::query_as("DELETE FROM stories WHERE sent_at <= ?1 RETURNING conversation_id, author, sent_at")
+                .bind(now_ms - STORY_LIFETIME_MS)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut story_files: Vec<String> = vec![];
+        for (conversation_id, author, sent_at) in &old_stories {
+            let files: Vec<Option<String>> = sqlx::query_scalar(
+                "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 RETURNING file",
+            )
+            .bind(author)
+            .bind(sent_at)
+            .fetch_all(&mut *tx)
+            .await?;
+            story_files.extend(files.into_iter().flatten());
+            sqlx::query("INSERT OR IGNORE INTO presage_forget(conversation_id, sent_at) VALUES (?1, ?2)")
+                .bind(conversation_id)
+                .bind(sent_at)
+                .execute(&mut *tx)
+                .await?;
+        }
         let expired: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT conversation_id, author, sent_at FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
         )
@@ -1723,6 +1860,7 @@ impl ProjectionDb {
             refresh_summary(&mut tx, c).await?;
         }
         tx.commit().await?;
+        files.extend(story_files);
         self.remove_files(&files);
         Ok(out)
     }
@@ -2745,12 +2883,15 @@ async fn conversation_of(
     conn: &mut SqliteConnection,
     key: &MessageKey,
 ) -> Result<Option<(String, MessageKey)>, sqlx::Error> {
-    let conv: Option<String> =
-        sqlx::query_scalar("SELECT conversation_id FROM messages WHERE author = ?1 AND sent_at = ?2")
-            .bind(&key.author)
-            .bind(key.sent_at)
-            .fetch_optional(conn)
-            .await?;
+    // a story's file is listed and downloaded like a message's
+    let conv: Option<String> = sqlx::query_scalar(
+        "SELECT conversation_id FROM messages WHERE author = ?1 AND sent_at = ?2
+         UNION ALL SELECT conversation_id FROM stories WHERE author = ?1 AND sent_at = ?2 LIMIT 1",
+    )
+    .bind(&key.author)
+    .bind(key.sent_at)
+    .fetch_optional(conn)
+    .await?;
     Ok(conv.map(|c| (c, key.clone())))
 }
 
@@ -4527,6 +4668,106 @@ mod tests {
                 .map(|o| (o.text.as_str(), o.voters.clone()))
                 .collect::<Vec<_>>(),
             vec![("A", vec!["bob".to_string()]), ("B", vec![])]
+        );
+    }
+
+    #[tokio::test]
+    async fn stories_from_accepted_chats_show_for_a_day_with_their_files() {
+        let db = db().await;
+        let day = 24 * 3600 * 1000;
+        let story = |author: &str, conversation: &str, sent_at, text: Option<&str>| {
+            Op::InsertStory(NewStory {
+                conversation_id: conversation.into(),
+                author: author.into(),
+                sent_at,
+                received_at: sent_at,
+                outgoing: false,
+                text: text.map(|t| StoryText {
+                    text: t.into(),
+                    style: 0,
+                    foreground: None,
+                    text_background: None,
+                    background: vec![0xFF112233],
+                    angle: 0,
+                    link: None,
+                }),
+            })
+        };
+        // a chat with alice exists (a message from her); none with mallory
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        assert_eq!(
+            db.apply(&story("alice", "c:alice", day, Some("hello"))).await.unwrap(),
+            vec![Applied::StoriesChanged]
+        );
+        db.apply(&story("alice", "c:alice", day + 1, None)).await.unwrap();
+        db.apply(&add(
+            k("alice", day + 1),
+            vec![new_attachment("image/jpeg", 10, false)],
+            None,
+        ))
+        .await
+        .unwrap();
+        db.apply(&story("mallory", "c:mallory", day, Some("hi stranger")))
+            .await
+            .unwrap();
+        let shown = db.stories(day + 10).await.unwrap();
+        assert_eq!(
+            shown.iter().map(|s| (s.author.as_str(), s.sent_at)).collect::<Vec<_>>(),
+            vec![("alice", day), ("alice", day + 1)]
+        );
+        assert_eq!(shown[0].text.as_ref().unwrap().background, vec![0xFF112233]);
+        // the photo story's file downloads like any other
+        let file = shown[1].file.as_ref().unwrap();
+        assert_eq!(file.content_type, "image/jpeg");
+        assert!(db.start_download(file.id).await.unwrap().is_some());
+        // seen, and a day later gone with its file
+        db.story_viewed(&k("alice", day)).await.unwrap();
+        assert!(db.stories(day + 10).await.unwrap()[0].viewed);
+        // a deleted chat takes its stories along
+        db.insert_message(&msg("bob", 2, "hey")).await.unwrap();
+        db.apply(&story("bob", "c:bob", day, Some("bye"))).await.unwrap();
+        db.delete_chat("c:bob").await.unwrap();
+        assert!(db.stories(day + 10).await.unwrap().iter().all(|s| s.author != "bob"));
+        db.delete_expired(2 * day + 1).await.unwrap();
+        assert_eq!(db.stories(2 * day + 1).await.unwrap().len(), 0);
+        assert!(db.attachment(file.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn blocked_chats_stories_dont_show() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        db.apply(&Op::InsertStory(NewStory {
+            conversation_id: "c:alice".into(),
+            author: "alice".into(),
+            sent_at: 5,
+            received_at: 5,
+            text: None,
+            outgoing: false,
+        }))
+        .await
+        .unwrap();
+        db.block("c:alice").await.unwrap();
+        assert!(db.stories(10).await.unwrap().is_empty());
+        // ours show without any chat for them
+        db.apply(&Op::InsertStory(NewStory {
+            conversation_id: "c:me".into(),
+            author: "me".into(),
+            sent_at: 6,
+            received_at: 6,
+            text: None,
+            outgoing: true,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            db.stories(10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|s| s.author.as_str())
+                .collect::<Vec<_>>(),
+            ["me"]
         );
     }
 

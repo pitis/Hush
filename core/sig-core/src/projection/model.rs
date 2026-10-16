@@ -265,6 +265,47 @@ impl MessageKind {
     }
 }
 
+/// A story: text, or one photo or video, shown for a day.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct Story {
+    /// The author's chat, the group's, or ours (`c:<our aci>`) for our own.
+    pub conversation_id: String,
+    pub author: String,
+    pub sent_at: i64,
+    /// A text story's words and look (None for a photo or video).
+    pub text: Option<StoryText>,
+    /// A photo or video story's file.
+    pub file: Option<Attachment>,
+    pub viewed: bool,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct StoryText {
+    pub text: String,
+    /// Signal's TextAttachment.Style: 0 default, 1 regular, 2 bold, 3 serif, 4 script, 5 condensed.
+    pub style: u32,
+    /// ARGB colours.
+    pub foreground: Option<u32>,
+    pub text_background: Option<u32>,
+    /// One colour, or a gradient's colours (empty: the default).
+    pub background: Vec<u32>,
+    /// The gradient's angle in degrees (0: bottom to top).
+    pub angle: u32,
+    pub link: Option<String>,
+}
+
+/// A story as it arrives (its file, if any, follows as `Op::AddAttachments`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewStory {
+    pub conversation_id: String,
+    pub author: String,
+    pub sent_at: i64,
+    pub received_at: i64,
+    pub text: Option<StoryText>,
+    /// Ours (posted from the phone): shown whatever its chat.
+    pub outgoing: bool,
+}
+
 /// A poll as its votes stand: each option with who chose it.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct Poll {
