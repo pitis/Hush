@@ -74,7 +74,7 @@ final class AppStoreConversationTests: XCTestCase {
         await store.send("   ")
         XCTAssertEqual(fake.sent.map(\.conversationId), ["c:a"])
         XCTAssertEqual(fake.sent.first?.body, "hello")
-        XCTAssertEqual(fake.sent.first?.quote, Quote(author: "a", sentAt: 9, text: "orig"))
+        XCTAssertEqual(fake.sent.first?.quote, Quote(author: "a", sentAt: 9, text: "orig", ranges: []))
         XCTAssertNil(store.replyTo)
         XCTAssertEqual(fake.sent.count, 1)
     }

@@ -188,7 +188,7 @@ struct SidebarView: View {
                 conversation: c, title: store.title(c), selected: selected,
                 line: ChatList.line(
                     c, selected: selected, typing: store.isTyping(c.id), draft: Composer.draft(for: c.id),
-                    authorName: store.senderName(c.lastMessageAuthor))
+                    authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
             )
             .contentShape(Rectangle())
         }

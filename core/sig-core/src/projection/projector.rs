@@ -24,6 +24,7 @@ pub enum Op {
     Edit {
         target: MessageKey,
         new_body: Option<String>,
+        new_ranges: Vec<BodyRange>,
         edited_at: i64,
     },
     /// Delete for everyone (always the deleter's own message).
@@ -192,8 +193,34 @@ fn edit(em: &EditMessage, author: &str) -> Option<Op> {
             sent_at: i64::try_from(em.target_sent_timestamp?).ok()?,
         },
         new_body: dm.body.clone(),
+        new_ranges: text_ranges(&dm.body_ranges),
         edited_at: i64::try_from(dm.timestamp?).ok()?,
     })
+}
+
+/// Signal's body ranges as ours; unknown styles and mentions without a readable ACI are left out.
+fn text_ranges(ranges: &[presage::proto::BodyRange]) -> Vec<BodyRange> {
+    use presage::proto::body_range::AssociatedValue;
+    ranges
+        .iter()
+        .filter_map(|r| {
+            let style = match r.associated_value.as_ref()? {
+                AssociatedValue::Style(s) => TextStyle::from_proto(*s)?,
+                AssociatedValue::MentionAci(a) => TextStyle::Mention {
+                    aci: aci(Some(a), None)?,
+                },
+                AssociatedValue::MentionAciBinary(b) => TextStyle::Mention {
+                    aci: aci(None, Some(b))?,
+                },
+            };
+            Some(BodyRange {
+                // proto2: a start left out is 0
+                start: r.start.unwrap_or(0),
+                length: r.length?,
+                style,
+            })
+        })
+        .collect()
 }
 
 /// A receipt from a recipient about messages we sent.
@@ -311,6 +338,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         Some(Quote {
             author: aci(q.author_aci.as_deref(), q.author_aci_binary.as_deref())?,
             sent_at: i64::try_from(q.id?).ok()?,
+            ranges: text_ranges(&q.body_ranges),
             text: q.text.clone(),
         })
     });
@@ -319,6 +347,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         author: author.to_string(),
         sent_at,
         received_at,
+        ranges: text_ranges(&dm.body_ranges),
         body: dm.body.clone(),
         is_outgoing: outgoing,
         status: if outgoing {
@@ -597,6 +626,7 @@ mod tests {
             Some(Quote {
                 author: BOB.into(),
                 sent_at: 100,
+                ranges: vec![],
                 text: Some("orig".into())
             })
         );
@@ -606,6 +636,88 @@ mod tests {
         q.author_aci_binary = Some(uuid(BOB).as_bytes().to_vec());
         let m = one(project(&content(ALICE, 400, ContentBody::DataMessage(dm)), ME));
         assert_eq!(m.quote.unwrap().author, BOB);
+    }
+
+    #[test]
+    fn styles_and_mentions_are_carried_in_the_body_the_quote_and_edits() {
+        use presage::proto::body_range::{AssociatedValue, Style};
+        let range = |start, length, v| presage::proto::BodyRange {
+            start: Some(start),
+            length: Some(length),
+            associated_value: Some(v),
+        };
+        let mut dm = text(400, "hi \u{fffc} bold");
+        dm.body_ranges = vec![
+            range(3, 1, AssociatedValue::MentionAciBinary(uuid(BOB).as_bytes().to_vec())),
+            range(5, 4, AssociatedValue::Style(Style::Bold as i32)),
+            // none, an unknown style and an unreadable mention are left out
+            range(0, 2, AssociatedValue::Style(Style::None as i32)),
+            // a start left out is 0 (proto2's default)
+            presage::proto::BodyRange {
+                start: None,
+                length: Some(2),
+                associated_value: Some(AssociatedValue::Style(Style::Spoiler as i32)),
+            },
+            range(0, 2, AssociatedValue::Style(99)),
+            range(0, 2, AssociatedValue::MentionAci("nope".into())),
+        ];
+        dm.quote = Some(data_message::Quote {
+            id: Some(100),
+            author_aci: Some(BOB.into()),
+            text: Some("orig".into()),
+            body_ranges: vec![range(0, 4, AssociatedValue::Style(Style::Spoiler as i32))],
+            ..Default::default()
+        });
+        let m = one(project(&content(ALICE, 400, ContentBody::DataMessage(dm.clone())), ME));
+        assert_eq!(
+            m.ranges,
+            vec![
+                BodyRange {
+                    start: 3,
+                    length: 1,
+                    style: TextStyle::Mention { aci: BOB.into() }
+                },
+                BodyRange {
+                    start: 5,
+                    length: 4,
+                    style: TextStyle::Bold
+                },
+                BodyRange {
+                    start: 0,
+                    length: 2,
+                    style: TextStyle::Spoiler
+                },
+            ]
+        );
+        assert_eq!(
+            m.quote.unwrap().ranges,
+            vec![BodyRange {
+                start: 0,
+                length: 4,
+                style: TextStyle::Spoiler
+            }]
+        );
+
+        let mut fixed = text(800, "fixed");
+        fixed.body_ranges = vec![range(0, 5, AssociatedValue::Style(Style::Italic as i32))];
+        let em = EditMessage {
+            target_sent_timestamp: Some(400),
+            data_message: Some(fixed),
+        };
+        let ops = project(&content(ALICE, 810, ContentBody::EditMessage(em)), ME);
+        assert_eq!(
+            ops,
+            vec![Op::Edit {
+                target: key(ALICE, 400),
+                new_body: Some("fixed".into()),
+                new_ranges: vec![BodyRange {
+                    start: 0,
+                    length: 5,
+                    style: TextStyle::Italic
+                }],
+                edited_at: 800
+            }]
+        );
     }
 
     #[test]
@@ -821,6 +933,7 @@ mod tests {
             vec![Op::Edit {
                 target: key(ALICE, 100),
                 new_body: Some("fixed".into()),
+                new_ranges: vec![],
                 edited_at: 800
             }]
         );
@@ -835,6 +948,7 @@ mod tests {
             vec![Op::Edit {
                 target: key(ME, 100),
                 new_body: Some("fixed".into()),
+                new_ranges: vec![],
                 edited_at: 800
             }]
         );

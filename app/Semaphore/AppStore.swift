@@ -381,7 +381,7 @@ final class AppStore {
         guard let client, let id = selectedId, !body.isEmpty || !files.isEmpty else { return false }
         // taken out of the tray now, so a second ↩ while this one is busy can't send them again
         outgoingFiles = []
-        let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body) }
+        let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body, ranges: $0.ranges) }
         do {
             // the core announces the new pending message itself
             if files.isEmpty {
@@ -660,10 +660,12 @@ final class AppStore {
             if try await client.isMuted(conversationId: conversationId) { return }
             guard let m = try await client.message(key: key), !m.deleted else { return }
             // a message with files reads "📷 Photo" (or "📷 caption"), as in Desktop
-            var text = Placeholder.text(m.kind) ?? m.body
+            for aci in MessageText.mentioned(m.ranges) { await loadName(aci) }
+            let body = m.body.map { MessageText.plain($0, ranges: m.ranges, name: mentionName) }
+            var text = Placeholder.text(m.kind) ?? body
             do {
                 if let first = try await client.attachments(key: key).first {
-                    text = Files.describe(Files.summary(first), body: m.body)
+                    text = Files.describe(Files.summary(first), body: body)
                 }
             } catch { append("query failed: \(error)") }  // still announced, with its text
             let author = reaction?.reactor ?? m.author
@@ -1174,6 +1176,11 @@ final class AppStore {
         senderNames[author] ?? String(author.prefix(8))
     }
 
+    /// A mentioned person's name; a mention of us reads "@You".
+    func mentionName(_ aci: String) -> String {
+        aci == ownAci ? "You" : senderName(aci)
+    }
+
     private func setTyping(_ conversationId: String, who: String, until: Date?) {
         typingUntil[conversationId, default: [:]][who] = until
         if typingUntil[conversationId]?.isEmpty == true { typingUntil[conversationId] = nil }
@@ -1277,6 +1284,7 @@ final class AppStore {
                 if generation == selectionGeneration { previews[key] = preview }
             } catch { append("query failed: \(error)") }
             if isGroup, !m.isOutgoing { await loadName(m.author) }
+            for aci in MessageText.mentioned(m.ranges + (m.quote?.ranges ?? [])) { await loadName(aci) }
         }
     }
 
@@ -1317,6 +1325,9 @@ final class AppStore {
                     // group rows say who wrote the last message
                     for c in conversations where c.kind == .group && !c.lastMessageOutgoing {
                         await loadName(c.lastMessageAuthor)
+                    }
+                    for c in conversations {
+                        for aci in MessageText.mentioned(c.lastMessageRanges) { await loadName(aci) }
                     }
                 } catch { append("query failed: \(error)") }
             } while refreshAgain

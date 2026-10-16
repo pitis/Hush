@@ -342,6 +342,7 @@ impl Client {
             author,
             sent_at: self.next_sent_at(),
             received_at: 0,
+            ranges: vec![],
             body: Some(body.clone()),
             is_outgoing: true,
             status: MessageStatus::Pending,
@@ -445,6 +446,7 @@ impl Client {
             author,
             sent_at: self.next_sent_at(),
             received_at: 0,
+            ranges: vec![],
             body: body.clone(),
             is_outgoing: true,
             status: MessageStatus::Pending,
@@ -1099,6 +1101,7 @@ mod tests {
             author: author.into(),
             sent_at,
             received_at: sent_at,
+            ranges: vec![],
             body: Some("x".into()),
             is_outgoing: author == ME,
             status: if author == ME {

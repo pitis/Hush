@@ -166,6 +166,7 @@ mod tests {
             author: author.into(),
             sent_at: 5,
             received_at: 5,
+            ranges: vec![],
             body: Some("hi".into()),
             is_outgoing: outgoing,
             status: MessageStatus::Delivered,

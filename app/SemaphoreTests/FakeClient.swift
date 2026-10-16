@@ -289,6 +289,7 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
 func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
     Conversation(
         id: id, kind: id.hasPrefix("g:") ? .group : .direct, title: id, lastMessageAt: 1, lastMessagePreview: "",
+        lastMessageRanges: [],
         unreadCount: unread, lastMessageAuthor: "a", lastMessageOutgoing: false, lastMessageStatus: .delivered,
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
         lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
@@ -322,7 +323,8 @@ func eventually(
 func message(_ conv: String, _ author: String, _ sentAt: Int64, _ body: String = "x", outgoing: Bool = false) -> Message
 {
     Message(
-        conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, isOutgoing: outgoing,
+        conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, ranges: [],
+        isOutgoing: outgoing,
         status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil, kind: .normal, expiresIn: 0,
         expiresAt: nil)
 }

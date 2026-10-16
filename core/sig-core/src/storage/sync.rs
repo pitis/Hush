@@ -584,6 +584,7 @@ mod tests {
             author: author.into(),
             sent_at: t,
             received_at: t,
+            ranges: vec![],
             body: Some("x".into()),
             is_outgoing: false,
             status: crate::projection::MessageStatus::Read,
