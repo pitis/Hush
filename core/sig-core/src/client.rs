@@ -157,6 +157,17 @@ impl Client {
         self.send(Command::ResetSession { conversation_id })
     }
 
+    /// "Continue without history": stops the history import (or clears a failed one), deletes
+    /// the archive and its state, and starts receiving.
+    pub fn cancel_history(&self) -> Result<(), CoreError> {
+        self.send(Command::CancelHistory)
+    }
+
+    /// After a failed history transfer: picks the import up from where it stopped.
+    pub fn retry_history(&self) -> Result<(), CoreError> {
+        self.send(Command::Start)
+    }
+
     /// Downloads an attachment that didn't download by itself (or failed). Reported through
     /// `AttachmentChanged`.
     pub fn download_attachment(&self, id: i64) -> Result<(), CoreError> {
@@ -393,6 +404,43 @@ impl Client {
         }
     }
 
+    /// A history import is waiting, downloading or importing: set right after linking when the
+    /// phone offered history, cleared when it finishes or is abandoned. While it is, the app
+    /// shows the progress screen (`HistoryProgress` events follow).
+    pub async fn history_pending(&self) -> Result<bool, CoreError> {
+        Ok(self.db.history_state().await?.is_some())
+    }
+
+    /// Relink to transfer history: stops the core and removes presage's store (this Mac becomes
+    /// a new linked device) but keeps every shown conversation and file. Open a new `Client`
+    /// and `link` afterwards; the import then merges the phone's history in.
+    pub async fn relink(&self) -> Result<(), CoreError> {
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        self.send(Command::Relink { done })?;
+        stopped.await.map_err(|_| CoreError::Closed)?;
+        // the core thread is ending: wait for it, so nothing writes presage.db again
+        drop(self.commands.lock().ok().and_then(|mut c| c.take()));
+        if let Some(thread) = self.thread.lock().ok().and_then(|mut t| t.take()) {
+            if !matches!(tokio::task::spawn_blocking(move || thread.join()).await, Ok(Ok(()))) {
+                tracing::error!("the core thread ended abnormally while relinking");
+            }
+        }
+        // a stale import (its key belongs to the old link) must not resume against the new one
+        self.db.clear_history_state().await?;
+        self.db.close().await;
+        let storage = |e: std::io::Error| CoreError::Storage { message: e.to_string() };
+        for suffix in ["", "-wal", "-shm"] {
+            match std::fs::remove_file(self.data_dir.join(format!("presage.db{suffix}"))) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
+                _ => {}
+            }
+        }
+        match std::fs::remove_file(self.data_dir.join("history.tmp")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(e)),
+            _ => Ok(()),
+        }
+    }
+
     /// A chat's events (e.g. undecryptable messages) from `since` (ms) on.
     pub async fn chat_events(&self, conversation_id: String, since: i64) -> Result<Vec<ChatEvent>, CoreError> {
         Ok(self.db.chat_events(&conversation_id, since).await?)
@@ -585,6 +633,64 @@ mod tests {
             == CoreEvent::Connection {
                 state: ConnectionState::Unlinked
             }));
+    }
+
+    /// Relinking makes this Mac a new device but keeps what it shows: presage's store goes, the
+    /// projection stays, and the client is closed (the app opens a fresh one to link).
+    #[test]
+    fn relink_keeps_the_projection_and_drops_presage() {
+        let dir = temp_dir("client-relink");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink.clone()).unwrap();
+        std::fs::write(dir.0.join("history.tmp"), b"stale").unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            client.relink().await.unwrap();
+            assert!(matches!(client.relink().await, Err(CoreError::Closed)), "closed");
+        });
+        assert!(!dir.0.join("presage.db").exists(), "presage's store is gone");
+        assert!(!dir.0.join("history.tmp").exists(), "stale archive gone");
+        assert!(dir.0.join("projection.db").exists(), "conversations stay");
+        // the data directory is free again: a fresh client can link anew
+        drop(client);
+        assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
+    }
+
+    #[test]
+    fn history_pending_only_with_a_state_row() {
+        let dir = temp_dir("client-pending");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(!client.history_pending().await.unwrap());
+            client
+                .db
+                .set_history_state(&crate::projection::HistoryImportState {
+                    stage: crate::projection::HistoryDbStage::Waiting,
+                    key: vec![1; 32],
+                    aci: "22222222-2222-2222-2222-222222222222".into(),
+                    cdn: None,
+                    cdn_key: None,
+                    bytes_done: 0,
+                    total_bytes: None,
+                })
+                .await
+                .unwrap();
+            assert!(client.history_pending().await.unwrap());
+            client.cancel_history().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while client.history_pending().await.unwrap() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!client.history_pending().await.unwrap(), "cancel clears it");
+        });
     }
 
     #[test]

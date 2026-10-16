@@ -78,6 +78,14 @@ pub enum Command {
         tell_server: bool,
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// Stops the history import (or clears a failed one) and continues without it; receiving
+    /// starts.
+    CancelHistory,
+    /// Stops the core so the app can delete presage's store and link again for history. Tells
+    /// the server to drop the old registration, best effort.
+    Relink {
+        done: oneshot::Sender<()>,
+    },
 }
 
 pub struct Handles {
@@ -100,6 +108,9 @@ pub fn spawn(
     let lock = File::create(data_dir.join(".lock")).map_err(|e| CoreError::Storage { message: e.to_string() })?;
     lock.try_lock().map_err(|_| CoreError::AlreadyOpen)?;
     let (commands, rx) = mpsc::unbounded_channel();
+    // The thread sends itself Start when a history import ends. Weak, or the thread would hold
+    // its own channel open and never see it close (the Client's drop would join forever).
+    let self_commands = commands.downgrade();
     let (ready_tx, ready_rx) = oneshot::channel();
     let thread = core_thread()
         .spawn(move || {
@@ -114,7 +125,16 @@ pub fn spawn(
             };
             tokio::task::LocalSet::new().block_on(
                 &rt,
-                Box::pin(run(data_dir, key, listener, linked, own_aci, rx, ready_tx)),
+                Box::pin(run(
+                    data_dir,
+                    key,
+                    listener,
+                    linked,
+                    own_aci,
+                    rx,
+                    self_commands,
+                    ready_tx,
+                )),
             );
         })
         .map_err(|e| CoreError::Storage { message: e.to_string() })?;
@@ -161,6 +181,7 @@ pub(crate) fn sqlite_options(path: &std::path::Path, key: &str) -> Result<Sqlite
         .pragma("key", format!("\"x'{key}'\"")))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     dir: PathBuf,
     key: String,
@@ -168,6 +189,7 @@ async fn run(
     linked: Arc<AtomicBool>,
     own_aci: Arc<Mutex<Option<String>>>,
     mut rx: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::WeakUnboundedSender<Command>,
     ready: oneshot::Sender<Result<ProjectionDb, CoreError>>,
 ) {
     let opened = async {
@@ -248,6 +270,9 @@ async fn run(
     tokio::task::spawn_local(expire(store.clone(), projection.clone(), listener.clone()));
     let receiving = Rc::new(Cell::new(false));
     let wake = Rc::new(tokio::sync::Notify::new());
+    // The history import between linking and receiving, if the phone offered one.
+    let history_running = Rc::new(Cell::new(false));
+    let history_cancel: Rc<RefCell<watch::Sender<bool>>> = Rc::new(RefCell::new(watch::channel(false).0));
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Command::Link { device_name } => {
@@ -260,6 +285,24 @@ async fn run(
                 // boxed to keep the large provisioning future off the stack (the stack size is the real fix)
                 match Box::pin(link(&store, device_name, listener.as_ref())).await {
                     Ok(m) => {
+                        // the key is one-time and lives only in memory: keep it (encrypted)
+                        // before anything else, or a crash loses the offered history
+                        if let Some(key) = m.registration_data().ephemeral_backup_key() {
+                            let state = crate::projection::HistoryImportState {
+                                stage: crate::projection::HistoryDbStage::Waiting,
+                                key: key.to_vec(),
+                                aci: m.registration_data().service_ids.aci.to_string(),
+                                cdn: None,
+                                cdn_key: None,
+                                bytes_done: 0,
+                                total_bytes: None,
+                            };
+                            if let Err(e) = projection.set_history_state(&state).await {
+                                listener.on_event(CoreEvent::Error {
+                                    message: format!("keeping the history key failed: {e}"),
+                                });
+                            }
+                        }
                         set_aci(&m);
                         manager = Some(m);
                         linked.store(true, Ordering::SeqCst);
@@ -276,6 +319,28 @@ async fn run(
             Command::Start => match &manager {
                 Some(_) if receiving.get() => {}
                 Some(m) => {
+                    // a pending history import goes first: the server queues new messages
+                    // meanwhile, so they arrive after the history, in order
+                    match projection.history_state().await {
+                        Ok(Some(_)) => {
+                            if !history_running.get() {
+                                start_history(
+                                    m,
+                                    &projection,
+                                    &listener,
+                                    &dir,
+                                    &commands,
+                                    &history_running,
+                                    &history_cancel,
+                                );
+                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => listener.on_event(CoreEvent::Error {
+                            message: format!("checking the history import failed: {e}"),
+                        }),
+                    }
                     receiving.set(true);
                     if !sending {
                         sending = true;
@@ -386,6 +451,46 @@ async fn run(
                 // everything on this thread (receiving, sending, downloads) ends with it
                 return;
             }
+            Command::CancelHistory => {
+                if history_running.get() {
+                    // the task cleans up and starts receiving itself
+                    let _ = history_cancel.borrow().send(true);
+                } else {
+                    // a failed (or never started) import: clear it here
+                    if let Err(e) = projection.clear_history_state().await {
+                        listener.on_event(CoreEvent::Error {
+                            message: format!("clearing the history import failed: {e}"),
+                        });
+                    }
+                    let _ = std::fs::remove_file(dir.join("history.tmp"));
+                    listener.on_event(CoreEvent::HistoryProgress {
+                        stage: crate::history::HistoryStage::NoHistory,
+                        done: 0,
+                        total: 0,
+                    });
+                    if manager.is_some() {
+                        if let Some(c) = commands.upgrade() {
+                            let _ = c.send(Command::Start);
+                        }
+                    }
+                }
+            }
+            Command::Relink { done } => {
+                if let Some(m) = &manager {
+                    // Best effort: the phone lists the old entry until it is removed there, and
+                    // the new link works either way.
+                    if tokio::time::timeout(Duration::from_secs(10), Box::pin(m.unlink_self()))
+                        .await
+                        .map_or(true, |r| r.is_err())
+                    {
+                        tracing::warn!("the server couldn't be told about the relink");
+                    }
+                }
+                linked.store(false, Ordering::SeqCst);
+                let _ = done.send(());
+                // the thread ends; the Client deletes presage's store and the app relinks
+                return;
+            }
             Command::Download(id) => {
                 let _ = download_tx.send(Download::One(id));
             }
@@ -424,6 +529,59 @@ async fn run(
             }
         }
     }
+}
+
+/// Runs the history import on this thread; receiving waits for it. When it ends (imported, none
+/// offered, or cancelled) it starts receiving by sending `Start`; a failure waits for the user
+/// (Retry sends `Start` again, Continue Without History sends `CancelHistory`).
+fn start_history(
+    m: &Manager<SqliteStore, Registered>,
+    projection: &ProjectionDb,
+    listener: &Arc<dyn EventListener>,
+    dir: &std::path::Path,
+    commands: &mpsc::WeakUnboundedSender<Command>,
+    running: &Rc<Cell<bool>>,
+    cancel: &Rc<RefCell<watch::Sender<bool>>>,
+) {
+    running.set(true);
+    let (tx, mut rx) = watch::channel(false);
+    *cancel.borrow_mut() = tx;
+    let (m, db, l, commands, running) = (
+        m.clone(),
+        projection.clone(),
+        listener.clone(),
+        commands.clone(),
+        running.clone(),
+    );
+    let tmp = dir.join("history.tmp");
+    tokio::task::spawn_local(async move {
+        let mut store = m.store().clone();
+        let outcome = async {
+            let mut server = crate::history::fetch::SignalServer::from_registration(m.registration_data())?;
+            crate::history::run(&db, &mut store, &mut server, &tmp, l.as_ref(), &mut rx).await
+        }
+        .await;
+        running.set(false);
+        match outcome {
+            Ok(_) => {
+                // imported, none offered, or cancelled: live messages may flow now
+                if let Some(c) = commands.upgrade() {
+                    let _ = c.send(Command::Start);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("the history transfer failed: {e}");
+                l.on_event(CoreEvent::Error {
+                    message: format!("The history transfer failed: {e}"),
+                });
+                l.on_event(CoreEvent::HistoryProgress {
+                    stage: crate::history::HistoryStage::Failed,
+                    done: 0,
+                    total: 0,
+                });
+            }
+        }
+    });
 }
 
 /// Links as a secondary device: emits `LinkUrl`, waits (bounded) for the phone to scan, then asks

@@ -1203,8 +1203,6 @@ impl ProjectionDb {
         Ok(())
     }
 
-    // TODO(remove when the driver lands): only tests call this until then.
-    #[allow(dead_code)]
     /// Writes one batch of imported history in one transaction, merging into what is already
     /// here: existing messages keep their content (only the read status can rise), existing
     /// reactions, files and titles win, and a repeated import changes nothing. Emits no events;

@@ -1,9 +1,5 @@
 //! Importing the phone's message history at link time (link-and-sync).
 
-// The pieces land one by one and are wired together by the driver; until then they are unused.
-// TODO(remove when the driver lands): drop this allow.
-#![allow(dead_code)]
-
 pub(crate) mod fetch;
 pub(crate) mod import;
 pub(crate) mod read;
