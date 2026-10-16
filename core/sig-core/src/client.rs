@@ -11,7 +11,7 @@ use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
     Attachment, BodyRange, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey, MessageKind,
-    MessageStatus, OutgoingFile, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
+    MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
 };
 use crate::send::{self, Job, SendJob};
 
@@ -76,6 +76,23 @@ impl Client {
         let slot = handed.entry((key.author.clone(), key.sent_at)).or_insert(0);
         *slot = (*slot).max(stored) + 1;
         Ok(*slot)
+    }
+
+    /// Where fetched preview images wait until sent.
+    fn previews_dir(&self) -> PathBuf {
+        self.data_dir.join("previews")
+    }
+
+    /// The stored link preview of our message `key`, for the send job.
+    async fn send_preview(&self, key: &MessageKey) -> Result<Option<Box<crate::send::SendPreview>>, CoreError> {
+        Ok(self.db.link_preview(key).await?.map(|p| {
+            Box::new(crate::send::SendPreview {
+                url: p.url,
+                title: p.title,
+                description: p.description,
+                image: p.image.map(|i| i.id),
+            })
+        }))
     }
 
     async fn stored(&self, key: &MessageKey) -> Result<Message, CoreError> {
@@ -182,6 +199,8 @@ impl Client {
         let linked = Arc::new(AtomicBool::new(false));
         let own_aci = Arc::new(Mutex::new(None));
         let data_dir = PathBuf::from(data_dir);
+        // preview images of drafts from before (never sent) don't stay
+        let _ = std::fs::remove_dir_all(data_dir.join("previews"));
         let h = actor::spawn(
             data_dir.clone(),
             db_key_hex,
@@ -367,14 +386,17 @@ fn trimmed(text: &str, ranges: Vec<BodyRange>) -> (String, Vec<BodyRange>) {
 impl Client {
     /// Shows `body` at once as a pending message and queues it for sending (it moves to Sent or
     /// Failed, reported through `MessageChanged`). Returns the new message's key. `ranges` are
-    /// its styles and mentions; ones that don't fit the text are dropped.
+    /// its styles and mentions; ones that don't fit the text are dropped. `preview` goes with it
+    /// when its link is in the text (recipients drop it otherwise).
     pub async fn send_text(
         &self,
         conversation_id: String,
         body: String,
         ranges: Vec<BodyRange>,
         quote: Option<Quote>,
+        preview: Option<PreviewDraft>,
     ) -> Result<MessageKey, CoreError> {
+        let preview = preview.filter(|p| body.contains(&p.url));
         if body.trim().is_empty() {
             return Err(CoreError::InvalidInput {
                 message: "empty message".into(),
@@ -410,18 +432,26 @@ impl Client {
         for _ in 0..1000 {
             message.received_at = message.sent_at;
             message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
-            if self.db.insert_message(&message).await? {
+            if self.db.insert_outgoing(&message, &[], preview.as_ref()).await? {
                 break;
             }
             message.sent_at = self.next_sent_at();
         }
+        // the fetched image was copied: it isn't kept twice (and not past the message)
+        if let Some(image) = preview.as_ref().and_then(|p| p.image.as_ref()) {
+            if std::path::Path::new(&image.path).starts_with(self.previews_dir()) {
+                let _ = std::fs::remove_file(&image.path);
+            }
+        }
         self.unarchived_by_sending(&conversation_id, was_archived).await?;
         let key = message.key();
+        let preview = self.send_preview(&key).await?;
         self.listener.on_event(CoreEvent::MessageChanged {
             conversation_id: conversation_id.clone(),
             key: key.clone(),
         });
         let queued = self.send(Command::Send(Job::Text(SendJob {
+            preview,
             key: key.clone(),
             conversation_id,
             body: Some(body),
@@ -434,6 +464,50 @@ impl Client {
             return Err(e);
         }
         Ok(key)
+    }
+
+    /// A preview for the first https link in `text`, from its page: None when there's no link,
+    /// the page says nothing, or the phone hasn't allowed link previews ("Generate link
+    /// previews"; until it says, no page is fetched). Its image is saved to a file to send.
+    pub async fn link_preview_for(&self, text: String) -> Result<Option<PreviewDraft>, CoreError> {
+        if self.db.settings().await?.link_previews != Some(true) {
+            return Ok(None);
+        }
+        let Some((typed, url)) = crate::link_preview::first_link(&text) else {
+            return Ok(None);
+        };
+        let fetched = crate::link_preview::fetch(&url)
+            .await
+            .map_err(|message| CoreError::Network { message })?;
+        let info = fetched.info;
+        if info.title.is_none() && fetched.image.is_none() {
+            return Ok(None);
+        }
+        let image = match fetched.image {
+            Some((bytes, content_type)) => {
+                // one draft at a time: an earlier one (dismissed, edited away) goes
+                let dir = self.previews_dir();
+                let _ = std::fs::remove_dir_all(&dir);
+                // named by a timestamp nothing else takes (the one a message would get)
+                let path = dir.join(self.next_sent_at().to_string());
+                let saved = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes));
+                // without the image the preview still says what the link is
+                saved.ok().map(|_| OutgoingFile {
+                    path: path.to_string_lossy().into_owned(),
+                    content_type,
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                })
+            }
+            None => None,
+        };
+        Ok(Some(PreviewDraft {
+            url: typed,
+            title: info.title,
+            description: info.description,
+            image,
+        }))
     }
 
     /// Re-queues a Failed message. Returns false if it isn't Failed.
@@ -449,7 +523,9 @@ impl Client {
             key: key.clone(),
         });
         let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
+        let preview = self.send_preview(&key).await?;
         self.send(Command::Send(Job::Text(SendJob {
+            preview,
             key,
             conversation_id: m.conversation_id,
             body: m.body,
@@ -519,7 +595,7 @@ impl Client {
         for _ in 0..1000 {
             message.received_at = message.sent_at;
             message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
-            if self.db.insert_outgoing(&message, &files).await? {
+            if self.db.insert_outgoing(&message, &files, None).await? {
                 break;
             }
             message.sent_at = self.next_sent_at();
@@ -532,6 +608,7 @@ impl Client {
         });
         let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
         let queued = self.send(Command::Send(Job::Text(SendJob {
+            preview: None,
             key: key.clone(),
             conversation_id,
             body,
@@ -1209,15 +1286,15 @@ mod tests {
         rt.block_on(async {
             let to = "c:22222222-2222-2222-2222-222222222222".to_string();
             assert!(matches!(
-                client.send_text(to.clone(), "  ".into(), vec![], None).await,
+                client.send_text(to.clone(), "  ".into(), vec![], None, None).await,
                 Err(CoreError::InvalidInput { .. })
             ));
             assert!(matches!(
-                client.send_text("c:nope".into(), "hi".into(), vec![], None).await,
+                client.send_text("c:nope".into(), "hi".into(), vec![], None, None).await,
                 Err(CoreError::InvalidInput { .. })
             ));
             assert!(matches!(
-                client.send_text(to, "hi".into(), vec![], None).await,
+                client.send_text(to, "hi".into(), vec![], None, None).await,
                 Err(CoreError::NotLinked)
             ));
         });
@@ -1715,7 +1792,10 @@ mod tests {
         let requests = || client.storage_sync_requests.load(Ordering::SeqCst);
         rt.block_on(async {
             client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
-            client.send_text(conv.clone(), "hi".into(), vec![], None).await.unwrap();
+            client
+                .send_text(conv.clone(), "hi".into(), vec![], None, None)
+                .await
+                .unwrap();
             assert_eq!(requests(), 0, "not archived: nothing for the phone");
             client.set_archived(conv.clone(), true).await.unwrap();
             client
@@ -1724,7 +1804,7 @@ mod tests {
                 .await
                 .unwrap();
             client
-                .send_text(conv.clone(), "back".into(), vec![], None)
+                .send_text(conv.clone(), "back".into(), vec![], None, None)
                 .await
                 .unwrap();
             assert_eq!(requests(), 2);
@@ -1929,6 +2009,7 @@ mod tests {
                     "👋 hi".into(),
                     vec![range(3, 2), range(4, 2), range(0, 0)],
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1954,6 +2035,92 @@ mod tests {
     }
 
     #[test]
+    fn a_link_preview_is_sent_only_with_its_link_and_fetched_only_when_allowed() {
+        let (_dir, _sink, client, rt) = as_me("client-previews");
+        let conv = format!("c:{ALICE}");
+        let draft = || PreviewDraft {
+            url: "https://example.com/a".into(),
+            title: Some("A page".into()),
+            description: None,
+            image: None,
+        };
+        rt.block_on(async {
+            let key = client
+                .send_text(
+                    conv.clone(),
+                    "see https://example.com/a".into(),
+                    vec![],
+                    None,
+                    Some(draft()),
+                )
+                .await
+                .unwrap();
+            let p = client.link_preview(key).await.unwrap().unwrap();
+            assert_eq!(
+                (p.url.as_str(), p.title.as_deref()),
+                ("https://example.com/a", Some("A page"))
+            );
+            // a preview of a link the text doesn't have isn't sent (recipients drop it)
+            let key = client
+                .send_text(conv.clone(), "no link".into(), vec![], None, Some(draft()))
+                .await
+                .unwrap();
+            assert_eq!(client.link_preview(key).await.unwrap(), None);
+            // the fetched image is the message's own copy once sent: the fetched file goes
+            let fetched = client.data_dir.join("previews").join("1");
+            std::fs::create_dir_all(fetched.parent().unwrap()).unwrap();
+            std::fs::write(&fetched, b"jpg").unwrap();
+            let with_image = PreviewDraft {
+                image: Some(OutgoingFile {
+                    path: fetched.to_string_lossy().into_owned(),
+                    content_type: "image/jpeg".into(),
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                }),
+                ..draft()
+            };
+            let key = client
+                .send_text(
+                    conv.clone(),
+                    "again https://example.com/a".into(),
+                    vec![],
+                    None,
+                    Some(with_image),
+                )
+                .await
+                .unwrap();
+            assert!(!fetched.exists());
+            let image = client.link_preview(key).await.unwrap().unwrap().image.unwrap();
+            assert_eq!(std::fs::read(image.path.unwrap()).unwrap(), b"jpg");
+            // no page is fetched while the phone hasn't allowed link previews
+            assert_eq!(
+                client
+                    .link_preview_for("see https://example.com/a".into())
+                    .await
+                    .unwrap(),
+                None
+            );
+            client
+                .db
+                .apply(&crate::projection::Op::Settings {
+                    read_receipts: None,
+                    typing_indicators: None,
+                    link_previews: Some(false),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                client
+                    .link_preview_for("see https://example.com/a".into())
+                    .await
+                    .unwrap(),
+                None
+            );
+        });
+    }
+
+    #[test]
     fn our_messages_take_the_chats_timer_and_start_it_at_once() {
         let (_dir, _sink, client, rt) = as_me("client-timer");
         let conv = format!("c:{ALICE}");
@@ -1968,7 +2135,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let key = client.send_text(conv, "brb".into(), vec![], None).await.unwrap();
+            let key = client.send_text(conv, "brb".into(), vec![], None, None).await.unwrap();
             let m = client.message(key.clone()).await.unwrap().unwrap();
             assert_eq!((m.expires_in, m.expires_at), (60, Some(key.sent_at + 60_000)));
         });

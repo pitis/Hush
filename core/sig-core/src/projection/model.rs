@@ -439,6 +439,16 @@ pub struct LinkPreview {
     pub image: Option<Attachment>,
 }
 
+/// A link preview to send with a message: its link (which must be in the message's text), what
+/// its page says, and the page's image as a file to send.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PreviewDraft {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image: Option<OutgoingFile>,
+}
+
 /// A file to send, described by the app (it knows types and image sizes).
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct OutgoingFile {
@@ -475,6 +485,8 @@ pub struct NewPreview {
 pub struct Settings {
     pub read_receipts: Option<bool>,
     pub typing_indicators: Option<bool>,
+    /// Unknown until the phone says: no page is fetched for a preview until then.
+    pub link_previews: Option<bool>,
 }
 
 #[cfg(test)]

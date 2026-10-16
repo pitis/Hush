@@ -71,11 +71,24 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     var sendError: Error?
     /// Each sent text's or caption's ranges, in order.
     private(set) var sentRanges: [[BodyRange]] = []
-    func sendText(conversationId: String, body: String, ranges: [BodyRange], quote: Quote?) async throws -> MessageKey {
+    /// Each sent text's link preview, in order.
+    private(set) var sentPreviews: [PreviewDraft?] = []
+    var previewDrafts: [String: PreviewDraft] = [:]
+    private(set) var previewFetches = 0
+    func linkPreviewFor(text: String) async throws -> PreviewDraft? {
+        lock.withLock {
+            previewFetches += 1
+            return previewDrafts.first { text.contains($0.key) }?.value
+        }
+    }
+    func sendText(conversationId: String, body: String, ranges: [BodyRange], quote: Quote?, preview: PreviewDraft?)
+        async throws -> MessageKey
+    {
         if let sendError { throw sendError }
         lock.withLock {
             sent.append((conversationId, body, quote))
             sentRanges.append(ranges)
+            sentPreviews.append(preview)
         }
         return MessageKey(author: aci ?? "", sentAt: Int64(sent.count))
     }
