@@ -20,6 +20,10 @@ targets:
         embed: false
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
+      # the call engine (RingRTC/WebRTC + cubeb) inside SigCore
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreGraphics.framework
     info:
       path: Semaphore/Info.plist
       properties:
@@ -30,6 +34,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.semaphore
         ENABLE_HARDENED_RUNTIME: NO
         GENERATE_INFOPLIST_FILE: YES
+        # RingRTC's WebRTC and cubeb are C++
+        OTHER_LDFLAGS: ["-lc++"]
   SemaphoreTests:
     type: bundle.unit-test
     platform: macOS

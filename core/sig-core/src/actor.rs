@@ -19,7 +19,7 @@ use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
-use presage::store::{ContentsStore, Thread};
+use presage::store::{ContentsStore, Store as _, Thread};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -78,6 +78,8 @@ pub enum Command {
         tell_server: bool,
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// A call action from the app, forwarded to the call engine (spawned on first use).
+    Call(crate::calls::actor::CallCommand),
     /// Stops the history import (or clears a failed one) and continues without it; receiving
     /// starts.
     CancelHistory,
@@ -239,10 +241,27 @@ async fn run(
     let (download_tx, download_rx) = mpsc::unbounded_channel::<Download>();
     let downloads: Downloads = Rc::new(RefCell::new(download_rx));
     let mut downloading = false;
+    // Received call messages route to the call router below.
+    let (incoming_calls_tx, incoming_calls_rx) = mpsc::unbounded_channel::<crate::calls::IncomingEnvelope>();
     let queues = Queues {
         sends: send_tx.clone(),
         downloads: download_tx.clone(),
+        calls: incoming_calls_tx,
     };
+    // What the call engine needs from the link: our device id, ACI, and credentials.
+    let registration: Rc<RefCell<Option<presage::manager::RegistrationData>>> =
+        Rc::new(RefCell::new(manager.as_ref().map(|m| m.registration_data().clone())));
+    let (call_out_tx, call_out_rx) = mpsc::unbounded_channel::<crate::calls::actor::CallOutput>();
+    let call_commands = spawn_call_router(
+        registration.clone(),
+        store.clone(),
+        projection.clone(),
+        listener.clone(),
+        send_tx.clone(),
+        call_out_tx,
+        call_out_rx,
+        incoming_calls_rx,
+    );
     // Downloads cut off by the previous run start over.
     if let Err(e) = projection.reset_downloads().await {
         listener.on_event(CoreEvent::Error {
@@ -304,6 +323,7 @@ async fn run(
                             }
                         }
                         set_aci(&m);
+                        *registration.borrow_mut() = Some(m.registration_data().clone());
                         manager = Some(m);
                         linked.store(true, Ordering::SeqCst);
                         listener.on_event(CoreEvent::Linked);
@@ -428,7 +448,7 @@ async fn run(
                         }
                         let author = to.raw_uuid().to_string();
                         match db
-                            .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author)
+                            .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author, None)
                             .await
                         {
                             Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
@@ -461,6 +481,18 @@ async fn run(
                 // everything on this thread (receiving, sending, downloads) ends with it
                 return;
             }
+            Command::Call(cmd) => match call_commands() {
+                Some(tx) => {
+                    if tx.send(cmd).is_err() {
+                        listener.on_event(CoreEvent::Error {
+                            message: "the call engine stopped; restart Semaphore to call".into(),
+                        });
+                    }
+                }
+                None => listener.on_event(CoreEvent::Error {
+                    message: "calls need a linked phone".into(),
+                }),
+            },
             Command::CancelHistory => {
                 // a send fails exactly when the task died: fall through and clean up here;
                 // a live task cleans up and starts receiving itself
@@ -615,6 +647,183 @@ fn start_history(
             });
         }
     });
+}
+
+/// Routes everything between the call engine's thread and the rest of the core: incoming
+/// envelopes get identity keys and go in, outgoing envelopes go out through the sender with
+/// acks, relay requests are fetched, chat events written. The engine thread starts on first
+/// use (it opens the audio stack) and only while linked.
+#[allow(clippy::too_many_arguments)]
+fn spawn_call_router(
+    registration: Rc<RefCell<Option<presage::manager::RegistrationData>>>,
+    store: SqliteStore,
+    db: ProjectionDb,
+    listener: Arc<dyn EventListener>,
+    send_tx: mpsc::UnboundedSender<Job>,
+    call_out_tx: mpsc::UnboundedSender<crate::calls::actor::CallOutput>,
+    mut call_out_rx: mpsc::UnboundedReceiver<crate::calls::actor::CallOutput>,
+    mut incoming_rx: mpsc::UnboundedReceiver<crate::calls::IncomingEnvelope>,
+) -> Rc<dyn Fn() -> Option<std::sync::mpsc::Sender<crate::calls::actor::CallCommand>>> {
+    use crate::calls::actor::{CallCommand, CallOutput};
+    let engine: Rc<RefCell<Option<std::sync::mpsc::Sender<CallCommand>>>> = Rc::new(RefCell::new(None));
+    let ensure_engine = {
+        let engine = engine.clone();
+        let registration = registration.clone();
+        let listener = listener.clone();
+        move || -> Option<std::sync::mpsc::Sender<CallCommand>> {
+            if let Some(tx) = engine.borrow().clone() {
+                return Some(tx);
+            }
+            let reg = registration.borrow();
+            let data = reg.as_ref()?;
+            let device_id = data.device_id.unwrap_or(1);
+            let tx = crate::calls::actor::spawn(device_id, listener.clone(), call_out_tx.clone());
+            *engine.borrow_mut() = Some(tx.clone());
+            Some(tx)
+        }
+    };
+    // Incoming envelopes: attach identity keys (RingRTC's call fingerprint) and hand them in.
+    {
+        let ensure_engine = ensure_engine.clone();
+        let (store, listener, registration) = (store.clone(), listener.clone(), registration.clone());
+        tokio::task::spawn_local(async move {
+            use presage::libsignal_service::protocol::{IdentityKeyStore, ProtocolAddress};
+            while let Some(envelope) = incoming_rx.recv().await {
+                let Some(sender_aci) = crate::calls::call_sender_aci(&envelope.sender) else {
+                    tracing::warn!("a call message from a non-ACI sender was ignored");
+                    continue;
+                };
+                let our_device_id = registration.borrow().as_ref().and_then(|d| d.device_id).unwrap_or(1);
+                let calls = crate::calls::wire::from_proto(&envelope.message, our_device_id);
+                if calls.is_empty() {
+                    continue; // not for this device, or nothing we handle: no audio stack for it
+                }
+                let Some(engine) = ensure_engine() else {
+                    tracing::warn!("a call message arrived while unlinked");
+                    continue;
+                };
+                let store = store.aci_protocol_store();
+                // RingRTC derives media keys from both identity keys; phones use the bare
+                // 32-byte key (no type byte), so we must too
+                let ours = match store.get_identity_key_pair().await {
+                    Ok(pair) => pair.identity_key().public_key().public_key_bytes().to_vec(),
+                    Err(e) => {
+                        listener.on_event(CoreEvent::Error {
+                            message: format!("a call couldn't be checked against our identity: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                let Some(device_id) = u8::try_from(envelope.sender_device)
+                    .ok()
+                    .and_then(|d| presage::libsignal_service::protocol::DeviceId::new(d).ok())
+                else {
+                    continue;
+                };
+                let address = ProtocolAddress::new(envelope.sender.service_id_string(), device_id);
+                let theirs = match store.get_identity(&address).await {
+                    Ok(Some(identity)) => identity.public_key().public_key_bytes().to_vec(),
+                    Ok(None) => {
+                        // no session with this device: a call can't be verified, so it can't ring
+                        tracing::warn!(sender = %sender_aci, "a call from an unknown device was ignored");
+                        continue;
+                    }
+                    Err(e) => {
+                        listener.on_event(CoreEvent::Error {
+                            message: format!("a call couldn't be checked against the sender's identity: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                let now = chrono::Utc::now().timestamp_millis();
+                let age_secs = ((now - envelope.server_timestamp_ms).max(0) / 1000) as u64;
+                let _ = engine.send(CallCommand::Incoming {
+                    sender_aci,
+                    sender_device_id: envelope.sender_device,
+                    age_secs,
+                    sender_identity_key: theirs,
+                    receiver_identity_key: ours,
+                    calls,
+                });
+            }
+        });
+    }
+    // The engine's outputs: sends (with acks), relay fetches, chat events.
+    {
+        let engine = engine.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(output) = call_out_rx.recv().await {
+                match output {
+                    CallOutput::Send {
+                        peer_aci,
+                        call_id_u64,
+                        proto,
+                    } => {
+                        let (done, outcome) = tokio::sync::oneshot::channel();
+                        let job = Job::Call {
+                            conversation_id: format!("c:{peer_aci}"),
+                            body: Box::new(presage::libsignal_service::content::ContentBody::CallMessage(proto)),
+                            at: chrono::Utc::now().timestamp_millis() as u64,
+                            done,
+                        };
+                        if send_tx.send(job).is_err() {
+                            if let Some(tx) = engine.borrow().clone() {
+                                let _ = tx.send(CallCommand::SendResult { call_id_u64, ok: false });
+                            }
+                            continue;
+                        }
+                        let engine = engine.clone();
+                        tokio::task::spawn_local(async move {
+                            let ok = outcome.await.unwrap_or(false);
+                            if let Some(tx) = engine.borrow().clone() {
+                                let _ = tx.send(CallCommand::SendResult { call_id_u64, ok });
+                            }
+                        });
+                    }
+                    CallOutput::NeedRelays { call_id_u64 } => {
+                        let data = registration.borrow().clone();
+                        let engine = engine.clone();
+                        let listener = listener.clone();
+                        tokio::task::spawn_local(async move {
+                            let servers = match data.as_ref().map(crate::net::push_service) {
+                                Some(Ok(push)) => crate::calls::relays::fetch(&push).await,
+                                Some(Err(e)) => {
+                                    tracing::warn!("no credentials for the relay fetch: {e}");
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
+                            };
+                            if servers.is_empty() {
+                                listener.on_event(CoreEvent::Error {
+                                    message:
+                                        "calling relays unavailable (see the log); the call tries a direct connection"
+                                            .into(),
+                                });
+                            }
+                            if let Some(tx) = engine.borrow().clone() {
+                                let _ = tx.send(CallCommand::Relays { call_id_u64, servers });
+                            }
+                        });
+                    }
+                    CallOutput::ChatEvent { peer_aci, kind, value } => {
+                        let conversation_id = format!("c:{peer_aci}");
+                        let at = chrono::Utc::now().timestamp_millis();
+                        match db.add_chat_event(&conversation_id, at, kind, &peer_aci, value).await {
+                            Ok(()) => {
+                                listener.on_event(CoreEvent::ChatEventAdded { conversation_id });
+                                listener.on_event(CoreEvent::ConversationsChanged);
+                            }
+                            Err(e) => listener.on_event(CoreEvent::Error {
+                                message: format!("recording a call failed: {e}"),
+                            }),
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // Commands from the app reach the engine through this: it spawns it on first use.
+    Rc::new(ensure_engine)
 }
 
 /// Links as a secondary device: emits `LinkUrl`, waits (bounded) for the phone to scan, then asks
@@ -982,7 +1191,7 @@ async fn handle(
             let at = chrono::Utc::now().timestamp_millis();
             let author = sender.raw_uuid().to_string();
             match db
-                .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author)
+                .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author, None)
                 .await
             {
                 Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
@@ -992,6 +1201,15 @@ async fn handle(
             }
         }
         Received::Content(content) => {
+            if let presage::libsignal_service::content::ContentBody::CallMessage(cm) = &content.body {
+                let _ = queues.calls.send(crate::calls::IncomingEnvelope {
+                    sender: content.metadata.sender,
+                    sender_device: content.metadata.sender_device.into(),
+                    server_timestamp_ms: content.metadata.server_timestamp.timestamp_millis(),
+                    message: cm.clone(),
+                });
+                return;
+            }
             let ops = project(&content, me);
             tracing::info!(ops = ops.len(), "projected");
             let sender = content.metadata.sender.service_id_string();
@@ -1014,6 +1232,7 @@ async fn handle(
 struct Queues {
     sends: mpsc::UnboundedSender<Job>,
     downloads: mpsc::UnboundedSender<Download>,
+    calls: mpsc::UnboundedSender<crate::calls::IncomingEnvelope>,
 }
 
 /// What applying one received content changed beyond the projection.

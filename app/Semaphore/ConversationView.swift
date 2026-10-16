@@ -45,6 +45,11 @@ struct ConversationHeader: View {
     let store: AppStore
     let conversation: Conversation
 
+    private var canCall: Bool {
+        conversation.kind == .direct && !conversation.id.hasPrefix("c:PNI:")
+            && conversation.id != store.ownAci.map { "c:\($0)" }
+    }
+
     var body: some View {
         let title = store.title(conversation)
         HStack(spacing: 12) {
@@ -65,6 +70,19 @@ struct ConversationHeader: View {
                 }
             }
             Spacer()
+            if canCall {
+                let inCall = store.call != nil && store.call?.phase != .ended
+                Button {
+                    if inCall { store.showCallWindow() } else { store.startCall(conversation.id) }
+                } label: {
+                    Image(systemName: inCall ? "phone.fill" : "phone").font(.system(size: 15))
+                }
+                .buttonStyle(.bordered)
+                // signaling rides the message pipeline: no call before it is connected
+                .disabled(!inCall && store.connection != .online)
+                .help(inCall ? "Show the call" : "Voice call")
+                .accessibilityLabel(inCall ? "Show the call" : "Start a voice call")
+            }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
@@ -479,6 +497,22 @@ struct ChatEventRow: View {
                 Label("You reset the secure session with \(name)", systemImage: "lock.rotation")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.secondaryText)
+            case .outgoingCall:
+                Label(
+                    Placeholder.call("Outgoing voice call", seconds: event.value), systemImage: "phone.arrow.up.right"
+                )
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondaryText)
+            case .incomingCall:
+                Label(
+                    Placeholder.call("Incoming voice call", seconds: event.value), systemImage: "phone.arrow.down.left"
+                )
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondaryText)
+            case .missedCall:
+                Label("Missed voice call", systemImage: "phone.down")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.red.opacity(0.9))
             }
         }
         .frame(maxWidth: .infinity)

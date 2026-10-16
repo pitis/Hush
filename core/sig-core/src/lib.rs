@@ -1,16 +1,19 @@
 uniffi::setup_scaffolding!();
 
 mod actor;
+mod calls;
 mod client;
 mod download;
 mod error;
 mod events;
 mod history;
 mod logging;
+mod net;
 pub mod projection;
 mod send;
 mod typing;
 
+pub use calls::{AudioDevice, AudioDevices, CallPhase};
 pub use client::Client;
 pub use error::CoreError;
 pub use events::{ConnectionState, CoreEvent, EventListener};

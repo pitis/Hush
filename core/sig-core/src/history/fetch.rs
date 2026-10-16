@@ -255,29 +255,10 @@ pub(crate) struct SignalServer {
 }
 
 impl SignalServer {
-    /// Authenticated with this device's credentials. presage keeps the account password
-    /// private, but `RegistrationData` serializes it — that is how presage itself persists it.
+    /// Authenticated with this device's credentials.
     pub(crate) fn from_registration(data: &presage::manager::RegistrationData) -> Result<Self, HistoryError> {
-        use presage::libsignal_service::configuration::{ServiceCredentials, SignalServers};
-        use presage::libsignal_service::prelude::{phonenumber, PushService};
-        use presage::libsignal_service::protocol::E164;
-        use std::str::FromStr as _;
-        let err = |m: String| HistoryError::Server(m);
-        let v = serde_json::to_value(data).map_err(|e| err(e.to_string()))?;
-        let password = v["password"]
-            .as_str()
-            .ok_or_else(|| err("no account password".into()))?
-            .to_owned();
-        let e164 = data.phone_number.format().mode(phonenumber::Mode::E164).to_string();
-        let credentials = ServiceCredentials {
-            aci: Some(data.service_ids.aci),
-            pni: Some(data.service_ids.pni),
-            phonenumber: E164::from_str(&e164).map_err(|e| err(format!("phone number: {e}")))?,
-            password: Some(password),
-            device_id: data.device_id.and_then(|d| d.try_into().ok()),
-        };
         Ok(Self {
-            push: PushService::new(SignalServers::Production, Some(credentials), "Semaphore"),
+            push: crate::net::push_service(data).map_err(HistoryError::Server)?,
         })
     }
 }

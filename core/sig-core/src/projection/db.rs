@@ -388,6 +388,7 @@ impl ProjectionDb {
         at: i64,
         kind: ChatEventKind,
         author: &str,
+        value: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         let conv_kind = kind_of(conversation_id)?;
         let mut tx = self.pool.begin().await?;
@@ -396,11 +397,12 @@ impl ProjectionDb {
             .bind(kind_to_i64(conv_kind))
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO chat_events(conversation_id, at, kind, author) VALUES (?1, ?2, ?3, ?4)")
+        sqlx::query("INSERT INTO chat_events(conversation_id, at, kind, author, value) VALUES (?1, ?2, ?3, ?4, ?5)")
             .bind(conversation_id)
             .bind(at)
             .bind(kind.to_i64())
             .bind(author)
+            .bind(value)
             .execute(&mut *tx)
             .await?;
         refresh_summary(&mut tx, conversation_id).await?;
@@ -1845,6 +1847,25 @@ mod tests {
             .into_iter()
             .find(|c| c.id == id)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_missed_call_shows_in_the_chat_with_duration_support() {
+        let db = db().await;
+        db.add_chat_event("c:alice", 50, ChatEventKind::MissedCall, "alice", None)
+            .await
+            .unwrap();
+        db.add_chat_event("c:alice", 90, ChatEventKind::IncomingCall, "alice", Some(125))
+            .await
+            .unwrap();
+        let events = db.chat_events("c:alice", 0).await.unwrap();
+        assert_eq!(
+            events.iter().map(|e| (e.kind, e.value)).collect::<Vec<_>>(),
+            vec![
+                (ChatEventKind::MissedCall, None),
+                (ChatEventKind::IncomingCall, Some(125))
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3812,13 +3833,13 @@ mod tests {
     #[tokio::test]
     async fn chat_events_are_kept_per_chat_in_time_order() {
         let db = db().await;
-        db.add_chat_event("c:alice", 20, ChatEventKind::DecryptionFailed, "alice")
+        db.add_chat_event("c:alice", 20, ChatEventKind::DecryptionFailed, "alice", None)
             .await
             .unwrap();
-        db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice")
+        db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice", None)
             .await
             .unwrap();
-        db.add_chat_event("c:bob", 15, ChatEventKind::DecryptionFailed, "bob")
+        db.add_chat_event("c:bob", 15, ChatEventKind::DecryptionFailed, "bob", None)
             .await
             .unwrap();
         let events = db.chat_events("c:alice", 0).await.unwrap();
@@ -3840,7 +3861,7 @@ mod tests {
         db.insert_message(&in_conv("c:bob", msg("bob", 50, "hi")))
             .await
             .unwrap();
-        db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice")
+        db.add_chat_event("c:alice", 10, ChatEventKind::DecryptionFailed, "alice", None)
             .await
             .unwrap();
         let c = conv(&db, "c:alice").await;
@@ -3858,13 +3879,13 @@ mod tests {
         .await
         .unwrap();
         db.apply(&Op::Delete { target: k("me", 5) }).await.unwrap();
-        db.add_chat_event("c:carol", 9, ChatEventKind::DecryptionFailed, "carol")
+        db.add_chat_event("c:carol", 9, ChatEventKind::DecryptionFailed, "carol", None)
             .await
             .unwrap();
         let c = conv(&db, "c:carol").await;
         assert!(c.last_message_undecryptable);
         assert!(!c.last_message_outgoing && !c.last_message_deleted && c.last_message_file.is_none());
-        db.add_chat_event("c:bob", 60, ChatEventKind::DecryptionFailed, "bob")
+        db.add_chat_event("c:bob", 60, ChatEventKind::DecryptionFailed, "bob", None)
             .await
             .unwrap();
         assert_eq!(db.conversations().await.unwrap()[0].id, "c:bob", "moved up");
@@ -3872,7 +3893,7 @@ mod tests {
         db.insert_message(&in_conv("c:bob", msg("bob", 70, "back")))
             .await
             .unwrap();
-        db.add_chat_event("c:bob", 80, ChatEventKind::SessionReset, "bob")
+        db.add_chat_event("c:bob", 80, ChatEventKind::SessionReset, "bob", None)
             .await
             .unwrap();
         let c = conv(&db, "c:bob").await;

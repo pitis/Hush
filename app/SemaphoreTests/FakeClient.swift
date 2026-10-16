@@ -198,6 +198,35 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         lock.withLock { (eventAnswers[conversationId] ?? []).filter { $0.at >= since } }
     }
 
+    private(set) var startCallCalls: [String] = []
+    private(set) var acceptCallCalls = 0
+    private(set) var hangupCallCalls = 0
+    private(set) var setMutedCalls: [Bool] = []
+    private(set) var setInputCalls: [String] = []
+    private(set) var setOutputCalls: [String] = []
+    var callError: Error?
+    var audioDevicesAnswer = AudioDevices(inputs: [], outputs: [], currentInput: nil, currentOutput: nil)
+
+    func startCall(conversationId: String) throws {
+        if let callError { throw callError }
+        lock.withLock { startCallCalls.append(conversationId) }
+    }
+    func acceptCall() throws {
+        if let callError { throw callError }
+        lock.withLock { acceptCallCalls += 1 }
+    }
+    func hangupCall() throws {
+        if let callError { throw callError }
+        lock.withLock { hangupCallCalls += 1 }
+    }
+    func setCallMuted(muted: Bool) throws {
+        if let callError { throw callError }
+        lock.withLock { setMutedCalls.append(muted) }
+    }
+    func setCallAudioInput(id: String) throws { lock.withLock { setInputCalls.append(id) } }
+    func setCallAudioOutput(id: String) throws { lock.withLock { setOutputCalls.append(id) } }
+    func callAudioDevices() async throws -> AudioDevices { lock.withLock { audioDevicesAnswer } }
+
     var historyPendingAnswer = false
     private(set) var cancelHistoryCalls = 0
     private(set) var retryHistoryCalls = 0

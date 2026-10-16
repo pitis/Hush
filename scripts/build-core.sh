@@ -22,6 +22,16 @@ mv "$GEN"/*.h "$HDR/"
 maps=("$GEN"/*.modulemap)
 [ ${#maps[@]} -eq 1 ] || { echo "✗ expected one modulemap, got ${#maps[@]}" >&2; exit 1; }
 mv "${maps[0]}" "$HDR/module.modulemap"
-xcodebuild -create-xcframework -library "$LIB" -headers "$HDR" \
+# RingRTC's prebuilt WebRTC stays a separate static library (cargo doesn't fold foreign
+# archives into a staticlib): merge it, or the app fails to link with missing Rust_* symbols.
+# ringrtc's build script extracts it into its cargo checkout (release-only prebuilts).
+# The checkout is picked by the rev Cargo.lock pins, so a stale sibling checkout can't be merged.
+RINGRTC_REV="$(sed -n 's|^source = "git+https://github.com/signalapp/ringrtc?[^#]*#\([0-9a-f]\{7\}\).*|\1|p' Cargo.lock | head -1)"
+[ -n "$RINGRTC_REV" ] || { echo "✗ ringrtc rev not found in Cargo.lock" >&2; exit 1; }
+WEBRTC="$(ls "$HOME"/.cargo/git/checkouts/ringrtc-*/"$RINGRTC_REV"/out/release/obj/libwebrtc.a 2>/dev/null | head -1)"
+[ -n "$WEBRTC" ] || { echo "✗ libwebrtc.a not found in the ringrtc checkout for $RINGRTC_REV (cargo build fetches it)" >&2; exit 1; }
+MERGED="$ROOT/core/target/aarch64-apple-darwin/$DIR/libsig_core_merged.a"
+libtool -static -no_warning_for_no_symbols -o "$MERGED" "$LIB" "$WEBRTC"
+xcodebuild -create-xcframework -library "$MERGED" -headers "$HDR" \
   -output "$ROOT/app/Frameworks/SigCore.xcframework" >/dev/null
-echo "built SigCore.xcframework ($DIR)"
+echo "built SigCore.xcframework ($DIR, with WebRTC)"

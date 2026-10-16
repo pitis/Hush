@@ -36,12 +36,49 @@ struct NotificationRequest: Equatable {
     let body: String
     /// Reply and Mark as Read (only when the content is shown).
     let hasActions: Bool
+    /// A non-message category (calls); wins over `hasActions`.
+    var category: String?
 }
 
 enum Notifications {
     static let category = "message"
     static let replyAction = "reply"
     static let markReadAction = "mark-read"
+    static let callCategory = "call"
+    static let acceptCallAction = "accept-call"
+    static let declineCallAction = "decline-call"
+
+    /// The one ringing notification of a conversation's incoming call.
+    static func callId(_ conversationId: String) -> String { "call|\(conversationId)" }
+
+    /// Rings until answered, declined, or the caller gives up. Nil when notifications are off;
+    /// the caller's name only when the setting shows names.
+    static func incomingCall(setting: NotificationContent, conversationId: String, title: String)
+        -> NotificationRequest?
+    {
+        guard let title = callTitle(setting, title) else { return nil }
+        return NotificationRequest(
+            id: callId(conversationId), conversationId: conversationId, title: title,
+            body: "Incoming voice call", hasActions: false, category: callCategory)
+    }
+
+    /// Posted when an incoming call ends without ever connecting (same privacy rules).
+    static func missedCall(setting: NotificationContent, conversationId: String, title: String, at: Date)
+        -> NotificationRequest?
+    {
+        guard let title = callTitle(setting, title) else { return nil }
+        return NotificationRequest(
+            id: "call-missed|\(conversationId)|\(Int(at.timeIntervalSince1970))", conversationId: conversationId,
+            title: title, body: "Missed voice call", hasActions: false)
+    }
+
+    private static func callTitle(_ setting: NotificationContent, _ name: String) -> String? {
+        switch setting {
+        case .off: nil
+        case .noNameOrMessage: "Semaphore"
+        case .nameOnly, .nameAndMessage: name
+        }
+    }
 
     /// The id of a notification about a message: the message itself (`reactor` nil) or a reaction
     /// to it. All of a message's notifications share `idPrefix`, to remove them together.
@@ -107,9 +144,15 @@ final class SystemNotifier: Notifier {
             identifier: Notifications.replyAction, title: "Reply", textInputButtonTitle: "Send",
             textInputPlaceholder: "Message")
         let markRead = UNNotificationAction(identifier: Notifications.markReadAction, title: "Mark as Read")
+        let accept = UNNotificationAction(
+            identifier: Notifications.acceptCallAction, title: "Accept", options: [.foreground])
+        let decline = UNNotificationAction(
+            identifier: Notifications.declineCallAction, title: "Decline", options: [.destructive])
         center.setNotificationCategories([
             UNNotificationCategory(
-                identifier: Notifications.category, actions: [reply, markRead], intentIdentifiers: [])
+                identifier: Notifications.category, actions: [reply, markRead], intentIdentifiers: []),
+            UNNotificationCategory(
+                identifier: Notifications.callCategory, actions: [accept, decline], intentIdentifiers: []),
         ])
         center.requestAuthorization(options: [.alert, .sound]) { granted, error in
             if let error {
@@ -127,7 +170,11 @@ final class SystemNotifier: Notifier {
         content.sound = .default
         content.threadIdentifier = request.conversationId
         content.userInfo = ["conversationId": request.conversationId]
-        if request.hasActions { content.categoryIdentifier = Notifications.category }
+        if let category = request.category {
+            content.categoryIdentifier = category
+        } else if request.hasActions {
+            content.categoryIdentifier = Notifications.category
+        }
         center.add(UNNotificationRequest(identifier: request.id, content: content, trigger: nil)) { error in
             if let error { Self.logger.error("showing a notification failed: \(error, privacy: .public)") }
         }
@@ -167,6 +214,10 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             if let text { await store.replyFromNotification(conversationId: id, text: text) }
         case Notifications.markReadAction:
             await store.markReadFromNotification(conversationId: id)
+        case Notifications.acceptCallAction:
+            await store.acceptCall()
+        case Notifications.declineCallAction:
+            await store.hangupCall()
         default:
             await store.openFromNotification(conversationId: id)
         }

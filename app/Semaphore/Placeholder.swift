@@ -3,6 +3,12 @@ import Foundation
 /// How messages we can't show yet, and disappearing-message timers, are worded (Signal Desktop's
 /// words).
 enum Placeholder {
+    /// "Outgoing voice call (2:05)" — the duration only when it connected.
+    static func call(_ what: String, seconds: Int64?) -> String {
+        guard let seconds, seconds > 0 else { return what }
+        return String(format: "%@ (%d:%02d)", what, seconds / 60, seconds % 60)
+    }
+
     /// A placeholder message's text, or nil for a normal one.
     static func text(_ kind: MessageKind) -> String? {
         switch kind {

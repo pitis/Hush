@@ -43,6 +43,8 @@ struct SemaphoreApp: App {
         }
         .commands { ChatCommands(store: core) }
         Window("Core Log", id: "core-log") { CoreLogView(store: core) }
+        Window("Call", id: "call") { CallWindow(store: core) }
+            .windowResizability(.contentSize)
         Settings { SettingsView(store: core) }
     }
 }
