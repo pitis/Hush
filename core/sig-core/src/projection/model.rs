@@ -63,6 +63,8 @@ pub struct Conversation {
     pub avatar: Option<String>,
     /// A contact's username, when known.
     pub username: Option<String>,
+    /// The note written about a contact on the phone.
+    pub note: Option<String>,
 }
 
 /// An answer to a message request, ours or one our phone reports

@@ -24,6 +24,25 @@ const ACCOUNT_NOTE_ARCHIVED: u32 = 5;
 const ACCOUNT_NOTE_MARKED_UNREAD: u32 = 10;
 const ACCOUNT_PINNED: u32 = 14;
 
+/// The name the phone shows for a contact: the nickname set for them, else their address-book
+/// name (as Signal: nickname, then system contact, then profile).
+fn contact_name(c: &ContactRecord) -> Option<String> {
+    let join = |given: &str, family: &str| {
+        let full = [given.trim(), family.trim()]
+            .iter()
+            .filter(|p| !p.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(full).filter(|f| !f.is_empty())
+    };
+    c.nickname
+        .as_ref()
+        .and_then(|n| join(&n.given, &n.family))
+        .or_else(|| join(&c.system_given_name, &c.system_family_name))
+        .or_else(|| Some(c.system_nickname.trim().to_string()).filter(|n| !n.is_empty()))
+}
+
 /// What a decrypted record means to us. `Err` only for bytes that aren't a protobuf message.
 pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
     let record = StorageRecord::decode(plaintext).map_err(|e| format!("storage record: {e}"))?;
@@ -42,6 +61,8 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                     && c.system_family_name.is_empty()
                     && c.system_nickname.is_empty()),
                 username: Some(c.username.clone()).filter(|u| !u.is_empty()),
+                name: contact_name(&c),
+                note: Some(c.note.clone()).filter(|n| !n.trim().is_empty()),
             },
             None => Remote::Other,
         },
@@ -56,6 +77,8 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
             ),
             phone_contact: false,
             username: None,
+            name: None,
+            note: None,
         },
         Some(Record::Account(a)) => Remote::Account {
             pins: a.pinned_conversations.iter().map(pin_of).collect(),
@@ -329,6 +352,34 @@ mod tests {
             ),
             (true, false, i64::MAX, true, false)
         );
+    }
+
+    #[test]
+    fn a_contact_is_called_by_its_nickname_else_its_address_book_name() {
+        use presage::libsignal_service::proto::contact_record::Name;
+        let record = |nickname: Option<(&str, &str)>, system: (&str, &str)| {
+            wrap(Record::Contact(ContactRecord {
+                aci: ALICE.into(),
+                nickname: nickname.map(|(given, family)| Name {
+                    given: given.into(),
+                    family: family.into(),
+                }),
+                system_given_name: system.0.into(),
+                system_family_name: system.1.into(),
+                note: "met at the conference".into(),
+                ..Default::default()
+            }))
+        };
+        let name_of = |bytes: Vec<u8>| match decode(&bytes).unwrap() {
+            Remote::Chat { name, note, .. } => (name, note),
+            _ => panic!(),
+        };
+        assert_eq!(
+            name_of(record(Some(("Ali", "")), ("Alice", "Smith"))),
+            (Some("Ali".into()), Some("met at the conference".into()))
+        );
+        assert_eq!(name_of(record(None, ("Alice", "Smith"))).0, Some("Alice Smith".into()));
+        assert_eq!(name_of(record(Some(("", "")), ("", ""))).0, None);
     }
 
     #[test]

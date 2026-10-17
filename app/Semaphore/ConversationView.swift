@@ -150,7 +150,15 @@ struct ConversationHeader: View {
         HStack(spacing: 12) {
             Avatar(id: conversation.id, name: title, size: 36)
             VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                    // the note written about them on the phone
+                    if let note = conversation.note {
+                        Image(systemName: "note.text").font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+                            .help(note)
+                            .accessibilityLabel("Note: \(note)")
+                    }
+                }
                 if let username = conversation.username, conversation.kind == .direct {
                     Text("@\(username)").font(.system(size: 12)).foregroundStyle(Theme.secondaryText).lineLimit(1)
                         .textSelection(.enabled)
