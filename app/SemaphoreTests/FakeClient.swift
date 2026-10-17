@@ -140,6 +140,9 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let changeError { throw changeError }
         lock.withLock { flagCalls.append(call) }
     }
+    func setWallpaper(conversationId: String, wallpaper: ChatColor?) async throws {
+        try await flag("wallpaper \(conversationId) \(wallpaper?.colors ?? [])")
+    }
     func setChatColor(conversationId: String, color: ChatColor?) async throws {
         try await flag("color \(conversationId) \(color?.colors ?? [])")
     }
@@ -363,7 +366,8 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
         lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
         blocked: false,
-        whitelisted: false, messageRequest: false, avatar: nil, username: nil, note: nil, chatColor: nil)
+        whitelisted: false, messageRequest: false, avatar: nil, username: nil, note: nil, chatColor: nil, wallpaper: nil
+    )
 }
 
 final class Counter: @unchecked Sendable {

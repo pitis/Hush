@@ -1,4 +1,4 @@
-# Chat colours (M4 design)
+# Chat colours and wallpapers (M4 design)
 
 ## Context
 Issue #55: chat colours and wallpapers, ideally from the phone. Storage Service records carry
@@ -24,8 +24,20 @@ style and custom colours.
 - App: an environment value carries the chat's colour to `MessageRow`. Gradients use Signal's angle
   (0° bottom to top, 90° left to right).
 
+## Wallpapers
+- Each chat's wallpaper preset and the phone's default come over the same way: `Chat.style` and
+  `defaultChatStyle`, stored in `conversations.wallpaper` and `app_values.default_wallpaper`
+  (migration 0022). Photo wallpapers aren't brought over.
+- `wallpaper_presets()` gives Signal's 21 presets, numbered by `WallpaperPreset`. The popover in
+  the header picks a colour and a wallpaper, or puts either back to the default.
+- The wallpaper fills the timeline and is dimmed in dark mode. Date separators, chat events
+  (missed calls, timer changes), group sender names and a sticker's time get a material pill over
+  a wallpaper, so they stay readable.
+- The batch that reads the account frame sets the phone's defaults, or removes them when the phone
+  has none. Later batches leave them alone.
+
 ## Not in this slice
-Wallpapers (presets and photos); automatic colours that follow a wallpaper.
+Photo wallpapers; automatic bubble colours that follow a wallpaper.
 
 ## Testing
 - Core: preset numbering; row round trip; import of custom gradient, preset and automatic, and the

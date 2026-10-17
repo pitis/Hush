@@ -23,6 +23,11 @@ pub(crate) struct HistoryBatch {
     pub events: Vec<ImportEvent>,
     /// The phone's default bubble colour (set from the account frame, which comes first).
     pub default_chat_color: Option<ChatColor>,
+    /// The phone's default wallpaper (a preset; photos aren't brought over).
+    pub default_wallpaper: Option<ChatColor>,
+    /// The account frame was in this batch: the defaults above are the phone's (None: it has
+    /// none), not merely unknown.
+    pub defaults_read: bool,
 }
 
 impl HistoryBatch {
@@ -43,6 +48,8 @@ pub(crate) struct ImportConversation {
     pub marked_unread: bool,
     /// Its own bubble colour (None: the default).
     pub chat_color: Option<ChatColor>,
+    /// Its own wallpaper preset (None: the default).
+    pub wallpaper: Option<ChatColor>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -127,6 +134,14 @@ enum Known {
     /// The service-id string: a bare ACI uuid, or `PNI:<uuid>`.
     Direct(String),
     Group(String),
+}
+
+/// A chat style's wallpaper preset; None for none, a photo (not brought over) or unknown.
+fn wallpaper(style: &backup::ChatStyle) -> Option<ChatColor> {
+    match &style.wallpaper {
+        Some(backup::chat_style::Wallpaper::WallpaperPreset(p)) => crate::projection::chat_colors::wallpaper(p.value()),
+        _ => None,
+    }
 }
 
 pub(crate) struct Importer {
@@ -312,6 +327,7 @@ impl Importer {
 
     /// Only its colours are ours: the custom ones chats point to, and the default.
     fn account(&mut self, a: &backup::AccountData) {
+        self.batch.defaults_read = true;
         let Some(settings) = a.accountSettings.as_ref() else {
             return;
         };
@@ -331,6 +347,7 @@ impl Importer {
             self.custom_colors.insert(c.id, color);
         }
         self.batch.default_chat_color = settings.defaultChatStyle.as_ref().and_then(|s| self.chat_color(s));
+        self.batch.default_wallpaper = settings.defaultChatStyle.as_ref().and_then(wallpaper);
     }
 
     /// A chat style's bubble colour: a preset or one of the account's custom colours. None for
@@ -363,6 +380,7 @@ impl Importer {
             mute_until: c.muteUntilMs.map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
             marked_unread: c.markedUnread,
             chat_color: c.style.as_ref().and_then(|s| self.chat_color(s)),
+            wallpaper: c.style.as_ref().and_then(wallpaper),
         });
         self.counts.conversations += 1;
     }
@@ -963,6 +981,14 @@ mod tests {
         imp.add(chat(12, 3, style(BubbleColor::AutoBubbleColor(Default::default()))));
         let (batch, _, _) = imp.finish();
         assert_eq!(
+            batch
+                .conversations
+                .iter()
+                .map(|c| c.wallpaper.clone())
+                .collect::<Vec<_>>(),
+            vec![None, None, None]
+        );
+        assert_eq!(
             batch.default_chat_color,
             crate::projection::chat_colors::preset(2),
             "the phone's default, crimson"
@@ -979,6 +1005,50 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn wallpapers_come_from_the_backup_but_photos_dont() {
+        use backup::chat_style::{Wallpaper, WallpaperPreset};
+        let style = |w: Wallpaper| {
+            protobuf::MessageField::some(backup::ChatStyle {
+                wallpaper: Some(w),
+                ..Default::default()
+            })
+        };
+        let mut imp = Importer::new(ME, NOW);
+        imp.add(frame(backup::frame::Item::Account(backup::AccountData {
+            accountSettings: protobuf::MessageField::some(backup::account_data::AccountSettings {
+                defaultChatStyle: style(Wallpaper::WallpaperPreset(WallpaperPreset::SOLID_NAVY.into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })));
+        imp.add(contact_frame(1, ALICE, "Alice"));
+        imp.add(contact_frame(2, BOB, "Bob"));
+        for (id, recipient_id, w) in [
+            (
+                10,
+                1,
+                Wallpaper::WallpaperPreset(WallpaperPreset::GRADIENT_PEACH.into()),
+            ),
+            (11, 2, Wallpaper::WallpaperPhoto(Default::default())),
+        ] {
+            imp.add(frame(backup::frame::Item::Chat(backup::Chat {
+                id,
+                recipientId: recipient_id,
+                style: style(w),
+                ..Default::default()
+            })));
+        }
+        let (batch, _, _) = imp.finish();
+        assert_eq!(
+            batch.default_wallpaper,
+            crate::projection::chat_colors::wallpaper(8),
+            "navy"
+        );
+        let walls: Vec<_> = batch.conversations.iter().map(|c| c.wallpaper.clone()).collect();
+        assert_eq!(walls, vec![crate::projection::chat_colors::wallpaper(21), None]);
     }
 
     #[test]
@@ -1009,6 +1079,7 @@ mod tests {
                 mute_until: i64::MAX,
                 marked_unread: true,
                 chat_color: None,
+                wallpaper: None,
             }]
         );
     }
