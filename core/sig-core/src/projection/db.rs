@@ -481,42 +481,59 @@ impl ProjectionDb {
             .await
     }
 
-    /// Listed chats (with messages) whose picture wasn't looked for in the last day, at most
+    /// Listed, accepted chats whose picture wasn't looked for in the last day, at most
     /// `limit`, the most recent first.
     pub async fn avatars_to_fetch(&self, now_ms: i64, limit: u32) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT id FROM conversations WHERE last_message_at > 0 AND avatar_checked_at <= ?1
-             ORDER BY last_message_at DESC, id LIMIT ?2",
-        )
+        // not a blocked chat's or a message request's: a stranger chooses that picture (as
+        // Signal, which hides it until accepted)
+        sqlx::query_scalar(concat!(
+            "SELECT c.id FROM conversations c WHERE c.last_message_at > 0 AND c.avatar_checked_at <= ?1
+               AND NOT c.blocked AND NOT ",
+            is_request!(),
+            " ORDER BY c.last_message_at DESC, c.id LIMIT ?2"
+        ))
         .bind(now_ms - 24 * 3600 * 1000)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
     }
 
-    /// Keeps a chat's fetched picture as a file beside the attachments (None: it has none, and an
-    /// earlier one goes), as looked for at `now_ms`. True if the picture changed.
+    /// Keeps a chat's fetched picture as a file beside the attachments (None: it has none), as
+    /// looked for at `now_ms`. A new picture gets a new file (the app caches pictures by path)
+    /// and the old one goes. True if the picture changed.
     pub async fn store_avatar(&self, id: &str, bytes: Option<&[u8]>, now_ms: i64) -> Result<bool, sqlx::Error> {
         let dir = self
             .files
             .clone()
             .ok_or_else(|| sqlx::Error::Configuration("no attachments folder".into()))?;
-        let path = dir.join(format!("avatar-{}", id.replace(':', "-")));
-        match bytes {
-            Some(bytes) => {
-                let unchanged = std::fs::read(&path).is_ok_and(|old| old == bytes);
-                if !unchanged {
-                    std::fs::create_dir_all(&dir)?;
-                    std::fs::write(&path, bytes)?;
-                }
-                let stored = self.set_avatar(id, Some(&path.to_string_lossy()), now_ms).await?;
-                Ok(stored || !unchanged)
-            }
-            None => {
-                let _ = std::fs::remove_file(&path);
-                self.set_avatar(id, None, now_ms).await
-            }
+        let old: Option<String> = sqlx::query_scalar("SELECT avatar FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+        let same = match (&old, bytes) {
+            (Some(path), Some(bytes)) => std::fs::read(path).is_ok_and(|b| b == bytes),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            self.set_avatar_checked(id, now_ms).await?;
+            return Ok(false);
         }
+        let path = match bytes {
+            Some(bytes) => {
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(format!("avatar-{}-{now_ms}", id.replace(':', "-")));
+                std::fs::write(&path, bytes)?;
+                Some(path.to_string_lossy().into_owned())
+            }
+            None => None,
+        };
+        self.set_avatar(id, path.as_deref(), now_ms).await?;
+        if let Some(old) = old {
+            let _ = std::fs::remove_file(old);
+        }
+        Ok(true)
     }
 
     /// A chat's picture was looked for (and not found or not reachable) at `now_ms`.
@@ -4955,8 +4972,12 @@ mod tests {
         let day = 24 * 3600 * 1000;
         db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
         db.insert_message(&in_conv("g:00", msg("bob", 2, "yo"))).await.unwrap();
-        // known but not listed (no messages): not asked about
+        // known but not listed (no messages): not asked about; nor a blocked chat
         db.upsert_conversation_title("c:carol", "Carol").await.unwrap();
+        db.insert_message(&in_conv("c:mallory", msg("mallory", 3, "spam")))
+            .await
+            .unwrap();
+        db.block("c:mallory").await.unwrap();
         assert_eq!(
             db.avatars_to_fetch(day, 10).await.unwrap(),
             vec!["g:00", "c:alice"],
@@ -4990,9 +5011,18 @@ mod tests {
         assert!(db.store_avatar("c:alice", Some(b"jpeg"), 1).await.unwrap());
         let path = conv(&db, "c:alice").await.avatar.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"jpeg");
-        assert!(db.store_avatar("c:alice", None, 2).await.unwrap());
-        assert_eq!(conv(&db, "c:alice").await.avatar, None);
+        assert!(
+            !db.store_avatar("c:alice", Some(b"jpeg"), 2).await.unwrap(),
+            "the same picture"
+        );
+        // a new picture is a new file (the app caches by path), the old one goes
+        assert!(db.store_avatar("c:alice", Some(b"png"), 3).await.unwrap());
+        let newer = conv(&db, "c:alice").await.avatar.unwrap();
+        assert_ne!(newer, path);
         assert!(!std::path::Path::new(&path).exists());
+        assert!(db.store_avatar("c:alice", None, 4).await.unwrap());
+        assert_eq!(conv(&db, "c:alice").await.avatar, None);
+        assert!(!std::path::Path::new(&newer).exists());
     }
 
     #[tokio::test]

@@ -126,7 +126,10 @@ final class AppStoreConversationTests: XCTestCase {
         let fake = FakeClient(linked: true)
         var alice = conversation("c:alice")
         alice.avatar = "/data/avatar-c-alice"
-        fake.conversationAnswers = [.success([alice, conversation("c:bob")])]
+        var stranger = conversation("c:mallory")
+        stranger.avatar = "/data/avatar-c-mallory"
+        stranger.messageRequest = true
+        fake.conversationAnswers = [.success([alice, conversation("c:bob"), stranger])]
         let store = await linkedStore(fake)
         await eventually { AvatarPictures.shared.paths["c:alice"] != nil }
         XCTAssertEqual(AvatarPictures.shared.paths, ["c:alice": "/data/avatar-c-alice"])

@@ -1148,6 +1148,8 @@ async fn receive_loop(
     let me = m.registration_data().service_ids.aci.to_string();
     let mut backoff = Duration::from_secs(1);
     let mut progress = Progress::default();
+    // a pass fetching chats' pictures is under way
+    let fetching_avatars = std::rc::Rc::new(std::cell::Cell::new(false));
     loop {
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Connecting,
@@ -1181,12 +1183,22 @@ async fn receive_loop(
                         }
                     };
                     let Some(received) = received else { break };
+                    let pictures = matches!(received, Received::QueueEmpty | Received::Contacts);
                     handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && progress.titles_synced;
                         *ready |= progress.titles_synced;
                         first
                     });
+                    // chats' pictures, beside the receiving (never holding it up), one pass at a time
+                    if pictures && !fetching_avatars.replace(true) {
+                        let (m, db, me, l, running) =
+                            (m.clone(), db.clone(), me.clone(), l.clone(), fetching_avatars.clone());
+                        tokio::task::spawn_local(async move {
+                            fetch_avatars(&m, &db, &me, l.as_ref()).await;
+                            running.set(false);
+                        });
+                    }
                 }
                 if woken {
                     // The server already counts what this connection read as delivered: handle
@@ -1298,14 +1310,10 @@ async fn handle(
             if progress.drained() {
                 sync_titles(m, db, l).await;
             }
-            fetch_avatars(m, db, me, l).await;
             l.on_event(CoreEvent::Ready);
             let _ = queues.storage.send(storage::Trigger::Connected);
         }
-        Received::Contacts => {
-            sync_titles(m, db, l).await;
-            fetch_avatars(m, db, me, l).await;
-        }
+        Received::Contacts => sync_titles(m, db, l).await,
         // Ids only: never log message content.
         Received::DecryptionError(sender) => {
             l.on_event(CoreEvent::Error {
@@ -1489,7 +1497,9 @@ fn content_kind(body: &presage::libsignal_service::content::ContentBody) -> &'st
 /// Copies contact names and group titles from presage's store into the projection.
 /// Fetches the pictures of the listed chats not looked at in the last day (a few per pass): a
 /// contact's profile avatar (with their profile key, ours for Note to Self), a group's avatar.
-/// presage caches both, so a changed picture shows once its profile key changes.
+/// presage caches both without re-checking: a contact's new picture shows once their profile
+/// key changes, a group's not at all (its cache is keyed by the group alone).
+/// Runs beside the receiving, never holding it up.
 async fn fetch_avatars(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, me: &str, l: &dyn EventListener) {
     use presage::libsignal_service::prelude::ProfileKey;
     let now = chrono::Utc::now().timestamp_millis();
