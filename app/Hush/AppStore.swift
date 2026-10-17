@@ -1491,6 +1491,68 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
+    /// Reading a group for its info panel.
+    enum GroupRead: Equatable {
+        /// Its members' and invitees' names are loaded.
+        case known(GroupInfo)
+        /// Not stored yet (no message has come in it).
+        case unknown
+        case failed(String)
+    }
+
+    func groupInfo(_ conversationId: String) async -> GroupRead {
+        guard let client else { return .failed("Not linked yet.") }
+        do {
+            let info = try await client.groupInfo(conversationId: conversationId)
+            for aci in (info?.members.map(\.aci) ?? []) + (info?.invited ?? []) where aci != ownAci {
+                await loadName(aci)
+            }
+            return info.map(GroupRead.known) ?? .unknown
+        } catch {
+            // ids only: a group's id is its key
+            append("group info failed: \(error)")
+            return .failed("Couldn't read the group: \(Self.describe(error))")
+        }
+    }
+
+    /// A group member's name; we are "You".
+    func memberName(_ aci: String) -> String {
+        aci == ownAci ? "You" : senderName(aci)
+    }
+
+    /// Changes a group, one change after the other (the core updates the chat as each lands).
+    /// Returns why the first that failed did, or nil.
+    func changeGroup(_ conversationId: String, _ changes: [GroupChange]) async -> String? {
+        guard let client else { return "Not linked yet." }
+        var failure: String?
+        for change in changes {
+            do {
+                try await client.changeGroup(conversationId: conversationId, change: change)
+            } catch {
+                append("couldn't change a group: \(error)")
+                guard failure == nil else { continue }
+                switch error {
+                // the server's refusal, or no answer: not only "couldn't be reached"
+                case CoreError.Network(let message): failure = "Couldn't change the group: \(message)"
+                default: failure = "Couldn't change the group: \(Self.describe(error))"
+                }
+            }
+        }
+        return failure
+    }
+
+    /// People who can be added to a group: those we have a chat with (accepted, not blocked,
+    /// known by account), but us and `members`, by name.
+    func addableContacts(excluding members: Set<String>) -> [(aci: String, name: String)] {
+        conversations.compactMap { c -> (aci: String, name: String)? in
+            guard c.kind == .direct, !c.blocked, !c.messageRequest, !c.id.hasPrefix("c:PNI:") else { return nil }
+            let aci = String(c.id.dropFirst(2))
+            guard aci != ownAci, !members.contains(aci) else { return nil }
+            return (aci, title(c))
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     /// Who can be mentioned in a group: its members but us, each with a name (ACI, name).
     func mentionCandidates(_ conversationId: String) async -> [(String, String)] {
         guard let client, conversationId.hasPrefix("g:") else { return [] }

@@ -6,6 +6,7 @@ mod client;
 mod download;
 mod error;
 mod events;
+mod groups;
 mod history;
 mod link_preview;
 mod logging;

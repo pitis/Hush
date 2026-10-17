@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use crate::actor::{self, Command};
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
+use crate::groups::{GroupChange, GroupInfo};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
     Attachment, BodyRange, ChatColor, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey,
@@ -1183,6 +1184,36 @@ impl Client {
         Ok(Some(id))
     }
 
+    /// A group as its info panel shows it; None if it isn't known yet (or not a group).
+    pub async fn group_info(&self, conversation_id: String) -> Result<Option<GroupInfo>, CoreError> {
+        let Some(key) = crate::projection::ids::group_key(&conversation_id) else {
+            return Ok(None);
+        };
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::GroupInfo { key, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Storage { message })
+    }
+
+    /// Changes a group, as its access control allows us; its members are told. Answers once the
+    /// server has it, the chat updated to presage's group (also after a failure, which may come
+    /// after the server took the change).
+    pub async fn change_group(&self, conversation_id: String, change: GroupChange) -> Result<(), CoreError> {
+        let invalid = |message: String| CoreError::InvalidInput { message };
+        let key = crate::projection::ids::group_key(&conversation_id).ok_or(invalid("not a group".into()))?;
+        let edit = crate::groups::edit(change).map_err(invalid)?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::ChangeGroup { key, edit, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })
+    }
+
     /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
     pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
         Ok(self.db.group_members(&conversation_id).await?)
@@ -1444,6 +1475,40 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(matches!(err, CoreError::Storage { .. }), "{err}");
+    }
+
+    #[test]
+    fn group_changes_need_a_group_a_valid_change_and_a_link() {
+        let dir = temp_dir("client-group");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let direct = "c:22222222-2222-2222-2222-222222222222".to_string();
+            let group = format!("g:{}", "ab".repeat(32));
+            assert_eq!(client.group_info(direct.clone()).await.unwrap(), None);
+            assert!(matches!(
+                client.group_info(group.clone()).await,
+                Err(CoreError::NotLinked)
+            ));
+            assert!(matches!(
+                client.change_group(direct, GroupChange::Leave).await,
+                Err(CoreError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                client
+                    .change_group(group.clone(), GroupChange::Title { title: " ".into() })
+                    .await,
+                Err(CoreError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                client.change_group(group, GroupChange::Leave).await,
+                Err(CoreError::NotLinked)
+            ));
+        });
     }
 
     #[test]

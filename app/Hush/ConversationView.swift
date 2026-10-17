@@ -135,6 +135,7 @@ struct ConversationHeader: View {
     let store: AppStore
     let conversation: Conversation
     @State private var choosingColor = false
+    @State private var showingGroupInfo = false
 
     /// A group's timer changes with the group (from the phone); a blocked or unaccepted chat
     /// has nothing to send it to.
@@ -202,6 +203,17 @@ struct ConversationHeader: View {
                 .fixedSize()
                 .help("Disappearing messages")
                 .accessibilityLabel("Disappearing messages")
+            }
+            if conversation.kind == .group {
+                Button {
+                    showingGroupInfo = true
+                } label: {
+                    Image(systemName: "info.circle").font(.system(size: 15))
+                }
+                .buttonStyle(.plain)
+                .help("Group info")
+                .accessibilityLabel("Group info")
+                .sheet(isPresented: $showingGroupInfo) { GroupInfoView(store: store, conversation: conversation) }
             }
             Button {
                 choosingColor = true
