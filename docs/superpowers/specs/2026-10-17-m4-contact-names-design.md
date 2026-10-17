@@ -15,6 +15,10 @@ names a contact by nickname, then address-book name, then profile name.
 ## Design
 - Migration 0019: `conversations.storage_name`, `conversations.note`, written by the storage
   pull (`set_contact_details`; the name is the nickname, else the address-book name).
+- Records pulled before this read their details (an existing install) are read once more, for
+  their details only (`storage_sync.details_read`; the manifest is asked for even if its version
+  is the same): a chat's settings and the pinned list aren't re-applied, so pending local
+  changes stay. Usernames (#72) come along the same way.
 - `conversations()` and `title(id)` read `COALESCE(storage_name, title)`; the profile's name
   stays in `title`, untouched.
 

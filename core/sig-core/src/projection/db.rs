@@ -854,6 +854,23 @@ impl ProjectionDb {
         Ok(())
     }
 
+    /// Whether the stored records were read for their contact details (names, notes,
+    /// usernames). True when there's no state yet: the first pull reads every record.
+    pub async fn storage_details_read(&self) -> Result<bool, sqlx::Error> {
+        let read: Option<bool> = sqlx::query_scalar("SELECT details_read FROM storage_sync WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(read.unwrap_or(true))
+    }
+
+    pub async fn mark_storage_details_read(&self, read: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE storage_sync SET details_read = ?1 WHERE id = 1")
+            .bind(read)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Forgets the applied manifest and its items (a new storage key): the next pull starts
     /// from nothing. Dirty marks stay, the account's too.
     pub async fn reset_storage_state(&self) -> Result<(), sqlx::Error> {

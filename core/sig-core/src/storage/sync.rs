@@ -41,7 +41,9 @@ pub(crate) async fn pull(
         state = None;
     }
     let version = state.as_ref().map_or(0, |s| s.version);
-    let Some(manifest) = api.manifest_if_changed(version).await? else {
+    // records pulled before their contact details were read are read once more, for those only
+    let refresh = !db.storage_details_read().await?;
+    let Some(manifest) = api.manifest_if_changed(if refresh { 0 } else { version }).await? else {
         return Ok(PullOutcome {
             applied: 0,
             chats_changed: false,
@@ -57,7 +59,7 @@ pub(crate) async fn pull(
     let wanted: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
-        .filter(|(k, _)| !stored.contains_key(k))
+        .filter(|(k, _)| refresh || !stored.contains_key(k))
         .map(|(k, _)| k.clone())
         .collect();
     let gone = stored
@@ -85,7 +87,10 @@ pub(crate) async fn pull(
                 name,
                 note,
             }) => {
-                changed |= db.apply_remote_chat(conversation_id, flags).await?;
+                // a record read again only for its details leaves the chat's settings be
+                if !(refresh && stored.contains_key(key)) {
+                    changed |= db.apply_remote_chat(conversation_id, flags).await?;
+                }
                 // it can turn a chat into a request or out of one
                 changed |= db.set_phone_contact(conversation_id, *phone_contact).await?;
                 changed |= db.set_username(conversation_id, username.as_deref()).await?;
@@ -95,7 +100,10 @@ pub(crate) async fn pull(
                 Some(conversation_id.clone())
             }
             Some(Remote::Account { pins, note_to_self }) => {
-                account = Some((pins.clone(), *note_to_self));
+                // read again only for contacts' details: pending pin changes stay
+                if !(refresh && stored.contains_key(key)) {
+                    account = Some((pins.clone(), *note_to_self));
+                }
                 None
             }
             Some(Remote::Other) => None,
@@ -136,6 +144,9 @@ pub(crate) async fn pull(
         unmappable_pins,
     })
     .await?;
+    if refresh {
+        db.mark_storage_details_read(true).await?;
+    }
     tracing::info!(
         version = manifest.version,
         read = wanted.len(),
@@ -633,6 +644,7 @@ mod tests {
         })
         .await
         .unwrap();
+        db.mark_storage_details_read(true).await.unwrap();
         db
     }
 
@@ -770,6 +782,63 @@ mod tests {
             dirty[0].1.mute_until, 5,
             "alice's record wasn't re-read: her change stands"
         );
+    }
+
+    #[tokio::test]
+    async fn records_pulled_before_details_were_read_are_read_once_for_them_only() {
+        let db = synced_db().await;
+        db.mark_storage_details_read(false).await.unwrap(); // as after the upgrade
+        db.set_mute_until(&format!("c:{ALICE}"), 5).await.unwrap(); // a pending change of ours
+        let mut named = presage::libsignal_service::proto::ContactRecord {
+            aci: ALICE.into(),
+            username: "alice.42".into(),
+            note: "from work".into(),
+            ..Default::default()
+        };
+        named.nickname = Some(presage::libsignal_service::proto::contact_record::Name {
+            given: "Ali".into(),
+            family: String::new(),
+        });
+        let mut api = FakeApi {
+            // the same manifest version: asked again all the same
+            manifest: Some(Manifest {
+                version: 3,
+                identifiers: vec![(key(0xA), KIND_CONTACT), (key(0xAC), KIND_ACCOUNT)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        api.items.insert(
+            key(0xA),
+            presage::libsignal_service::proto::StorageRecord {
+                record: Some(presage::libsignal_service::proto::storage_record::Record::Contact(
+                    named,
+                )),
+            }
+            .encode_to_vec(),
+        );
+        pull(&mut api, &db, &keys(), ME).await.unwrap();
+        let alice = db
+            .conversations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == format!("c:{ALICE}"))
+            .unwrap();
+        assert_eq!(
+            (alice.title.as_str(), alice.note.as_deref(), alice.username.as_deref()),
+            ("Ali", Some("from work"), Some("alice.42"))
+        );
+        assert_eq!(
+            db.dirty_chats().await.unwrap()[0].1.mute_until,
+            5,
+            "our pending change stands"
+        );
+        // once only
+        assert!(db.storage_details_read().await.unwrap());
+        api.manifest_calls.clear();
+        pull(&mut api, &db, &keys(), ME).await.unwrap();
+        assert_eq!(api.manifest_calls, vec![3]);
     }
 
     #[tokio::test]
