@@ -1463,6 +1463,11 @@ final class AppStore {
                     guard generation == listenerGeneration else { return }
                     conversations = found
                     conversationsLoaded = true
+                    // a blocked chat's or a request's picture isn't shown (a stranger chose it)
+                    AvatarPictures.shared.paths = Dictionary(
+                        found.filter { !$0.blocked && !$0.messageRequest }.compactMap { c in c.avatar.map { (c.id, $0) }
+                        },
+                        uniquingKeysWith: { a, _ in a })
                     Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
                     // group rows say who wrote the last message
                     for c in conversations where c.kind == .group && !c.lastMessageOutgoing {

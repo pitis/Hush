@@ -18,12 +18,28 @@ enum Theme {
     static let bubbleRadius: CGFloat = 18
 }
 
+/// The chats' pictures by chat id (`Conversation.avatar`), for every `Avatar` to find.
+@MainActor @Observable
+final class AvatarPictures {
+    static let shared = AvatarPictures()
+    var paths: [String: String] = [:]
+}
+
 struct Avatar: View {
     let id: String
     let name: String
     var size: CGFloat = 44
 
     var body: some View {
+        if let path = AvatarPictures.shared.paths[id] {
+            ThumbnailImage(path: path).frame(width: size, height: size).clipShape(Circle())
+                .accessibilityHidden(true)
+        } else {
+            initials
+        }
+    }
+
+    private var initials: some View {
         Circle()
             .fill(Theme.avatars[Formatting.avatarIndex(id)].gradient)
             .overlay(

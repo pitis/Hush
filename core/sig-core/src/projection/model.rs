@@ -59,6 +59,8 @@ pub struct Conversation {
     /// read receipts go out. Only once the phone's account state has been read (before that,
     /// every chat counts as accepted).
     pub message_request: bool,
+    /// The chat's picture file (a contact's profile avatar, a group's), when it has one.
+    pub avatar: Option<String>,
     /// A contact's username, when known.
     pub username: Option<String>,
 }
