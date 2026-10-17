@@ -13,7 +13,7 @@ option=$(ghp project field-list $PROJECT --owner $OWNER --format json |
   jq -r --arg f "$FIELD_ID" --arg s "$status" '.fields[] | select(.id==$f) | .options[] | select(.name==$s) | .id')
 [ -n "$option" ] || { echo "✗ unknown status: $status" >&2; exit 2; }
 items=$(ghp project item-list $PROJECT --owner $OWNER --format json --limit 1000 |
-  jq -r --argjson n "$issue" --arg r "$REPO" '.items[] | select(.content.number==$n and .content.repository==$r) | .id')
+  jq -r --argjson n "$issue" --arg r "$REPO" '.items[] | select(.content.number==$n and (.content.repository|ascii_downcase)==($r|ascii_downcase)) | .id')
 case $(grep -c . <<<"$items" || true) in
   0) echo "✗ issue #$issue is not on the board" >&2; exit 2 ;;
   1) ;;
