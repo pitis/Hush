@@ -725,7 +725,7 @@ async fn run(
                             match tokio::time::timeout(Duration::from_secs(30), Box::pin(m.cancel_join_request(&key)))
                                 .await
                             {
-                                Ok(r) => r.map_err(|e| e.to_string()),
+                                Ok(r) => r.map_err(|e| crate::groups::without_link(e.to_string())),
                                 Err(_) => Err("the server didn't answer in time".into()),
                             };
                         let own = m.registration_data().service_ids.clone();
@@ -1091,7 +1091,8 @@ async fn our_new_group(
     Ok(group.filter(ours).map(|_| key))
 }
 
-/// What a group's link shows: our own copy if we're in the group, else the server's answer to
+/// What a group's link shows: the group as the server has it for us if we're in it (our copy
+/// may say so though we were removed: it's fetched again), else the server's answer to
 /// whoever has the link.
 async fn preview_link(
     m: &mut Manager<SqliteStore, Registered>,
@@ -1100,11 +1101,18 @@ async fn preview_link(
     let id = group_id(&link.master_key);
     let me = m.registration_data().service_ids.aci;
     let ours = m.store().group(link.master_key).await.map_err(|e| e.to_string())?;
-    if let Some(g) = ours.filter(|g| g.members.iter().any(|x| ServiceId::from(x.aci).raw_uuid() == me)) {
-        return Ok(crate::groups::member_preview(&g, id));
+    if ours.is_some_and(|g| crate::groups::is_member(&g, me)) {
+        // a removed member can't fetch it: then they're asked as anyone with the link
+        if let Ok(Ok(g)) =
+            tokio::time::timeout(Duration::from_secs(20), Box::pin(m.fetch_group(&link.master_key))).await
+        {
+            if crate::groups::is_member(&g, me) {
+                return Ok(crate::groups::member_preview(&g, id));
+            }
+        }
     }
     let info = match tokio::time::timeout(Duration::from_secs(20), Box::pin(m.group_join_info(link))).await {
-        Ok(info) => info.map_err(|e| e.to_string())?,
+        Ok(info) => info.map_err(|e| crate::groups::without_link(e.to_string()))?,
         Err(_) => return Err("the server didn't answer in time".into()),
     };
     crate::groups::preview(&info, id)
@@ -1121,14 +1129,22 @@ async fn join_group(
     link: &GroupInviteLink,
 ) -> Result<bool, String> {
     use presage::manager::GroupJoin;
+    let own = m.registration_data().service_ids.clone();
+    let key = link.master_key;
+    // where we stood before: a failure counts as joined only if that moved
+    let standing = |g: Option<presage::model::groups::Group>| {
+        g.and_then(|g| match crate::groups::is_member(&g, own.aci) {
+            true => Some(false),
+            false => (crate::groups::standing(&g, own.aci, own.pni) == GroupStanding::Requesting).then_some(true),
+        })
+    };
+    let before = standing(m.store().group(key).await.map_err(|e| e.to_string())?);
     let joined = match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.join_group(link))).await {
         Ok(Ok(GroupJoin::Joined { .. })) => Ok(false),
         Ok(Ok(GroupJoin::Requested)) => Ok(true),
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Err(e)) => Err(crate::groups::without_link(e.to_string())),
         Err(_) => Err("the server didn't answer in time".into()),
     };
-    let own = m.registration_data().service_ids.clone();
-    let key = link.master_key;
     let now = chrono::Utc::now().timestamp_millis();
     match joined {
         Ok(requested) => {
@@ -1136,18 +1152,12 @@ async fn join_group(
             Ok(requested)
         }
         Err(problem) => {
-            let standing = match m.store().group(key).await {
-                Ok(Some(g)) if g.members.iter().any(|x| ServiceId::from(x.aci).raw_uuid() == own.aci) => Some(false),
-                Ok(Some(g))
-                    if g.requesting_members
-                        .iter()
-                        .any(|r| ServiceId::from(r.aci).raw_uuid() == own.aci) =>
-                {
-                    Some(true)
-                }
-                _ => None,
+            let after = match m.store().group(key).await {
+                Ok(g) => standing(g),
+                Err(e) => return Err(format!("{problem}; reading the group failed: {e}")),
             };
-            let Some(requested) = standing else {
+            // presage's copy from before this attempt (an old request) isn't this join
+            let Some(requested) = after.filter(|_| after != before) else {
                 return Err(problem);
             };
             list_new_group(m.store(), &own, db, l, &key, now).await;
@@ -2121,17 +2131,7 @@ async fn store_group(
         .map(|m| ServiceId::from(m.aci).raw_uuid().to_string())
         .collect();
     let timer = g.disappearing_messages_timer.as_ref().map_or(0, |t| t.duration);
-    let standing = if crate::groups::invited(g, own.aci, own.pni) {
-        GroupStanding::Invited
-    } else if g
-        .requesting_members
-        .iter()
-        .any(|r| ServiceId::from(r.aci).raw_uuid() == own.aci)
-    {
-        GroupStanding::Requesting
-    } else {
-        GroupStanding::Other
-    };
+    let standing = crate::groups::standing(g, own.aci, own.pni);
     db.set_group(&group_id(key), g.revision, &g.title, &members, timer, standing)
         .await
 }

@@ -1543,7 +1543,9 @@ final class AppStore {
     /// A clicked link: a group's invite link opens the join sheet (true); others are the
     /// system's.
     func handleLink(_ url: URL) -> Bool {
-        guard url.scheme == "https" || url.scheme == "sgnl", url.host() == "signal.group" else { return false }
+        guard url.scheme == "https" || url.scheme == "sgnl", url.host() == "signal.group",
+            url.fragment?.isEmpty == false
+        else { return false }
         joiningLink = url.absoluteString
         return true
     }

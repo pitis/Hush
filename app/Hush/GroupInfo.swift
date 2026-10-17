@@ -450,6 +450,7 @@ struct JoinGroupSheet: View {
             Text("Join a group").font(.system(size: 17, weight: .semibold))
             TextField("Group link", text: $link).textFieldStyle(.roundedBorder)
                 .onSubmit(show)
+                .disabled(busy)
                 .onChange(of: link) {
                     read = nil
                     problem = nil
@@ -495,7 +496,8 @@ struct JoinGroupSheet: View {
 
     @ViewBuilder private var primary: some View {
         if case .group(let group) = read {
-            if group.member || group.requested {
+            // asked from another device (no chat here): asking again lists it
+            if group.member || (group.requested && store.conversations.contains { $0.id == group.conversationId }) {
                 Button("Open Chat") {
                     store.select(group.conversationId)
                     dismiss()
@@ -510,8 +512,11 @@ struct JoinGroupSheet: View {
 
     private func show() {
         busy = true
+        let asked = link.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
-            read = await store.previewGroupLink(link.trimmingCharacters(in: .whitespacesAndNewlines))
+            let answer = await store.previewGroupLink(asked)
+            // the link changed meanwhile: this preview isn't the one to join from
+            if link.trimmingCharacters(in: .whitespacesAndNewlines) == asked { read = answer }
             busy = false
         }
     }

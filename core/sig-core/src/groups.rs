@@ -257,10 +257,44 @@ pub fn invited(group: &Group, aci: Uuid, pni: Uuid) -> bool {
     invitation(group, aci, pni).is_some()
 }
 
+/// Where we (our ACI, our number's PNI) stand in `group`: an invitation outranks a request.
+pub fn standing(group: &Group, aci: Uuid, pni: Uuid) -> crate::projection::GroupStanding {
+    use crate::projection::GroupStanding;
+    if invited(group, aci, pni) {
+        GroupStanding::Invited
+    } else if group
+        .requesting_members
+        .iter()
+        .any(|r| ServiceId::from(r.aci).raw_uuid() == aci)
+    {
+        GroupStanding::Requesting
+    } else {
+        GroupStanding::Other
+    }
+}
+
+/// We're one of `group`'s members.
+pub fn is_member(group: &Group, aci: Uuid) -> bool {
+    group.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == aci)
+}
+
+/// A server error's text without the invite link's password, which the join path carries
+/// (`/v1/groups/join/<password>`): it may be logged.
+pub fn without_link(error: String) -> String {
+    const PATH: &str = "groups/join/";
+    let Some(start) = error.find(PATH).map(|i| i + PATH.len()) else {
+        return error;
+    };
+    let end = error[start..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | '%')))
+        .map_or(error.len(), |i| start + i);
+    format!("{}…{}", &error[..start], without_link(error[end..].to_string()))
+}
+
 /// Our answer to an invitation shows in `group`: accepted, we're a member; declined, we're
 /// neither a member nor invited.
 pub fn answered(group: &Group, aci: Uuid, pni: Uuid, accept: bool) -> bool {
-    let member = group.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == aci);
+    let member = is_member(group, aci);
     if accept {
         member
     } else {
@@ -614,5 +648,37 @@ mod tests {
         assert!(preview(&info, "g:x".into()).is_err(), "turned off");
         let ours = member_preview(&group(vec![member(ME, Role::Default)], None), "g:x".into());
         assert!(ours.member && ours.member_count == 1 && ours.title == "Hikers");
+    }
+
+    #[test]
+    fn where_we_stand_invited_asking_or_neither() {
+        use crate::projection::GroupStanding;
+        use presage::model::groups::RequestingMember;
+        let carol = Uuid::parse_str(CAROL).unwrap();
+        let me = Uuid::parse_str(ME).unwrap();
+        let mut g = group(vec![member(ALICE, Role::Administrator)], None);
+        assert_eq!(standing(&g, carol, Uuid::nil()), GroupStanding::Invited);
+        g.requesting_members = vec![RequestingMember {
+            aci: super::aci(ME).unwrap(),
+            profile_key: ProfileKey::create([0; 32]),
+            timestamp: 0,
+        }];
+        assert_eq!(standing(&g, me, Uuid::nil()), GroupStanding::Requesting);
+        g.requesting_members[0].aci = super::aci(CAROL).unwrap();
+        assert_eq!(standing(&g, carol, Uuid::nil()), GroupStanding::Invited, "invited wins");
+        g.requesting_members.clear();
+        g.members.push(member(ME, Role::Default));
+        assert_eq!(standing(&g, me, Uuid::nil()), GroupStanding::Other, "let in");
+        assert!(is_member(&g, me));
+    }
+
+    #[test]
+    fn a_link_password_never_leaves_in_an_error() {
+        assert_eq!(
+            without_link("error sending request for url (https://x/v1/groups/join/Ab-c_9%3D): timed out".into()),
+            "error sending request for url (https://x/v1/groups/join/…): timed out"
+        );
+        assert_eq!(without_link("refused".into()), "refused");
+        assert_eq!(without_link("groups/join/abc".into()), "groups/join/…");
     }
 }

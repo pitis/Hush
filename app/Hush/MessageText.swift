@@ -57,7 +57,23 @@ enum MessageText {
             run[StylesKey.self]?.contains(.strikethrough) == true ? run.range : nil
         }
         for range in struck { text[range].strikethroughStyle = .single }
+        // a group's invite link joins here (`AppStore.handleLink`); other links stay text
+        for range in groupLinks(in: text) { text[range].link = URL(string: String(text[range].characters)) }
         return text
+    }
+
+    /// Where `text` has a group's invite link, but under a hidden spoiler.
+    static func groupLinks(in text: AttributedString) -> [Range<AttributedString.Index>] {
+        let plain = String(text.characters)
+        let link = ##/(?:https|sgnl)://signal\.group/#[A-Za-z0-9_=%-]+/##
+        return plain.matches(of: link).compactMap { match in
+            let lower = text.characters.index(
+                text.startIndex, offsetBy: plain.distance(from: plain.startIndex, to: match.range.lowerBound))
+            let upper = text.characters.index(
+                lower, offsetBy: plain.distance(from: match.range.lowerBound, to: match.range.upperBound))
+            let range = lower..<upper
+            return text[range].runs.allSatisfy { $0.backgroundColor == nil } ? range : nil
+        }
     }
 
     /// `body` as plain text: mentions as "@name", spoilers hidden unless `revealSpoilers` (Copy).

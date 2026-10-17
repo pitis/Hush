@@ -1261,7 +1261,13 @@ impl Client {
             .await
             .map_err(|_| CoreError::Closed)?
             .map_err(|message| CoreError::Network { message })?;
-        self.accept_request(conversation_id.clone()).await?;
+        // in or asking whatever happens next: a failure here is said, not the join's
+        if let Err(e) = self.accept_request(conversation_id.clone()).await {
+            tracing::warn!(error = %e, "a joined group's chat couldn't be accepted");
+            self.listener.on_event(CoreEvent::Error {
+                message: "The group's chat couldn't be accepted; accept it in the chat.".into(),
+            });
+        }
         Ok(GroupJoined {
             conversation_id,
             requested,

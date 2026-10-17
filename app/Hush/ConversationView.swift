@@ -86,6 +86,8 @@ struct RequestBar: View {
                     Button("Unblock") { store.acceptRequest(conversation.id) }
                         .keyboardShortcut(.defaultAction)
                 } else if conversation.groupJoinRequested {
+                    // here only, should cancelling fail for good (the request stays)
+                    Button("Delete") { confirming = .delete }
                     Button("Cancel Request") { confirming = .cancelRequest }.disabled(answering)
                 } else if conversation.groupInvitation {
                     Button("Block") { confirming = .block }
