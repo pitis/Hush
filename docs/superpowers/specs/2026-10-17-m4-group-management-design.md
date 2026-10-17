@@ -22,9 +22,12 @@ the stored group's fetches the group before the content reaches us.
    members and timer are re-read from presage's group when its revision moved (migration:
    `conversations.group_revision`). A group's message, edit, reaction, typing or story from an
    ACI that isn't a member is dropped like a blocked sender's (its presage copy queued to go).
-   Membership not known at the message's revision (the group was never stored, or presage
-   couldn't fetch the revision the message was sent at) drops nothing: losing a message is
-   worse.
+   A message claiming a revision newer than presage's group (presage's refresh failed) fetches
+   the group once more. The claimed revision never turns the check off (anyone can claim one):
+   a stored group's members judge every message, so a just-added member's message is lost only
+   if both fetches fail. A group never stored drops nothing. Senders are judged against the
+   group's latest members, as Signal's apps do: a message delayed past its sender's removal
+   is dropped too.
 2. **Group info.** A panel from the chat header: picture, title, description, members (admins
    marked), invited and requesting people. Admins (or everyone, as the group's access control
    says) edit title, description, picture and timer; admins add and remove members, make and
