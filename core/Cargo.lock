@@ -1665,7 +1665,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2323,7 +2323,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/whisperfish/libsignal-service-rs?rev=fae0679db1659bb2decb650fd07437c5dfd72f37#fae0679db1659bb2decb650fd07437c5dfd72f37"
+source = "git+https://github.com/barafael/libsignal-service-rs?rev=ec24ab5fc034c8cbdf2bff71ec5f508eeab58bee#ec24ab5fc034c8cbdf2bff71ec5f508eeab58bee"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -2910,7 +2910,7 @@ dependencies = [
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=07815e7e2f649396f2fdd8f44c722688b612c854#07815e7e2f649396f2fdd8f44c722688b612c854"
+source = "git+https://github.com/barafael/presage?rev=61721f2e9fe9cfa539373e23bfd67d3484c6442c#61721f2e9fe9cfa539373e23bfd67d3484c6442c"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2932,7 +2932,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=07815e7e2f649396f2fdd8f44c722688b612c854#07815e7e2f649396f2fdd8f44c722688b612c854"
+source = "git+https://github.com/barafael/presage?rev=61721f2e9fe9cfa539373e23bfd67d3484c6442c#61721f2e9fe9cfa539373e23bfd67d3484c6442c"
 dependencies = [
  "async-trait",
  "bytes",
