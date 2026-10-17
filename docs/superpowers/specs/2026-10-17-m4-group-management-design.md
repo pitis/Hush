@@ -30,9 +30,12 @@ the stored group's fetches the group before the content reaches us.
    group's latest members, as Signal's apps do: a message delayed past its sender's removal
    is dropped too.
 2. **Group info.** A panel from the chat header: picture, title, description, members (admins
-   marked), invited and requesting people. Admins (or everyone, as the group's access control
-   says) edit title, description, picture and timer; admins add and remove members, make and
-   unmake admins, approve or deny requests. Anyone leaves. Read live from presage's group.
+   marked) and invited people. As the group's access control says, members or only admins
+   edit title, description, picture and timer, and add members (picked from the people we
+   have accepted chats with); admins remove members and make and unmake admins. Anyone
+   leaves. Read live from presage's group (`Client::group_info`); each change goes through
+   `Client::change_group`, which stores the group in its chat once the server has it. A
+   picture is a file, sent as a JPEG of at most 1024 px. Join requests wait for piece 4.
 3. **New group.** From the sidebar's compose menu: name, members picked from contacts.
 4. **Invitations and invite links.** An invitation shows as a request to accept or decline;
    admins turn the link on (open or with approval), copy and reset it; a pasted
