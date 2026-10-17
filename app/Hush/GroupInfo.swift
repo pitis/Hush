@@ -18,6 +18,8 @@ struct GroupInfoView: View {
     @State private var confirmingLeave = false
     @State private var removing: GroupMember?
     @State private var confirmingReset = false
+    /// The link was just copied (or couldn't be).
+    @State private var copied: Bool?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -214,9 +216,13 @@ struct GroupInfoView: View {
                 HStack {
                     Button("Copy Link") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(link, forType: .string)
+                        copied = NSPasteboard.general.setString(link, forType: .string)
                     }
                     if info.admin { Button("Reset Link…") { confirmingReset = true }.disabled(busy) }
+                    if let copied {
+                        Text(copied ? "Copied" : "Couldn't copy the link").font(.system(size: 12))
+                            .foregroundStyle(copied ? Theme.secondaryText : .red)
+                    }
                 }
             }
         }

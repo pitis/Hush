@@ -43,9 +43,10 @@ the stored group's fetches the group before the content reaches us.
    (telling the members), the chat is still listed and opened, the failure shown: it's the
    one group presage didn't have before, under our name at its first revision. A picture is set afterwards in the group's info.
 4. **Invitations and invite links.** A group that invites us (our account, or our number's
-   PNI) lists its chat as it reaches us, unless the inviter or the group is blocked
-   (`conversations.group_invited`). The chat offers Join, Decline (which also deletes it)
-   and Block instead of the composer. In the info panel, admins turn the link on (anyone
+   PNI) lists its chat whenever it's stored so, unless the inviter or the group is blocked
+   (`conversations.group_invited`; an invitation isn't a message request). The chat offers
+   Join (which also accepts the chat), Decline (which also deletes it) and Block instead of
+   the composer. An answer that took counts as answered even if telling the group failed. In the info panel, admins turn the link on (anyone
    joins, or admins approve) or off, and reset it; members copy it while it's on. It holds
    the group's key, so it is never shown or logged. Admins approve or deny requests to join.
 5. **Joining by link.** A pasted `signal.group` link shows the group and joins it, or asks

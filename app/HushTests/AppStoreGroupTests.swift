@@ -115,7 +115,7 @@ final class AppStoreGroupTests: XCTestCase {
         fake.failingGroupChange = .declineInvitation
         let store = await linkedStore(fake)
         let failure = await store.answerInvitation(group, accept: false)
-        XCTAssertEqual(failure, "Couldn't change the group: refused")
+        XCTAssertEqual(failure, "Couldn't decline the invitation: refused")
         try? await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(fake.flagCalls, [])
     }

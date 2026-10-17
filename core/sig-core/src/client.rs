@@ -1204,6 +1204,7 @@ impl Client {
     pub async fn change_group(&self, conversation_id: String, change: GroupChange) -> Result<(), CoreError> {
         let invalid = |message: String| CoreError::InvalidInput { message };
         let key = crate::projection::ids::group_key(&conversation_id).ok_or(invalid("not a group".into()))?;
+        let joining = change == GroupChange::AcceptInvitation;
         let edit = crate::groups::edit(change).map_err(invalid)?;
         self.own_aci().ok_or(CoreError::NotLinked)?;
         let (done, answer) = tokio::sync::oneshot::channel();
@@ -1211,7 +1212,12 @@ impl Client {
         answer
             .await
             .map_err(|_| CoreError::Closed)?
-            .map_err(|message| CoreError::Network { message })
+            .map_err(|message| CoreError::Network { message })?;
+        // joining accepts the chat, as Signal's apps do: it isn't asked about again
+        if joining {
+            self.accept_request(conversation_id).await?;
+        }
+        Ok(())
     }
 
     /// Makes a group with `members` (ACIs): those we have a profile key for join, the others are

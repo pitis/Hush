@@ -1523,7 +1523,9 @@ final class AppStore {
 
     /// Changes a group, one change after the other (the core updates the chat as each lands).
     /// Returns why the first that failed did, or nil.
-    func changeGroup(_ conversationId: String, _ changes: [GroupChange]) async -> String? {
+    func changeGroup(
+        _ conversationId: String, _ changes: [GroupChange], failing: String = "Couldn't change the group"
+    ) async -> String? {
         guard let client else { return "Not linked yet." }
         var failure: String?
         for change in changes {
@@ -1534,8 +1536,8 @@ final class AppStore {
                 guard failure == nil else { continue }
                 switch error {
                 // the server's refusal, or no answer: not only "couldn't be reached"
-                case CoreError.Network(let message): failure = "Couldn't change the group: \(message)"
-                default: failure = "Couldn't change the group: \(Self.describe(error))"
+                case CoreError.Network(let message): failure = "\(failing): \(message)"
+                default: failure = "\(failing): \(Self.describe(error))"
                 }
             }
         }
@@ -1559,10 +1561,13 @@ final class AppStore {
         }
     }
 
-    /// Answers a group's invitation: accepting joins it, declining also deletes its chat. nil, or
-    /// why it failed (the chat then stays).
+    /// Answers a group's invitation: accepting joins it (and accepts the chat), declining also
+    /// deletes its chat. nil, or why it failed (the chat then stays).
     func answerInvitation(_ conversationId: String, accept: Bool) async -> String? {
-        if let failure = await changeGroup(conversationId, [accept ? .acceptInvitation : .declineInvitation]) {
+        let failing = accept ? "Couldn't join the group" : "Couldn't decline the invitation"
+        if let failure = await changeGroup(
+            conversationId, [accept ? .acceptInvitation : .declineInvitation], failing: failing)
+        {
             return failure
         }
         if !accept { deleteChat(conversationId) }

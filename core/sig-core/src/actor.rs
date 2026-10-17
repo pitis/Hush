@@ -890,6 +890,11 @@ async fn change_group(
         GroupEdit::Avatar(bytes) => Some(bytes.clone()),
         _ => None,
     };
+    let answer = match &edit {
+        GroupEdit::AcceptInvitation => Some(true),
+        GroupEdit::DeclineInvitation => Some(false),
+        _ => None,
+    };
     let changed = match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.change_group(&key, edit))).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
@@ -900,6 +905,19 @@ async fn change_group(
     let picture = picture.filter(|_| changed.is_ok());
     let own = m.registration_data().service_ids.clone();
     settle_group(m.store(), &own, db, l, &key, picture.as_deref()).await;
+    // an answer to an invitation that took is answered, though the members weren't told
+    if let (Err(problem), Some(accept)) = (&changed, answer) {
+        if let Ok(Some(g)) = m.store().group(key).await {
+            if crate::groups::answered(&g, own.aci, own.pni, accept) {
+                l.on_event(CoreEvent::Error {
+                    message: format!(
+                        "Your answer to the invitation went through, but the group may not know yet: {problem}"
+                    ),
+                });
+                return Ok(());
+            }
+        }
+    }
     changed
 }
 
@@ -1982,6 +2000,25 @@ async fn store_group(
         .await
 }
 
+/// Lists the chat of a group that invites us (`own`), from now, unless the group or whoever
+/// invited us is blocked; returns whether it was listed just now. Its state decides, not
+/// whether this revision was stored just now, so whatever stored it first, it shows.
+async fn list_invitation(
+    db: &ProjectionDb,
+    key: &[u8; 32],
+    g: &presage::model::groups::Group,
+    own: &ServiceIds,
+) -> Result<bool, sqlx::Error> {
+    let Some(invitation) = crate::groups::invitation(g, own.aci, own.pni) else {
+        return Ok(false);
+    };
+    let id = group_id(key);
+    if db.is_blocked(&id).await? || db.is_blocked(&direct_id(&invitation.added_by_aci.into())).await? {
+        return Ok(false);
+    }
+    db.list_chat(&id, chrono::Utc::now().timestamp_millis()).await
+}
+
 /// Brings a group message's chat up to presage's group, so its sender is checked against
 /// current members. presage refreshes the group before handing us a message sent at a newer
 /// revision; if that refresh failed, a group presage knows is fetched once more, though not
@@ -1998,14 +2035,14 @@ async fn sync_group(
         return;
     };
     let sent_at = sent_revision(&content.body);
-    let blocked = db
-        .is_blocked(&direct_id(&content.metadata.sender))
-        .await
-        .unwrap_or(true)
-        || db.is_blocked(&group_id(&key)).await.unwrap_or(true);
     let group = match m.store().group(key).await {
         Ok(Some(g)) if sent_at.is_none_or(|r| r <= g.revision) => Ok(g),
         Ok(Some(g)) => {
+            let blocked = db
+                .is_blocked(&direct_id(&content.metadata.sender))
+                .await
+                .unwrap_or(true)
+                || db.is_blocked(&group_id(&key)).await.unwrap_or(true);
             if blocked || !refetches.allow(key, std::time::Instant::now()) {
                 Ok(g)
             } else {
@@ -2021,13 +2058,9 @@ async fn sync_group(
     };
     let own = &m.registration_data().service_ids;
     let stored = match group {
-        // an invitation shows as its message comes (a blocked inviter's doesn't)
         Ok(g) => match store_group(db, &key, &g, own).await {
-            Ok(true) if !blocked && crate::groups::invited(&g, own.aci, own.pni) => db
-                .list_chat(&group_id(&key), chrono::Utc::now().timestamp_millis())
-                .await
-                .map(|_| true),
-            stored => stored,
+            Ok(stored) => list_invitation(db, &key, &g, own).await.map(|listed| stored || listed),
+            Err(e) => Err(e),
         }
         .map_err(|e| e.to_string()),
         Err(e) => Err(e),
@@ -2106,7 +2139,12 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
             for group in groups {
                 match group {
                     Ok((key, g)) => {
-                        if let Err(e) = store_group(db, &key, &g, &m.registration_data().service_ids).await {
+                        let own = &m.registration_data().service_ids;
+                        let stored = match store_group(db, &key, &g, own).await {
+                            Ok(_) => list_invitation(db, &key, &g, own).await,
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = stored {
                             problems.push(format!("storing a group: {e}"));
                         }
                     }
@@ -2588,7 +2626,6 @@ mod tests {
 
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
 
-    /// "Hikers" at `revision`: Alice (an admin), a minute's timer.
     /// Our ids in tests: an ACI and a PNI that no test group knows.
     fn own() -> super::ServiceIds {
         use presage::libsignal_service::prelude::Uuid;
@@ -2598,6 +2635,7 @@ mod tests {
         }
     }
 
+    /// "Hikers" at `revision`: Alice (an admin), a minute's timer.
     fn hikers(revision: u32) -> presage::model::groups::Group {
         use presage::libsignal_service::groups_v2::{Role, Timer};
         use presage::libsignal_service::prelude::{ProfileKey, Uuid};
@@ -2644,7 +2682,24 @@ mod tests {
             timestamp: 0,
         }];
         assert!(super::store_group(&db, &key, &g, &own()).await.unwrap());
-        db.list_chat(&id, 1).await.unwrap();
+        let inviter = super::direct_id(&g.members[0].aci.into());
+        db.upsert_conversation_title(&inviter, "Alice").await.unwrap();
+        db.block(&inviter).await.unwrap();
+        assert!(
+            !super::list_invitation(&db, &key, &g, &own()).await.unwrap(),
+            "a blocked inviter's invitation stays out"
+        );
+        db.accept(&inviter).await.unwrap();
+        db.block(&id).await.unwrap();
+        assert!(
+            !super::list_invitation(&db, &key, &g, &own()).await.unwrap(),
+            "so does a blocked group's"
+        );
+        db.accept(&id).await.unwrap();
+        assert!(
+            super::list_invitation(&db, &key, &g, &own()).await.unwrap(),
+            "listed though its revision was stored before"
+        );
         let invitation = |chats: Vec<crate::projection::model::Conversation>| {
             chats.iter().find(|c| c.id == id).map(|c| c.group_invitation)
         };

@@ -186,12 +186,27 @@ pub fn edit(change: GroupChange) -> Result<GroupEdit, String> {
     })
 }
 
-/// We (by our ACI or our phone number's PNI) are invited to `group` and haven't answered.
-pub fn invited(group: &Group, aci: Uuid, pni: Uuid) -> bool {
-    group.pending_members.iter().any(|p| match p.service_id_type {
+/// Our invitation to `group` (to our ACI or our phone number's PNI), if we haven't answered it.
+pub fn invitation(group: &Group, aci: Uuid, pni: Uuid) -> Option<&presage::model::groups::PendingMember> {
+    group.pending_members.iter().find(|p| match p.service_id_type {
         presage::model::ServiceIdType::AccountIdentity => p.uuid == aci,
         presage::model::ServiceIdType::PhoneNumberIdentity => p.uuid == pni,
     })
+}
+
+pub fn invited(group: &Group, aci: Uuid, pni: Uuid) -> bool {
+    invitation(group, aci, pni).is_some()
+}
+
+/// Our answer to an invitation shows in `group`: accepted, we're a member; declined, we're
+/// neither a member nor invited.
+pub fn answered(group: &Group, aci: Uuid, pni: Uuid, accept: bool) -> bool {
+    let member = group.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == aci);
+    if accept {
+        member
+    } else {
+        !member && !invited(group, aci, pni)
+    }
 }
 
 /// A new group's name (trimmed) and members; an error names what's wrong with them.
@@ -426,6 +441,13 @@ mod tests {
         g.access_control.as_mut().unwrap().add_from_invite_link = AccessRequired::Any;
         assert_eq!(info(&g, ME).link_access, LinkAccess::Anyone);
         assert_eq!(info(&g, CAROL).link, None, "only members get the link");
+        g.access_control.as_mut().unwrap().add_from_invite_link = AccessRequired::Unsatisfiable;
+        let off = info(&g, ME);
+        assert_eq!(
+            (off.link_access, off.link),
+            (LinkAccess::Off, None),
+            "turned off, the password kept: no link"
+        );
     }
 
     #[test]
@@ -436,6 +458,32 @@ mod tests {
         assert!(invited(&g, carol, other), "by account");
         assert!(invited(&g, other, carol), "by number");
         assert!(!invited(&g, other, other));
+        assert_eq!(
+            invitation(&g, carol, other).map(|p| p.added_by_aci),
+            Some(super::aci(ALICE).unwrap()),
+            "who invited us"
+        );
+    }
+
+    #[test]
+    fn an_answer_shows_in_the_group() {
+        let carol = Uuid::parse_str(CAROL).unwrap();
+        let nobody = Uuid::nil();
+        let invited_still = group(vec![member(ALICE, Role::Administrator)], None);
+        assert!(!answered(&invited_still, carol, nobody, true));
+        assert!(!answered(&invited_still, carol, nobody, false));
+        let mut joined = group(
+            vec![member(ALICE, Role::Administrator), member(CAROL, Role::Default)],
+            None,
+        );
+        joined.pending_members.clear();
+        assert!(answered(&joined, carol, nobody, true));
+        assert!(!answered(&joined, carol, nobody, false));
+        joined.members.pop();
+        assert!(
+            answered(&joined, carol, nobody, false),
+            "declined: neither in nor invited"
+        );
     }
 
     #[test]
