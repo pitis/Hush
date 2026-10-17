@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -22,9 +23,14 @@ struct GroupInfoView: View {
             if let info {
                 ScrollView { content(info).padding(20) }
             } else {
-                Text(loaded ? "This group isn't known yet: it shows once a message arrives in it." : "Loading…")
-                    .font(.system(size: 13)).foregroundStyle(Theme.secondaryText)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Text(
+                    !loaded
+                        ? "Loading…"
+                        : failure == nil
+                            ? "This group isn't known yet: it shows once a message arrives in it." : "Nothing to show."
+                )
+                .font(.system(size: 13)).foregroundStyle(Theme.secondaryText)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
             HStack {
@@ -38,23 +44,29 @@ struct GroupInfoView: View {
             .padding(12)
         }
         .frame(width: 400, height: 540)
+        .onExitCommand { dismiss() }
         // the chat changes with every stored change: read the group again
         .task(id: conversation) { await reload() }
         .sheet(isPresented: $editingDetails) {
             GroupDetailsSheet(title: conversation.title, description: info?.description ?? "") { title, description in
-                if title != conversation.title { change(.title(title: title)) }
-                if description != info?.description { change(.description(description: description)) }
+                let trimmed = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
+                var changes: [GroupChange] = []
+                if title != trimmed(conversation.title) { changes.append(.title(title: title)) }
+                if description != trimmed(info?.description ?? "") {
+                    changes.append(.description(description: description))
+                }
+                change(changes)
             }
         }
         .sheet(isPresented: $addingMembers) {
             AddMembersSheet(candidates: store.addableContacts(excluding: Set(info?.members.map(\.aci) ?? []))) {
-                change(.addMembers(acis: $0))
+                change([.addMembers(acis: $0)])
             }
         }
         .confirmationDialog(
             "Leave \(store.title(conversation))?", isPresented: $confirmingLeave
         ) {
-            Button("Leave Group", role: .destructive) { change(.leave) }
+            Button("Leave Group", role: .destructive) { change([.leave]) }
         } message: {
             Text("You won't get its messages any more. The chat stays here.")
         }
@@ -63,7 +75,7 @@ struct GroupInfoView: View {
             isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
             presenting: removing
         ) { member in
-            Button("Remove from Group", role: .destructive) { change(.removeMember(aci: member.aci)) }
+            Button("Remove from Group", role: .destructive) { change([.removeMember(aci: member.aci)]) }
         }
     }
 
@@ -88,7 +100,7 @@ struct GroupInfoView: View {
                     Menu("Picture") {
                         Button("Choose…", action: choosePicture)
                         if AvatarPictures.shared.paths[conversation.id] != nil {
-                            Button("Remove") { change(.avatar(image: Data())) }
+                            Button("Remove") { change([.avatar(image: Data())]) }
                         }
                     }
                     .fixedSize()
@@ -98,7 +110,7 @@ struct GroupInfoView: View {
                     "Disappearing messages",
                     selection: Binding(
                         get: { conversation.expireTimer },
-                        set: { change(.timer(seconds: $0)) })
+                        set: { if $0 != conversation.expireTimer { change([.timer(seconds: $0)]) } })
                 ) {
                     ForEach(Placeholder.timerChoices(current: conversation.expireTimer), id: \.self) {
                         Text(Placeholder.timerChoice($0)).tag($0)
@@ -135,18 +147,34 @@ struct GroupInfoView: View {
                 }
             }
             ForEach(sorted(info.members), id: \.aci) { member in
-                row(id: member.aci, name: store.memberName(member.aci), admin: member.admin)
-                    .contextMenu {
-                        // admins manage the others; Signal lets no one demote or remove themselves
-                        if info.admin, member.aci != store.ownAci {
-                            Button(member.admin ? "Remove as Admin" : "Make Admin") {
-                                change(.setAdmin(aci: member.aci, admin: !member.admin))
-                            }
-                            Button("Remove from Group…", role: .destructive) { removing = member }
+                // admins manage the others; no one demotes or removes themselves (they leave)
+                let manageable = info.admin && member.aci != store.ownAci
+                HStack {
+                    row(id: member.aci, name: store.memberName(member.aci), admin: member.admin)
+                    if manageable {
+                        Menu {
+                            memberActions(member)
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
                         }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .disabled(busy)
+                        .accessibilityLabel("Manage \(store.memberName(member.aci))")
                     }
+                }
+                .contextMenu { if manageable && !busy { memberActions(member) } }
             }
         }
+    }
+
+    @ViewBuilder
+    private func memberActions(_ member: GroupMember) -> some View {
+        Button(member.admin ? "Remove as Admin" : "Make Admin") {
+            change([.setAdmin(aci: member.aci, admin: !member.admin)])
+        }
+        Button("Remove from Group…", role: .destructive) { removing = member }
     }
 
     /// Us first, then admins, then by name.
@@ -168,19 +196,26 @@ struct GroupInfoView: View {
         .accessibilityElement(children: .combine)
     }
 
+    /// Reads the group again; a failed read keeps what shows and says why.
     private func reload() async {
-        info = await store.groupInfo(conversation.id)
+        switch await store.groupInfo(conversation.id) {
+        case .known(let read): info = read
+        case .unknown: info = nil
+        case .failed(let why): failure = why
+        }
         loaded = true
     }
 
-    private func change(_ change: GroupChange) {
+    /// Makes the changes one after the other; the first failure shows.
+    private func change(_ changes: [GroupChange]) {
+        guard !changes.isEmpty else { return }
         busy = true
         failure = nil
         Task {
-            failure = await store.changeGroup(conversation.id, change)
+            let failed = await store.changeGroup(conversation.id, changes)
             busy = false
-            // a change that leaves the chat as it was (a description alone) announces nothing
             await reload()
+            if let failed { failure = failed }
         }
     }
 
@@ -192,31 +227,39 @@ struct GroupInfoView: View {
             failure = "That file isn't a picture Hush can read."
             return
         }
-        change(.avatar(image: jpeg))
+        change([.avatar(image: jpeg)])
     }
 }
 
-/// A group picture as Signal's apps send one: a JPEG at most 1024 px on its longer side.
+/// A group picture as Signal's apps send one: a JPEG at most 1024 px on its longer side, upright,
+/// in sRGB, transparency on white.
 enum GroupPicture {
-    static let maxSide: CGFloat = 1024
+    static let maxSide = 1024
 
     static func jpeg(from url: URL) -> Data? {
-        guard let image = NSImage(contentsOf: url),
-            let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide,
+        ]
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+            let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
+            let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+            let context = CGContext(
+                data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: srgb, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
         else { return nil }
-        let scale = min(1, maxSide / CGFloat(max(cg.width, cg.height)))
-        let size = NSSize(width: (CGFloat(cg.width) * scale).rounded(), height: (CGFloat(cg.height) * scale).rounded())
-        guard
-            let rep = NSBitmapImageRep(
-                bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height), bitsPerSample: 8,
-                samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0,
-                bitsPerPixel: 0)
+        let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(rect)
+        context.draw(image, in: rect)
+        guard let flat = context.makeImage() else { return nil }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)
         else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        NSGraphicsContext.current?.cgContext.draw(cg, in: CGRect(origin: .zero, size: size))
-        NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+        CGImageDestinationAddImage(
+            destination, flat, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 }
 
@@ -243,11 +286,13 @@ struct GroupDetailsSheet: View {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    save(title.trimmingCharacters(in: .whitespaces), description.trimmingCharacters(in: .whitespaces))
+                    save(
+                        title.trimmingCharacters(in: .whitespacesAndNewlines),
+                        description.trimmingCharacters(in: .whitespacesAndNewlines))
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(20)

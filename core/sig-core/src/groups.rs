@@ -243,6 +243,17 @@ mod tests {
     }
 
     #[test]
+    fn anyone_means_members_here_and_no_one_means_no_one() {
+        let me = vec![member(ME, Role::Administrator)];
+        let any = info(&group(me.clone(), Some((AccessRequired::Any, AccessRequired::Any))), ME);
+        assert!(any.can_edit_details && any.can_add_members);
+        for none in [AccessRequired::Unsatisfiable, AccessRequired::Unknown] {
+            let i = info(&group(me.clone(), Some((none, none))), ME);
+            assert!(!i.can_edit_details && !i.can_add_members, "{none:?}, even for an admin");
+        }
+    }
+
+    #[test]
     fn after_leaving_nothing_can_be_changed() {
         let left = info(&group(vec![member(ALICE, Role::Administrator)], None), ME);
         assert!(!left.member && !left.admin && !left.can_edit_details && !left.can_add_members);
@@ -261,6 +272,21 @@ mod tests {
             format!("{:?}", GroupEdit::Title("Climbers".into()))
         );
         assert!(edit(GroupChange::Title { title: "  ".into() }).is_err());
+        let same =
+            |change, edit: GroupEdit| assert_eq!(format!("{:?}", super::edit(change).unwrap()), format!("{edit:?}"));
+        same(
+            GroupChange::Description {
+                description: " Sundays\n".into(),
+            },
+            GroupEdit::Description("Sundays".into()),
+        );
+        same(
+            GroupChange::Description { description: "".into() },
+            GroupEdit::Description("".into()),
+        );
+        same(GroupChange::Timer { seconds: 3600 }, GroupEdit::Timer(3600));
+        same(GroupChange::Avatar { image: vec![1, 2] }, GroupEdit::Avatar(vec![1, 2]));
+        same(GroupChange::Leave, GroupEdit::Leave);
         assert!(edit(GroupChange::AddMembers { acis: vec![] }).is_err());
         assert!(edit(GroupChange::RemoveMember { aci: "nope".into() }).is_err());
         assert_eq!(

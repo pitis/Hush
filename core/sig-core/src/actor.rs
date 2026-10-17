@@ -862,22 +862,63 @@ async fn change_group(
     key: [u8; 32],
     edit: presage::manager::GroupEdit,
 ) -> Result<(), String> {
-    match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.change_group(&key, edit))).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(e.to_string()),
-        Err(_) => return Err("the server didn't answer in time; the change may still have been made".into()),
+    use presage::manager::GroupEdit;
+    let me = m.registration_data().service_ids.aci.to_string();
+    // removing ourselves would skip presage's handling of leaving
+    if matches!(&edit, GroupEdit::RemoveMember(a) | GroupEdit::SetAdmin(a, _) if a.service_id_string() == me) {
+        return Err("that change can't be made to yourself".into());
     }
-    let group = match m.store().group(key).await {
-        Ok(Some(g)) => g,
-        Ok(None) => return Ok(()),
-        Err(e) => return Err(format!("the change was made, but reading it back failed: {e}")),
+    let picture = match &edit {
+        GroupEdit::Avatar(bytes) => Some(bytes.clone()),
+        _ => None,
     };
-    match store_group(db, &key, &group).await {
-        Ok(true) => l.on_event(CoreEvent::ConversationsChanged),
-        Ok(false) => {}
-        Err(e) => return Err(format!("the change was made, but storing it failed: {e}")),
+    let changed = match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.change_group(&key, edit))).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the server didn't answer in time; the change may still have been made".into()),
+    };
+    // whatever the answer: the server may have taken the change before something after it failed
+    // (telling the members, say), and presage then has the group as changed
+    let picture = picture.filter(|_| changed.is_ok());
+    settle_group(m.store(), db, l, &key, picture.as_deref()).await;
+    changed
+}
+
+/// Stores presage's group in its chat after a change, and the picture we set (empty: removed),
+/// which presage keeps to itself.
+async fn settle_group(
+    store: &SqliteStore,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    key: &[u8; 32],
+    picture: Option<&[u8]>,
+) {
+    let mut changed = false;
+    let mut problems = vec![];
+    match store.group(*key).await {
+        Ok(Some(g)) => match store_group(db, key, &g).await {
+            Ok(c) => changed |= c,
+            Err(e) => problems.push(format!("storing a changed group failed: {e}")),
+        },
+        Ok(None) => {}
+        Err(e) => problems.push(format!("reading a changed group failed: {e}")),
     }
-    Ok(())
+    if let Some(bytes) = picture {
+        let now = chrono::Utc::now().timestamp_millis();
+        match db
+            .store_avatar(&group_id(key), (!bytes.is_empty()).then_some(bytes), now)
+            .await
+        {
+            Ok(c) => changed |= c,
+            Err(e) => problems.push(format!("storing a group's new picture failed: {e}")),
+        }
+    }
+    for message in problems {
+        l.on_event(CoreEvent::Error { message });
+    }
+    if changed {
+        l.on_event(CoreEvent::ConversationsChanged);
+    }
 }
 
 /// Installs a pack unless presage has it already.
@@ -2397,24 +2438,20 @@ mod tests {
         assert!(refetches.allow([1; 32], t + Duration::from_secs(301)));
     }
 
-    /// presage's group lands in the chat: its title, members' ACIs and timer, at its revision.
-    #[tokio::test]
-    async fn presages_group_is_stored_in_the_chat() {
+    const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+
+    /// "Hikers" at `revision`: Alice (an admin), a minute's timer.
+    fn hikers(revision: u32) -> presage::model::groups::Group {
         use presage::libsignal_service::groups_v2::{Role, Timer};
         use presage::libsignal_service::prelude::{ProfileKey, Uuid};
         use presage::libsignal_service::protocol::Aci;
         use presage::model::groups::{Group, Member};
-        const ALICE: &str = "22222222-2222-2222-2222-222222222222";
-        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
-            .await
-            .unwrap();
-        let key = [7u8; 32];
-        let group = Group {
+        Group {
             title: "Hikers".into(),
             avatar: String::new(),
             disappearing_messages_timer: Some(Timer { duration: 60 }),
             access_control: None,
-            revision: 3,
+            revision,
             members: vec![Member {
                 aci: Aci::from(Uuid::parse_str(ALICE).unwrap()),
                 role: Role::Administrator,
@@ -2427,13 +2464,60 @@ mod tests {
             requesting_members: vec![],
             invite_link_password: vec![],
             description: None,
-        };
-        assert!(super::store_group(&db, &key, &group).await.unwrap());
+        }
+    }
+
+    /// presage's group lands in the chat: its title, members' ACIs and timer, at its revision.
+    #[tokio::test]
+    async fn presages_group_is_stored_in_the_chat() {
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        let key = [7u8; 32];
+        assert!(super::store_group(&db, &key, &hikers(3)).await.unwrap());
         let id = crate::projection::ids::group_id(&key);
         assert_eq!(db.group_members(&id).await.unwrap(), vec![ALICE]);
         assert_eq!(db.title(&id).await.unwrap().as_deref(), Some("Hikers"));
         assert_eq!(db.expire_timer(&id).await.unwrap(), 60);
         assert_eq!(db.group_revision(&id).await.unwrap(), Some(3));
+    }
+
+    /// After a change (whatever presage answered: it may have failed after the server took it),
+    /// the chat takes presage's group, and a picture we just set or removed.
+    #[tokio::test]
+    async fn after_a_group_change_the_chat_takes_the_group_and_its_new_picture() {
+        use presage::model::identity::OnNewIdentity;
+        use presage::store::ContentsStore;
+        use presage_store_sqlite::SqliteStore;
+        let dir = std::env::temp_dir().join(format!("sig-core-settle-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStore::open_with_options(
+            super::sqlite_options(&dir.join("presage.db"), &"00".repeat(32)).unwrap(),
+            OnNewIdentity::Trust,
+        )
+        .await
+        .unwrap();
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap()
+            .with_files(dir.join("attachments"));
+        let key = [7u8; 32];
+        let id = crate::projection::ids::group_id(&key);
+        store.save_group(key, hikers(4)).await.unwrap();
+        let sink = Sink(std::sync::Mutex::new(vec![]));
+        super::settle_group(&store, &db, &sink, &key, Some(b"jpeg")).await;
+        assert_eq!(db.group_revision(&id).await.unwrap(), Some(4));
+        assert!(
+            !db.store_avatar(&id, Some(b"jpeg"), 1).await.unwrap(),
+            "the chat has the picture already"
+        );
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [CoreEvent::ConversationsChanged]
+        ));
+        super::settle_group(&store, &db, &sink, &key, Some(b"")).await;
+        assert!(!db.store_avatar(&id, None, 2).await.unwrap(), "removed already");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A deleted chat's messages leave presage's store too.

@@ -1189,6 +1189,7 @@ impl Client {
         let Some(key) = crate::projection::ids::group_key(&conversation_id) else {
             return Ok(None);
         };
+        self.own_aci().ok_or(CoreError::NotLinked)?;
         let (done, answer) = tokio::sync::oneshot::channel();
         self.send(Command::GroupInfo { key, done })?;
         answer
@@ -1198,7 +1199,8 @@ impl Client {
     }
 
     /// Changes a group, as its access control allows us; its members are told. Answers once the
-    /// server has it (the chat is updated by then).
+    /// server has it, the chat updated to presage's group (also after a failure, which may come
+    /// after the server took the change).
     pub async fn change_group(&self, conversation_id: String, change: GroupChange) -> Result<(), CoreError> {
         let invalid = |message: String| CoreError::InvalidInput { message };
         let key = crate::projection::ids::group_key(&conversation_id).ok_or(invalid("not a group".into()))?;
@@ -1488,6 +1490,10 @@ mod tests {
             let direct = "c:22222222-2222-2222-2222-222222222222".to_string();
             let group = format!("g:{}", "ab".repeat(32));
             assert_eq!(client.group_info(direct.clone()).await.unwrap(), None);
+            assert!(matches!(
+                client.group_info(group.clone()).await,
+                Err(CoreError::NotLinked)
+            ));
             assert!(matches!(
                 client.change_group(direct, GroupChange::Leave).await,
                 Err(CoreError::InvalidInput { .. })

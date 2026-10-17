@@ -1491,19 +1491,27 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
-    /// A group as its info panel shows it, its members' and invitees' names loaded; nil if it
-    /// isn't known yet.
-    func groupInfo(_ conversationId: String) async -> GroupInfo? {
-        guard let client else { return nil }
+    /// Reading a group for its info panel.
+    enum GroupRead: Equatable {
+        /// Its members' and invitees' names are loaded.
+        case known(GroupInfo)
+        /// Not stored yet (no message has come in it).
+        case unknown
+        case failed(String)
+    }
+
+    func groupInfo(_ conversationId: String) async -> GroupRead {
+        guard let client else { return .failed("Not linked yet.") }
         do {
             let info = try await client.groupInfo(conversationId: conversationId)
             for aci in (info?.members.map(\.aci) ?? []) + (info?.invited ?? []) where aci != ownAci {
                 await loadName(aci)
             }
-            return info
+            return info.map(GroupRead.known) ?? .unknown
         } catch {
+            // ids only: a group's id is its key
             append("group info failed: \(error)")
-            return nil
+            return .failed("Couldn't read the group: \(Self.describe(error))")
         }
     }
 
@@ -1512,17 +1520,25 @@ final class AppStore {
         aci == ownAci ? "You" : senderName(aci)
     }
 
-    /// Changes a group (the core updates the chat once the server has it). Returns why it
-    /// failed, or nil.
-    func changeGroup(_ conversationId: String, _ change: GroupChange) async -> String? {
+    /// Changes a group, one change after the other (the core updates the chat as each lands).
+    /// Returns why the first that failed did, or nil.
+    func changeGroup(_ conversationId: String, _ changes: [GroupChange]) async -> String? {
         guard let client else { return "Not linked yet." }
-        do {
-            try await client.changeGroup(conversationId: conversationId, change: change)
-            return nil
-        } catch {
-            append("couldn't change group \(conversationId): \(error)")
-            return Self.describe(error)
+        var failure: String?
+        for change in changes {
+            do {
+                try await client.changeGroup(conversationId: conversationId, change: change)
+            } catch {
+                append("couldn't change a group: \(error)")
+                guard failure == nil else { continue }
+                switch error {
+                // the server's refusal, or no answer: not only "couldn't be reached"
+                case CoreError.Network(let message): failure = "Couldn't change the group: \(message)"
+                default: failure = "Couldn't change the group: \(Self.describe(error))"
+                }
+            }
         }
+        return failure
     }
 
     /// People who can be added to a group: those we have a chat with (accepted, not blocked,

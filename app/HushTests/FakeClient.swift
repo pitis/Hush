@@ -155,13 +155,17 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func storyViewed(key: MessageKey) async throws { lock.withLock { viewedStories.append(key) } }
     var usernames: [String: String] = [:]
     var groupInfoAnswers: [String: GroupInfo] = [:]
+    var groupInfoError: Error?
     private(set) var groupChanges: [(String, GroupChange)] = []
+    /// This change is refused (the server's word: "refused"); the others go through.
+    var failingGroupChange: GroupChange?
     func groupInfo(conversationId: String) async throws -> GroupInfo? {
-        lock.withLock { groupInfoAnswers[conversationId] }
+        if let groupInfoError { throw groupInfoError }
+        return lock.withLock { groupInfoAnswers[conversationId] }
     }
     func changeGroup(conversationId: String, change: GroupChange) async throws {
-        if let changeError { throw changeError }
         lock.withLock { groupChanges.append((conversationId, change)) }
+        if change == failingGroupChange { throw CoreError.Network(message: "refused") }
     }
     func findUsername(username: String) async throws -> String? {
         if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
@@ -243,8 +247,12 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     var reactionAnswers: [MessageKey: [Reaction]] = [:]
     private(set) var reactionCalls = 0
 
+    private(set) var titleLookups: [String] = []
     func title(conversationId: String) async throws -> String? {
-        lock.withLock { titleCalls += 1 }
+        lock.withLock {
+            titleCalls += 1
+            titleLookups.append(conversationId)
+        }
         return titles[conversationId]
     }
 
