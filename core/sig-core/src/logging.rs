@@ -1,5 +1,5 @@
 //! Warnings and errors from the core and presage go to the unified log (Console.app, subsystem
-//! `dev.pitis.semaphore`). Never log message content.
+//! `dev.pitis.hush`). Never log message content.
 
 use std::sync::Once;
 
@@ -16,7 +16,7 @@ pub fn init() {
         let filter = EnvFilter::new("warn,sig_core=info,sqlx=off,ringrtc=warn");
         let subscriber = tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_oslog::OsLogger::new("dev.pitis.semaphore", "core"));
+            .with(tracing_oslog::OsLogger::new("dev.pitis.hush", "core"));
         let _ = tracing::subscriber::set_global_default(subscriber);
         let _ = tracing_log::LogTracer::init();
     });

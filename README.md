@@ -1,4 +1,4 @@
-# Semaphore
+# Hush
 
 An unofficial, personal native macOS client for Signal: a Rust core built on
 [presage](https://github.com/whisperfish/presage) and a SwiftUI/AppKit app. It links to your

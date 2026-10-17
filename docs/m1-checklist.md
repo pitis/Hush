@@ -1,8 +1,8 @@
-# M1 sign-off: Semaphore next to Signal Desktop
+# M1 sign-off: Hush next to Signal Desktop
 
 **Merge #42 before the week starts:** it fixes message loss on reconnect and unlinking from #41.
 
-Run both side by side for a week (#17). For each row, do the check in Semaphore and compare
+Run both side by side for a week (#17). For each row, do the check in Hush and compare
 with Signal Desktop. `make release` installs the app; `make perf` measures the budget.
 
 Legend: ✅ built (the PR that did it) · ◐ partly · ✗ not in M1 (where it goes)

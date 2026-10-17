@@ -17,8 +17,8 @@ placeholder under a `mentionAci` range). Messages with mentions can be edited ag
 - Core (migration 0014): `group_members(conversation_id, aci)`, replaced for each group at title
   sync from presage's group store; `Client.group_members(id)`. Membership changes reach it at
   the next sync (start, contact sync).
-- App: `ComposerText` keeps a token as "@Name" under `semaphore.mention` (the ACI) and
-  `semaphore.mentionText` (the text inserted); `message(from:)` shrinks each token to U+FFFC
+- App: `ComposerText` keeps a token as "@Name" under `hush.mention` (the ACI) and
+  `hush.mentionText` (the text inserted); `message(from:)` shrinks each token to U+FFFC
   before reading styles and adds the mention ranges. `MentionPicker` follows the "@word" before
   the caret and inserts through the text view (undoable). Names come from contact titles
   (`AppStore.mentionCandidates`).

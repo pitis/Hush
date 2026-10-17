@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Regenerates app/Semaphore/Assets.xcassets/AppIcon.appiconset from scripts/make-icon.swift.
+# Regenerates app/Hush/Assets.xcassets/AppIcon.appiconset from scripts/make-icon.swift.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SET="$ROOT/app/Semaphore/Assets.xcassets/AppIcon.appiconset"
+SET="$ROOT/app/Hush/Assets.xcassets/AppIcon.appiconset"
 mkdir -p "$SET"
 swift "$ROOT/scripts/make-icon.swift" "$SET/icon_1024.png"
 images=""

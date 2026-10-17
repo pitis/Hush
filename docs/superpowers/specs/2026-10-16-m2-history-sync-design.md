@@ -2,7 +2,7 @@
 
 ## Context
 Signal Desktop can bring your past messages over when it is linked ("Transfer message history",
-called link-and-sync). Semaphore, linked through presage, starts empty. M2 (#18) closes that gap.
+called link-and-sync). Hush, linked through presage, starts empty. M2 (#18) closes that gap.
 
 How it works on the wire (researched from Signal-Desktop f3040f3, Signal-Server, Signal-Android
 and libsignal v0.99.0):
@@ -63,7 +63,7 @@ All new core code is in `core/sig-core/src/history/`.
   - Long-polls `transfer_archive` in 60-second requests (the HTTP client's reads time out at
     65 s), looping until the archive comes, the phone gives up, or the user cancels — Cancel
     and Continue Without History are always on screen, so there is no separate time budget.
-  - Downloads the archive to `Application Support/Semaphore/history.tmp`, resuming from the bytes
+  - Downloads the archive to `Application Support/Hush/history.tmp`, resuming from the bytes
     it already has.
   - HTTP sits behind a small trait (`ArchiveServer`) so tests can play the server's answers.
 - **Reader (`history/read.rs`).**

@@ -16,10 +16,10 @@ impl EventListener for Print {
 }
 
 fn main() {
-    let dir = std::env::temp_dir().join(format!("semaphore-link-probe-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("hush-link-probe-{}", std::process::id()));
     let client = Client::open(dir.to_string_lossy().into(), "ab".repeat(32), Arc::new(Print)).expect("open");
     println!("linked: {}", client.is_linked());
-    client.link("Semaphore probe".into()).expect("link");
+    client.link("Hush probe".into()).expect("link");
     std::thread::sleep(Duration::from_secs(20));
     drop(client);
     let _ = std::fs::remove_dir_all(dir);

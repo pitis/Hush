@@ -12,7 +12,7 @@ downloads it and imports it. The archive holds pointers to files, not the files.
 
 ## Decisions
 
-1. **Import straight into Semaphore's own database (projection.db).** Only what presage needs to
+1. **Import straight into Hush's own database (projection.db).** Only what presage needs to
    send (contacts with profile keys, group master keys) goes into presage's store. History is not
    replayed through the live message pipeline and not kept in a separate database. This matches
    Signal Desktop, whose importer writes straight into its own database.

@@ -1,8 +1,8 @@
 core/target/
 app/Generated/
 app/Frameworks/
-app/Semaphore.xcodeproj/
-app/Semaphore/Info.plist
+app/Hush.xcodeproj/
+app/Hush/Info.plist
 build/
 worktrees/
 .DS_Store

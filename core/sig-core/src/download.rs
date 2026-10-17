@@ -170,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_corrupt_download_fails_and_the_others_still_arrive() {
-        let files = TempFiles(std::env::temp_dir().join(format!("semaphore-dl-{}", std::process::id())));
+        let files = TempFiles(std::env::temp_dir().join(format!("hush-dl-{}", std::process::id())));
         let db = ProjectionDb::open("sqlite::memory:", None)
             .await
             .unwrap()
@@ -239,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_download_that_cant_be_saved_fails_and_says_so() {
-        let blocker = TempFiles(std::env::temp_dir().join(format!("semaphore-dl-blocked-{}", std::process::id())));
+        let blocker = TempFiles(std::env::temp_dir().join(format!("hush-dl-blocked-{}", std::process::id())));
         std::fs::write(&blocker.0, b"a file where the folder should be").unwrap();
         let db = ProjectionDb::open("sqlite::memory:", None)
             .await

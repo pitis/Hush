@@ -1,4 +1,4 @@
-name: Semaphore
+name: Hush
 options:
   bundleIdPrefix: dev.pitis
   deploymentTarget: { macOS: "15.0" }
@@ -11,10 +11,10 @@ settings:
     CODE_SIGN_IDENTITY: "Apple Development"
     DEVELOPMENT_TEAM: 95KQ82C586
 targets:
-  Semaphore:
+  Hush:
     type: application
     platform: macOS
-    sources: [Semaphore, Generated]
+    sources: [Hush, Generated]
     dependencies:
       - framework: Frameworks/SigCore.xcframework
         embed: false
@@ -25,13 +25,13 @@ targets:
       - sdk: AudioToolbox.framework
       - sdk: CoreGraphics.framework
     info:
-      path: Semaphore/Info.plist
+      path: Hush/Info.plist
       properties:
-        CFBundleDisplayName: Semaphore
+        CFBundleDisplayName: Hush
         LSMinimumSystemVersion: "15.0"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.semaphore
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.hush
         ENABLE_HARDENED_RUNTIME: NO
         GENERATE_INFOPLIST_FILE: YES
         # RingRTC's WebRTC and cubeb are C++
@@ -45,15 +45,15 @@ targets:
           DEPLOYMENT_POSTPROCESSING: YES
           STRIP_INSTALLED_PRODUCT: YES
           STRIP_STYLE: non-global
-  SemaphoreTests:
+  HushTests:
     type: bundle.unit-test
     platform: macOS
-    sources: [SemaphoreTests]
-    dependencies: [{ target: Semaphore }]
+    sources: [HushTests]
+    dependencies: [{ target: Hush }]
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
 schemes:
-  Semaphore:
-    build: { targets: { Semaphore: all, SemaphoreTests: [test] } }
-    test: { targets: [SemaphoreTests] }
+  Hush:
+    build: { targets: { Hush: all, HushTests: [test] } }
+    test: { targets: [HushTests] }

@@ -20,9 +20,5 @@ pub(crate) fn push_service(data: &presage::manager::RegistrationData) -> Result<
         password: Some(password),
         device_id: data.device_id.and_then(|d| d.try_into().ok()),
     };
-    Ok(PushService::new(
-        SignalServers::Production,
-        Some(credentials),
-        "Semaphore",
-    ))
+    Ok(PushService::new(SignalServers::Production, Some(credentials), "Hush"))
 }

@@ -27,7 +27,7 @@ The feasibility spike (2026-10-16) retired the ticket's "largest risk":
 - Version coupling: ringrtc v2.72.1 pins libsignal v0.99.1 internally; our tree pins v0.99.0.
   Cargo simply carries both source trees (Signal acknowledges this pattern, ringrtc#55); no
   zkgroup types cross ringrtc's public API, so the duplication costs build time, not
-  correctness. RingRTC is AGPL-3.0, same as Semaphore.
+  correctness. RingRTC is AGPL-3.0, same as Hush.
 
 ## Decisions (owner, 2026-10-16)
 1. **Voice only for now.** M3 ships 1:1 voice calls; video is deferred to its own later stage

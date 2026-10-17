@@ -34,7 +34,7 @@ spike's API findings are in the spec's Context).
 - Never edit `app/Generated/`; regenerate with `make core && make project`.
 - No `--no-verify`; `make format && make check` before push (Swift tests run unsigned on this
   machine: `xcodebuild … test CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""`).
-- Work in `/Users/pitis/development/semaphore/worktrees/48--calls`, branch `feat/calls`.
+- Work in `/Users/pitis/development/hush/worktrees/48--calls`, branch `feat/calls`.
 - Commits: plain sentences, no `#NNN`, no AI attribution.
 - App strings may say "Signal" only in instructions about the phone app, never as our branding.
 
@@ -331,7 +331,7 @@ Finished calls become chat events, like timer changes do.
   check: `add_chat_event(&self, conversation_id, at, kind, author)` exists; add a
   `add_chat_event_value(..., value: Option<i64>)` variant or extend the existing fn and update
   its callers)
-- Modify: `app/Semaphore/Timeline.swift` + `app/Semaphore/Placeholder.swift` (wording) — the
+- Modify: `app/Hush/Timeline.swift` + `app/Hush/Placeholder.swift` (wording) — the
   Swift side lands in Task 8; this task is core-only.
 
 **Interfaces:**
@@ -768,17 +768,17 @@ fn only_aci_senders_may_ring() {
 ### Task 8: The app: call window, ringing, chat button, timeline rows
 
 **Files:**
-- Modify: `app/Semaphore/AppStore.swift` (call state machine)
-- Create: `app/Semaphore/CallWindow.swift`
-- Modify: `app/Semaphore/SemaphoreApp.swift` (Window scene + notification categories)
-- Modify: `app/Semaphore/Notifications.swift` (call category with Accept/Decline actions)
-- Modify: `app/Semaphore/ConversationView.swift` (phone button in direct chats)
-- Modify: `app/Semaphore/Timeline.swift` + `app/Semaphore/Placeholder.swift` (call event rows:
+- Modify: `app/Hush/AppStore.swift` (call state machine)
+- Create: `app/Hush/CallWindow.swift`
+- Modify: `app/Hush/HushApp.swift` (Window scene + notification categories)
+- Modify: `app/Hush/Notifications.swift` (call category with Accept/Decline actions)
+- Modify: `app/Hush/ConversationView.swift` (phone button in direct chats)
+- Modify: `app/Hush/Timeline.swift` + `app/Hush/Placeholder.swift` (call event rows:
   "Outgoing voice call (2 min)", "Incoming voice call (2 min)", "Missed voice call")
-- Modify: `app/project.yml` (`NSMicrophoneUsageDescription`: "Semaphore uses the microphone
-  for voice calls." — check how Info.plist keys are declared; `app/Semaphore/Info.plist`
+- Modify: `app/project.yml` (`NSMicrophoneUsageDescription`: "Hush uses the microphone
+  for voice calls." — check how Info.plist keys are declared; `app/Hush/Info.plist`
   exists, add there)
-- Create: `app/SemaphoreTests/AppStoreCallTests.swift`
+- Create: `app/HushTests/AppStoreCallTests.swift`
 
 **Interfaces (AppStore):**
 
@@ -825,7 +825,7 @@ CallWindow (SwiftUI):
 - [ ] **Step 1:** failing AppStoreCallTests (event upserts, ended keeps reason, startCall
   guards, accept/decline plumbing to FakeClient, mute optimistic flip, notification trigger
   when inactive — follow AppStoreHistoryTests' style with `isAppActive` injection).
-- [ ] **Step 2:** RED (unsigned xcodebuild, `-only-testing:SemaphoreTests/AppStoreCallTests`).
+- [ ] **Step 2:** RED (unsigned xcodebuild, `-only-testing:HushTests/AppStoreCallTests`).
 - [ ] **Step 3:** implement AppStore + views + plist + notification category.
 - [ ] **Step 4:** GREEN; full Swift suite green.
 - [ ] **Step 5:** `make project` diff check (project.yml changed? regenerate; never commit the
@@ -841,7 +841,7 @@ CallWindow (SwiftUI):
 - [ ] **Step 1:** Update the spec where reality diverged (actor-thread design, ack-driven
   `should_assume_messages_sent=false`, device-picker shape).
 - [ ] **Step 2:** `make format`; Rust suite + unsigned Swift suite green; `make lint`.
-- [ ] **Step 3:** Push, `gh pr create` — title "Semaphore makes and takes 1:1 voice calls";
+- [ ] **Step 3:** Push, `gh pr create` — title "Hush makes and takes 1:1 voice calls";
   body: what/why/how tested, ending `Part of #19` (not `Closes`: #19 is the M3 epic and the
   owner staged it — video and group calls follow in their own PRs; say so in the body).
 - [ ] **Step 4:** The card stays In progress (the epic is mid-way); say so in chat.

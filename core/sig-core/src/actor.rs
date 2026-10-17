@@ -200,7 +200,7 @@ impl Drop for PanicReporter {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.0.on_event(CoreEvent::Error {
-                message: "the core stopped unexpectedly; restart Semaphore".into(),
+                message: "the core stopped unexpectedly; restart Hush".into(),
             });
             self.0.on_event(CoreEvent::Connection {
                 state: ConnectionState::Offline,
@@ -235,6 +235,11 @@ async fn run(
         let projection = ProjectionDb::open(&format!("sqlite://{}", dir.join("projection.db").display()), Some(&key))
             .await?
             .with_files(dir.join("attachments"));
+        match projection.reroot_avatars().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(n, "chat pictures now point into the moved data folder"),
+            Err(e) => tracing::warn!(error = %e, "re-pointing chat pictures after a folder move failed"),
+        }
         let store =
             SqliteStore::open_with_options(sqlite_options(&dir.join("presage.db"), &key)?, OnNewIdentity::Trust)
                 .await
@@ -535,7 +540,7 @@ async fn run(
                 Some(tx) => {
                     if tx.send(cmd).is_err() {
                         listener.on_event(CoreEvent::Error {
-                            message: "the call engine stopped; restart Semaphore to call".into(),
+                            message: "the call engine stopped; restart Hush to call".into(),
                         });
                     }
                 }
@@ -877,7 +882,7 @@ fn spawn_storage_sync(
     tokio::task::spawn_local(async move {
         if let Err(e) = task.await {
             l.on_event(CoreEvent::Error {
-                message: format!("Syncing chat settings with the phone stopped until Semaphore restarts: {e}"),
+                message: format!("Syncing chat settings with the phone stopped until Hush restarts: {e}"),
             });
         }
     });

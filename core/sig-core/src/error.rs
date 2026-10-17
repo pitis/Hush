@@ -3,7 +3,7 @@
 pub enum CoreError {
     #[error("storage: {message}")]
     Storage { message: String },
-    /// Another Semaphore core already has this data directory open.
+    /// Another Hush core already has this data directory open.
     #[error("the data is already open in another window or process")]
     AlreadyOpen,
     #[error("the core has stopped")]
