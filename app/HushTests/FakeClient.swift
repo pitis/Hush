@@ -154,6 +154,15 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func stories() async throws -> [Story] { lock.withLock { storyAnswers } }
     func storyViewed(key: MessageKey) async throws { lock.withLock { viewedStories.append(key) } }
     var usernames: [String: String] = [:]
+    var groupInfoAnswers: [String: GroupInfo] = [:]
+    private(set) var groupChanges: [(String, GroupChange)] = []
+    func groupInfo(conversationId: String) async throws -> GroupInfo? {
+        lock.withLock { groupInfoAnswers[conversationId] }
+    }
+    func changeGroup(conversationId: String, change: GroupChange) async throws {
+        if let changeError { throw changeError }
+        lock.withLock { groupChanges.append((conversationId, change)) }
+    }
     func findUsername(username: String) async throws -> String? {
         if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
         return lock.withLock { usernames[username] }

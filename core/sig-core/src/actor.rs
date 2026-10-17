@@ -113,6 +113,17 @@ pub enum Command {
         key: Vec<u8>,
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// A group as its info panel shows it, as presage has it; None if presage hasn't it.
+    GroupInfo {
+        key: [u8; 32],
+        done: oneshot::Sender<Result<Option<crate::groups::GroupInfo>, String>>,
+    },
+    /// Changes a group (its members are told), then stores it in its chat.
+    ChangeGroup {
+        key: [u8; 32],
+        edit: presage::manager::GroupEdit,
+        done: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// A sticker as the client needs it to send it.
@@ -625,6 +636,31 @@ async fn run(
                 };
                 let _ = done.send(found);
             }
+            Command::GroupInfo { key, done } => {
+                let info = match &manager {
+                    Some(m) => {
+                        let me = m.registration_data().service_ids.aci.to_string();
+                        match m.store().group(key).await {
+                            Ok(g) => Ok(g.map(|g| crate::groups::info(&g, &me))),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                    None => Err("not linked yet".into()),
+                };
+                let _ = done.send(info);
+            }
+            Command::ChangeGroup { key, edit, done } => match &manager {
+                Some(m) => {
+                    // the server, then a message to every member: commands go on meanwhile
+                    let (mut m, db, l) = (m.clone(), projection.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(change_group(&mut m, &db, l.as_ref(), key, edit).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::Relink { done } => {
                 if let Some(m) = &manager {
                     // Best effort: the new link works either way, but each failure leaves a
@@ -816,6 +852,32 @@ async fn chosen_sticker(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Makes a group change, then stores the group in its chat.
+async fn change_group(
+    m: &mut Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    key: [u8; 32],
+    edit: presage::manager::GroupEdit,
+) -> Result<(), String> {
+    match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.change_group(&key, edit))).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Err("the server didn't answer in time; the change may still have been made".into()),
+    }
+    let group = match m.store().group(key).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(format!("the change was made, but reading it back failed: {e}")),
+    };
+    match store_group(db, &key, &group).await {
+        Ok(true) => l.on_event(CoreEvent::ConversationsChanged),
+        Ok(false) => {}
+        Err(e) => return Err(format!("the change was made, but storing it failed: {e}")),
+    }
+    Ok(())
 }
 
 /// Installs a pack unless presage has it already.

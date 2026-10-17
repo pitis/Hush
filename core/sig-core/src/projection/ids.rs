@@ -23,12 +23,17 @@ pub fn group_id(master_key: &[u8; 32]) -> String {
 /// The group identifier of a `g:<hex master key>` chat: how the server, typing messages and
 /// block lists name a group. None for anything else.
 pub fn group_identifier(conversation_id: &str) -> Option<Vec<u8>> {
-    let key: [u8; 32] = hex::decode(conversation_id.strip_prefix("g:")?).ok()?.try_into().ok()?;
+    let key = group_key(conversation_id)?;
     Some(
         GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key))
             .get_group_identifier()
             .to_vec(),
     )
+}
+
+/// The master key of a `g:<hex master key>` chat; None for anything else.
+pub fn group_key(conversation_id: &str) -> Option<[u8; 32]> {
+    hex::decode(conversation_id.strip_prefix("g:")?).ok()?.try_into().ok()
 }
 
 /// An ACI as our canonical lowercase hyphenated UUID string, from either the string or the

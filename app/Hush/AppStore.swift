@@ -1491,6 +1491,52 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
+    /// A group as its info panel shows it, its members' and invitees' names loaded; nil if it
+    /// isn't known yet.
+    func groupInfo(_ conversationId: String) async -> GroupInfo? {
+        guard let client else { return nil }
+        do {
+            let info = try await client.groupInfo(conversationId: conversationId)
+            for aci in (info?.members.map(\.aci) ?? []) + (info?.invited ?? []) where aci != ownAci {
+                await loadName(aci)
+            }
+            return info
+        } catch {
+            append("group info failed: \(error)")
+            return nil
+        }
+    }
+
+    /// A group member's name; we are "You".
+    func memberName(_ aci: String) -> String {
+        aci == ownAci ? "You" : senderName(aci)
+    }
+
+    /// Changes a group (the core updates the chat once the server has it). Returns why it
+    /// failed, or nil.
+    func changeGroup(_ conversationId: String, _ change: GroupChange) async -> String? {
+        guard let client else { return "Not linked yet." }
+        do {
+            try await client.changeGroup(conversationId: conversationId, change: change)
+            return nil
+        } catch {
+            append("couldn't change group \(conversationId): \(error)")
+            return Self.describe(error)
+        }
+    }
+
+    /// People who can be added to a group: those we have a chat with (accepted, not blocked,
+    /// known by account), but us and `members`, by name.
+    func addableContacts(excluding members: Set<String>) -> [(aci: String, name: String)] {
+        conversations.compactMap { c -> (aci: String, name: String)? in
+            guard c.kind == .direct, !c.blocked, !c.messageRequest, !c.id.hasPrefix("c:PNI:") else { return nil }
+            let aci = String(c.id.dropFirst(2))
+            guard aci != ownAci, !members.contains(aci) else { return nil }
+            return (aci, title(c))
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     /// Who can be mentioned in a group: its members but us, each with a name (ACI, name).
     func mentionCandidates(_ conversationId: String) async -> [(String, String)] {
         guard let client, conversationId.hasPrefix("g:") else { return [] }
