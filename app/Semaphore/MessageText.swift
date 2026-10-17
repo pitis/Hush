@@ -39,7 +39,8 @@ enum MessageText {
             case .monospace: add(.monospace, to: span, in: &text)
             case .spoiler where !revealSpoilers:
                 text[span].foregroundColor = .clear
-                text[span].backgroundColor = .white.opacity(0.45)
+                // the appearance's text colour, half covering: a grey block on either bubble
+                text[span].backgroundColor = .primary.opacity(0.45)
             case .spoiler, .mention: break
             }
         }

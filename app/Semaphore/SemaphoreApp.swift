@@ -53,6 +53,7 @@ struct SemaphoreApp: App {
 struct SettingsView: View {
     let store: AppStore
     @AppStorage(NotificationContent.key) private var content = NotificationContent.nameAndMessage
+    @AppStorage(Appearance.key) private var appearance = Appearance.default
     @AppStorage(MenuBar.key) private var showInMenuBar = true
     @State private var openAtLogin = LoginItem.isEnabled
     @State private var loginItemError: String?
@@ -63,6 +64,10 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Picker("Appearance", selection: $appearance) {
+                ForEach(Appearance.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
             Picker("Notification content", selection: $content) {
                 ForEach(NotificationContent.allCases) { Text($0.label).tag($0) }
             }

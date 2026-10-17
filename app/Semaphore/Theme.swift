@@ -1,14 +1,59 @@
 import SwiftUI
 
-/// Colors after Signal Desktop's dark theme.
+/// The look the app takes: the system's, or always light or dark (Settings).
+enum Appearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+
+    static let key = "appearance"
+    /// As before there was a choice: the app was dark only.
+    static let `default` = Appearance.dark
+
+    var id: String { rawValue }
+    var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
+    var scheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    /// The app-wide appearance it sets (every window, Settings and the call window too).
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: nil
+        case .light: NSAppearance(named: .aqua)
+        case .dark: NSAppearance(named: .darkAqua)
+        }
+    }
+
+    @MainActor func apply() { NSApp.appearance = nsAppearance }
+}
+
+/// Colors after Signal Desktop's light and dark themes, following the window's appearance.
 enum Theme {
-    static let window = Color(red: 0x1B / 255, green: 0x1B / 255, blue: 0x1D / 255)
-    static let sidebar = Color(red: 0x1F / 255, green: 0x1F / 255, blue: 0x21 / 255)
-    static let selection = Color(red: 0x2C / 255, green: 0x2C / 255, blue: 0x2E / 255)
+    static let window = adaptive(light: 0xFFFFFF, dark: 0x1B1B1D)
+    static let sidebar = adaptive(light: 0xF6F6F6, dark: 0x1F1F21)
+    static let selection = adaptive(light: 0xE3E3E3, dark: 0x2C2C2E)
     static let outgoing = Color(red: 0x2C / 255, green: 0x6B / 255, blue: 0xED / 255)
-    static let incoming = Color(red: 0x3B / 255, green: 0x3B / 255, blue: 0x3D / 255)
-    static let field = Color(red: 0x2C / 255, green: 0x2C / 255, blue: 0x2E / 255)
-    static let secondaryText = Color(white: 0.62)
+    static let incoming = adaptive(light: 0xE9E9E9, dark: 0x3B3B3D)
+    /// The words in an incoming bubble (an outgoing one's are white).
+    static let incomingText = adaptive(light: 0x1B1B1D, dark: 0xFFFFFF)
+    static let field = adaptive(light: 0xF0F0F0, dark: 0x2C2C2E)
+    static let secondaryText = adaptive(light: 0x6B6B6B, dark: 0x9E9E9E)
+
+    /// A colour with a light and a dark value (RGB hex), picked by the drawing appearance.
+    private static func adaptive(light: UInt32, dark: UInt32) -> Color {
+        let rgb = { (hex: UInt32) in
+            NSColor(
+                srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
+                blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+        }
+        return Color(
+            nsColor: NSColor(name: nil) { appearance in
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? rgb(dark) : rgb(light)
+            })
+    }
     static let avatars: [Color] = [
         Color(red: 0.86, green: 0.36, blue: 0.36), Color(red: 0.89, green: 0.55, blue: 0.27),
         Color(red: 0.80, green: 0.66, blue: 0.20), Color(red: 0.36, green: 0.68, blue: 0.42),

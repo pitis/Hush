@@ -151,7 +151,7 @@ struct SidebarView: View {
                 if store.searchPending {
                     Text("Searching…")
                 } else if let failed = store.searchFailed {
-                    Text("Search failed: \(failed)").foregroundStyle(.yellow)
+                    Text("Search failed: \(failed)").foregroundStyle(.orange)
                 } else {
                     Text("No messages found")
                 }

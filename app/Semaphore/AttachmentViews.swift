@@ -37,7 +37,7 @@ struct DownloadState: View {
                 Label("Retry", systemImage: "exclamationmark.arrow.circlepath")
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.yellow)
+            .foregroundStyle(.orange)
         case .pending:
             Button(action: download) {
                 Image(systemName: "arrow.down.circle.fill").font(.system(size: 26))
@@ -130,7 +130,7 @@ struct AudioAttachmentView: View {
     var body: some View {
         HStack(spacing: 10) {
             if unplayable {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                 Text("This recording can't be played").font(.system(size: 12))
             } else {
                 if attachment.state == .ready {
@@ -224,8 +224,9 @@ struct Track: View {
 
     var body: some View {
         ZStack(alignment: .leading) {
-            Capsule().fill(.white.opacity(0.3))
-            Capsule().fill(.white).frame(width: 140 * min(max(fraction, 0), 1))
+            // the bubble's words' colour: white on blue, dark on light grey
+            Capsule().fill(.quaternary)
+            Capsule().fill(.primary).frame(width: 140 * min(max(fraction, 0), 1))
         }
         .frame(width: 140, height: 4)
         .accessibilityHidden(true)

@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @AppStorage(Appearance.key) private var appearance = Appearance.default
     let core: AppStore
     @Environment(\.openWindow) private var openWindow
 
@@ -48,7 +49,7 @@ struct ContentView: View {
         }
         .frame(minWidth: 820, minHeight: 520)
         .background(Theme.window)
-        .preferredColorScheme(.dark)
+        .onChange(of: appearance, initial: true) { _, chosen in chosen.apply() }
         .task { await core.boot() }
         .onAppear { WindowOpener.open = openWindow }
         .task {
@@ -128,7 +129,7 @@ struct UnlinkedView: View {
                 Text(
                     "It was removed from your phone's linked devices. Link it again to keep using Semaphore here. "
                         + "Messages stored on this Mac are removed first.")
-                if let error = store.lastError { Text(error).foregroundStyle(.yellow) }
+                if let error = store.lastError { Text(error).foregroundStyle(.orange) }
             }
         } actions: {
             Button {
