@@ -11,6 +11,7 @@ mod history;
 mod link_preview;
 mod logging;
 mod net;
+mod profile;
 pub mod projection;
 mod send;
 mod stickers;

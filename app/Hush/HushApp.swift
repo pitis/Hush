@@ -91,6 +91,8 @@ struct SettingsView: View {
             if let loginItemError { Text(loginItemError).font(.caption).foregroundStyle(.secondary) }
             if store.screen == .chats {
                 Divider()
+                ProfileSettings(store: store)
+                Divider()
                 LabeledContent("Message history") {
                     Button("Transfer Message History…") { confirmRelink = true }.disabled(working)
                 }

@@ -58,8 +58,18 @@ the stored group's fetches the group before the content reaches us.
    A join the server took counts though telling the members failed (only if presage's copy
    moved during this attempt). The link holds the group's key: it is never logged, nor is
    its password in a server error.
-6. **Own profile.** Settings shows and edits our name and about. The picture stays the phone's
-   (presage can't upload one).
+6. **Own profile.** Settings shows and edits our name (a first name is needed) and about. The
+   picture stays the phone's (presage can't upload one), and so does the about's emoji (kept,
+   dropped with a cleared about). Read from the server each time Settings opens: presage's copy
+   of our profile is never refreshed, and asking through presage's websocket isn't offered (a
+   second one would displace it), so it's fetched over HTTPS (`/v1/profile/<aci>/<version>`)
+   and presage's copy replaced. A save writes it the same way (`PUT /v1/profile`, as
+   libsignal-service builds it), not through presage's `update_profile`: that leaves out the
+   payment address and the phone number sharing setting, which the server then clears; ours
+   sends them back as read. A write whose answer was lost counts if the profile read back
+   holds it. Then the save asks
+   our other devices to fetch our profile (`FetchLatest` `LOCAL_PROFILE`, as Signal Desktop
+   does) so the phone shows, and keeps, the new name.
 
 ## Testing
 Pure parts (membership decisions, revision gating, edit permissions) get unit tests; network
