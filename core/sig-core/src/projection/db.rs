@@ -2565,16 +2565,27 @@ impl ProjectionDb {
             .execute(&mut *tx)
             .await?;
         }
-        for (key, value) in [
-            ("default_chat_color", &batch.default_chat_color),
-            ("default_wallpaper", &batch.default_wallpaper),
-        ] {
-            if let Some(v) = value {
-                sqlx::query("INSERT OR REPLACE INTO app_values VALUES (?1, ?2)")
-                    .bind(key)
-                    .bind(v.to_row())
-                    .execute(&mut *tx)
-                    .await?;
+        // the phone's defaults, set or removed: only from the batch that read them
+        if batch.defaults_read {
+            for (key, value) in [
+                ("default_chat_color", &batch.default_chat_color),
+                ("default_wallpaper", &batch.default_wallpaper),
+            ] {
+                match value {
+                    Some(v) => {
+                        sqlx::query("INSERT OR REPLACE INTO app_values VALUES (?1, ?2)")
+                            .bind(key)
+                            .bind(v.to_row())
+                            .execute(&mut *tx)
+                            .await?
+                    }
+                    None => {
+                        sqlx::query("DELETE FROM app_values WHERE key = ?1")
+                            .bind(key)
+                            .execute(&mut *tx)
+                            .await?
+                    }
+                };
             }
         }
         for m in &batch.messages {
@@ -3461,6 +3472,7 @@ mod tests {
                 events: vec![],
                 default_chat_color: None,
                 default_wallpaper: None,
+                defaults_read: false,
             }
         }
 
@@ -3584,6 +3596,7 @@ mod tests {
                     }],
                     default_chat_color: None,
                     default_wallpaper: None,
+                    defaults_read: false,
                 }
             };
             db.import_history(&batch()).await.unwrap();
@@ -3635,6 +3648,7 @@ mod tests {
                 events: vec![],
                 default_chat_color: None,
                 default_wallpaper: None,
+                defaults_read: false,
             })
             .await
             .unwrap();
@@ -3686,6 +3700,7 @@ mod tests {
                 events: vec![],
                 default_chat_color: Some(crimson.clone()),
                 default_wallpaper: None,
+                defaults_read: true,
             })
             .await
             .unwrap();
@@ -3729,6 +3744,7 @@ mod tests {
                 }],
                 messages: vec![imported("c:bob", "bob", 2, "hi", MessageStatus::Read)],
                 default_wallpaper: Some(navy.clone()),
+                defaults_read: true,
                 ..Default::default()
             })
             .await
@@ -3736,8 +3752,19 @@ mod tests {
             assert_eq!(conv(&db, "c:alice").await.wallpaper, Some(navy.clone()), "the default");
             assert_eq!(conv(&db, "c:bob").await.wallpaper, Some(peach));
             assert!(db.set_wallpaper("c:bob", None).await.unwrap());
-            assert_eq!(conv(&db, "c:bob").await.wallpaper, Some(navy));
+            assert_eq!(conv(&db, "c:bob").await.wallpaper, Some(navy.clone()));
             assert!(!db.set_wallpaper("c:nobody", None).await.unwrap());
+            // a later batch that didn't read the defaults leaves them
+            db.import_history(&batch_with(vec![])).await.unwrap();
+            assert_eq!(conv(&db, "c:alice").await.wallpaper, Some(navy));
+            // imported again, the phone has no default any more: none here either
+            db.import_history(&HistoryBatch {
+                defaults_read: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(conv(&db, "c:alice").await.wallpaper, None);
         }
 
         #[tokio::test]

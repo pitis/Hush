@@ -435,6 +435,7 @@ struct MessageRow: View {
                 if isGroup && !outgoing && first {
                     Text(senderName).font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Theme.avatars[Formatting.avatarIndex("c:\(message.author)")])
+                        .wallpaperBacked()
                         .padding(.horizontal, 12)
                 }
                 HStack(alignment: .center, spacing: 6) {
@@ -563,7 +564,8 @@ struct MessageRow: View {
                     }
                 }
                 .font(.system(size: 14))
-                meta
+                // a sticker has no bubble: its time and ticks would sit on a wallpaper
+                if stickerImage != nil { meta.wallpaperBacked() } else { meta }
             }
         }
         .padding(.horizontal, 12)

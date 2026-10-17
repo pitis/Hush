@@ -30,8 +30,11 @@ style and custom colours.
   (migration 0022). Photo wallpapers aren't brought over.
 - `wallpaper_presets()` gives Signal's 21 presets, numbered by `WallpaperPreset`. The popover in
   the header picks a colour and a wallpaper, or puts either back to the default.
-- The wallpaper fills the timeline and is dimmed in dark mode. Date separators and chat events
-  (missed calls, timer changes) get a material pill over a wallpaper, so they stay readable.
+- The wallpaper fills the timeline and is dimmed in dark mode. Date separators, chat events
+  (missed calls, timer changes), group sender names and a sticker's time get a material pill over
+  a wallpaper, so they stay readable.
+- The batch that reads the account frame sets the phone's defaults, or removes them when the phone
+  has none. Later batches leave them alone.
 
 ## Not in this slice
 Photo wallpapers; automatic bubble colours that follow a wallpaper.

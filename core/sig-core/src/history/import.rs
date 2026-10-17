@@ -25,6 +25,9 @@ pub(crate) struct HistoryBatch {
     pub default_chat_color: Option<ChatColor>,
     /// The phone's default wallpaper (a preset; photos aren't brought over).
     pub default_wallpaper: Option<ChatColor>,
+    /// The account frame was in this batch: the defaults above are the phone's (None: it has
+    /// none), not merely unknown.
+    pub defaults_read: bool,
 }
 
 impl HistoryBatch {
@@ -324,6 +327,7 @@ impl Importer {
 
     /// Only its colours are ours: the custom ones chats point to, and the default.
     fn account(&mut self, a: &backup::AccountData) {
+        self.batch.defaults_read = true;
         let Some(settings) = a.accountSettings.as_ref() else {
             return;
         };
