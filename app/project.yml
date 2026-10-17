@@ -36,6 +36,15 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         # RingRTC's WebRTC and cubeb are C++
         OTHER_LDFLAGS: ["-lc++"]
+      configs:
+        Release:
+          # Drop unused code and strip local symbols in every Release build, not only an archive:
+          # the Rust core and WebRTC otherwise ship ~35 MB of dead code and symbols (63 MB → 29 MB).
+          # Global symbols stay.
+          DEAD_CODE_STRIPPING: YES
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_INSTALLED_PRODUCT: YES
+          STRIP_STYLE: non-global
   SemaphoreTests:
     type: bundle.unit-test
     platform: macOS
