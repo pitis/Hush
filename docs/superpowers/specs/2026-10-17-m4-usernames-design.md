@@ -17,7 +17,7 @@ Username links (`signal.me/#eu/…`), our own username (setting or showing it).
 ## Design
 - Migration 0017: `conversations.username`, written by the storage pull (`set_username`).
 - `Command::LookupUsername` runs presage's lookup on the core thread (15 s); `Client
-  .find_username` checks the form (a name, a dot, two or more digits), asks, and on a hit stores
+  .find_username` checks the form with Signal's own rules (libsignal's `Username::new`), asks, and on a hit stores
   the username and lists the chat now (`open_found` sets its time when it has no messages).
 - App: `FindUsernameSheet`; `AppStore.findUsername` selects the chat or says why not.
 

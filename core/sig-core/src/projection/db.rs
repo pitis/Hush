@@ -481,9 +481,6 @@ impl ProjectionDb {
             .await
     }
 
-    /// Whether the contact is in the phone's address book (its storage record carries system
-    /// names), which makes it never a request. The chat is created if needed.
-    /// True if it changed.
     /// Stores a contact's username (None: it has none). True if it changed.
     pub async fn set_username(&self, id: &str, username: Option<&str>) -> Result<bool, sqlx::Error> {
         let kind = kind_of(id)?;
@@ -512,6 +509,9 @@ impl ProjectionDb {
         Ok(())
     }
 
+    /// Whether the contact is in the phone's address book (its storage record carries system
+    /// names), which makes it never a request. The chat is created if needed.
+    /// True if it changed.
     pub async fn set_phone_contact(&self, id: &str, on: bool) -> Result<bool, sqlx::Error> {
         let kind = kind_of(id)?;
         let res = sqlx::query(

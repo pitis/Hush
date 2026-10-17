@@ -1026,11 +1026,9 @@ impl Client {
     /// returns its id, or None if no one has it.
     pub async fn find_username(&self, username: String) -> Result<Option<String>, CoreError> {
         let username = username.trim().trim_start_matches('@').to_string();
-        // Signal's form: a name, a dot, at least two digits
-        let valid = username.split_once('.').is_some_and(|(name, digits)| {
-            !name.is_empty() && digits.len() >= 2 && digits.chars().all(|c| c.is_ascii_digit())
-        });
-        if !valid {
+        // Signal's own rules (a name, a dot, a number; lengths, characters, zeros): a username
+        // that breaks them isn't asked about
+        if presage::libsignal_service::protocol::Username::new(&username).is_err() {
             return Err(CoreError::InvalidInput {
                 message: "a username looks like name.42".into(),
             });
@@ -2165,7 +2163,9 @@ mod tests {
     fn a_username_must_look_like_one_before_its_asked_about() {
         let (_dir, _sink, client, rt) = as_me("client-username");
         rt.block_on(async {
-            for bad in ["", "alice", "alice.", "alice.4", ".42", "alice.4x"] {
+            for bad in [
+                "", "alice", "alice.", "alice.4", ".42", "alice.4x", "abc.00", "abc.007", "1abc.42", "ab-c.42",
+            ] {
                 assert!(invalid(client.find_username(bad.into()).await), "{bad:?}");
             }
         });
