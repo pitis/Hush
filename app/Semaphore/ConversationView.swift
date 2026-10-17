@@ -21,6 +21,8 @@ struct ConversationView: View {
                 }
             }
             .environment(\.chatColor, conversation.chatColor)
+            .environment(\.onWallpaper, conversation.wallpaper != nil)
+            .background { if let w = conversation.wallpaper { Wallpaper(wallpaper: w) } }
             if conversation.blocked || conversation.messageRequest {
                 RequestBar(store: store, conversation: conversation)
             } else {
@@ -207,13 +209,13 @@ struct ConversationHeader: View {
                 Image(systemName: "paintpalette").font(.system(size: 15))
             }
             .buttonStyle(.plain)
-            .help("Chat colour")
-            .accessibilityLabel("Chat colour")
+            .help("Chat colour and wallpaper")
+            .accessibilityLabel("Chat colour and wallpaper")
             .popover(isPresented: $choosingColor, arrowEdge: .bottom) {
-                ChatColorPicker(current: conversation.chatColor) {
-                    store.setChatColor(conversation.id, $0)
-                    choosingColor = false
-                }
+                ChatStylePicker(
+                    chatColor: conversation.chatColor, wallpaper: conversation.wallpaper,
+                    chooseColor: { store.setChatColor(conversation.id, $0) },
+                    chooseWallpaper: { store.setWallpaper(conversation.id, $0) })
             }
             if canCall {
                 let inCall = store.call != nil && store.call?.phase != .ended
@@ -254,6 +256,7 @@ struct TimelineList: View {
                         switch item {
                         case .day(let title, _):
                             Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.secondaryText)
+                                .wallpaperBacked()
                                 .padding(.vertical, 10)
                         case .event(let e):
                             ChatEventRow(
@@ -754,6 +757,7 @@ struct ChatEventRow: View {
                     .foregroundStyle(.red.opacity(0.9))
             }
         }
+        .wallpaperBacked()
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
     }

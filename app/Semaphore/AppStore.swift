@@ -675,6 +675,13 @@ final class AppStore {
         }
     }
 
+    /// Sets a chat's wallpaper (nil: the default).
+    func setWallpaper(_ conversationId: String, _ wallpaper: ChatColor?) {
+        change(conversationId, "set the wallpaper") {
+            try await $0.setWallpaper(conversationId: conversationId, wallpaper: wallpaper)
+        }
+    }
+
     /// Sets a direct chat's disappearing-message timer (0: off).
     func setTimer(_ conversationId: String, seconds: UInt32) {
         change(conversationId, "set the disappearing timer") {

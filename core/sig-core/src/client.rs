@@ -1007,6 +1007,19 @@ impl Client {
         Ok(())
     }
 
+    /// Sets a chat's wallpaper (None: the default). Kept on this Mac only.
+    pub async fn set_wallpaper(&self, conversation_id: String, wallpaper: Option<ChatColor>) -> Result<(), CoreError> {
+        if wallpaper.as_ref().is_some_and(|c| c.colors.is_empty()) {
+            return Err(CoreError::InvalidInput {
+                message: "a wallpaper needs a colour".into(),
+            });
+        }
+        self.known_conversation(&conversation_id).await?;
+        self.db.set_wallpaper(&conversation_id, wallpaper.as_ref()).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
+    }
+
     /// Archives a chat (out of the list, behind "Archived") or brings it back.
     pub async fn set_archived(&self, conversation_id: String, archived: bool) -> Result<(), CoreError> {
         self.known_conversation(&conversation_id).await?;

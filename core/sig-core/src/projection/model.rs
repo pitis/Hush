@@ -68,9 +68,11 @@ pub struct Conversation {
     /// Our bubbles' colour in this chat (its own, else the default set on the phone); None: the
     /// app's.
     pub chat_color: Option<ChatColor>,
+    /// The chat's wallpaper (its own, else the phone's default); None: none.
+    pub wallpaper: Option<ChatColor>,
 }
 
-/// A bubble colour: one colour (solid) or a gradient of several, at `angle` degrees (0: bottom to
+/// A bubble colour or a wallpaper: one colour (solid) or a gradient of several, at `angle` degrees (0: bottom to
 /// top, 90: left to right, as in Signal's backups). Colours are 0xAARRGGBB.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct ChatColor {

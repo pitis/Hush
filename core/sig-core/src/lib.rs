@@ -34,6 +34,12 @@ pub fn chat_color_presets() -> Vec<projection::ChatColor> {
     projection::chat_colors::presets()
 }
 
+/// Signal's wallpaper presets, for the picker.
+#[uniffi::export]
+pub fn wallpaper_presets() -> Vec<projection::ChatColor> {
+    projection::chat_colors::wallpapers()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

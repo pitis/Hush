@@ -1,5 +1,5 @@
-//! Signal's bubble colour presets (`ChatStyle.BubbleColorPreset` in backups), as the phone shows
-//! them, and the chat styles of a history archive in our terms.
+//! Signal's bubble colour and wallpaper presets (`ChatStyle.BubbleColorPreset` and
+//! `WallpaperPreset` in backups), as the phone shows them.
 
 use super::model::ChatColor;
 
@@ -45,6 +45,39 @@ pub fn presets() -> Vec<ChatColor> {
     ]
 }
 
+/// The wallpaper presets in `WallpaperPreset` order (1 = Blush … 21 = Peach).
+pub fn wallpapers() -> Vec<ChatColor> {
+    vec![
+        solid(0xFFE26983),                     // blush
+        solid(0xFFDF9171),                     // copper
+        solid(0xFF9E9887),                     // dust
+        solid(0xFF89AE8F),                     // celadon
+        solid(0xFF146148),                     // rainforest
+        solid(0xFF32C7E2),                     // pacific
+        solid(0xFF7C99B6),                     // frost
+        solid(0xFF403B91),                     // navy
+        solid(0xFFC988E7),                     // lilac
+        solid(0xFFE297C3),                     // pink
+        solid(0xFF624249),                     // eggplant
+        solid(0xFFA2A2AA),                     // silver
+        gradient(192, 0xFFF3DC47, 0xFFDB7133), // sunset
+        gradient(180, 0xFF16161D, 0xFF3B3B4E), // noir
+        gradient(192, 0xFFF53844, 0xFF42378F), // heatmap
+        gradient(180, 0xFF0093E9, 0xFF80D0C7), // aqua
+        gradient(192, 0xFFF04CE6, 0xFF0E2FDD), // iridescent
+        gradient(180, 0xFF65CDAC, 0xFF0A995A), // monstera
+        gradient(180, 0xFFD8E1FA, 0xFFF5E1F0), // bliss
+        gradient(180, 0xFFD8EBFD, 0xFFA5D2FC), // sky
+        gradient(180, 0xFFFFE5C2, 0xFFFCA390), // peach
+    ]
+}
+
+/// A wallpaper by its `WallpaperPreset` number; None for unknown (none).
+pub fn wallpaper(number: i32) -> Option<ChatColor> {
+    let i = usize::try_from(number).ok()?.checked_sub(1)?;
+    wallpapers().into_iter().nth(i)
+}
+
 /// A preset by its `BubbleColorPreset` number; None for unknown (the default).
 pub fn preset(number: i32) -> Option<ChatColor> {
     let i = usize::try_from(number).ok()?.checked_sub(1)?;
@@ -63,6 +96,15 @@ mod tests {
         assert_eq!(preset(22).map(|c| c.colors.len()), Some(2), "tangerine is a gradient");
         assert_eq!(preset(23), None);
         assert_eq!(preset(-1), None);
+    }
+
+    #[test]
+    fn wallpapers_go_by_their_backup_numbers() {
+        assert_eq!(wallpapers().len(), 21);
+        assert_eq!(wallpaper(0), None, "unknown: none");
+        assert_eq!(wallpaper(8), Some(solid(0xFF403B91)), "navy");
+        assert_eq!(wallpaper(21).map(|c| c.colors.len()), Some(2), "peach is a gradient");
+        assert_eq!(wallpaper(22), None);
     }
 
     #[test]
