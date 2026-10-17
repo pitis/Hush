@@ -9,8 +9,8 @@ crate-type = ["staticlib", "lib"]
 
 [dependencies]
 uniffi = { workspace = true, features = ["tokio"] }
-presage = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "971b14bf1b7382e45bc363966e1ed588173e7c36" }
+presage = { git = "https://github.com/whisperfish/presage", rev = "07815e7e2f649396f2fdd8f44c722688b612c854" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "07815e7e2f649396f2fdd8f44c722688b612c854" }
 # Reads the link-and-sync history archive. Same libsignal tag as libsignal-service's pins, so
 # the checkouts unify. `test-util` makes its `proto` (backup.proto types) and `export` (archive
 # writing, for tests) modules public.
