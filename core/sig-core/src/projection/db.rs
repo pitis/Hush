@@ -536,6 +536,32 @@ impl ProjectionDb {
         Ok(true)
     }
 
+    /// Points pictures stored under another folder (the data folder was moved, e.g. by the app's
+    /// rename) at the same file name in this one. The count of pictures moved.
+    pub async fn reroot_avatars(&self) -> Result<u64, sqlx::Error> {
+        let Some(dir) = self.files.clone() else { return Ok(0) };
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, avatar FROM conversations WHERE avatar IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut moved = 0;
+        for (id, avatar) in rows {
+            let old = std::path::Path::new(&avatar);
+            let Some(name) = old.file_name() else { continue };
+            if old.parent() == Some(dir.as_path()) {
+                continue;
+            }
+            let path = dir.join(name);
+            moved += sqlx::query("UPDATE conversations SET avatar = ?2 WHERE id = ?1")
+                .bind(&id)
+                .bind(path.to_string_lossy())
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        }
+        Ok(moved)
+    }
+
     /// A chat's picture was looked for (and not found or not reachable) at `now_ms`.
     pub async fn set_avatar_checked(&self, id: &str, now_ms: i64) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE conversations SET avatar_checked_at = ?2 WHERE id = ?1")
@@ -5291,6 +5317,33 @@ mod tests {
         assert!(db.store_avatar("c:alice", None, 4).await.unwrap());
         assert_eq!(conv(&db, "c:alice").await.avatar, None);
         assert!(!std::path::Path::new(&newer).exists());
+    }
+
+    #[tokio::test]
+    async fn pictures_stored_under_a_moved_folder_point_into_the_current_one() {
+        let files = TempFiles::new("reroot");
+        let db = db().await.with_files(files.0.clone());
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        db.insert_message(&Message {
+            conversation_id: "c:bob".into(),
+            ..msg("bob", 1, "hi")
+        })
+        .await
+        .unwrap();
+        assert!(db.store_avatar("c:alice", Some(b"jpeg"), 1).await.unwrap());
+        let kept = conv(&db, "c:alice").await.avatar.unwrap();
+        sqlx::query("UPDATE conversations SET avatar = '/old/Semaphore/attachments/avatar-c-bob-1' WHERE id = 'c:bob'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(db.reroot_avatars().await.unwrap(), 1);
+        assert_eq!(conv(&db, "c:alice").await.avatar.unwrap(), kept);
+        assert_eq!(
+            conv(&db, "c:bob").await.avatar.unwrap(),
+            files.0.join("avatar-c-bob-1").to_string_lossy()
+        );
+        assert_eq!(db.reroot_avatars().await.unwrap(), 0);
     }
 
     #[tokio::test]

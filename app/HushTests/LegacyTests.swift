@@ -53,6 +53,27 @@ final class LegacyTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
     }
 
+    func testOldDataFolderInUseIsNotMoved() throws {
+        let support = try temporaryFolder()
+        let old = support.appendingPathComponent("Semaphore")
+        try FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
+        // as a running core holds it
+        let held = open(old.appendingPathComponent(".lock").path, O_CREAT | O_RDWR, 0o644)
+        XCTAssertGreaterThanOrEqual(held, 0)
+        defer { close(held) }
+        XCTAssertEqual(flock(held, LOCK_EX | LOCK_NB), 0)
+
+        XCTAssertThrowsError(try AppStore.dataDirectory(in: support)) {
+            XCTAssertEqual($0 as? Legacy.MoveError, .stillOpen)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: old.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: support.appendingPathComponent("Hush").path))
+
+        flock(held, LOCK_UN)
+        XCTAssertEqual(try AppStore.dataDirectory(in: support).lastPathComponent, "Hush")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+    }
+
     func testExistingNewDataFolderIsKept() throws {
         let support = try temporaryFolder()
         for name in ["Semaphore", "Hush"] {

@@ -210,8 +210,9 @@ final class AppStoreTests: XCTestCase {
     }
 
     func testDataDirectoryIsApplicationSupportHush() throws {
-        let dir = try AppStore.dataDirectory()
-        XCTAssertEqual(dir.lastPathComponent, "Hush")
-        XCTAssertEqual(dir.deletingLastPathComponent().lastPathComponent, "Application Support")
+        // never `dataDirectory()` here: it would move a real Semaphore folder
+        let support = FileManager.default.temporaryDirectory.appendingPathComponent("Application Support")
+        let dir = try AppStore.dataDirectory(in: support)
+        XCTAssertEqual(dir, support.appendingPathComponent("Hush", isDirectory: true))
     }
 }

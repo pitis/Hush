@@ -210,7 +210,7 @@ final class AppStore {
         let legacy = support.appendingPathComponent(Legacy.name, isDirectory: true)
         let files = FileManager.default
         if !files.fileExists(atPath: dir.path), files.fileExists(atPath: legacy.path) {
-            try files.moveItem(at: legacy, to: dir)
+            try Legacy.whileClosed(legacy) { try files.moveItem(at: legacy, to: dir) }
         }
         return dir
     }
@@ -1554,6 +1554,8 @@ final class AppStore {
         switch error {
         case CoreError.AlreadyOpen:
             return "Hush is already running."
+        case Legacy.MoveError.stillOpen:
+            return "Quit \(Legacy.name) and reopen Hush: it moves \(Legacy.name)'s data over once nothing has it open."
         case KeychainError.status(errSecInteractionNotAllowed), KeychainError.status(errSecAuthFailed),
             KeychainError.status(errSecUserCanceled):
             return "Hush couldn't read its key from your keychain. Unlock the keychain, allow access, and reopen."
