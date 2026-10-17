@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures::{channel::oneshot as fut_oneshot, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Content;
+use presage::libsignal_service::groups_v2::GroupInviteLink;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::push_service::ServiceIds;
 use presage::manager::Registered;
@@ -31,7 +32,7 @@ use crate::download::{downloader, Download, Downloads};
 use crate::error::CoreError;
 use crate::events::{alert, from_applied, ConnectionState, CoreEvent, EventListener};
 use crate::projection::ids::{direct_id, group_id};
-use crate::projection::{project, ChatEventKind, Op, ProjectionDb};
+use crate::projection::{project, ChatEventKind, GroupStanding, Op, ProjectionDb};
 use crate::send::{sender, Job, Jobs};
 use crate::storage;
 use crate::typing::{Typing, TYPING_IDLE};
@@ -130,6 +131,21 @@ pub enum Command {
         title: String,
         members: Vec<Aci>,
         done: oneshot::Sender<Result<[u8; 32], String>>,
+    },
+    /// What a group's invite link shows (our own copy if we're in it).
+    PreviewGroupLink {
+        link: GroupInviteLink,
+        done: oneshot::Sender<Result<crate::groups::GroupPreview, String>>,
+    },
+    /// Joins a group through its link, or asks to, then lists its chat; answers whether we asked.
+    JoinGroup {
+        link: GroupInviteLink,
+        done: oneshot::Sender<Result<bool, String>>,
+    },
+    /// Withdraws our request to join a group, then stores it in its chat.
+    CancelJoinRequest {
+        key: [u8; 32],
+        done: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -679,6 +695,48 @@ async fn run(
                     let _ = done.send(Err("not linked yet".into()));
                 }
             },
+            Command::PreviewGroupLink { link, done } => match &manager {
+                Some(m) => {
+                    let mut m = m.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(preview_link(&mut m, &link).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
+            Command::JoinGroup { link, done } => match &manager {
+                Some(m) => {
+                    let (mut m, db, l) = (m.clone(), projection.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(join_group(&mut m, &db, l.as_ref(), &link).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
+            Command::CancelJoinRequest { key, done } => match &manager {
+                Some(m) => {
+                    let (mut m, db, l) = (m.clone(), projection.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let cancelled =
+                            match tokio::time::timeout(Duration::from_secs(30), Box::pin(m.cancel_join_request(&key)))
+                                .await
+                            {
+                                Ok(r) => r.map_err(|e| e.to_string()),
+                                Err(_) => Err("the server didn't answer in time".into()),
+                            };
+                        let own = m.registration_data().service_ids.clone();
+                        settle_group(m.store(), &own, &db, l.as_ref(), &key, None).await;
+                        let _ = done.send(cancelled);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::Relink { done } => {
                 if let Some(m) = &manager {
                     // Best effort: the new link works either way, but each failure leaves a
@@ -1031,6 +1089,74 @@ async fn our_new_group(
     };
     let group = store.group(key).await.map_err(|e| e.to_string())?;
     Ok(group.filter(ours).map(|_| key))
+}
+
+/// What a group's link shows: our own copy if we're in the group, else the server's answer to
+/// whoever has the link.
+async fn preview_link(
+    m: &mut Manager<SqliteStore, Registered>,
+    link: &GroupInviteLink,
+) -> Result<crate::groups::GroupPreview, String> {
+    let id = group_id(&link.master_key);
+    let me = m.registration_data().service_ids.aci;
+    let ours = m.store().group(link.master_key).await.map_err(|e| e.to_string())?;
+    if let Some(g) = ours.filter(|g| g.members.iter().any(|x| ServiceId::from(x.aci).raw_uuid() == me)) {
+        return Ok(crate::groups::member_preview(&g, id));
+    }
+    let info = match tokio::time::timeout(Duration::from_secs(20), Box::pin(m.group_join_info(link))).await {
+        Ok(info) => info.map_err(|e| e.to_string())?,
+        Err(_) => return Err("the server didn't answer in time".into()),
+    };
+    crate::groups::preview(&info, id)
+}
+
+/// Joins a group through its link, or asks to, then lists its chat; answers whether we asked.
+/// A failure after the server took it (telling the members, say) still lists the chat and
+/// answers, the failure going out as an error event: presage then has us in the group or
+/// asking.
+async fn join_group(
+    m: &mut Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    link: &GroupInviteLink,
+) -> Result<bool, String> {
+    use presage::manager::GroupJoin;
+    let joined = match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.join_group(link))).await {
+        Ok(Ok(GroupJoin::Joined { .. })) => Ok(false),
+        Ok(Ok(GroupJoin::Requested)) => Ok(true),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the server didn't answer in time".into()),
+    };
+    let own = m.registration_data().service_ids.clone();
+    let key = link.master_key;
+    let now = chrono::Utc::now().timestamp_millis();
+    match joined {
+        Ok(requested) => {
+            list_new_group(m.store(), &own, db, l, &key, now).await;
+            Ok(requested)
+        }
+        Err(problem) => {
+            let standing = match m.store().group(key).await {
+                Ok(Some(g)) if g.members.iter().any(|x| ServiceId::from(x.aci).raw_uuid() == own.aci) => Some(false),
+                Ok(Some(g))
+                    if g.requesting_members
+                        .iter()
+                        .any(|r| ServiceId::from(r.aci).raw_uuid() == own.aci) =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            };
+            let Some(requested) = standing else {
+                return Err(problem);
+            };
+            list_new_group(m.store(), &own, db, l, &key, now).await;
+            l.on_event(CoreEvent::Error {
+                message: format!("You're in, or asked to be, but the group may not know yet: {problem}"),
+            });
+            Ok(requested)
+        }
+    }
 }
 
 /// The master keys of the groups presage has (an unreadable one is left out: it isn't ours).
@@ -1981,7 +2107,7 @@ async fn timed_avatar<E: std::fmt::Display>(
     }
 }
 
-/// Stores a group's title, members, timer and whether we (`own`) are invited, as presage has
+/// Stores a group's title, members, timer and where we (`own`) stand, as presage has
 /// them, unless that revision is stored already; returns whether it was stored.
 async fn store_group(
     db: &ProjectionDb,
@@ -1995,8 +2121,18 @@ async fn store_group(
         .map(|m| ServiceId::from(m.aci).raw_uuid().to_string())
         .collect();
     let timer = g.disappearing_messages_timer.as_ref().map_or(0, |t| t.duration);
-    let invited = crate::groups::invited(g, own.aci, own.pni);
-    db.set_group(&group_id(key), g.revision, &g.title, &members, timer, invited)
+    let standing = if crate::groups::invited(g, own.aci, own.pni) {
+        GroupStanding::Invited
+    } else if g
+        .requesting_members
+        .iter()
+        .any(|r| ServiceId::from(r.aci).raw_uuid() == own.aci)
+    {
+        GroupStanding::Requesting
+    } else {
+        GroupStanding::Other
+    };
+    db.set_group(&group_id(key), g.revision, &g.title, &members, timer, standing)
         .await
 }
 
@@ -2547,9 +2683,16 @@ mod tests {
         let (known, unknown) = ([7u8; 32], [8u8; 32]);
         let group = crate::projection::ids::group_id(&known);
         let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
-        db.set_group(&group, 1, "G", &[ME.into(), ALICE.into()], 0, false)
-            .await
-            .unwrap();
+        db.set_group(
+            &group,
+            1,
+            "G",
+            &[ME.into(), ALICE.into()],
+            0,
+            super::GroupStanding::Other,
+        )
+        .await
+        .unwrap();
         let text = |ms: u64, key: [u8; 32]| {
             ContentBody::DataMessage(DataMessage {
                 body: Some("x".into()),

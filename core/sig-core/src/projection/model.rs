@@ -61,6 +61,8 @@ pub struct Conversation {
     pub message_request: bool,
     /// A group we're invited to and haven't answered: the app offers Accept and Decline.
     pub group_invitation: bool,
+    /// A group we asked to join through its link: the app offers to cancel the request.
+    pub group_join_requested: bool,
     /// The chat's picture file (a contact's profile avatar, a group's), when it has one.
     pub avatar: Option<String>,
     /// A contact's username, when known.

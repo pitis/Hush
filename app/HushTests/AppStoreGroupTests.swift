@@ -119,4 +119,55 @@ final class AppStoreGroupTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(fake.flagCalls, [])
     }
+
+    private let link = "https://signal.group/#CjQKIA"
+
+    func testALinkShowsItsGroupOrWhyNot() async {
+        let fake = FakeClient(linked: true)
+        let preview = GroupPreview(
+            conversationId: group, title: "Hikers", description: "", memberCount: 7, approval: true, requested: false,
+            member: false)
+        fake.linkPreviews[link] = preview
+        let store = await linkedStore(fake)
+        let read = await store.previewGroupLink(link)
+        XCTAssertEqual(read, .group(preview))
+        let bad = await store.previewGroupLink("hello")
+        XCTAssertEqual(bad, .failed("Couldn't read the link: that isn't a group link"))
+    }
+
+    func testJoiningOpensTheChatAndAFailureSaysWhy() async {
+        let fake = FakeClient(linked: true)
+        fake.joinAnswers[link] = GroupJoined(conversationId: group, requested: true)
+        let store = await linkedStore(fake)
+        let joined = await store.joinGroup(link)
+        XCTAssertNil(joined)
+        XCTAssertEqual(store.selectedId, group, "asked: the chat opens, waiting")
+        store.select(nil)
+        fake.joinError = CoreError.Network(message: "refused")
+        let failed = await store.joinGroup(link)
+        XCTAssertEqual(failed, "Couldn't join the group: refused")
+        XCTAssertNil(store.selectedId)
+    }
+
+    func testACancelledRequestTakesItsChatAway() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        let cancelled = await store.cancelJoinRequest(group)
+        XCTAssertNil(cancelled)
+        XCTAssertEqual(fake.cancelledRequests, [group])
+        await eventually { fake.flagCalls == ["delete \(self.group)"] }
+        fake.cancelError = CoreError.Network(message: "refused")
+        let failed = await store.cancelJoinRequest(group)
+        XCTAssertEqual(failed, "Couldn't cancel the request: refused")
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(fake.flagCalls.count, 1, "the chat stays")
+    }
+
+    func testAClickedGroupLinkOpensTheJoinSheetAndOthersTheBrowser() async {
+        let store = await linkedStore(FakeClient(linked: true))
+        XCTAssertTrue(store.handleLink(URL(string: link)!))
+        XCTAssertEqual(store.joiningLink, link)
+        XCTAssertFalse(store.handleLink(URL(string: "https://example.com/#x")!))
+        XCTAssertFalse(store.handleLink(URL(string: "https://signal.group.example.com/#x")!))
+    }
 }

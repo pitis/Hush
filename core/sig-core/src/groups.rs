@@ -43,6 +43,65 @@ pub struct GroupMember {
     pub admin: bool,
 }
 
+/// A group as its invite link shows it to someone outside.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupPreview {
+    /// Its chat (`g:…`): it holds the group's key, so it is never logged.
+    pub conversation_id: String,
+    pub title: String,
+    pub description: String,
+    pub member_count: u32,
+    /// Joining asks an admin to let us in.
+    pub approval: bool,
+    /// We asked already and wait for an admin.
+    pub requested: bool,
+    /// We're in it already.
+    pub member: bool,
+}
+
+/// What a link shows of its group (`info`, as the server answers whoever has the link); an
+/// error if the link lets no one in any more.
+pub fn preview(
+    info: &presage::libsignal_service::groups_v2::GroupJoinInfo,
+    conversation_id: String,
+) -> Result<GroupPreview, String> {
+    let approval = match info.add_from_invite_link {
+        AccessRequired::Any => false,
+        AccessRequired::Administrator => true,
+        _ => return Err("this group link has been turned off".into()),
+    };
+    Ok(GroupPreview {
+        conversation_id,
+        title: info.title.clone(),
+        description: info.description_text.clone().unwrap_or_default(),
+        member_count: info.member_count,
+        approval,
+        requested: info.pending_admin_approval,
+        member: false,
+    })
+}
+
+/// A link's group we're in already, as we have it: its chat opens, whatever the link says.
+pub fn member_preview(group: &Group, conversation_id: String) -> GroupPreview {
+    GroupPreview {
+        conversation_id,
+        title: group.title.clone(),
+        description: group.description.clone().unwrap_or_default(),
+        member_count: group.members.len() as u32,
+        approval: false,
+        requested: false,
+        member: true,
+    }
+}
+
+/// How joining through a link went.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupJoined {
+    pub conversation_id: String,
+    /// We asked; an admin lets us in.
+    pub requested: bool,
+}
+
 /// A change to a group the app asks for.
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum GroupChange {
@@ -520,5 +579,40 @@ mod tests {
             GroupEdit::DenyRequest(super::aci(ALICE).unwrap()),
         );
         assert!(edit(GroupChange::ApproveRequest { aci: "x".into() }).is_err());
+    }
+
+    #[test]
+    fn a_link_shows_its_group_and_whether_joining_asks_an_admin() {
+        use presage::libsignal_service::groups_v2::GroupJoinInfo;
+        let mut info = GroupJoinInfo {
+            title: "Hikers".into(),
+            description_text: None,
+            avatar: String::new(),
+            member_count: 7,
+            add_from_invite_link: AccessRequired::Any,
+            version: 3,
+            pending_admin_approval: false,
+        };
+        let open = preview(&info, "g:x".into()).unwrap();
+        assert_eq!(
+            open,
+            GroupPreview {
+                conversation_id: "g:x".into(),
+                title: "Hikers".into(),
+                description: String::new(),
+                member_count: 7,
+                approval: false,
+                requested: false,
+                member: false,
+            }
+        );
+        info.add_from_invite_link = AccessRequired::Administrator;
+        info.pending_admin_approval = true;
+        let asked = preview(&info, "g:x".into()).unwrap();
+        assert!(asked.approval && asked.requested);
+        info.add_from_invite_link = AccessRequired::Unsatisfiable;
+        assert!(preview(&info, "g:x".into()).is_err(), "turned off");
+        let ours = member_preview(&group(vec![member(ME, Role::Default)], None), "g:x".into());
+        assert!(ours.member && ours.member_count == 1 && ours.title == "Hikers");
     }
 }

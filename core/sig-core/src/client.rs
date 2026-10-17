@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crate::actor::{self, Command};
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
-use crate::groups::{GroupChange, GroupInfo};
+use crate::groups::{GroupChange, GroupInfo, GroupJoined, GroupPreview};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
     Attachment, BodyRange, ChatColor, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey,
@@ -1236,6 +1236,52 @@ impl Client {
         Ok(crate::projection::ids::group_id(&key))
     }
 
+    /// What a group's invite link (`https://signal.group/#…`) shows: the group, and whether
+    /// we're in it or asked to join already. The link holds the group's key: never logged.
+    pub async fn group_link_preview(&self, link: String) -> Result<GroupPreview, CoreError> {
+        let link = group_link(&link)?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::PreviewGroupLink { link, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })
+    }
+
+    /// Joins a group through its invite link, or asks to where admins approve; its chat is
+    /// listed and accepted (as Signal's apps do: we chose it).
+    pub async fn join_group(&self, link: String) -> Result<GroupJoined, CoreError> {
+        let link = group_link(&link)?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let conversation_id = crate::projection::ids::group_id(&link.master_key);
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::JoinGroup { link, done })?;
+        let requested = answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })?;
+        self.accept_request(conversation_id.clone()).await?;
+        Ok(GroupJoined {
+            conversation_id,
+            requested,
+        })
+    }
+
+    /// Withdraws our request to join a group; the chat stays (the app deletes it).
+    pub async fn cancel_join_request(&self, conversation_id: String) -> Result<(), CoreError> {
+        let key = crate::projection::ids::group_key(&conversation_id).ok_or(CoreError::InvalidInput {
+            message: "not a group".into(),
+        })?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::CancelJoinRequest { key, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })
+    }
+
     /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
     pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
         Ok(self.db.group_members(&conversation_id).await?)
@@ -1293,6 +1339,13 @@ fn check_conversation(id: &str) -> Result<(), CoreError> {
         });
     }
     Ok(())
+}
+
+/// A group invite link, as pasted or clicked.
+fn group_link(link: &str) -> Result<presage::libsignal_service::groups_v2::GroupInviteLink, CoreError> {
+    presage::libsignal_service::groups_v2::GroupInviteLink::parse(link).ok_or(CoreError::InvalidInput {
+        message: "that isn't a group link".into(),
+    })
 }
 
 #[cfg(test)]
@@ -1537,6 +1590,30 @@ mod tests {
             assert!(matches!(
                 client.create_group("Hikers".into(), vec![]).await,
                 Err(CoreError::NotLinked)
+            ));
+            let link = presage::libsignal_service::groups_v2::GroupInviteLink {
+                master_key: [3; 32],
+                password: vec![1; 16],
+            }
+            .to_url();
+            for bad in ["https://signal.org/#abc", "hello"] {
+                assert!(matches!(
+                    client.group_link_preview(bad.into()).await,
+                    Err(CoreError::InvalidInput { .. })
+                ));
+                assert!(matches!(
+                    client.join_group(bad.into()).await,
+                    Err(CoreError::InvalidInput { .. })
+                ));
+            }
+            assert!(matches!(
+                client.group_link_preview(link.clone()).await,
+                Err(CoreError::NotLinked)
+            ));
+            assert!(matches!(client.join_group(link).await, Err(CoreError::NotLinked)));
+            assert!(matches!(
+                client.cancel_join_request("c:x".into()).await,
+                Err(CoreError::InvalidInput { .. })
             ));
         });
     }

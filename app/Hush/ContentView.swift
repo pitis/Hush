@@ -40,6 +40,14 @@ struct ContentView: View {
                         }
                     }
                     .navigationTitle("")
+                    // a group link clicked in a message joins here, not in the browser
+                    .environment(\.openURL, OpenURLAction { core.handleLink($0) ? .handled : .systemAction })
+                    .sheet(
+                        isPresented: Binding(
+                            get: { core.joiningLink != nil }, set: { if !$0 { core.joiningLink = nil } })
+                    ) {
+                        JoinGroupSheet(store: core, link: core.joiningLink ?? "")
+                    }
                     if let progress = core.history {
                         Color.black.opacity(0.35).ignoresSafeArea()
                         HistoryView(progress: progress, cancel: core.cancelHistory, retry: core.retryHistory)

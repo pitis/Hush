@@ -40,6 +40,9 @@ final class ChatListTests: XCTestCase {
         invitation.groupInvitation = true
         invitation.messageRequest = true
         XCTAssertEqual(line(invitation), .message("Group invitation", tick: nil))
+        var asked = last("g:00")
+        asked.groupJoinRequested = true
+        XCTAssertEqual(line(asked), .message("Asked to join", tick: nil))
     }
 
     func testTheRequestBarNamesThePersonOrTheGroup() {
@@ -54,6 +57,9 @@ final class ChatListTests: XCTestCase {
         group.groupInvitation = true
         XCTAssertTrue(RequestBar.prompt(group, name: "G").hasPrefix("You're invited to join this group."))
         XCTAssertTrue(RequestBar.blockMessage(group).contains("The invitation stays unanswered"), "not a member yet")
+        group.groupInvitation = false
+        group.groupJoinRequested = true
+        XCTAssertEqual(RequestBar.prompt(group, name: "G"), "You asked to join this group. An admin has to let you in.")
     }
 
     func testGroupsNameTheAuthorLikeDesktop() {
