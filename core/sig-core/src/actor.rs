@@ -99,7 +99,13 @@ pub enum Command {
     /// The installed sticker packs (images written under `stickers/`), each with its key and its
     /// stickers' content types.
     StickerPacks {
-        done: oneshot::Sender<Result<Vec<InstalledPack>, String>>,
+        done: oneshot::Sender<Result<Vec<crate::projection::model::StickerPackInfo>, String>>,
+    },
+    /// One installed sticker, to send: None if its pack isn't installed or it has no image.
+    Sticker {
+        pack_id: Vec<u8>,
+        sticker_id: u32,
+        done: oneshot::Sender<Result<Option<ChosenSticker>, String>>,
     },
     /// Download and install a sticker pack (our other devices are told), then answer.
     InstallStickerPack {
@@ -109,12 +115,12 @@ pub enum Command {
     },
 }
 
-/// An installed pack as the client needs it to send from it.
-pub(crate) struct InstalledPack {
-    pub info: crate::projection::model::StickerPackInfo,
-    pub key: Vec<u8>,
-    /// Each shown sticker's content type, by id (presage's, else empty).
-    pub content_types: std::collections::HashMap<u32, String>,
+/// A sticker as the client needs it to send it.
+pub(crate) struct ChosenSticker {
+    pub pack_key: Vec<u8>,
+    pub info: crate::projection::model::StickerInfo,
+    /// presage's, else empty.
+    pub content_type: String,
 }
 
 /// Downloading a pack's manifest and every sticker in it.
@@ -561,13 +567,32 @@ async fn run(
                     }
                 }
             }
-            Command::StickerPacks { done } => {
-                let packs = match &manager {
-                    Some(m) => installed_packs(m.store(), &dir.join("stickers")).await,
-                    None => Err("not linked yet".into()),
-                };
-                let _ = done.send(packs);
-            }
+            Command::StickerPacks { done } => match &manager {
+                Some(m) => {
+                    let (store, dir) = (m.store().clone(), dir.join("stickers"));
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(installed_packs(&store, dir).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
+            Command::Sticker {
+                pack_id,
+                sticker_id,
+                done,
+            } => match &manager {
+                Some(m) => {
+                    let (store, dir) = (m.store().clone(), dir.join("stickers"));
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(chosen_sticker(&store, dir, pack_id, sticker_id).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::InstallStickerPack { id, key, done } => match &manager {
                 Some(m) => {
                     // a pack can take a while: commands go on meanwhile
@@ -736,7 +761,11 @@ fn start_history(
     });
 }
 
-async fn installed_packs(store: &SqliteStore, dir: &std::path::Path) -> Result<Vec<InstalledPack>, String> {
+/// The installed packs with stickers we have images of, by title (images written off this thread).
+async fn installed_packs(
+    store: &SqliteStore,
+    dir: PathBuf,
+) -> Result<Vec<crate::projection::model::StickerPackInfo>, String> {
     let mut packs = vec![];
     for pack in store.sticker_packs().await.map_err(|e| e.to_string())? {
         let pack = match pack {
@@ -747,24 +776,41 @@ async fn installed_packs(store: &SqliteStore, dir: &std::path::Path) -> Result<V
                 continue;
             }
         };
-        let info = crate::stickers::pack_info(&pack, dir);
-        if info.stickers.is_empty() {
-            continue;
-        }
-        let content_types = pack
-            .manifest
-            .stickers
-            .iter()
-            .map(|s| (s.id, s.content_type.clone().unwrap_or_default()))
-            .collect();
-        packs.push(InstalledPack {
-            info,
-            key: pack.key.clone(),
-            content_types,
-        });
+        packs.push(pack);
     }
-    packs.sort_by_key(|p| p.info.title.to_lowercase());
-    Ok(packs)
+    let mut infos = tokio::task::spawn_blocking(move || {
+        packs
+            .iter()
+            .map(|p| crate::stickers::pack_info(p, &dir))
+            .filter(|i| !i.stickers.is_empty())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    infos.sort_by_key(|i| i.title.to_lowercase());
+    Ok(infos)
+}
+
+/// One sticker from its pack alone (not every pack), its image written off this thread.
+async fn chosen_sticker(
+    store: &SqliteStore,
+    dir: PathBuf,
+    pack_id: Vec<u8>,
+    sticker_id: u32,
+) -> Result<Option<ChosenSticker>, String> {
+    let Some(pack) = store.sticker_pack(&pack_id).await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || {
+        let s = pack.manifest.stickers.iter().find(|s| s.id == sticker_id)?;
+        Some(ChosenSticker {
+            info: crate::stickers::sticker_info(&pack, s, &dir)?,
+            content_type: s.content_type.clone().unwrap_or_default(),
+            pack_key: pack.key.clone(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Installs a pack unless presage has it already.

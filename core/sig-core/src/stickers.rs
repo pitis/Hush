@@ -34,34 +34,41 @@ pub(crate) fn parse_link(link: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 
 /// A pack as the picker shows it: each sticker presage has the image of, written once to
 /// `<dir>/<pack id>/<sticker id>` (a sticker without one, or that can't be written, is left out).
+/// Blocking file IO: off the core's thread.
 pub(crate) fn pack_info(pack: &presage::store::StickerPack, dir: &Path) -> StickerPackInfo {
-    let id = hex::encode(&pack.id);
-    let folder = dir.join(&id);
     let stickers = pack
         .manifest
         .stickers
         .iter()
-        .filter_map(|s| {
-            let bytes = s.bytes.as_ref()?;
-            let path = folder.join(s.id.to_string());
-            if !path.exists() {
-                std::fs::create_dir_all(&folder)
-                    .and_then(|_| std::fs::write(&path, bytes))
-                    .ok()?;
-            }
-            Some(StickerInfo {
-                id: s.id,
-                emoji: s.emoji.clone().filter(|e| !e.is_empty()),
-                path: path.to_string_lossy().into_owned(),
-            })
-        })
+        .filter_map(|s| sticker_info(pack, s, dir))
         .collect();
     StickerPackInfo {
-        id,
+        id: hex::encode(&pack.id),
         title: pack.manifest.title.clone(),
         author: pack.manifest.author.clone(),
         stickers,
     }
+}
+
+/// One sticker of `pack` as `pack_info` shows it (its image written if it isn't yet).
+pub(crate) fn sticker_info(
+    pack: &presage::store::StickerPack,
+    s: &presage::store::Sticker,
+    dir: &Path,
+) -> Option<StickerInfo> {
+    let bytes = s.bytes.as_ref()?;
+    let folder = dir.join(hex::encode(&pack.id));
+    let path = folder.join(s.id.to_string());
+    if !path.exists() {
+        std::fs::create_dir_all(&folder)
+            .and_then(|_| std::fs::write(&path, bytes))
+            .ok()?;
+    }
+    Some(StickerInfo {
+        id: s.id,
+        emoji: s.emoji.clone().filter(|e| !e.is_empty()),
+        path: path.to_string_lossy().into_owned(),
+    })
 }
 
 #[cfg(test)]

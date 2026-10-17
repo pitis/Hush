@@ -2838,6 +2838,11 @@ async fn forget_deleted_text(conn: &mut SqliteConnection, key: &MessageKey) -> R
         .bind(key.sent_at)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("DELETE FROM outgoing_stickers WHERE author = ?1 AND sent_at = ?2")
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM poll_votes WHERE target_author = ?1 AND target_sent_at = ?2")
         .bind(&key.author)
         .bind(key.sent_at)
@@ -6054,10 +6059,21 @@ mod tests {
         };
         assert!(db.insert_outgoing(&mine, &[file], None, Some(&sticker)).await.unwrap());
         assert_eq!(db.attachments(&k("me", 6)).await.unwrap().len(), 1, "its image");
-        assert_eq!(db.outgoing_sticker(&k("me", 6)).await.unwrap(), Some(sticker));
+        assert_eq!(db.outgoing_sticker(&k("me", 6)).await.unwrap(), Some(sticker.clone()));
         db.forget_outgoing_sticker(&k("me", 6)).await.unwrap();
         assert_eq!(db.outgoing_sticker(&k("me", 6)).await.unwrap(), None);
         assert_eq!(db.outgoing_sticker(&k("me", 99)).await.unwrap(), None);
+        // a failed sticker deleted: which sticker it was goes too
+        let mut again = mine.clone();
+        again.sent_at = 7;
+        assert!(db.insert_outgoing(&again, &[], None, Some(&sticker)).await.unwrap());
+        db.apply(&Op::Delete { target: k("me", 7) }).await.unwrap();
+        assert_eq!(db.outgoing_sticker(&k("me", 7)).await.unwrap(), None);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outgoing_stickers")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]

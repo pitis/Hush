@@ -57,15 +57,6 @@ impl Drop for Client {
 }
 
 impl Client {
-    async fn installed_packs(&self) -> Result<Vec<crate::actor::InstalledPack>, CoreError> {
-        self.own_aci().ok_or(CoreError::NotLinked)?;
-        let (done, answer) = tokio::sync::oneshot::channel();
-        self.send(Command::StickerPacks { done })?;
-        answer
-            .await
-            .map_err(|_| CoreError::Closed)?
-            .map_err(|message| CoreError::Storage { message })
-    }
     /// Files (or a sticker: its image is the one file) as a pending message; see `send_attachments`.
     async fn queue_files(
         &self,
@@ -660,7 +651,13 @@ impl Client {
 
     /// The installed sticker packs, by title, for the picker: each sticker we have the image of.
     pub async fn sticker_packs(&self) -> Result<Vec<StickerPackInfo>, CoreError> {
-        Ok(self.installed_packs().await?.into_iter().map(|p| p.info).collect())
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::StickerPacks { done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Storage { message })
     }
 
     /// Adds the sticker pack a sticker link names (signal.art's "add stickers" link); our other
@@ -690,34 +687,35 @@ impl Client {
         let invalid = |message: &str| CoreError::InvalidInput {
             message: message.into(),
         };
-        let pack = self
-            .installed_packs()
-            .await?
-            .into_iter()
-            .find(|p| p.info.id == pack_id)
-            .ok_or(invalid("that sticker pack isn't installed"))?;
-        let shown = pack
-            .info
-            .stickers
-            .iter()
-            .find(|s| s.id == sticker_id)
-            .ok_or(invalid("that sticker isn't in the pack"))?;
-        let content_type = match pack.content_types.get(&sticker_id) {
-            Some(t) if !t.is_empty() => t.clone(),
+        let id = hex::decode(&pack_id).map_err(|_| invalid("that sticker pack isn't installed"))?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::Sticker {
+            pack_id: id.clone(),
+            sticker_id,
+            done,
+        })?;
+        let chosen = answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Storage { message })?
+            .ok_or(invalid("that sticker isn't installed"))?;
+        let content_type = match chosen.content_type {
+            t if !t.is_empty() => t,
             _ => "image/webp".into(),
         };
         let file = OutgoingFile {
-            path: shown.path.clone(),
+            path: chosen.info.path.clone(),
             content_type,
             width: None,
             height: None,
             is_voice_note: false,
         };
         let sticker = crate::send::SendSticker {
-            pack_id: hex::decode(&pack_id).map_err(|_| invalid("that sticker pack isn't installed"))?,
-            pack_key: pack.key,
+            pack_id: id,
+            pack_key: chosen.pack_key,
             sticker_id,
-            emoji: shown.emoji.clone(),
+            emoji: chosen.info.emoji,
         };
         self.queue_files(conversation_id, vec![file], None, vec![], quote, Some(sticker))
             .await
@@ -753,10 +751,14 @@ impl Client {
                 }
             }
         }
-        match std::fs::remove_dir_all(self.data_dir.join("attachments")) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(e)),
-            _ => Ok(()),
+        // sticker images are copies out of presage's store
+        for dir in ["attachments", "stickers"] {
+            match std::fs::remove_dir_all(self.data_dir.join(dir)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
+                _ => {}
+            }
         }
+        Ok(())
     }
 
     /// The microphones and speakers a call can use. Starts the audio engine if needed.
@@ -801,6 +803,11 @@ impl Client {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
                 _ => {}
             }
+        }
+        // presage's packs go with its store: so do our copies of their images
+        match std::fs::remove_dir_all(self.data_dir.join("stickers")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
+            _ => {}
         }
         match std::fs::remove_file(self.data_dir.join("history.tmp")) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(e)),
@@ -2092,12 +2099,14 @@ mod tests {
         let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
         std::fs::create_dir_all(dir.0.join("attachments")).unwrap();
         std::fs::write(dir.0.join("attachments").join("1"), b"photo").unwrap();
+        std::fs::create_dir_all(dir.0.join("stickers").join("ab")).unwrap();
+        std::fs::write(dir.0.join("stickers").join("ab").join("1"), b"fox").unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async { client.unlink(false).await.unwrap() });
-        for gone in ["presage.db", "projection.db", "attachments"] {
+        for gone in ["presage.db", "projection.db", "attachments", "stickers"] {
             assert!(!dir.0.join(gone).exists(), "{gone} is still there");
         }
         assert!(matches!(client.start(), Err(CoreError::Closed)));

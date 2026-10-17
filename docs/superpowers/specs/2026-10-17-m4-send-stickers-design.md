@@ -18,14 +18,16 @@ packs with their images: it installs a pack when our phone says it installed one
 ## Design
 - **Listing:** `Client::sticker_packs` reads presage's packs on the actor thread and writes each
   sticker's image once to `stickers/<pack id>/<sticker id>`. Only stickers with an image show.
-  Packs are sorted by title.
+  Packs are sorted by title. The images are written off the core's thread. Unlinking or relinking
+  removes them along with presage's store.
 - **Sending:**
   - `send_sticker` sends the image as the message's one file, through the normal file path:
     a pending row and a stored copy.
   - The message kind is Sticker, and `SendJob.sticker` puts the uploaded pointer in
     `DataMessage.sticker`, not in its attachments.
+  - `send_sticker` reads only the chosen sticker's pack, not every pack.
   - The pack and sticker id stay in `outgoing_stickers` until the message is sent, so Retry sends
-    a sticker again.
+    a sticker again. They also go when the message is deleted or expires.
 - **History:** `Seed.sticker_packs` collects the archive's StickerPack frames, and
   `Outcome::Done` carries them. After `Start`, they're installed one by one on the history task.
   A pack that fails is logged and skipped.
