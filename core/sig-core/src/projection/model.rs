@@ -65,6 +65,38 @@ pub struct Conversation {
     pub username: Option<String>,
     /// The note written about a contact on the phone.
     pub note: Option<String>,
+    /// Our bubbles' colour in this chat (its own, else the default set on the phone); None: the
+    /// app's.
+    pub chat_color: Option<ChatColor>,
+}
+
+/// A bubble colour: one colour (solid) or a gradient of several, at `angle` degrees (0: bottom to
+/// top, 90: left to right, as in Signal's backups). Colours are 0xAARRGGBB.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct ChatColor {
+    pub colors: Vec<u32>,
+    pub angle: u32,
+}
+
+impl ChatColor {
+    /// As stored: "<angle>:<AARRGGBB>[,<AARRGGBB>…]".
+    pub fn to_row(&self) -> String {
+        let colors: Vec<String> = self.colors.iter().map(|c| format!("{c:08X}")).collect();
+        format!("{}:{}", self.angle, colors.join(","))
+    }
+
+    /// None for anything `to_row` doesn't write (and for no colours).
+    pub fn from_row(row: &str) -> Option<Self> {
+        let (angle, colors) = row.split_once(':')?;
+        let colors = colors
+            .split(',')
+            .map(|c| u32::from_str_radix(c, 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        (!colors.is_empty()).then_some(Self {
+            colors,
+            angle: angle.parse().ok()?,
+        })
+    }
 }
 
 /// An answer to a message request, ours or one our phone reports

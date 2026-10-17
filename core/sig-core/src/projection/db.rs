@@ -564,6 +564,16 @@ impl ProjectionDb {
         Ok(changed)
     }
 
+    /// Sets our bubbles' colour in a chat (None: the default). False if there's no such chat.
+    pub async fn set_chat_color(&self, conversation_id: &str, color: Option<&ChatColor>) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("UPDATE conversations SET chat_color = ?2 WHERE id = ?1")
+            .bind(conversation_id)
+            .bind(color.map(ChatColor::to_row))
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Stores what the phone calls a contact (preferred to their profile's name) and the note
     /// about them. True if either changed.
     pub async fn set_contact_details(
@@ -1252,7 +1262,9 @@ impl ProjectionDb {
         let rows = sqlx::query(concat!(
             "SELECT c.*, ",
             is_request!(),
-            " AS message_request, COALESCE(c.storage_name, c.title) AS display_title, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
+            " AS message_request, COALESCE(c.storage_name, c.title) AS display_title,
+               COALESCE(c.chat_color, (SELECT value FROM app_values WHERE key = 'default_chat_color'))
+                 AS shown_chat_color, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
                m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
                a.is_voice_note AS file_voice, m.sent_at AS last_sent_at, m.kind AS last_kind,
                m.kind_text AS last_kind_text, m.body_ranges AS last_ranges,
@@ -2516,12 +2528,13 @@ impl ProjectionDb {
             // the phone's chat flags win: at link time they are the truth
             sqlx::query(
                 "INSERT INTO conversations(id, kind, title, expire_timer, archived, pinned_order, mute_until,
-                   marked_unread)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                   marked_unread, chat_color)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                    title = CASE WHEN conversations.title = '' THEN excluded.title ELSE conversations.title END,
                    archived = excluded.archived, pinned_order = excluded.pinned_order,
-                   mute_until = excluded.mute_until, marked_unread = excluded.marked_unread",
+                   mute_until = excluded.mute_until, marked_unread = excluded.marked_unread,
+                   chat_color = excluded.chat_color",
             )
             .bind(&c.id)
             .bind(kind_to_i64(kind))
@@ -2531,8 +2544,15 @@ impl ProjectionDb {
             .bind(c.pinned_order.map(i64::from))
             .bind(c.mute_until)
             .bind(c.marked_unread)
+            .bind(c.chat_color.as_ref().map(ChatColor::to_row))
             .execute(&mut *tx)
             .await?;
+        }
+        if let Some(default) = &batch.default_chat_color {
+            sqlx::query("INSERT OR REPLACE INTO app_values VALUES ('default_chat_color', ?1)")
+                .bind(default.to_row())
+                .execute(&mut *tx)
+                .await?;
         }
         for m in &batch.messages {
             let msg = &m.message;
@@ -3232,6 +3252,9 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         avatar: r.try_get("avatar")?,
         username: r.try_get("username")?,
         note: r.try_get("note")?,
+        chat_color: r
+            .try_get::<Option<String>, _>("shown_chat_color")?
+            .and_then(|c| ChatColor::from_row(&c)),
         id,
     })
 }
@@ -3410,6 +3433,7 @@ mod tests {
                 conversations: vec![],
                 messages,
                 events: vec![],
+                default_chat_color: None,
             }
         }
 
@@ -3531,6 +3555,7 @@ mod tests {
                         author: "alice".into(),
                         value: 60,
                     }],
+                    default_chat_color: None,
                 }
             };
             db.import_history(&batch()).await.unwrap();
@@ -3580,6 +3605,7 @@ mod tests {
                 ],
                 messages: vec![imported("c:bob", "bob", 2, "hi", MessageStatus::Read)],
                 events: vec![],
+                default_chat_color: None,
             })
             .await
             .unwrap();
@@ -3597,6 +3623,60 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_chat_shows_its_own_colour_else_the_phones_default() {
+            let db = db().await;
+            let crimson = crate::projection::chat_colors::preset(2).unwrap();
+            let sea = crate::projection::chat_colors::preset(21).unwrap();
+            let teal = crate::projection::chat_colors::preset(7).unwrap();
+            db.import_history(&batch_with(vec![imported(
+                "c:alice",
+                "alice",
+                1,
+                "hi",
+                MessageStatus::Read,
+            )]))
+            .await
+            .unwrap();
+            assert_eq!(conv(&db, "c:alice").await.chat_color, None, "nothing set: the app's");
+            db.import_history(&HistoryBatch {
+                conversations: vec![
+                    ImportConversation {
+                        id: "c:alice".into(),
+                        chat_color: Some(sea.clone()),
+                        ..Default::default()
+                    },
+                    ImportConversation {
+                        id: "c:bob".into(),
+                        ..Default::default()
+                    },
+                ],
+                messages: vec![
+                    imported("c:alice", "alice", 2, "hi", MessageStatus::Read),
+                    imported("c:bob", "bob", 3, "hi", MessageStatus::Read),
+                ],
+                events: vec![],
+                default_chat_color: Some(crimson.clone()),
+            })
+            .await
+            .unwrap();
+            assert_eq!(conv(&db, "c:alice").await.chat_color, Some(sea));
+            assert_eq!(
+                conv(&db, "c:bob").await.chat_color,
+                Some(crimson.clone()),
+                "the default"
+            );
+            assert!(db.set_chat_color("c:bob", Some(&teal)).await.unwrap());
+            assert_eq!(conv(&db, "c:bob").await.chat_color, Some(teal));
+            assert!(db.set_chat_color("c:alice", None).await.unwrap());
+            assert_eq!(
+                conv(&db, "c:alice").await.chat_color,
+                Some(crimson),
+                "back to the default"
+            );
+            assert!(!db.set_chat_color("c:nobody", None).await.unwrap());
+        }
+
+        #[tokio::test]
         async fn the_import_sets_the_chat_flags_and_a_later_import_resets_them() {
             let db = db().await;
             db.insert_message(&msg("alice", 1, "a")).await.unwrap();
@@ -3610,6 +3690,7 @@ mod tests {
                     pinned_order,
                     mute_until,
                     marked_unread,
+                    chat_color: None,
                 }],
                 ..Default::default()
             };

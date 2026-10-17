@@ -668,6 +668,13 @@ final class AppStore {
         }
     }
 
+    /// Sets our bubbles' colour in a chat (nil: the default).
+    func setChatColor(_ conversationId: String, _ color: ChatColor?) {
+        change(conversationId, "set the chat colour") {
+            try await $0.setChatColor(conversationId: conversationId, color: color)
+        }
+    }
+
     /// Sets a direct chat's disappearing-message timer (0: off).
     func setTimer(_ conversationId: String, seconds: UInt32) {
         change(conversationId, "set the disappearing timer") {

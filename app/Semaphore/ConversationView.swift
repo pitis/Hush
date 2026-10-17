@@ -20,6 +20,7 @@ struct ConversationView: View {
                     return false
                 }
             }
+            .environment(\.chatColor, conversation.chatColor)
             if conversation.blocked || conversation.messageRequest {
                 RequestBar(store: store, conversation: conversation)
             } else {
@@ -131,6 +132,7 @@ struct RequestBar: View {
 struct ConversationHeader: View {
     let store: AppStore
     let conversation: Conversation
+    @State private var choosingColor = false
 
     /// A group's timer changes with the group (from the phone); a blocked or unaccepted chat
     /// has nothing to send it to.
@@ -198,6 +200,20 @@ struct ConversationHeader: View {
                 .fixedSize()
                 .help("Disappearing messages")
                 .accessibilityLabel("Disappearing messages")
+            }
+            Button {
+                choosingColor = true
+            } label: {
+                Image(systemName: "paintpalette").font(.system(size: 15))
+            }
+            .buttonStyle(.plain)
+            .help("Chat colour")
+            .accessibilityLabel("Chat colour")
+            .popover(isPresented: $choosingColor, arrowEdge: .bottom) {
+                ChatColorPicker(current: conversation.chatColor) {
+                    store.setChatColor(conversation.id, $0)
+                    choosingColor = false
+                }
             }
             if canCall {
                 let inCall = store.call != nil && store.call?.phase != .ended
@@ -372,6 +388,7 @@ struct MessageRow: View {
     /// Shows a file; false if it couldn't be.
     let open: (Attachment) -> Bool
     var actions = Actions()
+    @Environment(\.chatColor) private var chatColor
     @State private var hovering = false
     @State private var picking = false
     @State private var showingReactors = false
@@ -551,7 +568,8 @@ struct MessageRow: View {
         .foregroundStyle(outgoing ? .white : Theme.incomingText)
         // as Desktop: a sticker stands on its own, without a bubble
         .background(
-            stickerImage != nil ? .clear : outgoing ? Theme.outgoing : Theme.incoming,
+            stickerImage != nil
+                ? AnyShapeStyle(.clear) : outgoing ? ChatColors.style(chatColor) : AnyShapeStyle(Theme.incoming),
             in: RoundedRectangle(cornerRadius: Theme.bubbleRadius)
         )
         .overlay {

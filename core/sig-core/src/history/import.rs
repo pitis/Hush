@@ -7,7 +7,7 @@ use libsignal_message_backup::proto::backup;
 use presage::libsignal_service::prelude::{ProfileKey, ProtobufMessage as _, Timer, Uuid};
 use presage::libsignal_service::protocol::{Aci, Pni, ServiceId};
 
-use crate::projection::{BodyRange, Message, MessageKind, MessageStatus, Quote, TextStyle};
+use crate::projection::{BodyRange, ChatColor, Message, MessageKind, MessageStatus, Quote, TextStyle};
 
 /// How many rows go into one transaction.
 pub(crate) const BATCH: usize = 1_000;
@@ -21,6 +21,8 @@ pub(crate) struct HistoryBatch {
     pub conversations: Vec<ImportConversation>,
     pub messages: Vec<ImportMessage>,
     pub events: Vec<ImportEvent>,
+    /// The phone's default bubble colour (set from the account frame, which comes first).
+    pub default_chat_color: Option<ChatColor>,
 }
 
 impl HistoryBatch {
@@ -39,6 +41,8 @@ pub(crate) struct ImportConversation {
     /// Ms since the epoch; 0: not muted; `i64::MAX`: always (the backup's INT64_MAX).
     pub mute_until: i64,
     pub marked_unread: bool,
+    /// Its own bubble colour (None: the default).
+    pub chat_color: Option<ChatColor>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -139,6 +143,8 @@ pub(crate) struct Importer {
     /// Contact seeds: (ACI, name, recipient id), joined with chat timers in `finish`.
     contact_parts: Vec<(Uuid, String, u64)>,
     sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The account's custom bubble colours by id (chat styles name them).
+    custom_colors: HashMap<u64, ChatColor>,
     /// Chat timers by recipient id, for the contact seeds.
     timer_by_recipient: HashMap<u64, u32>,
     /// Group snapshots wait for `finish`, so members can join profile keys seen later.
@@ -158,6 +164,7 @@ impl Importer {
             profile_keys: HashMap::new(),
             contact_parts: Vec::new(),
             sticker_packs: Vec::new(),
+            custom_colors: HashMap::new(),
             timer_by_recipient: HashMap::new(),
             group_frames: Vec::new(),
             batch: HistoryBatch::default(),
@@ -174,7 +181,7 @@ impl Importer {
             Some(backup::frame::Item::StickerPack(p)) => self.sticker_packs.push((p.packId, p.packKey)),
             // account data isn't ours to import; the rest (calls, notification profiles, chat
             // folders) is out of scope
-            Some(backup::frame::Item::Account(_)) => {}
+            Some(backup::frame::Item::Account(a)) => self.account(&a),
             Some(_) | None => self.counts.skipped += 1,
         }
         (self.batch.len() >= BATCH).then(|| std::mem::take(&mut self.batch))
@@ -303,6 +310,41 @@ impl Importer {
         self.recipients.insert(r.id, known);
     }
 
+    /// Only its colours are ours: the custom ones chats point to, and the default.
+    fn account(&mut self, a: &backup::AccountData) {
+        let Some(settings) = a.accountSettings.as_ref() else {
+            return;
+        };
+        use backup::chat_style::custom_chat_color::Color;
+        for c in &settings.customChatColors {
+            let color = match &c.color {
+                Some(Color::Solid(s)) => ChatColor {
+                    colors: vec![*s],
+                    angle: 0,
+                },
+                Some(Color::Gradient(g)) if !g.colors.is_empty() => ChatColor {
+                    colors: g.colors.clone(),
+                    angle: g.angle,
+                },
+                _ => continue,
+            };
+            self.custom_colors.insert(c.id, color);
+        }
+        self.batch.default_chat_color = settings.defaultChatStyle.as_ref().and_then(|s| self.chat_color(s));
+    }
+
+    /// A chat style's bubble colour: a preset or one of the account's custom colours. None for
+    /// automatic (it follows the wallpaper; with none, the default blue) and anything unknown.
+    fn chat_color(&self, style: &backup::ChatStyle) -> Option<ChatColor> {
+        use backup::chat_style::BubbleColor;
+        match &style.bubbleColor {
+            Some(BubbleColor::BubbleColorPreset(p)) => crate::projection::chat_colors::preset(p.value()),
+            Some(BubbleColor::CustomColorId(id)) => self.custom_colors.get(id).cloned(),
+            // automatic, or a kind this build doesn't know
+            _ => None,
+        }
+    }
+
     fn chat(&mut self, c: backup::Chat) {
         let Some(Some(known)) = self.recipients.get(&c.recipientId) else {
             self.counts.skipped += 1;
@@ -320,6 +362,7 @@ impl Importer {
             pinned_order: c.pinnedOrder,
             mute_until: c.muteUntilMs.map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
             marked_unread: c.markedUnread,
+            chat_color: c.style.as_ref().and_then(|s| self.chat_color(s)),
         });
         self.counts.conversations += 1;
     }
@@ -714,6 +757,7 @@ mod tests {
     const ME: &str = "11111111-1111-1111-1111-111111111111";
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
     const BOB: &str = "33333333-3333-3333-3333-333333333333";
+    const CAROL: &str = "44444444-4444-4444-4444-444444444444";
     const NOW: i64 = 1_800_000_000_000;
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -874,6 +918,70 @@ mod tests {
     }
 
     #[test]
+    fn chat_colours_come_from_the_backup() {
+        use backup::chat_style::{custom_chat_color::Color, BubbleColor, BubbleColorPreset, CustomChatColor, Gradient};
+        let style = |b: BubbleColor| {
+            protobuf::MessageField::some(backup::ChatStyle {
+                bubbleColor: Some(b),
+                ..Default::default()
+            })
+        };
+        let mut imp = Importer::new(ME, NOW);
+        imp.add(frame(backup::frame::Item::Account(backup::AccountData {
+            accountSettings: protobuf::MessageField::some(backup::account_data::AccountSettings {
+                customChatColors: vec![CustomChatColor {
+                    id: 7,
+                    color: Some(Color::Gradient(Gradient {
+                        angle: 90,
+                        colors: vec![0xFF000001, 0xFF000002],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                defaultChatStyle: style(BubbleColor::BubbleColorPreset(BubbleColorPreset::SOLID_CRIMSON.into())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })));
+        imp.add(contact_frame(1, ALICE, "Alice"));
+        imp.add(contact_frame(2, BOB, "Bob"));
+        imp.add(contact_frame(3, CAROL, "Carol"));
+        let chat = |id, recipient_id, chat_style| {
+            frame(backup::frame::Item::Chat(backup::Chat {
+                id,
+                recipientId: recipient_id,
+                style: chat_style,
+                ..Default::default()
+            }))
+        };
+        imp.add(chat(10, 1, style(BubbleColor::CustomColorId(7))));
+        imp.add(chat(
+            11,
+            2,
+            style(BubbleColor::BubbleColorPreset(BubbleColorPreset::GRADIENT_SEA.into())),
+        ));
+        imp.add(chat(12, 3, style(BubbleColor::AutoBubbleColor(Default::default()))));
+        let (batch, _, _) = imp.finish();
+        assert_eq!(
+            batch.default_chat_color,
+            crate::projection::chat_colors::preset(2),
+            "the phone's default, crimson"
+        );
+        let colors: Vec<_> = batch.conversations.iter().map(|c| c.chat_color.clone()).collect();
+        assert_eq!(
+            colors,
+            vec![
+                Some(ChatColor {
+                    colors: vec![0xFF000001, 0xFF000002],
+                    angle: 90
+                }),
+                crate::projection::chat_colors::preset(21),
+                None,
+            ]
+        );
+    }
+
+    #[test]
     fn chat_flags_come_from_the_backup() {
         let mut imp = Importer::new(ME, NOW);
         assert!(imp.add(contact_frame(1, ALICE, "Alice")).is_none());
@@ -900,6 +1008,7 @@ mod tests {
                 pinned_order: Some(2),
                 mute_until: i64::MAX,
                 marked_unread: true,
+                chat_color: None,
             }]
         );
     }

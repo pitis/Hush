@@ -1,6 +1,7 @@
 //! The app-facing view of Signal data: conversations, messages, reactions and search, kept in
 //! its own encrypted SQLite file and fed from presage content.
 
+pub mod chat_colors;
 pub mod db;
 pub mod ids;
 pub mod model;
