@@ -167,6 +167,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         lock.withLock { groupChanges.append((conversationId, change)) }
         if change == failingGroupChange { throw CoreError.Network(message: "refused") }
     }
+    private(set) var createdGroups: [(title: String, members: [String])] = []
+    var createGroupError: CoreError?
+    func createGroup(title: String, members: [String]) async throws -> String {
+        lock.withLock { createdGroups.append((title, members)) }
+        if let createGroupError { throw createGroupError }
+        return "g:" + String(repeating: "cd", count: 32)
+    }
     func findUsername(username: String) async throws -> String? {
         if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
         return lock.withLock { usernames[username] }

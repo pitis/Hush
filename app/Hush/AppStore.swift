@@ -1541,6 +1541,23 @@ final class AppStore {
         return failure
     }
 
+    /// Makes a group and opens its chat; nil, or why it failed.
+    func createGroup(_ title: String, members: [String]) async -> String? {
+        guard let client else { return "Not linked yet." }
+        do {
+            let id = try await client.createGroup(title: title, members: members)
+            select(id)
+            refreshConversations()
+            return nil
+        } catch {
+            append("couldn't make a group: \(error)")
+            switch error {
+            case CoreError.Network(let message): return "Couldn't make the group: \(message)"
+            default: return "Couldn't make the group: \(Self.describe(error))"
+            }
+        }
+    }
+
     /// People who can be added to a group: those we have a chat with (accepted, not blocked,
     /// known by account), but us and `members`, by name.
     func addableContacts(excluding members: Set<String>) -> [(aci: String, name: String)] {

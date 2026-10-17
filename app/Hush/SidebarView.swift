@@ -9,6 +9,7 @@ struct SidebarView: View {
     /// The chat whose "Block…" waits for confirmation.
     @State private var blocking: Conversation?
     @State private var findingUsername = false
+    @State private var makingGroup = false
     @State private var showingStories = false
 
     private var searching: Bool { store.isSearching }
@@ -35,15 +36,17 @@ struct SidebarView: View {
                 Text(inArchive ? "Archived" : "Chats").font(.system(size: 22, weight: .bold))
                 Spacer()
                 if !inArchive {
-                    Button {
-                        findingUsername = true
+                    Menu {
+                        Button("New Chat by Username…") { findingUsername = true }
+                        Button("New Group…") { makingGroup = true }
                     } label: {
                         Image(systemName: "square.and.pencil").font(.system(size: 16))
                     }
-                    .buttonStyle(.plain)
-                    .help("New chat by username")
-                    .accessibilityLabel("New chat by username")
+                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                    .help("New chat")
+                    .accessibilityLabel("New chat")
                     .sheet(isPresented: $findingUsername) { FindUsernameSheet(store: store) }
+                    .sheet(isPresented: $makingGroup) { NewGroupSheet(store: store) }
                 }
                 if !inArchive && !store.stories.isEmpty {
                     let unseen = StoryList.unseenCount(store.stories, me: store.ownAci)

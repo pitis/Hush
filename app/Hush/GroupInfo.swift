@@ -305,33 +305,13 @@ struct AddMembersSheet: View {
     let candidates: [(aci: String, name: String)]
     let add: ([String]) -> Void
     @State private var chosen: Set<String> = []
-    @State private var filter = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Add members").font(.system(size: 17, weight: .semibold))
-            TextField("Search", text: $filter).textFieldStyle(.roundedBorder)
-            let shown = candidates.filter { filter.isEmpty || $0.name.localizedCaseInsensitiveContains(filter) }
-            if shown.isEmpty {
-                Text(candidates.isEmpty ? "Everyone you chat with is in this group." : "No one matches.")
-                    .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
-                    .frame(maxWidth: .infinity, minHeight: 200)
-            } else {
-                List(shown, id: \.aci) { person in
-                    Toggle(
-                        isOn: Binding(
-                            get: { chosen.contains(person.aci) },
-                            set: { if $0 { chosen.insert(person.aci) } else { chosen.remove(person.aci) } })
-                    ) {
-                        HStack(spacing: 10) {
-                            Avatar(id: "c:\(person.aci)", name: person.name, size: 24)
-                            Text(person.name).lineLimit(1)
-                        }
-                    }
-                }
-                .frame(minHeight: 260)
-            }
+            PeoplePicker(
+                candidates: candidates, chosen: $chosen, noOne: "Everyone you chat with is in this group.")
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
@@ -345,5 +325,79 @@ struct AddMembersSheet: View {
         }
         .padding(20)
         .frame(width: 380)
+    }
+}
+
+/// A new group: its name and members, from the people we chat with.
+struct NewGroupSheet: View {
+    let store: AppStore
+    @State private var name = ""
+    @State private var chosen: Set<String> = []
+    @State private var busy = false
+    @State private var problem: String?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let candidates = store.addableContacts(excluding: [])
+        VStack(alignment: .leading, spacing: 12) {
+            Text("New group").font(.system(size: 17, weight: .semibold))
+            TextField("Group name", text: $name).textFieldStyle(.roundedBorder)
+            PeoplePicker(
+                candidates: candidates, chosen: $chosen, noOne: "No one to add yet; members can be added later.")
+            if let problem {
+                Text(problem).font(.system(size: 12)).foregroundStyle(.red)
+            }
+            HStack {
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    busy = true
+                    problem = nil
+                    Task {
+                        problem = await store.createGroup(name, members: candidates.map(\.aci).filter(chosen.contains))
+                        busy = false
+                        if problem == nil { dismiss() }
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(busy || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+    }
+}
+
+/// People to tick, with a search over their names.
+private struct PeoplePicker: View {
+    let candidates: [(aci: String, name: String)]
+    @Binding var chosen: Set<String>
+    /// Shown when there's no one to pick at all.
+    let noOne: String
+    @State private var filter = ""
+
+    var body: some View {
+        TextField("Search", text: $filter).textFieldStyle(.roundedBorder)
+        let shown = candidates.filter { filter.isEmpty || $0.name.localizedCaseInsensitiveContains(filter) }
+        if shown.isEmpty {
+            Text(candidates.isEmpty ? noOne : "No one matches.")
+                .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+                .frame(maxWidth: .infinity, minHeight: 200)
+        } else {
+            List(shown, id: \.aci) { person in
+                Toggle(
+                    isOn: Binding(
+                        get: { chosen.contains(person.aci) },
+                        set: { if $0 { chosen.insert(person.aci) } else { chosen.remove(person.aci) } })
+                ) {
+                    HStack(spacing: 10) {
+                        Avatar(id: "c:\(person.aci)", name: person.name, size: 24)
+                        Text(person.name).lineLimit(1)
+                    }
+                }
+            }
+            .frame(minHeight: 260)
+        }
     }
 }
