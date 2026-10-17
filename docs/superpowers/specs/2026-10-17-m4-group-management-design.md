@@ -23,7 +23,8 @@ the stored group's fetches the group before the content reaches us.
    `conversations.group_revision`). A group's message, edit, reaction, typing or story from an
    ACI that isn't a member is dropped like a blocked sender's (its presage copy queued to go).
    A message claiming a revision newer than presage's group (presage's refresh failed) fetches
-   the group once more. The claimed revision never turns the check off (anyone can claim one):
+   the group once more, if presage knows the group, neither it nor the sender is blocked, and
+   it wasn't fetched again in the last five minutes. The claimed revision never turns the check off (anyone can claim one):
    a stored group's members judge every message, so a just-added member's message is lost only
    if both fetches fail. A group never stored drops nothing. Senders are judged against the
    group's latest members, as Signal's apps do: a message delayed past its sender's removal

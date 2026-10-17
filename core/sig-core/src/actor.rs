@@ -1418,6 +1418,8 @@ struct Progress {
     titles_synced: bool,
     /// This connection has drained the server queue: what arrives now is new.
     live: bool,
+    /// Groups fetched again for messages claiming a newer revision (`sync_group`).
+    refetches: Refetches,
 }
 
 impl Progress {
@@ -1478,7 +1480,7 @@ async fn handle(
             }
         }
         Received::Content(content) => {
-            sync_group(m, db, l, &content).await;
+            sync_group(m, db, l, &mut progress.refetches, &content).await;
             match drop_blocked(db, &content, me).await {
                 Ok(true) => {
                     tracing::info!(kind = content_kind(&content.body), "dropped: blocked or not a member");
@@ -1740,19 +1742,39 @@ async fn store_group(
 
 /// Brings a group message's chat up to presage's group, so its sender is checked against
 /// current members. presage refreshes the group before handing us a message sent at a newer
-/// revision; if that refresh failed (or the group was never fetched) it is fetched once more.
-async fn sync_group(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener, content: &Content) {
+/// revision; if that refresh failed, a group presage knows is fetched once more, though not
+/// for a blocked sender or group and at most every five minutes (`Refetches`): the revision
+/// is whatever the sender wrote.
+async fn sync_group(
+    m: &Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    refetches: &mut Refetches,
+    content: &Content,
+) {
     let Ok(Thread::Group(key)) = Thread::try_from(content) else {
         return;
     };
     let sent_at = sent_revision(&content.body);
     let group = match m.store().group(key).await {
         Ok(Some(g)) if sent_at.is_none_or(|r| r <= g.revision) => Ok(g),
-        // a refetch on every such message, at worst: a sender claiming a revision that doesn't exist
-        Ok(_) => match tokio::time::timeout(Duration::from_secs(10), m.clone().fetch_group(&key)).await {
-            Ok(fetched) => fetched.map_err(|e| e.to_string()),
-            Err(_) => Err("fetching it timed out".into()),
-        },
+        Ok(Some(g)) => {
+            let blocked = db
+                .is_blocked(&direct_id(&content.metadata.sender))
+                .await
+                .unwrap_or(true)
+                || db.is_blocked(&group_id(&key)).await.unwrap_or(true);
+            if blocked || !refetches.allow(key, std::time::Instant::now()) {
+                Ok(g)
+            } else {
+                match tokio::time::timeout(Duration::from_secs(10), m.clone().fetch_group(&key)).await {
+                    Ok(fetched) => fetched.map_err(|e| e.to_string()),
+                    Err(_) => Err("fetching it timed out".into()),
+                }
+            }
+        }
+        // presage couldn't fetch it as the message came: not ours to try again
+        Ok(None) => return,
         Err(e) => Err(e.to_string()),
     };
     let stored = match group {
@@ -1765,6 +1787,27 @@ async fn sync_group(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l: 
         Err(e) => l.on_event(CoreEvent::Error {
             message: format!("syncing a group failed: {e}"),
         }),
+    }
+}
+
+/// When each group was last fetched again by `sync_group`.
+#[derive(Default)]
+struct Refetches(std::collections::HashMap<[u8; 32], std::time::Instant>);
+
+impl Refetches {
+    const EVERY: Duration = Duration::from_secs(5 * 60);
+
+    /// Whether the group may be fetched again at `now`; if so, counts it as fetched.
+    fn allow(&mut self, key: [u8; 32], now: std::time::Instant) -> bool {
+        if self
+            .0
+            .get(&key)
+            .is_some_and(|last| now.duration_since(*last) < Self::EVERY)
+        {
+            return false;
+        }
+        self.0.insert(key, now);
+        true
     }
 }
 
@@ -2278,6 +2321,18 @@ mod tests {
             vec![(group.clone(), 100), (group.clone(), 101), (group, 500)],
             "presage's copies of the dropped messages go too"
         );
+    }
+
+    /// A group is fetched again at most every five minutes, whatever its messages claim.
+    #[test]
+    fn a_group_is_refetched_at_most_every_five_minutes() {
+        use std::time::{Duration, Instant};
+        let mut refetches = super::Refetches::default();
+        let t = Instant::now();
+        assert!(refetches.allow([1; 32], t));
+        assert!(!refetches.allow([1; 32], t + Duration::from_secs(60)));
+        assert!(refetches.allow([2; 32], t + Duration::from_secs(60)), "another group");
+        assert!(refetches.allow([1; 32], t + Duration::from_secs(301)));
     }
 
     /// presage's group lands in the chat: its title, members' ACIs and timer, at its revision.
