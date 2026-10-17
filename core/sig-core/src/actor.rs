@@ -959,7 +959,8 @@ async fn create_group(
                 // dropped midway, perhaps after the server made it but before presage stored it
                 _ => "the server didn't answer in time; the group may have been made, so look in your chats before trying again".into(),
             };
-            match our_new_group(m.store(), &before, title).await {
+            let me = Aci::from(m.registration_data().service_ids.aci);
+            match our_new_group(m.store(), &before, &me, title, members).await {
                 Ok(Some(key)) => {
                     list_new_group(m.store(), db, l, &key, chrono::Utc::now().timestamp_millis()).await;
                     l.on_event(CoreEvent::Error {
@@ -978,17 +979,34 @@ async fn create_group(
 }
 
 /// The group we just made, if presage has it though making it failed: the one group it didn't
-/// have `before`, under our `title` at its first revision (not one we were added to meanwhile).
+/// have `before`, at its first revision, under our `title`, with us (`me`) its only admin and
+/// everyone else one of the `members` we asked for. A group someone else made and added us to
+/// meanwhile has its maker for admin.
 async fn our_new_group(
     store: &SqliteStore,
     before: &std::collections::HashSet<[u8; 32]>,
+    me: &Aci,
     title: &str,
+    members: &[Aci],
 ) -> Result<Option<[u8; 32]>, String> {
+    use presage::libsignal_service::groups_v2::Role;
+    use presage::libsignal_service::prelude::Uuid;
     let Some(key) = made_group(before, &group_keys(store).await?) else {
         return Ok(None);
     };
+    let asked = |uuid: Uuid| members.iter().any(|a| ServiceId::from(*a).raw_uuid() == uuid);
+    let ours = |g: &presage::model::groups::Group| {
+        g.title == title
+            && g.revision == 0
+            && g.members.iter().any(|m| m.aci == *me)
+            && g.members.iter().all(|m| match m.aci == *me {
+                true => m.role == Role::Administrator,
+                false => m.role != Role::Administrator && asked(ServiceId::from(m.aci).raw_uuid()),
+            })
+            && g.pending_members.iter().all(|p| asked(p.uuid))
+    };
     let group = store.group(key).await.map_err(|e| e.to_string())?;
-    Ok(group.filter(|g| g.title == title && g.revision == 0).map(|_| key))
+    Ok(group.filter(ours).map(|_| key))
 }
 
 /// The master keys of the groups presage has (an unreadable one is left out: it isn't ours).
@@ -2629,6 +2647,8 @@ mod tests {
     /// A group we just made is listed at once under its name, though it has no messages.
     #[tokio::test]
     async fn a_new_group_is_listed_at_once() {
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::protocol::Aci;
         use presage::model::identity::OnNewIdentity;
         use presage::store::ContentsStore;
         use presage_store_sqlite::SqliteStore;
@@ -2645,17 +2665,36 @@ mod tests {
             .unwrap();
         let key = [9u8; 32];
         let before = super::group_keys(&store).await.unwrap();
+        let alice = Aci::from(Uuid::parse_str(ALICE).unwrap());
+        let bob = Aci::from(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
         store.save_group([8; 32], hikers(3)).await.unwrap();
         assert_eq!(
-            super::our_new_group(&store, &before, "Hikers").await.unwrap(),
+            super::our_new_group(&store, &before, &alice, "Hikers", &[])
+                .await
+                .unwrap(),
             None,
-            "a group we were added to meanwhile isn't ours"
+            "past its first revision"
         );
         let before = super::group_keys(&store).await.unwrap();
+        // Hikers: Alice its only member and admin
         store.save_group(key, hikers(0)).await.unwrap();
-        assert_eq!(super::our_new_group(&store, &before, "Climbers").await.unwrap(), None);
         assert_eq!(
-            super::our_new_group(&store, &before, "Hikers").await.unwrap(),
+            super::our_new_group(&store, &before, &bob, "Hikers", &[alice])
+                .await
+                .unwrap(),
+            None,
+            "Alice made it and added Bob: not his, though he asked for her and the same name"
+        );
+        assert_eq!(
+            super::our_new_group(&store, &before, &alice, "Climbers", &[])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            super::our_new_group(&store, &before, &alice, "Hikers", &[])
+                .await
+                .unwrap(),
             Some(key)
         );
         let sink = Sink(std::sync::Mutex::new(vec![]));
