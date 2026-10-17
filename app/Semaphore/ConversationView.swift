@@ -151,6 +151,10 @@ struct ConversationHeader: View {
             Avatar(id: conversation.id, name: title, size: 36)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                if let username = conversation.username, conversation.kind == .direct {
+                    Text("@\(username)").font(.system(size: 12)).foregroundStyle(Theme.secondaryText).lineLimit(1)
+                        .textSelection(.enabled)
+                }
                 if conversation.expireTimer > 0 {
                     Label(Placeholder.duration(Int64(conversation.expireTimer)), systemImage: "hourglass")
                         .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)

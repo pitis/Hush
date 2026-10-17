@@ -41,6 +41,7 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                 phone_contact: !(c.system_given_name.is_empty()
                     && c.system_family_name.is_empty()
                     && c.system_nickname.is_empty()),
+                username: Some(c.username.clone()).filter(|u| !u.is_empty()),
             },
             None => Remote::Other,
         },
@@ -54,6 +55,7 @@ pub(crate) fn decode(plaintext: &[u8]) -> Result<Remote, String> {
                 g.whitelisted,
             ),
             phone_contact: false,
+            username: None,
         },
         Some(Record::Account(a)) => Remote::Account {
             pins: a.pinned_conversations.iter().map(pin_of).collect(),
@@ -327,6 +329,20 @@ mod tests {
             ),
             (true, false, i64::MAX, true, false)
         );
+    }
+
+    #[test]
+    fn a_contacts_username_comes_along() {
+        let named = wrap(Record::Contact(ContactRecord {
+            aci: ALICE.into(),
+            username: "alice.42".into(),
+            ..Default::default()
+        }));
+        assert!(matches!(decode(&named).unwrap(), Remote::Chat { username: Some(u), .. } if u == "alice.42"));
+        assert!(matches!(
+            decode(&contact(ALICE)).unwrap(),
+            Remote::Chat { username: None, .. }
+        ));
     }
 
     #[test]

@@ -147,6 +147,11 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     private(set) var viewedStories: [MessageKey] = []
     func stories() async throws -> [Story] { lock.withLock { storyAnswers } }
     func storyViewed(key: MessageKey) async throws { lock.withLock { viewedStories.append(key) } }
+    var usernames: [String: String] = [:]
+    func findUsername(username: String) async throws -> String? {
+        if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
+        return lock.withLock { usernames[username] }
+    }
     var polls: [MessageKey: Poll] = [:]
     func poll(key: MessageKey) async throws -> Poll? { lock.withLock { polls[key] } }
     func vote(key: MessageKey, options: [UInt32]) async throws { try await flag("vote \(key.sentAt) \(options)") }
@@ -340,7 +345,7 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
         lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
         blocked: false,
-        whitelisted: false, messageRequest: false)
+        whitelisted: false, messageRequest: false, username: nil)
 }
 
 final class Counter: @unchecked Sendable {
