@@ -564,6 +564,32 @@ impl ProjectionDb {
         Ok(changed)
     }
 
+    /// Stores what the phone calls a contact (preferred to their profile's name) and the note
+    /// about them. True if either changed.
+    pub async fn set_contact_details(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(id)?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(id)
+            .bind(kind_to_i64(kind))
+            .execute(&self.pool)
+            .await?;
+        let res = sqlx::query(
+            "UPDATE conversations SET storage_name = ?2, note = ?3
+             WHERE id = ?1 AND (storage_name IS NOT ?2 OR note IS NOT ?3)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(note)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     /// Stores a contact's username (None: it has none). True if it changed.
     pub async fn set_username(&self, id: &str, username: Option<&str>) -> Result<bool, sqlx::Error> {
         let kind = kind_of(id)?;
@@ -1166,7 +1192,7 @@ impl ProjectionDb {
         let rows = sqlx::query(concat!(
             "SELECT c.*, ",
             is_request!(),
-            " AS message_request, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
+            " AS message_request, COALESCE(c.storage_name, c.title) AS display_title, m.author AS last_author, m.is_outgoing AS last_outgoing, m.status AS last_status,
                m.deleted AS last_deleted, a.content_type AS file_type, a.file_name AS file_name,
                a.is_voice_note AS file_voice, m.sent_at AS last_sent_at, m.kind AS last_kind,
                m.kind_text AS last_kind_text, m.body_ranges AS last_ranges,
@@ -2045,10 +2071,13 @@ impl ProjectionDb {
     /// The stored title of any conversation (also contacts not shown in the list), e.g. to name
     /// group senders.
     pub async fn title(&self, id: &str) -> Result<Option<String>, sqlx::Error> {
-        let t: Option<String> = sqlx::query_scalar("SELECT title FROM conversations WHERE id = ?1 AND title != ''")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let t: Option<String> = sqlx::query_scalar(
+            "SELECT COALESCE(storage_name, NULLIF(title, '')) FROM conversations WHERE id = ?1
+               AND COALESCE(storage_name, NULLIF(title, '')) IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(t)
     }
 
@@ -3116,7 +3145,7 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
             None => None,
         },
         kind,
-        title: r.try_get("title")?,
+        title: r.try_get("display_title")?,
         last_message_at: r.try_get("last_message_at")?,
         last_message_preview: r.try_get("last_message_preview")?,
         last_message_ranges: if undecryptable {
@@ -3137,6 +3166,7 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         message_request: r.try_get("message_request")?,
         avatar: r.try_get("avatar")?,
         username: r.try_get("username")?,
+        note: r.try_get("note")?,
         id,
     })
 }
@@ -5023,6 +5053,30 @@ mod tests {
         assert!(db.store_avatar("c:alice", None, 4).await.unwrap());
         assert_eq!(conv(&db, "c:alice").await.avatar, None);
         assert!(!std::path::Path::new(&newer).exists());
+    }
+
+    #[tokio::test]
+    async fn the_phones_name_for_a_contact_wins_and_its_note_shows() {
+        let db = db().await;
+        db.upsert_conversation_title("c:alice", "Alice Profile").await.unwrap();
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        assert!(db
+            .set_contact_details("c:alice", Some("Ali"), Some("from work"))
+            .await
+            .unwrap());
+        assert!(
+            !db.set_contact_details("c:alice", Some("Ali"), Some("from work"))
+                .await
+                .unwrap(),
+            "unchanged"
+        );
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.title.as_str(), c.note.as_deref()), ("Ali", Some("from work")));
+        assert_eq!(db.title("c:alice").await.unwrap().as_deref(), Some("Ali"));
+        // taken away on the phone: the profile's name again
+        db.set_contact_details("c:alice", None, None).await.unwrap();
+        let c = conv(&db, "c:alice").await;
+        assert_eq!((c.title.as_str(), c.note), ("Alice Profile", None));
     }
 
     #[tokio::test]
