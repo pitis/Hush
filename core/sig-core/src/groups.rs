@@ -278,11 +278,14 @@ pub fn is_member(group: &Group, aci: Uuid) -> bool {
     group.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == aci)
 }
 
-/// A server error's text without the invite link's password, which the join path carries
-/// (`/v1/groups/join/<password>`): it may be logged.
+/// A server error's text without the invite link's password, which its requests carry
+/// (`/v1/groups/join/<password>`, `?inviteLinkPassword=<password>`): it may be logged.
 pub fn without_link(error: String) -> String {
-    const PATH: &str = "groups/join/";
-    let Some(start) = error.find(PATH).map(|i| i + PATH.len()) else {
+    let found = ["groups/join/", "inviteLinkPassword="]
+        .iter()
+        .filter_map(|marker| error.find(marker).map(|i| i + marker.len()))
+        .min();
+    let Some(start) = found else {
         return error;
     };
     let end = error[start..]
@@ -680,5 +683,9 @@ mod tests {
         );
         assert_eq!(without_link("refused".into()), "refused");
         assert_eq!(without_link("groups/join/abc".into()), "groups/join/…");
+        assert_eq!(
+            without_link("PATCH https://x/v1/groups/?inviteLinkPassword=Zm9v%3D&a=1 and /groups/join/b".into()),
+            "PATCH https://x/v1/groups/?inviteLinkPassword=…&a=1 and /groups/join/…"
+        );
     }
 }
