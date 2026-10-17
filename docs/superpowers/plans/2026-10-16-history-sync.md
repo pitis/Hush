@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When Semaphore is linked (first link or an explicit relink), it downloads the phone's
+**Goal:** When Hush is linked (first link or an explicit relink), it downloads the phone's
 link-and-sync archive and imports the message history into projection.db, with progress, cancel,
 retry, and resume after a crash.
 
@@ -31,7 +31,7 @@ registration password), sqlx/SQLCipher, uniffi, SwiftUI.
 - Never log message content; ids, counts and errors only.
 - Never edit `app/Generated/`; regenerate with `make core`. Xcode project via `make project`.
 - No `--no-verify`; verify with `make format && make check` before each push.
-- Work in `/Users/pitis/development/semaphore/worktrees/47--history-sync`, branch `feat/history-sync`.
+- Work in `/Users/pitis/development/hush/worktrees/47--history-sync`, branch `feat/history-sync`.
 - Commit messages: plain sentences, no `#NNN`, no AI attribution.
 - `PushService`'s HTTP client has a 65 s read timeout → long-poll requests use `timeout=60`.
 
@@ -981,7 +981,7 @@ impl SignalServer {
 serde detour. The phonenumber crate is re-exported at
 `presage::libsignal_service::prelude::phonenumber`; format with
 `data.phone_number.format().mode(phonenumber::Mode::E164).to_string()` then `E164::from_str`.
-Then `PushService::new(SignalServers::Production, Some(credentials), "Semaphore")`.
+Then `PushService::new(SignalServers::Production, Some(credentials), "Hush")`.
 Auth only matters for `wait`; `download` is unauthenticated.
 
 ```rust
@@ -1881,13 +1881,13 @@ new protocol methods.
 
 **Files:**
 - Run: `make core && make project` (regenerates `app/Generated/sig_core.swift` with the new API — never edit it)
-- Modify: `app/Semaphore/AppStore.swift`
-- Create: `app/Semaphore/HistoryView.swift`
-- Modify: `app/Semaphore/ContentView.swift` (overlay in the `.chats` case)
-- Modify: `app/Semaphore/SemaphoreApp.swift` (SettingsView button)
-- Modify: `app/Semaphore/LinkView.swift` (one hint line)
-- Modify: `app/SemaphoreTests/FakeClient.swift`
-- Create: `app/SemaphoreTests/AppStoreHistoryTests.swift`
+- Modify: `app/Hush/AppStore.swift`
+- Create: `app/Hush/HistoryView.swift`
+- Modify: `app/Hush/ContentView.swift` (overlay in the `.chats` case)
+- Modify: `app/Hush/HushApp.swift` (SettingsView button)
+- Modify: `app/Hush/LinkView.swift` (one hint line)
+- Modify: `app/HushTests/FakeClient.swift`
+- Create: `app/HushTests/AppStoreHistoryTests.swift`
 
 **Interfaces:**
 - Consumes (generated): `CoreEvent.historyProgress(stage: HistoryStage, done: UInt64, total: UInt64)`,
@@ -1964,9 +1964,9 @@ final class AppStoreHistoryTests: XCTestCase {
 - [ ] **Step 4: Run them** — unsigned test run:
 
 ```
-xcodebuild -project app/Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' \
+xcodebuild -project app/Hush.xcodeproj -scheme Hush -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath build test CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" \
-  -only-testing:SemaphoreTests/AppStoreHistoryTests
+  -only-testing:HushTests/AppStoreHistoryTests
 ```
 
 Expected: FAIL (no `history` property yet).
@@ -2013,7 +2013,7 @@ func retryHistory() {
 /// Settings ▸ Transfer Message History…: this Mac relinks as a new device; everything shown
 /// is kept and the phone's history merges in. Returns why it couldn't start, or nil.
 func relinkForHistory() async -> String? {
-    guard let client else { return "Semaphore isn't running." }
+    guard let client else { return "Hush isn't running." }
     do { try await client.relink() } catch {
         Self.logger.error("relink failed: \(Self.describe(error), privacy: .private)")
         return Self.describe(error)
@@ -2029,7 +2029,7 @@ func relinkForHistory() async -> String? {
 
 - [ ] **Step 6: HistoryView**
 
-`app/Semaphore/HistoryView.swift` — a card overlay (Desktop's link-and-sync look: progress +
+`app/Hush/HistoryView.swift` — a card overlay (Desktop's link-and-sync look: progress +
 stage text), shown by ContentView:
 
 ```swift
@@ -2112,7 +2112,7 @@ Text("If your phone offers to transfer your message history, accept it to see yo
     .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 360)
 ```
 
-SettingsView (`SemaphoreApp.swift`), in the `store.screen == .chats` section under the Unlink
+SettingsView (`HushApp.swift`), in the `store.screen == .chats` section under the Unlink
 row:
 
 ```swift
@@ -2149,9 +2149,9 @@ private func relink() {
   build ad-hoc instead and run:
 
 ```
-xcodebuild -project app/Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' \
+xcodebuild -project app/Hush.xcodeproj -scheme Hush -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath build -configuration Debug build CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=""
-open build/Build/Products/Debug/Semaphore.app
+open build/Build/Products/Debug/Hush.app
 ```
 
 The app opens at the QR screen (this machine is unlinked): check the new LinkView hint renders.
@@ -2182,7 +2182,7 @@ The progress overlay itself renders in previews/tests; the full flow needs the o
 
 ```bash
 git push -u origin feat/history-sync
-gh pr create --title "Message history transfers from the phone when Semaphore is linked" --body "$(cat <<'EOF'
+gh pr create --title "Message history transfers from the phone when Hush is linked" --body "$(cat <<'EOF'
 ## What
 - The linking QR code asks the phone for message history (link-and-sync, capabilities=backup5).
 - After linking, the core waits for the phone's encrypted archive, downloads it with resume,

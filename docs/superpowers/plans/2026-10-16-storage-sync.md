@@ -34,7 +34,7 @@
 - Create: `core/sig-core/migrations/0011_storage_sync.sql`
 - Modify: `core/sig-core/src/projection/model.rs` (Conversation: `blocked`, `whitelisted`)
 - Modify: `core/sig-core/src/projection/db.rs` (row mapping, setters mark dirty, new methods + tests)
-- Modify: `app/SemaphoreTests/FakeClient.swift` (`conversation()` fixture gains the two fields; done in Task 7 with the bindings)
+- Modify: `app/HushTests/FakeClient.swift` (`conversation()` fixture gains the two fields; done in Task 7 with the bindings)
 
 **Interfaces:**
 - Produces (all on `ProjectionDb`, `Result<_, sqlx::Error>`):
@@ -530,7 +530,7 @@ pub(crate) struct RunOutcome { pub pulled: PullOutcome, pub pushed: Option<PushO
 ### Task 7: App: the Settings switch, the new fields, bindings
 
 **Files:**
-- Modify: `app/Semaphore/SemaphoreApp.swift` (SettingsView: `Toggle("Sync chat settings to your phone", isOn: …)` under "Message history", only when `store.screen == .chats`), `app/Semaphore/AppStore.swift` (`private(set) var storageWrites = true` loaded at boot via `client.storageWrites()`; `func setStorageWrites(_ on: Bool)` → client, error → `lastError`), `app/SemaphoreTests/FakeClient.swift` (`conversation()` fixture: `blocked: false, whitelisted: false`; `storageWrites` answer + recorder), `app/SemaphoreTests/AppStoreTests.swift` (one test)
+- Modify: `app/Hush/HushApp.swift` (SettingsView: `Toggle("Sync chat settings to your phone", isOn: …)` under "Message history", only when `store.screen == .chats`), `app/Hush/AppStore.swift` (`private(set) var storageWrites = true` loaded at boot via `client.storageWrites()`; `func setStorageWrites(_ on: Bool)` → client, error → `lastError`), `app/HushTests/FakeClient.swift` (`conversation()` fixture: `blocked: false, whitelisted: false`; `storageWrites` answer + recorder), `app/HushTests/AppStoreTests.swift` (one test)
 - Run `make core` first (new `Conversation` fields, two new client calls), then `make project` (no new files, harmless).
 
 - [ ] **Step 1: Failing test** `testTheStorageWritesSwitchReadsAndWritesTheCore`: boot with `fake.storageWritesAnswer = false` → `store.storageWrites == false`; `store.setStorageWrites(true)` → `fake.storageWritesSet == [true]`.

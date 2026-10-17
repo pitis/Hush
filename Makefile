@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash -o pipefail
-XCB := xcodebuild -project app/Semaphore.xcodeproj -scheme Semaphore -destination 'platform=macOS,arch=arm64' -derivedDataPath build
+XCB := xcodebuild -project app/Hush.xcodeproj -scheme Hush -destination 'platform=macOS,arch=arm64' -derivedDataPath build
 # the test host app prints harmless linkd/XPC noise on stderr; keep only what matters
 XCB_FILTER := { grep -vE 'com\.apple\.linkd|synchronousRemoteObjectProxy|Process Instance Registry|IDETestOperationsObserverDebug' || true; }
 
@@ -26,16 +26,18 @@ app: core project ## Build the Debug app into build/
 	$(XCB) -configuration Debug build -quiet 2>&1 | $(XCB_FILTER)
 
 run: app ## Build and launch the Debug app
-	open build/Build/Products/Debug/Semaphore.app
+	open build/Build/Products/Debug/Hush.app
 
 release: ## Build the Release app (release core: thin LTO, stripped) and install it in /Applications
 	scripts/build-core.sh release
 	cd app && xcodegen -q
 	$(XCB) -configuration Release build -quiet 2>&1 | $(XCB_FILTER)
-	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; sleep 1
-	rm -rf /Applications/Semaphore.app
-	ditto build/Build/Products/Release/Semaphore.app /Applications/Semaphore.app
-	@echo "✓ /Applications/Semaphore.app"
+	@osascript -e 'quit app id "dev.pitis.hush"' 2>/dev/null; sleep 1
+	@# the app's old name: Hush moves its data over on first launch
+	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; rm -rf /Applications/Semaphore.app
+	rm -rf /Applications/Hush.app
+	ditto build/Build/Products/Release/Hush.app /Applications/Hush.app
+	@echo "✓ /Applications/Hush.app"
 
 perf: ## Measure the installed app against the M1 budget (size, cold launch, idle RAM and CPU)
 	scripts/perf.sh
@@ -44,12 +46,12 @@ perf: ## Measure the installed app against the M1 budget (size, cold launch, idl
 
 format: ## Format Rust and Swift sources
 	cd core && cargo fmt
-	xcrun swift-format format -i -r app/Semaphore app/SemaphoreTests
+	xcrun swift-format format -i -r app/Hush app/HushTests
 
 lint: ## rustfmt check, clippy -D warnings, swift-format lint --strict
 	cd core && cargo fmt --check
 	cd core && cargo clippy --all-targets -q -- -D warnings
-	xcrun swift-format lint --strict -r app/Semaphore app/SemaphoreTests
+	xcrun swift-format lint --strict -r app/Hush app/HushTests
 
 test: core project ## Rust tests + XCTest
 	cd core && cargo test -q

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # scripts/card.sh <issue number> <status>
-# Moves the issue's card on the Semaphore board (https://github.com/users/pitis/projects/2).
+# Moves the issue's card on the Hush board (https://github.com/users/pitis/projects/2).
 # Projects need the keyring login: GH_TOKEN/GITHUB_TOKEN (env tokens without project access)
 # would take precedence, so both are blanked.
 set -euo pipefail
 [ $# -eq 2 ] || { echo 'usage: scripts/card.sh <issue> "Todo|In progress|In review|Done|Needs decision"' >&2; exit 2; }
 issue=$1 status=$2
 [[ $issue =~ ^[0-9]+$ ]] || { echo "✗ issue must be a number (got: $issue)" >&2; exit 2; }
-PROJECT=2 OWNER=pitis REPO=pitis/semaphore PROJECT_ID=PVT_kwHOAkXkrM4BnMZS FIELD_ID=PVTSSF_lAHOAkXkrM4BnMZSzhlyH_U
+PROJECT=2 OWNER=pitis REPO=pitis/hush PROJECT_ID=PVT_kwHOAkXkrM4BnMZS FIELD_ID=PVTSSF_lAHOAkXkrM4BnMZSzhlyH_U
 ghp() { GH_TOKEN= GITHUB_TOKEN= gh "$@"; }
 option=$(ghp project field-list $PROJECT --owner $OWNER --format json |
   jq -r --arg f "$FIELD_ID" --arg s "$status" '.fields[] | select(.id==$f) | .options[] | select(.name==$s) | .id')

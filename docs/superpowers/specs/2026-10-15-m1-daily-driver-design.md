@@ -13,10 +13,10 @@ Personal, unofficial build; no "Signal" branding if ever distributed; AGPL-3.0 (
 Environment verified: arm64, macOS 26.6, Xcode 27, Rust 1.96. Missing: `protoc`, `xcodegen` (brew install).
 
 ## Architecture
-New project at `~/development/semaphore/` (working name; own git repo, outside the vault).
+New project at `~/development/hush/` (working name; own git repo, outside the vault).
 
 ```
-semaphore/
+hush/
   core/                 Rust workspace
     sig-core/           presage wrapper + projection DB + UniFFI API
   app/                  SwiftUI/AppKit app, project.yml (XcodeGen, no hand-edited pbxproj)

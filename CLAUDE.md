@@ -1,11 +1,11 @@
-# Semaphore
+# Hush
 
 Native macOS Signal client: Rust core on [presage](https://github.com/whisperfish/presage) +
 SwiftUI/AppKit app. Unofficial, personal use. AGPL-3.0 (inherited from presage).
 
 - Spec: `docs/superpowers/specs/2026-10-15-m1-daily-driver-design.md`
 - Plans: `docs/superpowers/plans/`
-- Board: <https://github.com/users/pitis/projects/2> (issues in `pitis/semaphore`)
+- Board: <https://github.com/users/pitis/projects/2> (issues in `pitis/hush`)
 
 ## Working principles
 

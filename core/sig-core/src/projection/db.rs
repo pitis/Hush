@@ -4087,7 +4087,7 @@ mod tests {
     struct TempDb(std::path::PathBuf);
     impl TempDb {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("semaphore-{tag}-{}.db", std::process::id()));
+            let p = std::env::temp_dir().join(format!("hush-{tag}-{}.db", std::process::id()));
             let _ = std::fs::remove_file(&p);
             Self(p)
         }
@@ -5973,7 +5973,7 @@ mod tests {
     struct TempFiles(std::path::PathBuf);
     impl TempFiles {
         fn new(tag: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("semaphore-files-{tag}-{}", std::process::id()));
+            let p = std::env::temp_dir().join(format!("hush-files-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             Self(p)
         }

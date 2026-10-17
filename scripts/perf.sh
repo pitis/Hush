@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Measures the installed app against the M1 budget: size < 40 MB, cold launch < 1 s, idle RAM
-# < 100 MB, idle CPU ~0 %. Needs a linked Semaphore (launch ends when the chat list has loaded).
-# Usage: scripts/perf.sh [path/to/Semaphore.app]   (default /Applications/Semaphore.app)
+# < 100 MB, idle CPU ~0 %. Needs a linked Hush (launch ends when the chat list has loaded).
+# Usage: scripts/perf.sh [path/to/Hush.app]   (default /Applications/Hush.app)
 set -euo pipefail
-APP="${1:-/Applications/Semaphore.app}"
-EXE="$APP/Contents/MacOS/Semaphore"
+APP="${1:-/Applications/Hush.app}"
+EXE="$APP/Contents/MacOS/Hush"
 [ -x "$EXE" ] || { echo "✗ no app at $APP (make release)" >&2; exit 1; }
 now() { python3 -c 'import time; print(time.time())'; }
 
 echo "size: app $(du -sh "$APP" | cut -f1), executable $(du -h "$EXE" | cut -f1)   (budget: < 40 MB)"
 
-osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null || true
+osascript -e 'quit app id "dev.pitis.hush"' 2>/dev/null || true
 sleep 2
 LOG="$(mktemp)"
 # the app logs "conversations: N" (counts only) once its core is open and the chat list is loaded
-log stream --style compact --predicate 'subsystem == "dev.pitis.semaphore" AND eventMessage BEGINSWITH "conversations:"' >"$LOG" &
+log stream --style compact --predicate 'subsystem == "dev.pitis.hush" AND eventMessage BEGINSWITH "conversations:"' >"$LOG" &
 STREAM=$!
 trap 'kill $STREAM 2>/dev/null || true; rm -f "$LOG"' EXIT
 sleep 1
@@ -26,7 +26,7 @@ end=$(now)
 [ -n "$loaded" ] || { echo "✗ the chat list didn't load within 10 s (linked? keychain prompt? see Window ▸ Core Log)" >&2; exit 1; }
 python3 -c "print(f'cold launch: {($end - $start):.2f} s   (budget: < 1 s; until the chat list is shown)')"
 
-PID=$(pgrep -x Semaphore)
+PID=$(pgrep -x Hush)
 echo "idle: settling 30 s, then sampling for 60 s (leave the Mac alone)…"
 sleep 30
 rss=0; cpu=0; n=0

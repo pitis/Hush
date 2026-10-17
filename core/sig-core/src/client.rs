@@ -636,7 +636,7 @@ impl Client {
     }
 
     /// Sends files (with an optional caption) like `send_text`: shown at once as a pending
-    /// message, with a copy of each file kept by Semaphore; uploaded, then sent.
+    /// message, with a copy of each file kept by Hush; uploaded, then sent.
     pub async fn send_attachments(
         &self,
         conversation_id: String,
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> TempDir {
-        let d = std::env::temp_dir().join(format!("semaphore-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("hush-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         TempDir(d)
     }
@@ -2062,7 +2062,7 @@ mod tests {
                 ("image/heic", Some("beach.heic"), 4)
             );
             assert_eq!((files[0].width, files[0].state), (Some(4), AttachmentState::Ready));
-            // a copy in Semaphore's own folder: the original can go away
+            // a copy in Hush's own folder: the original can go away
             let copy = files[0].path.clone().unwrap();
             assert_ne!(copy, photo);
             std::fs::remove_file(&photo).unwrap();
