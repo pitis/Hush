@@ -177,9 +177,37 @@ impl ProjectionDb {
         self
     }
 
-    /// Replaces a group's members (ACIs) with `acis`.
-    pub async fn set_group_members(&self, conversation_id: &str, acis: &[String]) -> Result<(), sqlx::Error> {
+    /// Stores a group as presage has it at `revision`: its title (an empty one never replaces a
+    /// known one), members (ACIs, replaced whole) and timer. Nothing happens when that revision
+    /// or a later one is stored already; returns whether it was stored.
+    pub async fn set_group(
+        &self,
+        conversation_id: &str,
+        revision: u32,
+        title: &str,
+        acis: &[String],
+        timer: u32,
+    ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let stored: Option<Option<i64>> = sqlx::query_scalar("SELECT group_revision FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if stored.flatten().is_some_and(|r| r >= i64::from(revision)) {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO conversations(id, kind, title, expire_timer, group_revision) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET title = CASE WHEN ?3 = '' THEN title ELSE ?3 END,
+               expire_timer = ?4, group_revision = ?5",
+        )
+        .bind(conversation_id)
+        .bind(kind_to_i64(kind_of(conversation_id)?))
+        .bind(title)
+        .bind(i64::from(timer))
+        .bind(i64::from(revision))
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM group_members WHERE conversation_id = ?1")
             .bind(conversation_id)
             .execute(&mut *tx)
@@ -191,7 +219,17 @@ impl ProjectionDb {
                 .execute(&mut *tx)
                 .await?;
         }
-        tx.commit().await
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The revision of presage's group the chat was last stored at (`set_group`); None if never.
+    pub async fn group_revision(&self, conversation_id: &str) -> Result<Option<u32>, sqlx::Error> {
+        let r: Option<Option<i64>> = sqlx::query_scalar("SELECT group_revision FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.flatten().and_then(|r| u32::try_from(r).ok()))
     }
 
     /// The poll in message `key` as its votes stand; None if it isn't (or no longer) here. A
@@ -4896,14 +4934,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_groups_members_are_replaced_whole() {
+    async fn a_group_is_stored_whole_and_only_when_its_revision_moves() {
         let db = db().await;
         let g = format!("g:{}", "ab".repeat(32));
         assert_eq!(db.group_members(&g).await.unwrap(), Vec::<String>::new());
-        db.set_group_members(&g, &["bob".into(), "alice".into()]).await.unwrap();
+        assert!(db
+            .set_group(&g, 2, "Hikers", &["bob".into(), "alice".into()], 60)
+            .await
+            .unwrap());
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
-        db.set_group_members(&g, &["carol".into()]).await.unwrap();
+        assert_eq!(db.title(&g).await.unwrap().as_deref(), Some("Hikers"));
+        assert_eq!(db.expire_timer(&g).await.unwrap(), 60);
+        assert!(
+            !db.set_group(&g, 2, "Old", &["carol".into()], 0).await.unwrap(),
+            "the same revision is already stored"
+        );
+        assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
+        assert!(db.set_group(&g, 3, "Climbers", &["carol".into()], 0).await.unwrap());
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["carol"]);
+        assert_eq!(db.title(&g).await.unwrap().as_deref(), Some("Climbers"));
+        assert_eq!(db.expire_timer(&g).await.unwrap(), 0);
     }
 
     #[tokio::test]

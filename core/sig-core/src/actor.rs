@@ -1418,6 +1418,8 @@ struct Progress {
     titles_synced: bool,
     /// This connection has drained the server queue: what arrives now is new.
     live: bool,
+    /// Groups fetched again for messages claiming a newer revision (`sync_group`).
+    refetches: Refetches,
 }
 
 impl Progress {
@@ -1478,9 +1480,10 @@ async fn handle(
             }
         }
         Received::Content(content) => {
+            sync_group(m, db, l, &mut progress.refetches, &content).await;
             match drop_blocked(db, &content, me).await {
                 Ok(true) => {
-                    tracing::info!(kind = content_kind(&content.body), "dropped: blocked");
+                    tracing::info!(kind = content_kind(&content.body), "dropped: blocked or not a member");
                     return;
                 }
                 Ok(false) => {}
@@ -1521,9 +1524,10 @@ async fn handle(
     }
 }
 
-/// Whether content comes from a blocked person, or belongs to a blocked group (messages, edits,
-/// typing), so nothing should see it. A dropped message's copy in presage's store (saved before
-/// we see it) is queued for the sweep to delete. Our own devices are never blocked.
+/// Whether content comes from a blocked person, or belongs to a blocked group or to a group
+/// the sender isn't a member of (messages, edits, typing, stories), so nothing should see it.
+/// A dropped message's copy in presage's store (saved before we see it) is queued for the
+/// sweep to delete. Our own devices are never blocked.
 async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<bool, sqlx::Error> {
     use presage::libsignal_service::content::ContentBody;
     let sender = &content.metadata.sender;
@@ -1531,27 +1535,18 @@ async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<
         return Ok(false);
     }
     let group = match &content.body {
-        ContentBody::DataMessage(dm) => dm
-            .group_v2
-            .as_ref()
-            .and_then(|g| g.master_key.as_deref())
-            .map(hex_group),
-        ContentBody::EditMessage(em) => em
-            .data_message
-            .as_ref()
-            .and_then(|dm| dm.group_v2.as_ref())
-            .and_then(|g| g.master_key.as_deref())
-            .map(hex_group),
+        ContentBody::DataMessage(dm) => group_chat(dm.group_v2.as_ref()),
+        ContentBody::EditMessage(em) => group_chat(em.data_message.as_ref().and_then(|dm| dm.group_v2.as_ref())),
         ContentBody::TypingMessage(tm) => match &tm.group_id {
             Some(identifier) => db.group_by_identifier(identifier).await?,
             None => None,
         },
-        ContentBody::StoryMessage(sm) => sm.group.as_ref().and_then(|g| g.master_key.as_deref()).map(hex_group),
+        ContentBody::StoryMessage(sm) => group_chat(sm.group.as_ref()),
         _ => None,
     };
     let blocked = db.is_blocked(&direct_id(sender)).await?
         || match &group {
-            Some(g) => db.is_blocked(g).await?,
+            Some(g) => db.is_blocked(g).await? || outsider(db, g, sender).await?,
             None => false,
         };
     if blocked && matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
@@ -1566,10 +1561,25 @@ async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<
             Err(e) => Err(e.to_string()),
         };
         if let Err(e) = queued {
-            tracing::warn!(error = %e, "a blocked sender's stored copy wasn't queued for deletion");
+            tracing::warn!(error = %e, "a dropped message's stored copy wasn't queued for deletion");
         }
     }
     Ok(blocked)
+}
+
+/// Whether `sender` isn't among a group's members (a removed member still holding the key,
+/// say), as last stored (`sync_group`): the group's latest members, as Signal's apps judge, so a
+/// message delayed past its sender's removal goes too, and so does the change telling of
+/// someone leaving (nothing shows for it anyway). A group never stored says nothing: its
+/// members aren't known. The revision a message claims plays no part: anyone can claim one.
+async fn outsider(db: &ProjectionDb, group: &str, sender: &ServiceId) -> Result<bool, sqlx::Error> {
+    Ok(db.group_revision(group).await?.is_some()
+        && !db.group_members(group).await?.contains(&sender.raw_uuid().to_string()))
+}
+
+/// The chat (`g:<hex>`) of a message's group context.
+fn group_chat(g: Option<&presage::proto::GroupContextV2>) -> Option<String> {
+    g.and_then(|g| g.master_key.as_deref()).map(hex_group)
 }
 
 /// `g:<hex>` for a master key as messages carry it.
@@ -1713,6 +1723,109 @@ async fn timed_avatar<E: std::fmt::Display>(
     }
 }
 
+/// Stores a group's title, members and timer as presage has them, unless that revision is
+/// stored already; returns whether it was stored.
+async fn store_group(
+    db: &ProjectionDb,
+    key: &[u8; 32],
+    g: &presage::model::groups::Group,
+) -> Result<bool, sqlx::Error> {
+    let members: Vec<String> = g
+        .members
+        .iter()
+        .map(|m| ServiceId::from(m.aci).raw_uuid().to_string())
+        .collect();
+    let timer = g.disappearing_messages_timer.as_ref().map_or(0, |t| t.duration);
+    db.set_group(&group_id(key), g.revision, &g.title, &members, timer)
+        .await
+}
+
+/// Brings a group message's chat up to presage's group, so its sender is checked against
+/// current members. presage refreshes the group before handing us a message sent at a newer
+/// revision; if that refresh failed, a group presage knows is fetched once more, though not
+/// for a blocked sender or group and at most every five minutes (`Refetches`): the revision
+/// is whatever the sender wrote.
+async fn sync_group(
+    m: &Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    refetches: &mut Refetches,
+    content: &Content,
+) {
+    let Ok(Thread::Group(key)) = Thread::try_from(content) else {
+        return;
+    };
+    let sent_at = sent_revision(&content.body);
+    let group = match m.store().group(key).await {
+        Ok(Some(g)) if sent_at.is_none_or(|r| r <= g.revision) => Ok(g),
+        Ok(Some(g)) => {
+            let blocked = db
+                .is_blocked(&direct_id(&content.metadata.sender))
+                .await
+                .unwrap_or(true)
+                || db.is_blocked(&group_id(&key)).await.unwrap_or(true);
+            if blocked || !refetches.allow(key, std::time::Instant::now()) {
+                Ok(g)
+            } else {
+                match tokio::time::timeout(Duration::from_secs(10), m.clone().fetch_group(&key)).await {
+                    Ok(fetched) => fetched.map_err(|e| e.to_string()),
+                    Err(_) => Err("fetching it timed out".into()),
+                }
+            }
+        }
+        // presage couldn't fetch it as the message came: not ours to try again
+        Ok(None) => return,
+        Err(e) => Err(e.to_string()),
+    };
+    let stored = match group {
+        Ok(g) => store_group(db, &key, &g).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match stored {
+        Ok(true) => l.on_event(CoreEvent::ConversationsChanged),
+        Ok(false) => {}
+        Err(e) => l.on_event(CoreEvent::Error {
+            message: format!("syncing a group failed: {e}"),
+        }),
+    }
+}
+
+/// When each group was last fetched again by `sync_group`.
+#[derive(Default)]
+struct Refetches(std::collections::HashMap<[u8; 32], std::time::Instant>);
+
+impl Refetches {
+    const EVERY: Duration = Duration::from_secs(5 * 60);
+
+    /// Whether the group may be fetched again at `now`; if so, counts it as fetched.
+    fn allow(&mut self, key: [u8; 32], now: std::time::Instant) -> bool {
+        if self
+            .0
+            .get(&key)
+            .is_some_and(|last| now.duration_since(*last) < Self::EVERY)
+        {
+            return false;
+        }
+        self.0.insert(key, now);
+        true
+    }
+}
+
+/// The revision of the group a group message says it was sent at.
+fn sent_revision(body: &presage::libsignal_service::content::ContentBody) -> Option<u32> {
+    use presage::libsignal_service::content::ContentBody;
+    let dm = match body {
+        ContentBody::DataMessage(dm) => Some(dm),
+        ContentBody::EditMessage(em) => em.data_message.as_ref(),
+        ContentBody::SynchronizeMessage(sm) => match &sm.content {
+            Some(presage::proto::sync_message::Content::Sent(sent)) => sent.message.as_ref(),
+            _ => None,
+        },
+        _ => None,
+    };
+    dm.and_then(|dm| dm.group_v2.as_ref()).and_then(|g| g.revision)
+}
+
 async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener) {
     let mut problems: Vec<String> = vec![];
     match m.store().contacts().await {
@@ -1742,20 +1855,8 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
             for group in groups {
                 match group {
                     Ok((key, g)) => {
-                        if let Err(e) = db.upsert_conversation_title(&group_id(&key), &g.title).await {
-                            problems.push(format!("storing a group title: {e}"));
-                        }
-                        let members: Vec<String> = g
-                            .members
-                            .iter()
-                            .map(|m| ServiceId::from(m.aci).raw_uuid().to_string())
-                            .collect();
-                        if let Err(e) = db.set_group_members(&group_id(&key), &members).await {
-                            problems.push(format!("storing a group's members: {e}"));
-                        }
-                        let timer = g.disappearing_messages_timer.map_or(0, |t| t.duration);
-                        if let Err(e) = db.set_chat_timer(&group_id(&key), timer).await {
-                            problems.push(format!("storing a chat's timer: {e}"));
+                        if let Err(e) = store_group(db, &key, &g).await {
+                            problems.push(format!("storing a group: {e}"));
                         }
                     }
                     Err(e) => problems.push(format!("reading a group: {e}")),
@@ -2141,6 +2242,136 @@ mod tests {
             ],
             "presage's copies of the dropped messages go too"
         );
+    }
+
+    /// In a group whose members are known, whatever someone outside it sends (a removed member,
+    /// or anyone else holding the key) is dropped like a blocked sender's; members and our own
+    /// devices get through, and a group whose members aren't known drops nothing.
+    #[tokio::test]
+    async fn what_non_members_send_in_a_group_is_dropped() {
+        use crate::projection::ProjectionDb;
+        use presage::libsignal_service::content::ContentBody;
+        use presage::proto::{typing_message, DataMessage, GroupContextV2, TypingMessage};
+        const ME: &str = "11111111-1111-1111-1111-111111111111";
+        const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+        const MALLORY: &str = "44444444-4444-4444-4444-444444444444";
+        let (known, unknown) = ([7u8; 32], [8u8; 32]);
+        let group = crate::projection::ids::group_id(&known);
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        db.set_group(&group, 1, "G", &[ME.into(), ALICE.into()], 0)
+            .await
+            .unwrap();
+        let text = |ms: u64, key: [u8; 32]| {
+            ContentBody::DataMessage(DataMessage {
+                body: Some("x".into()),
+                timestamp: Some(ms),
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(key.to_vec()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let dropped = |c| {
+            let db = &db;
+            async move { super::drop_blocked(db, &c, ME).await.unwrap() }
+        };
+        assert!(dropped(content_from(MALLORY, 100, text(100, known))).await);
+        let edit = ContentBody::EditMessage(presage::proto::EditMessage {
+            target_sent_timestamp: Some(100),
+            data_message: match text(101, known) {
+                ContentBody::DataMessage(dm) => Some(dm),
+                _ => unreachable!(),
+            },
+        });
+        assert!(dropped(content_from(MALLORY, 101, edit)).await);
+        let typing = ContentBody::TypingMessage(TypingMessage {
+            timestamp: Some(1),
+            action: Some(typing_message::Action::Started as i32),
+            group_id: crate::projection::ids::group_identifier(&group),
+        });
+        assert!(dropped(content_from(MALLORY, 2, typing)).await);
+        let story = ContentBody::StoryMessage(presage::proto::StoryMessage {
+            group: Some(GroupContextV2 {
+                master_key: Some(known.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(dropped(content_from(MALLORY, 3, story)).await);
+        assert!(!dropped(content_from(ALICE, 200, text(200, known))).await, "a member");
+        assert!(
+            !dropped(content_from(ME, 300, text(300, known))).await,
+            "our own devices"
+        );
+        assert!(
+            !dropped(content_from(MALLORY, 400, text(400, unknown))).await,
+            "members not known"
+        );
+        let mut newer = text(500, known);
+        if let ContentBody::DataMessage(dm) = &mut newer {
+            dm.group_v2.as_mut().unwrap().revision = Some(2);
+        }
+        assert!(
+            dropped(content_from(MALLORY, 500, newer)).await,
+            "a revision the sender claims doesn't turn the check off"
+        );
+        assert_eq!(
+            db.presage_forget_queue().await.unwrap(),
+            vec![(group.clone(), 100), (group.clone(), 101), (group, 500)],
+            "presage's copies of the dropped messages go too"
+        );
+    }
+
+    /// A group is fetched again at most every five minutes, whatever its messages claim.
+    #[test]
+    fn a_group_is_refetched_at_most_every_five_minutes() {
+        use std::time::{Duration, Instant};
+        let mut refetches = super::Refetches::default();
+        let t = Instant::now();
+        assert!(refetches.allow([1; 32], t));
+        assert!(!refetches.allow([1; 32], t + Duration::from_secs(60)));
+        assert!(refetches.allow([2; 32], t + Duration::from_secs(60)), "another group");
+        assert!(refetches.allow([1; 32], t + Duration::from_secs(301)));
+    }
+
+    /// presage's group lands in the chat: its title, members' ACIs and timer, at its revision.
+    #[tokio::test]
+    async fn presages_group_is_stored_in_the_chat() {
+        use presage::libsignal_service::groups_v2::{Role, Timer};
+        use presage::libsignal_service::prelude::{ProfileKey, Uuid};
+        use presage::libsignal_service::protocol::Aci;
+        use presage::model::groups::{Group, Member};
+        const ALICE: &str = "22222222-2222-2222-2222-222222222222";
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        let key = [7u8; 32];
+        let group = Group {
+            title: "Hikers".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: Some(Timer { duration: 60 }),
+            access_control: None,
+            revision: 3,
+            members: vec![Member {
+                aci: Aci::from(Uuid::parse_str(ALICE).unwrap()),
+                role: Role::Administrator,
+                profile_key: ProfileKey::create([0; 32]),
+                joined_at_revision: 0,
+                label: None,
+                label_emoji: None,
+            }],
+            pending_members: vec![],
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+        };
+        assert!(super::store_group(&db, &key, &group).await.unwrap());
+        let id = crate::projection::ids::group_id(&key);
+        assert_eq!(db.group_members(&id).await.unwrap(), vec![ALICE]);
+        assert_eq!(db.title(&id).await.unwrap().as_deref(), Some("Hikers"));
+        assert_eq!(db.expire_timer(&id).await.unwrap(), 60);
+        assert_eq!(db.group_revision(&id).await.unwrap(), Some(3));
     }
 
     /// A deleted chat's messages leave presage's store too.
