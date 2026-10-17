@@ -130,6 +130,15 @@ pub fn edit(change: GroupChange) -> Result<GroupEdit, String> {
     })
 }
 
+/// A new group's name (trimmed) and members; an error names what's wrong with them.
+pub fn new_group(title: &str, acis: &[String]) -> Result<(String, Vec<Aci>), String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("a group needs a name".into());
+    }
+    Ok((title, acis.iter().map(|a| aci(a)).collect::<Result<_, _>>()?))
+}
+
 fn aci(s: &str) -> Result<Aci, String> {
     Uuid::parse_str(s)
         .map(Aci::from)
@@ -310,5 +319,15 @@ mod tests {
             ),
             format!("{:?}", GroupEdit::AddMembers(vec![super::aci(ALICE).unwrap().into()]))
         );
+    }
+
+    #[test]
+    fn a_new_group_needs_a_name_and_account_ids() {
+        let (title, members) = new_group(" Climbers\n", &[ALICE.into()]).unwrap();
+        assert_eq!(title, "Climbers");
+        assert_eq!(members, vec![super::aci(ALICE).unwrap()]);
+        assert!(new_group("Just me", &[]).is_ok(), "members can be added later");
+        assert!(new_group("  ", &[ALICE.into()]).is_err());
+        assert!(new_group("Climbers", &["PNI:x".into()]).is_err());
     }
 }

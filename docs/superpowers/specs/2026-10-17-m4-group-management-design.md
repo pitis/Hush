@@ -36,7 +36,12 @@ the stored group's fetches the group before the content reaches us.
    leaves. Read live from presage's group (`Client::group_info`); each change goes through
    `Client::change_group`, which stores the group in its chat once the server has it. A
    picture is a file, sent as a JPEG of at most 1024 px. Join requests wait for piece 4.
-3. **New group.** From the sidebar's compose menu: name, members picked from contacts.
+3. **New group.** From the sidebar's compose menu: a name and members picked from the people
+   we have accepted chats with (none is fine; members can be added later). Those we have a
+   profile key for join, the others are invited (presage's `create_group`). The chat is listed
+   and opened at once, before any message. If something fails after the server made the group
+   (telling the members), the chat is still listed and opened, the failure shown: it's the
+   one group presage didn't have before, under our name at its first revision. A picture is set afterwards in the group's info.
 4. **Invitations and invite links.** An invitation shows as a request to accept or decline;
    admins turn the link on (open or with approval), copy and reset it; a pasted
    `signal.group` link shows the group and joins or asks to.

@@ -75,4 +75,23 @@ final class AppStoreGroupTests: XCTestCase {
         XCTAssertEqual(addable.map(\.aci), ["anna-aci", "bob-aci"])
         XCTAssertEqual(addable.map(\.name), ["anna", "Bob"], "by name, whatever the case")
     }
+
+    func testANewGroupOpensOnceMade() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        let failure = await store.createGroup("Climbers", members: ["alice-aci"])
+        XCTAssertNil(failure)
+        XCTAssertEqual(fake.createdGroups.map(\.title), ["Climbers"])
+        XCTAssertEqual(fake.createdGroups.map(\.members), [["alice-aci"]])
+        XCTAssertEqual(store.selectedId, "g:" + String(repeating: "cd", count: 32))
+    }
+
+    func testAGroupThatCantBeMadeSaysWhy() async {
+        let fake = FakeClient(linked: true)
+        fake.createGroupError = CoreError.Network(message: "refused")
+        let store = await linkedStore(fake)
+        let failure = await store.createGroup("Climbers", members: [])
+        XCTAssertEqual(failure, "Couldn't make the group: refused")
+        XCTAssertNil(store.selectedId)
+    }
 }

@@ -698,6 +698,11 @@ impl ProjectionDb {
     /// it already has messages.
     pub async fn open_found(&self, id: &str, username: &str, at: i64) -> Result<(), sqlx::Error> {
         self.set_username(id, Some(username)).await?;
+        self.list_chat(id, at).await
+    }
+
+    /// Lists a chat without messages (from `at`), so it can be opened and written in.
+    pub async fn list_chat(&self, id: &str, at: i64) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE conversations SET last_message_at = ?2 WHERE id = ?1 AND last_message_at = 0")
             .bind(id)
             .bind(at)

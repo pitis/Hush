@@ -124,6 +124,12 @@ pub enum Command {
         edit: presage::manager::GroupEdit,
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// Makes a group (its members are told), then lists its chat; answers its master key.
+    CreateGroup {
+        title: String,
+        members: Vec<Aci>,
+        done: oneshot::Sender<Result<[u8; 32], String>>,
+    },
 }
 
 /// A sticker as the client needs it to send it.
@@ -661,6 +667,17 @@ async fn run(
                     let _ = done.send(Err("not linked yet".into()));
                 }
             },
+            Command::CreateGroup { title, members, done } => match &manager {
+                Some(m) => {
+                    let (mut m, db, l) = (m.clone(), projection.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(create_group(&mut m, &db, l.as_ref(), &title, &members).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::Relink { done } => {
                 if let Some(m) = &manager {
                     // Best effort: the new link works either way, but each failure leaves a
@@ -919,6 +936,113 @@ async fn settle_group(
     if changed {
         l.on_event(CoreEvent::ConversationsChanged);
     }
+}
+
+/// Makes a group, then lists its chat. A failure after the server made it (telling the
+/// members, say) still lists and answers it, the failure going out as an error event.
+async fn create_group(
+    m: &mut Manager<SqliteStore, Registered>,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    title: &str,
+    members: &[Aci],
+) -> Result<[u8; 32], String> {
+    let before = group_keys(m.store()).await?;
+    match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.create_group(title, members))).await {
+        Ok(Ok((key, at))) => {
+            list_new_group(m.store(), db, l, &key, at as i64).await;
+            Ok(key)
+        }
+        failed => {
+            let problem = match failed {
+                Ok(Err(e)) => e.to_string(),
+                // dropped midway, perhaps after the server made it but before presage stored it
+                _ => "the server didn't answer in time; the group may have been made, so look in your chats before trying again".into(),
+            };
+            let me = Aci::from(m.registration_data().service_ids.aci);
+            match our_new_group(m.store(), &before, &me, title, members).await {
+                Ok(Some(key)) => {
+                    list_new_group(m.store(), db, l, &key, chrono::Utc::now().timestamp_millis()).await;
+                    l.on_event(CoreEvent::Error {
+                        message: format!("The group was made, but its members may not know yet: {problem}"),
+                    });
+                    Ok(key)
+                }
+                Ok(None) => Err(problem),
+                Err(e) => Err(format!(
+                    "{problem}; the group may have been made, so look in your chats before trying again \
+                     (reading the groups failed: {e})"
+                )),
+            }
+        }
+    }
+}
+
+/// The group we just made, if presage has it though making it failed: the one group it didn't
+/// have `before`, at its first revision, under our `title`, with us (`me`) its only admin and
+/// everyone else one of the `members` we asked for. A group someone else made and added us to
+/// meanwhile has its maker for admin.
+async fn our_new_group(
+    store: &SqliteStore,
+    before: &std::collections::HashSet<[u8; 32]>,
+    me: &Aci,
+    title: &str,
+    members: &[Aci],
+) -> Result<Option<[u8; 32]>, String> {
+    use presage::libsignal_service::groups_v2::Role;
+    use presage::libsignal_service::prelude::Uuid;
+    let Some(key) = made_group(before, &group_keys(store).await?) else {
+        return Ok(None);
+    };
+    let asked = |uuid: Uuid| members.iter().any(|a| ServiceId::from(*a).raw_uuid() == uuid);
+    let ours = |g: &presage::model::groups::Group| {
+        g.title == title
+            && g.revision == 0
+            && g.members.iter().any(|m| m.aci == *me)
+            && g.members.iter().all(|m| match m.aci == *me {
+                true => m.role == Role::Administrator,
+                false => m.role != Role::Administrator && asked(ServiceId::from(m.aci).raw_uuid()),
+            })
+            && g.pending_members.iter().all(|p| asked(p.uuid))
+    };
+    let group = store.group(key).await.map_err(|e| e.to_string())?;
+    Ok(group.filter(ours).map(|_| key))
+}
+
+/// The master keys of the groups presage has (an unreadable one is left out: it isn't ours).
+async fn group_keys(store: &SqliteStore) -> Result<std::collections::HashSet<[u8; 32]>, String> {
+    let groups = store.groups().await.map_err(|e| e.to_string())?;
+    Ok(groups.filter_map(|g| g.ok().map(|(key, _)| key)).collect())
+}
+
+/// The group made between two reads of presage's groups, if exactly one appeared.
+fn made_group(
+    before: &std::collections::HashSet<[u8; 32]>,
+    after: &std::collections::HashSet<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    let mut new = after.difference(before);
+    match (new.next(), new.next()) {
+        (Some(key), None) => Some(*key),
+        _ => None,
+    }
+}
+
+/// Stores a group we just made in its chat, listed from `at` though it has no messages yet.
+async fn list_new_group(store: &SqliteStore, db: &ProjectionDb, l: &dyn EventListener, key: &[u8; 32], at: i64) {
+    let listed = match store.group(*key).await {
+        Ok(Some(g)) => match store_group(db, key, &g).await {
+            Ok(_) => db.list_chat(&group_id(key), at).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        Ok(None) => Err("presage hasn't it".into()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = listed {
+        l.on_event(CoreEvent::Error {
+            message: format!("listing a new group failed: {e}"),
+        });
+    }
+    l.on_event(CoreEvent::ConversationsChanged);
 }
 
 /// Installs a pack unless presage has it already.
@@ -2518,6 +2642,92 @@ mod tests {
         super::settle_group(&store, &db, &sink, &key, Some(b"")).await;
         assert!(!db.store_avatar(&id, None, 2).await.unwrap(), "removed already");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A group we just made is listed at once under its name, though it has no messages.
+    #[tokio::test]
+    async fn a_new_group_is_listed_at_once() {
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::protocol::Aci;
+        use presage::model::identity::OnNewIdentity;
+        use presage::store::ContentsStore;
+        use presage_store_sqlite::SqliteStore;
+        let dir = std::env::temp_dir().join(format!("sig-core-new-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStore::open_with_options(
+            super::sqlite_options(&dir.join("presage.db"), &"00".repeat(32)).unwrap(),
+            OnNewIdentity::Trust,
+        )
+        .await
+        .unwrap();
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        let key = [9u8; 32];
+        let before = super::group_keys(&store).await.unwrap();
+        let alice = Aci::from(Uuid::parse_str(ALICE).unwrap());
+        let bob = Aci::from(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+        store.save_group([8; 32], hikers(3)).await.unwrap();
+        assert_eq!(
+            super::our_new_group(&store, &before, &alice, "Hikers", &[])
+                .await
+                .unwrap(),
+            None,
+            "past its first revision"
+        );
+        let before = super::group_keys(&store).await.unwrap();
+        // Hikers: Alice its only member and admin
+        store.save_group(key, hikers(0)).await.unwrap();
+        assert_eq!(
+            super::our_new_group(&store, &before, &bob, "Hikers", &[alice])
+                .await
+                .unwrap(),
+            None,
+            "Alice made it and added Bob: not his, though he asked for her and the same name"
+        );
+        assert_eq!(
+            super::our_new_group(&store, &before, &alice, "Climbers", &[])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            super::our_new_group(&store, &before, &alice, "Hikers", &[])
+                .await
+                .unwrap(),
+            Some(key)
+        );
+        let sink = Sink(std::sync::Mutex::new(vec![]));
+        super::list_new_group(&store, &db, &sink, &[6; 32], 1234).await;
+        assert!(
+            matches!(
+                sink.0.lock().unwrap().as_slice(),
+                [CoreEvent::Error { .. }, CoreEvent::ConversationsChanged]
+            ),
+            "a group presage hasn't is said, and the list refreshed all the same"
+        );
+        sink.0.lock().unwrap().clear();
+        super::list_new_group(&store, &db, &sink, &key, 1234).await;
+        let chats = db.conversations().await.unwrap();
+        let chat = chats
+            .iter()
+            .find(|c| c.id == crate::projection::ids::group_id(&key))
+            .expect("listed");
+        assert_eq!((chat.title.as_str(), chat.last_message_at), ("Hikers", 1234));
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [CoreEvent::ConversationsChanged]
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only one new group is taken for the one we made: two could be one that arrived meanwhile.
+    #[test]
+    fn the_group_made_is_the_only_new_one() {
+        let set = |keys: &[u8]| keys.iter().map(|k| [*k; 32]).collect::<std::collections::HashSet<_>>();
+        assert_eq!(super::made_group(&set(&[1]), &set(&[1, 2])), Some([2; 32]));
+        assert_eq!(super::made_group(&set(&[1]), &set(&[1])), None);
+        assert_eq!(super::made_group(&set(&[1]), &set(&[1, 2, 3])), None);
     }
 
     /// A deleted chat's messages leave presage's store too.

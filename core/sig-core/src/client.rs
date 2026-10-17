@@ -1214,6 +1214,22 @@ impl Client {
             .map_err(|message| CoreError::Network { message })
     }
 
+    /// Makes a group with `members` (ACIs): those we have a profile key for join, the others are
+    /// invited. Answers its chat's id, listed once the server has the group; a failure past
+    /// that point (telling the members) goes out as an error event, the chat answered all the same.
+    pub async fn create_group(&self, title: String, members: Vec<String>) -> Result<String, CoreError> {
+        let (title, members) =
+            crate::groups::new_group(&title, &members).map_err(|message| CoreError::InvalidInput { message })?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::CreateGroup { title, members, done })?;
+        let key = answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })?;
+        Ok(crate::projection::ids::group_id(&key))
+    }
+
     /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
     pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
         Ok(self.db.group_members(&conversation_id).await?)
@@ -1506,6 +1522,14 @@ mod tests {
             ));
             assert!(matches!(
                 client.change_group(group, GroupChange::Leave).await,
+                Err(CoreError::NotLinked)
+            ));
+            assert!(matches!(
+                client.create_group(" ".into(), vec![]).await,
+                Err(CoreError::InvalidInput { .. })
+            ));
+            assert!(matches!(
+                client.create_group("Hikers".into(), vec![]).await,
                 Err(CoreError::NotLinked)
             ));
         });
