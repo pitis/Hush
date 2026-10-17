@@ -147,6 +147,17 @@ pub enum Command {
         key: [u8; 32],
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// Our profile as the server has it now (the phone changes it too).
+    OwnProfile {
+        done: oneshot::Sender<Result<crate::profile::OwnProfile, String>>,
+    },
+    /// Uploads our name and about (the picture and the about's emoji kept), then tells our
+    /// other devices.
+    SetProfile {
+        name: presage::libsignal_service::profile_name::ProfileName<String>,
+        about: Option<String>,
+        done: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// A sticker as the client needs it to send it.
@@ -737,6 +748,28 @@ async fn run(
                     let _ = done.send(Err("not linked yet".into()));
                 }
             },
+            Command::OwnProfile { done } => match &manager {
+                Some(m) => {
+                    let m = m.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(fetch_own_profile(&m).await.map(|p| crate::profile::own(&p)));
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
+            Command::SetProfile { name, about, done } => match &manager {
+                Some(m) => {
+                    let (mut m, l) = (m.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(set_profile(&mut m, l.as_ref(), name, about).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::Relink { done } => {
                 if let Some(m) = &manager {
                     // Best effort: the new link works either way, but each failure leaves a
@@ -1089,6 +1122,72 @@ async fn our_new_group(
     };
     let group = store.group(key).await.map_err(|e| e.to_string())?;
     Ok(group.filter(ours).map(|_| key))
+}
+
+/// Our profile as the server has it now. presage answers ours from a copy nothing refreshes,
+/// and fetching it anew through presage's websocket isn't offered (a second one would displace
+/// it): it's asked over HTTPS, and presage's copy replaced.
+async fn fetch_own_profile(
+    m: &Manager<SqliteStore, Registered>,
+) -> Result<presage::libsignal_service::Profile, String> {
+    use presage::libsignal_service::configuration::Endpoint;
+    use presage::libsignal_service::push_service::HttpAuthOverride;
+    let data = m.registration_data();
+    let (aci, key) = (data.service_ids.aci(), data.profile_key());
+    let push = crate::net::push_service(data)?;
+    let request = push
+        .request(
+            reqwest::Method::GET,
+            Endpoint::service(crate::profile::path(aci, key)),
+            HttpAuthOverride::NoOverride,
+        )
+        .map_err(|e| e.to_string())?;
+    let fetch = async {
+        // reqwest's error text carries the URL, our ACI in it: not for the log
+        let response = request.send().await.map_err(|e| e.without_url().to_string())?;
+        match response.status().as_u16() {
+            200 => response.bytes().await.map_err(|e| e.without_url().to_string()),
+            status => Err(format!("the server answered {status}")),
+        }
+    };
+    let body = tokio::time::timeout(Duration::from_secs(20), fetch)
+        .await
+        .map_err(|_| "the server didn't answer in time".to_string())??;
+    let profile = crate::profile::decrypt(&body, key)?;
+    // what presage answers from its copy (Note to Self's picture) follows
+    if let Err(e) = m.store().clone().save_profile(aci.into(), key, profile.clone()).await {
+        tracing::warn!(error = %e, "our fetched profile wasn't stored");
+    }
+    Ok(profile)
+}
+
+async fn set_profile(
+    m: &mut Manager<SqliteStore, Registered>,
+    l: &dyn EventListener,
+    name: presage::libsignal_service::profile_name::ProfileName<String>,
+    about: Option<String>,
+) -> Result<(), String> {
+    // the emoji as it is now: the phone may have changed it since Settings read the profile
+    let emoji = crate::profile::kept_emoji(&about, fetch_own_profile(m).await?.about_emoji);
+    match tokio::time::timeout(Duration::from_secs(30), Box::pin(m.update_profile(name, about, emoji))).await {
+        Ok(r) => r.map_err(|e| e.to_string())?,
+        Err(_) => return Err("the server didn't answer in time".into()),
+    }
+    // as Signal Desktop does, so the phone shows (and keeps) the new name
+    let me = m.registration_data().service_ids.aci();
+    let sync = crate::send::local_profile_changed_sync();
+    let told = tokio::time::timeout(
+        Duration::from_secs(30),
+        Box::pin(m.send_message(me, sync, chrono::Utc::now().timestamp_millis() as u64)),
+    )
+    .await;
+    if !matches!(told, Ok(Ok(_))) {
+        tracing::warn!("the phone wasn't told our profile changed");
+        l.on_event(CoreEvent::Error {
+            message: "Your profile is saved, but your phone wasn't told: it may show the old one for a while.".into(),
+        });
+    }
+    Ok(())
 }
 
 /// What a group's link shows: the group as the server has it for us if we're in it (our copy

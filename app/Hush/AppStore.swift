@@ -1508,7 +1508,7 @@ final class AppStore {
         } catch {
             // never the link: it holds the group's key
             append("group link preview failed: \(error)")
-            return .failed(Self.groupFailure("Couldn't read the link", error))
+            return .failed(Self.serverFailure("Couldn't read the link", error))
         }
     }
 
@@ -1522,7 +1522,7 @@ final class AppStore {
             return nil
         } catch {
             append("joining a group failed: \(error)")
-            return Self.groupFailure("Couldn't join the group", error)
+            return Self.serverFailure("Couldn't join the group", error)
         }
     }
 
@@ -1534,10 +1534,38 @@ final class AppStore {
             try await client.cancelJoinRequest(conversationId: conversationId)
         } catch {
             append("cancelling a join request failed: \(error)")
-            return Self.groupFailure("Couldn't cancel the request", error)
+            return Self.serverFailure("Couldn't cancel the request", error)
         }
         deleteChat(conversationId)
         return nil
+    }
+
+    /// Reading or saving our profile.
+    enum ProfileRead: Equatable {
+        case profile(OwnProfile)
+        case failed(String)
+    }
+
+    /// Our name and about as the server has them now.
+    func ownProfile() async -> ProfileRead {
+        guard let client else { return .failed("Not linked yet.") }
+        do {
+            return .profile(try await client.ownProfile())
+        } catch {
+            append("reading our profile failed: \(error)")
+            return .failed(Self.serverFailure("Couldn't read your profile", error))
+        }
+    }
+
+    /// Saves our name and about; the profile as saved (trimmed), or why it failed.
+    func saveProfile(givenName: String, familyName: String, about: String) async -> ProfileRead {
+        guard let client else { return .failed("Not linked yet.") }
+        do {
+            return .profile(try await client.setProfile(givenName: givenName, familyName: familyName, about: about))
+        } catch {
+            append("saving our profile failed: \(error)")
+            return .failed(Self.serverFailure("Couldn't save your profile", error))
+        }
     }
 
     /// A clicked link: a group's invite link opens the join sheet (true); others are the
@@ -1551,7 +1579,7 @@ final class AppStore {
     }
 
     /// `what` failed: the core's reason (the server's refusal is not "couldn't be reached").
-    private static func groupFailure(_ what: String, _ error: Error) -> String {
+    private static func serverFailure(_ what: String, _ error: Error) -> String {
         switch error {
         case CoreError.Network(let message): "\(what): \(message)"
         default: "\(what): \(describe(error))"

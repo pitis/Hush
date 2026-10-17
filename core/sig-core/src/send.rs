@@ -375,6 +375,16 @@ pub fn storage_changed_sync() -> SyncMessage {
     }
 }
 
+/// Asks our other devices to fetch our profile again: we changed it.
+pub fn local_profile_changed_sync() -> SyncMessage {
+    SyncMessage {
+        content: Some(sync_message::Content::FetchLatest(sync_message::FetchLatest {
+            r#type: Some(sync_message::fetch_latest::Type::LocalProfile as i32),
+        })),
+        ..Default::default()
+    }
+}
+
 /// Tells our other devices how we answered a contact's message request. None for a group (as
 /// Desktop: they have no ACI to name; the block list carries group blocks) or a PNI chat.
 pub fn request_response_sync(conversation_id: &str, response: RequestResponse) -> Option<SyncMessage> {
@@ -988,6 +998,16 @@ mod tests {
                 if f.r#type == Some(sync_message::fetch_latest::Type::StorageManifest as i32)
         ));
         assert!(sm.read.is_empty());
+    }
+
+    #[test]
+    fn a_changed_profile_asks_the_other_devices_to_fetch_it() {
+        let sm = local_profile_changed_sync();
+        assert!(matches!(
+            sm.content,
+            Some(sync_message::Content::FetchLatest(f))
+                if f.r#type == Some(sync_message::fetch_latest::Type::LocalProfile as i32)
+        ));
     }
 
     #[test]

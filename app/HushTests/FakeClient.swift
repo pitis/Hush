@@ -196,6 +196,22 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         lock.withLock { cancelledRequests.append(conversationId) }
         if let cancelError { throw cancelError }
     }
+    var profile = OwnProfile(givenName: "Ada", familyName: "", about: "")
+    var profileError: CoreError?
+    private(set) var savedProfiles: [OwnProfile] = []
+    func ownProfile() async throws -> OwnProfile {
+        if let profileError { throw profileError }
+        return lock.withLock { profile }
+    }
+    func setProfile(givenName: String, familyName: String, about: String) async throws -> OwnProfile {
+        if let profileError { throw profileError }
+        let saved = OwnProfile(givenName: givenName, familyName: familyName, about: about)
+        lock.withLock {
+            savedProfiles.append(saved)
+            profile = saved
+        }
+        return saved
+    }
     func findUsername(username: String) async throws -> String? {
         if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
         return lock.withLock { usernames[username] }

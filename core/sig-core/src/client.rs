@@ -1289,6 +1289,42 @@ impl Client {
             .map_err(|message| CoreError::Network { message })
     }
 
+    /// Our name and about, as the server has them now.
+    pub async fn own_profile(&self) -> Result<crate::profile::OwnProfile, CoreError> {
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::OwnProfile { done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })
+    }
+
+    /// Saves our name and about (the picture stays the phone's); answers them as saved, trimmed.
+    /// Our other devices are told; failing that goes out as an error event.
+    pub async fn set_profile(
+        &self,
+        given_name: String,
+        family_name: String,
+        about: String,
+    ) -> Result<crate::profile::OwnProfile, CoreError> {
+        let (name, about) = crate::profile::edit(&given_name, &family_name, &about)
+            .map_err(|message| CoreError::InvalidInput { message })?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let saved = crate::profile::OwnProfile {
+            given_name: name.given_name.clone(),
+            family_name: name.family_name.clone().unwrap_or_default(),
+            about: about.clone().unwrap_or_default(),
+        };
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::SetProfile { name, about, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })?;
+        Ok(saved)
+    }
+
     /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
     pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
         Ok(self.db.group_members(&conversation_id).await?)
@@ -2482,6 +2518,16 @@ mod tests {
             ] {
                 assert!(invalid(client.find_username(bad.into()).await), "{bad:?}");
             }
+        });
+    }
+
+    #[test]
+    fn a_profile_without_a_first_name_isnt_saved() {
+        let (_dir, _sink, client, rt) = as_me("client-profile");
+        rt.block_on(async {
+            assert!(invalid(
+                client.set_profile(" ".into(), "Lovelace".into(), "".into()).await
+            ));
         });
     }
 
