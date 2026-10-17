@@ -36,6 +36,10 @@ final class ChatListTests: XCTestCase {
         blocked.blocked = true
         XCTAssertEqual(line(blocked), .message("Blocked", tick: nil))
         XCTAssertEqual(line(request, typing: true), .typing)
+        var invitation = last("g:00")
+        invitation.groupInvitation = true
+        invitation.messageRequest = true
+        XCTAssertEqual(line(invitation), .message("Group invitation", tick: nil))
     }
 
     func testTheRequestBarNamesThePersonOrTheGroup() {
@@ -44,9 +48,12 @@ final class ChatListTests: XCTestCase {
         person.blocked = true
         XCTAssertEqual(RequestBar.prompt(person, name: "Alice"), "You blocked Alice.")
         XCTAssertEqual(RequestBar.blockTitle(person, name: "Alice"), "Block Alice?")
-        let group = conversation("g:00")
+        var group = conversation("g:00")
         XCTAssertTrue(RequestBar.prompt(group, name: "G").hasPrefix("Join this group?"))
         XCTAssertTrue(RequestBar.blockMessage(group).contains("You stay a member"))
+        group.groupInvitation = true
+        XCTAssertTrue(RequestBar.prompt(group, name: "G").hasPrefix("You're invited to join this group."))
+        XCTAssertTrue(RequestBar.blockMessage(group).contains("The invitation stays unanswered"), "not a member yet")
     }
 
     func testGroupsNameTheAuthorLikeDesktop() {

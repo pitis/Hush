@@ -43,7 +43,7 @@ pub const STORY_LIFETIME_MS: i64 = 24 * 3600 * 1000;
 macro_rules! is_request {
     () => {
         "(EXISTS (SELECT 1 FROM storage_sync WHERE version > 0)
-           AND NOT c.whitelisted AND NOT c.blocked AND NOT c.phone_contact
+           AND NOT c.whitelisted AND NOT c.blocked AND NOT c.phone_contact AND NOT c.group_invited
            AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = c.id AND o.is_outgoing = 1))"
     };
 }
@@ -178,7 +178,7 @@ impl ProjectionDb {
     }
 
     /// Stores a group as presage has it at `revision`: its title (an empty one never replaces a
-    /// known one), members (ACIs, replaced whole) and timer. Nothing happens when that revision
+    /// known one), members (ACIs, replaced whole), timer and whether we're `invited`. Nothing happens when that revision
     /// or a later one is stored already; returns whether it was stored.
     pub async fn set_group(
         &self,
@@ -187,6 +187,7 @@ impl ProjectionDb {
         title: &str,
         acis: &[String],
         timer: u32,
+        invited: bool,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let stored: Option<Option<i64>> = sqlx::query_scalar("SELECT group_revision FROM conversations WHERE id = ?1")
@@ -197,15 +198,17 @@ impl ProjectionDb {
             return Ok(false);
         }
         sqlx::query(
-            "INSERT INTO conversations(id, kind, title, expire_timer, group_revision) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO conversations(id, kind, title, expire_timer, group_revision, group_invited)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET title = CASE WHEN ?3 = '' THEN title ELSE ?3 END,
-               expire_timer = ?4, group_revision = ?5",
+               expire_timer = ?4, group_revision = ?5, group_invited = ?6",
         )
         .bind(conversation_id)
         .bind(kind_to_i64(kind_of(conversation_id)?))
         .bind(title)
         .bind(i64::from(timer))
         .bind(i64::from(revision))
+        .bind(invited)
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM group_members WHERE conversation_id = ?1")
@@ -698,17 +701,18 @@ impl ProjectionDb {
     /// it already has messages.
     pub async fn open_found(&self, id: &str, username: &str, at: i64) -> Result<(), sqlx::Error> {
         self.set_username(id, Some(username)).await?;
-        self.list_chat(id, at).await
+        self.list_chat(id, at).await.map(|_| ())
     }
 
-    /// Lists a chat without messages (from `at`), so it can be opened and written in.
-    pub async fn list_chat(&self, id: &str, at: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE conversations SET last_message_at = ?2 WHERE id = ?1 AND last_message_at = 0")
+    /// Lists a chat without messages (from `at`), so it can be opened and written in; returns
+    /// whether it wasn't listed before.
+    pub async fn list_chat(&self, id: &str, at: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE conversations SET last_message_at = ?2 WHERE id = ?1 AND last_message_at = 0")
             .bind(id)
             .bind(at)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     /// Whether the contact is in the phone's address book (its storage record carries system
@@ -3352,6 +3356,7 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         blocked: r.try_get("blocked")?,
         whitelisted: r.try_get("whitelisted")?,
         message_request: r.try_get("message_request")?,
+        group_invitation: r.try_get("group_invited")?,
         avatar: r.try_get("avatar")?,
         username: r.try_get("username")?,
         note: r.try_get("note")?,
@@ -4944,18 +4949,25 @@ mod tests {
         let g = format!("g:{}", "ab".repeat(32));
         assert_eq!(db.group_members(&g).await.unwrap(), Vec::<String>::new());
         assert!(db
-            .set_group(&g, 2, "Hikers", &["bob".into(), "alice".into()], 60)
+            .set_group(&g, 2, "Hikers", &["bob".into(), "alice".into()], 60, true)
             .await
             .unwrap());
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
         assert_eq!(db.title(&g).await.unwrap().as_deref(), Some("Hikers"));
         assert_eq!(db.expire_timer(&g).await.unwrap(), 60);
+        db.list_chat(&g, 5).await.unwrap();
+        let invitation = |chats: Vec<Conversation>| chats.iter().find(|c| c.id == g).map(|c| c.group_invitation);
+        assert_eq!(invitation(db.conversations().await.unwrap()), Some(true));
         assert!(
-            !db.set_group(&g, 2, "Old", &["carol".into()], 0).await.unwrap(),
+            !db.set_group(&g, 2, "Old", &["carol".into()], 0, false).await.unwrap(),
             "the same revision is already stored"
         );
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
-        assert!(db.set_group(&g, 3, "Climbers", &["carol".into()], 0).await.unwrap());
+        assert!(db
+            .set_group(&g, 3, "Climbers", &["carol".into()], 0, false)
+            .await
+            .unwrap());
+        assert_eq!(invitation(db.conversations().await.unwrap()), Some(false), "answered");
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["carol"]);
         assert_eq!(db.title(&g).await.unwrap().as_deref(), Some("Climbers"));
         assert_eq!(db.expire_timer(&g).await.unwrap(), 0);
@@ -6954,6 +6966,26 @@ mod tests {
         assert!(conv(&db, "c:alice").await.message_request);
         db.accept("c:alice").await.unwrap();
         assert!(!conv(&db, "c:alice").await.message_request);
+    }
+
+    /// An invitation is answered with Join or Decline, not as a message request; joining
+    /// accepts the chat too (or it would ask again).
+    #[tokio::test]
+    async fn an_invitation_is_not_a_message_request() {
+        let db = db().await;
+        phone_state_known(&db).await;
+        let g = format!("g:{}", "ab".repeat(32));
+        db.set_group(&g, 1, "Hikers", &["alice".into()], 0, true).await.unwrap();
+        assert!(db.list_chat(&g, 5).await.unwrap());
+        assert!(!db.list_chat(&g, 6).await.unwrap(), "listed already");
+        let c = conv(&db, &g).await;
+        assert!(c.group_invitation && !c.message_request);
+        db.set_group(&g, 2, "Hikers", &["alice".into(), "me".into()], 0, false)
+            .await
+            .unwrap();
+        assert!(conv(&db, &g).await.message_request, "joined, not accepted");
+        db.accept(&g).await.unwrap();
+        assert!(!conv(&db, &g).await.message_request);
     }
 
     #[tokio::test]

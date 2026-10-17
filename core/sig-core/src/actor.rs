@@ -16,6 +16,7 @@ use futures::{channel::oneshot as fut_oneshot, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Content;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
+use presage::libsignal_service::push_service::ServiceIds;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
@@ -647,7 +648,7 @@ async fn run(
                     Some(m) => {
                         let me = m.registration_data().service_ids.aci.to_string();
                         match m.store().group(key).await {
-                            Ok(g) => Ok(g.map(|g| crate::groups::info(&g, &me))),
+                            Ok(g) => Ok(g.map(|g| crate::groups::info(&g, key, &me))),
                             Err(e) => Err(e.to_string()),
                         }
                     }
@@ -889,6 +890,11 @@ async fn change_group(
         GroupEdit::Avatar(bytes) => Some(bytes.clone()),
         _ => None,
     };
+    let answer = match &edit {
+        GroupEdit::AcceptInvitation => Some(true),
+        GroupEdit::DeclineInvitation => Some(false),
+        _ => None,
+    };
     let changed = match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.change_group(&key, edit))).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
@@ -897,7 +903,21 @@ async fn change_group(
     // whatever the answer: the server may have taken the change before something after it failed
     // (telling the members, say), and presage then has the group as changed
     let picture = picture.filter(|_| changed.is_ok());
-    settle_group(m.store(), db, l, &key, picture.as_deref()).await;
+    let own = m.registration_data().service_ids.clone();
+    settle_group(m.store(), &own, db, l, &key, picture.as_deref()).await;
+    // an answer to an invitation that took is answered, though the members weren't told
+    if let (Err(problem), Some(accept)) = (&changed, answer) {
+        if let Ok(Some(g)) = m.store().group(key).await {
+            if crate::groups::answered(&g, own.aci, own.pni, accept) {
+                l.on_event(CoreEvent::Error {
+                    message: format!(
+                        "Your answer to the invitation went through, but the group may not know yet: {problem}"
+                    ),
+                });
+                return Ok(());
+            }
+        }
+    }
     changed
 }
 
@@ -905,6 +925,7 @@ async fn change_group(
 /// which presage keeps to itself.
 async fn settle_group(
     store: &SqliteStore,
+    own: &ServiceIds,
     db: &ProjectionDb,
     l: &dyn EventListener,
     key: &[u8; 32],
@@ -913,7 +934,7 @@ async fn settle_group(
     let mut changed = false;
     let mut problems = vec![];
     match store.group(*key).await {
-        Ok(Some(g)) => match store_group(db, key, &g).await {
+        Ok(Some(g)) => match store_group(db, key, &g, own).await {
             Ok(c) => changed |= c,
             Err(e) => problems.push(format!("storing a changed group failed: {e}")),
         },
@@ -950,7 +971,8 @@ async fn create_group(
     let before = group_keys(m.store()).await?;
     match tokio::time::timeout(Duration::from_secs(60), Box::pin(m.create_group(title, members))).await {
         Ok(Ok((key, at))) => {
-            list_new_group(m.store(), db, l, &key, at as i64).await;
+            let own = m.registration_data().service_ids.clone();
+            list_new_group(m.store(), &own, db, l, &key, at as i64).await;
             Ok(key)
         }
         failed => {
@@ -962,7 +984,9 @@ async fn create_group(
             let me = Aci::from(m.registration_data().service_ids.aci);
             match our_new_group(m.store(), &before, &me, title, members).await {
                 Ok(Some(key)) => {
-                    list_new_group(m.store(), db, l, &key, chrono::Utc::now().timestamp_millis()).await;
+                    let own = m.registration_data().service_ids.clone();
+                    let now = chrono::Utc::now().timestamp_millis();
+                    list_new_group(m.store(), &own, db, l, &key, now).await;
                     l.on_event(CoreEvent::Error {
                         message: format!("The group was made, but its members may not know yet: {problem}"),
                     });
@@ -1028,9 +1052,16 @@ fn made_group(
 }
 
 /// Stores a group we just made in its chat, listed from `at` though it has no messages yet.
-async fn list_new_group(store: &SqliteStore, db: &ProjectionDb, l: &dyn EventListener, key: &[u8; 32], at: i64) {
+async fn list_new_group(
+    store: &SqliteStore,
+    own: &ServiceIds,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    key: &[u8; 32],
+    at: i64,
+) {
     let listed = match store.group(*key).await {
-        Ok(Some(g)) => match store_group(db, key, &g).await {
+        Ok(Some(g)) => match store_group(db, key, &g, own).await {
             Ok(_) => db.list_chat(&group_id(key), at).await.map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         },
@@ -1950,12 +1981,13 @@ async fn timed_avatar<E: std::fmt::Display>(
     }
 }
 
-/// Stores a group's title, members and timer as presage has them, unless that revision is
-/// stored already; returns whether it was stored.
+/// Stores a group's title, members, timer and whether we (`own`) are invited, as presage has
+/// them, unless that revision is stored already; returns whether it was stored.
 async fn store_group(
     db: &ProjectionDb,
     key: &[u8; 32],
     g: &presage::model::groups::Group,
+    own: &ServiceIds,
 ) -> Result<bool, sqlx::Error> {
     let members: Vec<String> = g
         .members
@@ -1963,8 +1995,28 @@ async fn store_group(
         .map(|m| ServiceId::from(m.aci).raw_uuid().to_string())
         .collect();
     let timer = g.disappearing_messages_timer.as_ref().map_or(0, |t| t.duration);
-    db.set_group(&group_id(key), g.revision, &g.title, &members, timer)
+    let invited = crate::groups::invited(g, own.aci, own.pni);
+    db.set_group(&group_id(key), g.revision, &g.title, &members, timer, invited)
         .await
+}
+
+/// Lists the chat of a group that invites us (`own`), from now, unless the group or whoever
+/// invited us is blocked; returns whether it was listed just now. Its state decides, not
+/// whether this revision was stored just now, so whatever stored it first, it shows.
+async fn list_invitation(
+    db: &ProjectionDb,
+    key: &[u8; 32],
+    g: &presage::model::groups::Group,
+    own: &ServiceIds,
+) -> Result<bool, sqlx::Error> {
+    let Some(invitation) = crate::groups::invitation(g, own.aci, own.pni) else {
+        return Ok(false);
+    };
+    let id = group_id(key);
+    if db.is_blocked(&id).await? || db.is_blocked(&direct_id(&invitation.added_by_aci.into())).await? {
+        return Ok(false);
+    }
+    db.list_chat(&id, chrono::Utc::now().timestamp_millis()).await
 }
 
 /// Brings a group message's chat up to presage's group, so its sender is checked against
@@ -2004,8 +2056,13 @@ async fn sync_group(
         Ok(None) => return,
         Err(e) => Err(e.to_string()),
     };
+    let own = &m.registration_data().service_ids;
     let stored = match group {
-        Ok(g) => store_group(db, &key, &g).await.map_err(|e| e.to_string()),
+        Ok(g) => match store_group(db, &key, &g, own).await {
+            Ok(stored) => list_invitation(db, &key, &g, own).await.map(|listed| stored || listed),
+            Err(e) => Err(e),
+        }
+        .map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
     match stored {
@@ -2082,7 +2139,12 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
             for group in groups {
                 match group {
                     Ok((key, g)) => {
-                        if let Err(e) = store_group(db, &key, &g).await {
+                        let own = &m.registration_data().service_ids;
+                        let stored = match store_group(db, &key, &g, own).await {
+                            Ok(_) => list_invitation(db, &key, &g, own).await,
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = stored {
                             problems.push(format!("storing a group: {e}"));
                         }
                     }
@@ -2485,7 +2547,7 @@ mod tests {
         let (known, unknown) = ([7u8; 32], [8u8; 32]);
         let group = crate::projection::ids::group_id(&known);
         let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
-        db.set_group(&group, 1, "G", &[ME.into(), ALICE.into()], 0)
+        db.set_group(&group, 1, "G", &[ME.into(), ALICE.into()], 0, false)
             .await
             .unwrap();
         let text = |ms: u64, key: [u8; 32]| {
@@ -2564,6 +2626,15 @@ mod tests {
 
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
 
+    /// Our ids in tests: an ACI and a PNI that no test group knows.
+    fn own() -> super::ServiceIds {
+        use presage::libsignal_service::prelude::Uuid;
+        super::ServiceIds {
+            aci: Uuid::from_u128(0xa),
+            pni: Uuid::from_u128(0xb),
+        }
+    }
+
     /// "Hikers" at `revision`: Alice (an admin), a minute's timer.
     fn hikers(revision: u32) -> presage::model::groups::Group {
         use presage::libsignal_service::groups_v2::{Role, Timer};
@@ -2591,6 +2662,54 @@ mod tests {
         }
     }
 
+    /// A group that invites our number (or our account) is stored as an invitation; once
+    /// we're in, it isn't.
+    #[tokio::test]
+    async fn a_group_inviting_us_is_stored_as_an_invitation() {
+        use presage::libsignal_service::groups_v2::Role;
+        use presage::model::groups::PendingMember;
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        let key = [4u8; 32];
+        let id = crate::projection::ids::group_id(&key);
+        let mut g = hikers(1);
+        g.pending_members = vec![PendingMember {
+            uuid: own().pni,
+            service_id_type: presage::model::ServiceIdType::PhoneNumberIdentity,
+            role: Role::Default,
+            added_by_aci: g.members[0].aci,
+            timestamp: 0,
+        }];
+        assert!(super::store_group(&db, &key, &g, &own()).await.unwrap());
+        let inviter = super::direct_id(&g.members[0].aci.into());
+        db.upsert_conversation_title(&inviter, "Alice").await.unwrap();
+        db.block(&inviter).await.unwrap();
+        assert!(
+            !super::list_invitation(&db, &key, &g, &own()).await.unwrap(),
+            "a blocked inviter's invitation stays out"
+        );
+        db.accept(&inviter).await.unwrap();
+        db.block(&id).await.unwrap();
+        assert!(
+            !super::list_invitation(&db, &key, &g, &own()).await.unwrap(),
+            "so does a blocked group's"
+        );
+        db.accept(&id).await.unwrap();
+        assert!(
+            super::list_invitation(&db, &key, &g, &own()).await.unwrap(),
+            "listed though its revision was stored before"
+        );
+        let invitation = |chats: Vec<crate::projection::model::Conversation>| {
+            chats.iter().find(|c| c.id == id).map(|c| c.group_invitation)
+        };
+        assert_eq!(invitation(db.conversations().await.unwrap()), Some(true));
+        g.pending_members.clear();
+        g.revision = 2;
+        assert!(super::store_group(&db, &key, &g, &own()).await.unwrap());
+        assert_eq!(invitation(db.conversations().await.unwrap()), Some(false));
+    }
+
     /// presage's group lands in the chat: its title, members' ACIs and timer, at its revision.
     #[tokio::test]
     async fn presages_group_is_stored_in_the_chat() {
@@ -2598,7 +2717,7 @@ mod tests {
             .await
             .unwrap();
         let key = [7u8; 32];
-        assert!(super::store_group(&db, &key, &hikers(3)).await.unwrap());
+        assert!(super::store_group(&db, &key, &hikers(3), &own()).await.unwrap());
         let id = crate::projection::ids::group_id(&key);
         assert_eq!(db.group_members(&id).await.unwrap(), vec![ALICE]);
         assert_eq!(db.title(&id).await.unwrap().as_deref(), Some("Hikers"));
@@ -2629,7 +2748,7 @@ mod tests {
         let id = crate::projection::ids::group_id(&key);
         store.save_group(key, hikers(4)).await.unwrap();
         let sink = Sink(std::sync::Mutex::new(vec![]));
-        super::settle_group(&store, &db, &sink, &key, Some(b"jpeg")).await;
+        super::settle_group(&store, &own(), &db, &sink, &key, Some(b"jpeg")).await;
         assert_eq!(db.group_revision(&id).await.unwrap(), Some(4));
         assert!(
             !db.store_avatar(&id, Some(b"jpeg"), 1).await.unwrap(),
@@ -2639,7 +2758,7 @@ mod tests {
             sink.0.lock().unwrap().as_slice(),
             [CoreEvent::ConversationsChanged]
         ));
-        super::settle_group(&store, &db, &sink, &key, Some(b"")).await;
+        super::settle_group(&store, &own(), &db, &sink, &key, Some(b"")).await;
         assert!(!db.store_avatar(&id, None, 2).await.unwrap(), "removed already");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2698,7 +2817,7 @@ mod tests {
             Some(key)
         );
         let sink = Sink(std::sync::Mutex::new(vec![]));
-        super::list_new_group(&store, &db, &sink, &[6; 32], 1234).await;
+        super::list_new_group(&store, &own(), &db, &sink, &[6; 32], 1234).await;
         assert!(
             matches!(
                 sink.0.lock().unwrap().as_slice(),
@@ -2707,7 +2826,7 @@ mod tests {
             "a group presage hasn't is said, and the list refreshed all the same"
         );
         sink.0.lock().unwrap().clear();
-        super::list_new_group(&store, &db, &sink, &key, 1234).await;
+        super::list_new_group(&store, &own(), &db, &sink, &key, 1234).await;
         let chats = db.conversations().await.unwrap();
         let chat = chats
             .iter()
