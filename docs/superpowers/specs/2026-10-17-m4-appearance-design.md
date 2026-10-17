@@ -10,11 +10,13 @@ a fixed palette after Signal Desktop's dark theme, white words in every bubble).
    incoming bubbles with dark words; outgoing bubbles stay blue with white words.
 
 ## Design
-- `Appearance` (stored in user defaults) sets the root view's colour scheme (`nil` for System).
+- `Appearance` (stored in user defaults) sets the app-wide appearance (`NSApp.appearance`; none
+  for System), so every window follows: the main one, Settings, the call window, the log.
 - `Theme` colours are dynamic `NSColor`s with a light and a dark value, picked by the drawing
   appearance; `Theme.incomingText` is the incoming bubble's words.
-- In bubbles, dimmed words (deleted, time, poll hints) and poll bars use hierarchical styles of
-  the bubble's own foreground; a spoiler's cover is the words' colour.
+- In bubbles, dimmed words (deleted, time, poll hints), poll bars and a voice note's progress
+  use hierarchical styles of the bubble's own foreground; a spoiler's cover is the appearance's
+  text colour, half transparent. Warnings are orange (yellow can't be read on light grey).
 
 ## Not in this slice
 Chat colours and wallpapers (synced from the phone's account record).

@@ -17,6 +17,17 @@ enum Appearance: String, CaseIterable, Identifiable {
         case .dark: .dark
         }
     }
+
+    /// The app-wide appearance it sets (every window, Settings and the call window too).
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: nil
+        case .light: NSAppearance(named: .aqua)
+        case .dark: NSAppearance(named: .darkAqua)
+        }
+    }
+
+    @MainActor func apply() { NSApp.appearance = nsAppearance }
 }
 
 /// Colors after Signal Desktop's light and dark themes, following the window's appearance.

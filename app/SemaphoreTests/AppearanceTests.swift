@@ -11,6 +11,19 @@ final class AppearanceTests: XCTestCase {
         XCTAssertNil(Appearance.system.scheme)
         XCTAssertEqual(Appearance.light.scheme, .light)
         XCTAssertEqual(Appearance.dark.scheme, .dark)
+        // set app-wide, so Settings and the call window follow
+        XCTAssertNil(Appearance.system.nsAppearance)
+        XCTAssertEqual(Appearance.light.nsAppearance?.name, .aqua)
+        XCTAssertEqual(Appearance.dark.nsAppearance?.name, .darkAqua)
+    }
+
+    @MainActor func testApplyingSetsTheWholeAppsAppearance() {
+        let before = NSApp.appearance
+        defer { NSApp.appearance = before }
+        Appearance.light.apply()
+        XCTAssertEqual(NSApp.appearance?.name, .aqua)
+        Appearance.system.apply()
+        XCTAssertNil(NSApp.appearance)
     }
 
     func testThemeColoursFollowTheAppearance() {

@@ -14,7 +14,6 @@ struct CallWindow: View {
         }
         .frame(width: 320, height: 300)
         .background(Theme.window)
-        .preferredColorScheme(.dark)
         // closing the window mid-call ends the call: a running call with no window would be
         // a call you can't hang up
         .onDisappear { if let call = store.call, call.phase != .ended { store.hangupCall() } }
