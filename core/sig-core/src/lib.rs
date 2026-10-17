@@ -28,6 +28,12 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Signal's bubble colour presets, for the chat colour picker.
+#[uniffi::export]
+pub fn chat_color_presets() -> Vec<projection::ChatColor> {
+    projection::chat_colors::presets()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

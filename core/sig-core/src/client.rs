@@ -10,8 +10,8 @@ use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
-    Attachment, BodyRange, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey, MessageKind,
-    MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
+    Attachment, BodyRange, ChatColor, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey,
+    MessageKind, MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
     StickerPackInfo,
 };
 use crate::send::{self, Job, SendJob};
@@ -992,6 +992,19 @@ impl Client {
         // if the core is closing, the stored receipts go out on the next start
         let _ = self.send(Command::Send(Job::Receipts));
         Ok(targets.len() as u32)
+    }
+
+    /// Sets our bubbles' colour in a chat (None: the default). Kept on this Mac only.
+    pub async fn set_chat_color(&self, conversation_id: String, color: Option<ChatColor>) -> Result<(), CoreError> {
+        if color.as_ref().is_some_and(|c| c.colors.is_empty()) {
+            return Err(CoreError::InvalidInput {
+                message: "a chat colour needs a colour".into(),
+            });
+        }
+        self.known_conversation(&conversation_id).await?;
+        self.db.set_chat_color(&conversation_id, color.as_ref()).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(())
     }
 
     /// Archives a chat (out of the list, behind "Archived") or brings it back.
