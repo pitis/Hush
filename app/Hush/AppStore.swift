@@ -1504,7 +1504,8 @@ final class AppStore {
         guard let client else { return .failed("Not linked yet.") }
         do {
             let info = try await client.groupInfo(conversationId: conversationId)
-            for aci in (info?.members.map(\.aci) ?? []) + (info?.invited ?? []) where aci != ownAci {
+            let people = (info?.members.map(\.aci) ?? []) + (info?.invited ?? []) + (info?.requesting ?? [])
+            for aci in people where aci != ownAci {
                 await loadName(aci)
             }
             return info.map(GroupRead.known) ?? .unknown
@@ -1556,6 +1557,16 @@ final class AppStore {
             default: return "Couldn't make the group: \(Self.describe(error))"
             }
         }
+    }
+
+    /// Answers a group's invitation: accepting joins it, declining also deletes its chat. nil, or
+    /// why it failed (the chat then stays).
+    func answerInvitation(_ conversationId: String, accept: Bool) async -> String? {
+        if let failure = await changeGroup(conversationId, [accept ? .acceptInvitation : .declineInvitation]) {
+            return failure
+        }
+        if !accept { deleteChat(conversationId) }
+        return nil
     }
 
     /// People who can be added to a group: those we have a chat with (accepted, not blocked,

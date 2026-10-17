@@ -13,12 +13,28 @@ pub struct GroupInfo {
     pub members: Vec<GroupMember>,
     /// Invited and not yet joined: ACIs, or `PNI:<uuid>` for an invited phone number.
     pub invited: Vec<String>,
+    /// Asked to join through the link (ACIs), waiting for an admin.
+    pub requesting: Vec<String>,
+    /// Who the invite link lets in.
+    pub link_access: LinkAccess,
+    /// The invite link, for members while it's on. It holds the group's key: never logged.
+    pub link: Option<String>,
     /// We are a member (not after leaving or being removed).
     pub member: bool,
     pub admin: bool,
     /// We may change the title, description, picture and timer.
     pub can_edit_details: bool,
     pub can_add_members: bool,
+}
+
+/// Who a group's invite link lets in.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkAccess {
+    Off,
+    /// Anyone with the link joins.
+    Anyone,
+    /// Anyone with the link asks; an admin lets them in.
+    Approval,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -57,20 +73,39 @@ pub enum GroupChange {
         admin: bool,
     },
     Leave,
+    /// Joins a group we're invited to.
+    AcceptInvitation,
+    DeclineInvitation,
+    /// Turns the invite link on (a new one if there was none) or off.
+    LinkAccess {
+        access: LinkAccess,
+    },
+    /// A new invite link: the old one stops working.
+    ResetLink,
+    /// Lets in someone who asked to join.
+    ApproveRequest {
+        aci: String,
+    },
+    DenyRequest {
+        aci: String,
+    },
 }
 
-/// What `me` (an ACI) sees of `group` and may do in it, as its access control says.
-pub fn info(group: &Group, me: &str) -> GroupInfo {
+/// What `me` (an ACI) sees of `group` (whose master key is `key`) and may do in it, as its
+/// access control says.
+pub fn info(group: &Group, key: [u8; 32], me: &str) -> GroupInfo {
     let mine = group.members.iter().find(|m| m.aci.service_id_string() == me);
     let member = mine.is_some();
     let admin = mine.is_some_and(|m| m.role == Role::Administrator);
-    // a group without access control has Signal's defaults: members may do both
-    let (attributes, members) = group
-        .access_control
-        .as_ref()
-        .map_or((AccessRequired::Member, AccessRequired::Member), |a| {
-            (a.attributes, a.members)
-        });
+    // a group without access control has Signal's defaults: members may do both, no link
+    let (attributes, members, link) = group.access_control.as_ref().map_or(
+        (
+            AccessRequired::Member,
+            AccessRequired::Member,
+            AccessRequired::Unsatisfiable,
+        ),
+        |a| (a.attributes, a.members, a.add_from_invite_link),
+    );
     let allowed = |required: AccessRequired| match required {
         AccessRequired::Any | AccessRequired::Member => member,
         AccessRequired::Administrator => admin,
@@ -94,6 +129,17 @@ pub fn info(group: &Group, me: &str) -> GroupInfo {
                 presage::model::ServiceIdType::AccountIdentity => p.uuid.to_string(),
             })
             .collect(),
+        requesting: group
+            .requesting_members
+            .iter()
+            .map(|r| r.aci.service_id_string())
+            .collect(),
+        link_access: match link {
+            AccessRequired::Any => LinkAccess::Anyone,
+            AccessRequired::Administrator => LinkAccess::Approval,
+            _ => LinkAccess::Off,
+        },
+        link: group.invite_link(key).filter(|_| member).map(|l| l.to_url()),
         member,
         admin,
         can_edit_details: allowed(attributes),
@@ -127,6 +173,24 @@ pub fn edit(change: GroupChange) -> Result<GroupEdit, String> {
         GroupChange::RemoveMember { aci: a } => GroupEdit::RemoveMember(aci(&a)?),
         GroupChange::SetAdmin { aci: a, admin } => GroupEdit::SetAdmin(aci(&a)?, admin),
         GroupChange::Leave => GroupEdit::Leave,
+        GroupChange::AcceptInvitation => GroupEdit::AcceptInvitation,
+        GroupChange::DeclineInvitation => GroupEdit::DeclineInvitation,
+        GroupChange::LinkAccess { access } => GroupEdit::InviteLinkAccess(match access {
+            LinkAccess::Off => AccessRequired::Unsatisfiable,
+            LinkAccess::Anyone => AccessRequired::Any,
+            LinkAccess::Approval => AccessRequired::Administrator,
+        }),
+        GroupChange::ResetLink => GroupEdit::ResetInviteLink,
+        GroupChange::ApproveRequest { aci: a } => GroupEdit::ApproveRequest(aci(&a)?),
+        GroupChange::DenyRequest { aci: a } => GroupEdit::DenyRequest(aci(&a)?),
+    })
+}
+
+/// We (by our ACI or our phone number's PNI) are invited to `group` and haven't answered.
+pub fn invited(group: &Group, aci: Uuid, pni: Uuid) -> bool {
+    group.pending_members.iter().any(|p| match p.service_id_type {
+        presage::model::ServiceIdType::AccountIdentity => p.uuid == aci,
+        presage::model::ServiceIdType::PhoneNumberIdentity => p.uuid == pni,
     })
 }
 
@@ -155,6 +219,12 @@ mod tests {
     const ME: &str = "11111111-1111-1111-1111-111111111111";
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
     const CAROL: &str = "33333333-3333-3333-3333-333333333333";
+    const KEY: [u8; 32] = [5; 32];
+
+    /// As the panel reads it, for the group whose key is `KEY`.
+    fn info(group: &Group, me: &str) -> GroupInfo {
+        super::info(group, KEY, me)
+    }
 
     fn member(aci: &str, role: Role) -> Member {
         Member {
@@ -329,5 +399,78 @@ mod tests {
         assert!(new_group("Just me", &[]).is_ok(), "members can be added later");
         assert!(new_group("  ", &[ALICE.into()]).is_err());
         assert!(new_group("Climbers", &["PNI:x".into()]).is_err());
+    }
+
+    #[test]
+    fn members_see_the_link_while_its_on_and_admins_the_requests() {
+        use presage::model::groups::RequestingMember;
+        let mut g = group(
+            vec![member(ME, Role::Administrator)],
+            Some((AccessRequired::Member, AccessRequired::Member)),
+        );
+        let i = info(&g, ME);
+        assert_eq!((i.link_access, i.link.as_deref()), (LinkAccess::Off, None));
+        g.invite_link_password = vec![1; 16];
+        g.access_control.as_mut().unwrap().add_from_invite_link = AccessRequired::Administrator;
+        g.requesting_members = vec![RequestingMember {
+            aci: super::aci(ALICE).unwrap(),
+            profile_key: ProfileKey::create([0; 32]),
+            timestamp: 0,
+        }];
+        let i = info(&g, ME);
+        assert_eq!(i.link_access, LinkAccess::Approval);
+        let link = i.link.expect("on");
+        let parsed = presage::libsignal_service::groups_v2::GroupInviteLink::parse(&link).unwrap();
+        assert_eq!((parsed.master_key, parsed.password), (KEY, vec![1; 16]));
+        assert_eq!(i.requesting, vec![ALICE.to_string()]);
+        g.access_control.as_mut().unwrap().add_from_invite_link = AccessRequired::Any;
+        assert_eq!(info(&g, ME).link_access, LinkAccess::Anyone);
+        assert_eq!(info(&g, CAROL).link, None, "only members get the link");
+    }
+
+    #[test]
+    fn an_invitation_is_to_our_account_or_our_number() {
+        let g = group(vec![member(ALICE, Role::Administrator)], None);
+        let carol = Uuid::parse_str(CAROL).unwrap();
+        let other = Uuid::parse_str(ALICE).unwrap();
+        assert!(invited(&g, carol, other), "by account");
+        assert!(invited(&g, other, carol), "by number");
+        assert!(!invited(&g, other, other));
+    }
+
+    #[test]
+    fn invitation_and_link_changes_become_presages_edits() {
+        let same =
+            |change, edit: GroupEdit| assert_eq!(format!("{:?}", super::edit(change).unwrap()), format!("{edit:?}"));
+        same(GroupChange::AcceptInvitation, GroupEdit::AcceptInvitation);
+        same(GroupChange::DeclineInvitation, GroupEdit::DeclineInvitation);
+        same(
+            GroupChange::LinkAccess {
+                access: LinkAccess::Off,
+            },
+            GroupEdit::InviteLinkAccess(AccessRequired::Unsatisfiable),
+        );
+        same(
+            GroupChange::LinkAccess {
+                access: LinkAccess::Anyone,
+            },
+            GroupEdit::InviteLinkAccess(AccessRequired::Any),
+        );
+        same(
+            GroupChange::LinkAccess {
+                access: LinkAccess::Approval,
+            },
+            GroupEdit::InviteLinkAccess(AccessRequired::Administrator),
+        );
+        same(GroupChange::ResetLink, GroupEdit::ResetInviteLink);
+        same(
+            GroupChange::ApproveRequest { aci: ALICE.into() },
+            GroupEdit::ApproveRequest(super::aci(ALICE).unwrap()),
+        );
+        same(
+            GroupChange::DenyRequest { aci: ALICE.into() },
+            GroupEdit::DenyRequest(super::aci(ALICE).unwrap()),
+        );
+        assert!(edit(GroupChange::ApproveRequest { aci: "x".into() }).is_err());
     }
 }

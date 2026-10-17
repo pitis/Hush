@@ -390,7 +390,8 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
         lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
         blocked: false,
-        whitelisted: false, messageRequest: false, avatar: nil, username: nil, note: nil, chatColor: nil, wallpaper: nil
+        whitelisted: false, messageRequest: false, groupInvitation: false, avatar: nil, username: nil, note: nil,
+        chatColor: nil, wallpaper: nil
     )
 }
 

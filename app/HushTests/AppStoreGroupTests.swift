@@ -18,13 +18,15 @@ final class AppStoreGroupTests: XCTestCase {
         fake.groupInfoAnswers[group] = GroupInfo(
             description: "Sundays",
             members: [GroupMember(aci: "me-aci", admin: false), GroupMember(aci: "alice-aci", admin: true)],
-            invited: ["PNI:bob"], member: true, admin: false, canEditDetails: true, canAddMembers: true)
+            invited: ["PNI:bob"], requesting: ["carol-aci"], linkAccess: .approval, link: nil, member: true,
+            admin: false, canEditDetails: true, canAddMembers: true)
         let store = await linkedStore(fake)
         guard case .known(let info) = await store.groupInfo(group) else { return XCTFail("read") }
         XCTAssertEqual(info.description, "Sundays")
         XCTAssertEqual(store.memberName("alice-aci"), "Alice")
         XCTAssertEqual(store.memberName("me-aci"), "You")
-        XCTAssertEqual(fake.titleLookups.sorted(), ["c:PNI:bob", "c:alice-aci"], "invitees are named too")
+        XCTAssertEqual(
+            fake.titleLookups.sorted(), ["c:PNI:bob", "c:alice-aci", "c:carol-aci"], "invitees and requesters too")
     }
 
     func testGroupChangesReachTheCoreInOrderAndTheFirstFailureIsKept() async {
@@ -93,5 +95,28 @@ final class AppStoreGroupTests: XCTestCase {
         let failure = await store.createGroup("Climbers", members: [])
         XCTAssertEqual(failure, "Couldn't make the group: refused")
         XCTAssertNil(store.selectedId)
+    }
+
+    func testAcceptingAnInvitationJoinsAndDecliningAlsoDeletesTheChat() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        let accepted = await store.answerInvitation(group, accept: true)
+        XCTAssertNil(accepted)
+        XCTAssertEqual(fake.groupChanges.map(\.1), [.acceptInvitation])
+        XCTAssertEqual(fake.flagCalls, [], "an accepted invitation's chat stays")
+        let declined = await store.answerInvitation(group, accept: false)
+        XCTAssertNil(declined)
+        XCTAssertEqual(fake.groupChanges.last?.1, .declineInvitation)
+        await eventually { fake.flagCalls == ["delete \(self.group)"] }
+    }
+
+    func testAnInvitationNotDeclinedKeepsItsChat() async {
+        let fake = FakeClient(linked: true)
+        fake.failingGroupChange = .declineInvitation
+        let store = await linkedStore(fake)
+        let failure = await store.answerInvitation(group, accept: false)
+        XCTAssertEqual(failure, "Couldn't change the group: refused")
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(fake.flagCalls, [])
     }
 }

@@ -42,10 +42,15 @@ the stored group's fetches the group before the content reaches us.
    and opened at once, before any message. If something fails after the server made the group
    (telling the members), the chat is still listed and opened, the failure shown: it's the
    one group presage didn't have before, under our name at its first revision. A picture is set afterwards in the group's info.
-4. **Invitations and invite links.** An invitation shows as a request to accept or decline;
-   admins turn the link on (open or with approval), copy and reset it; a pasted
-   `signal.group` link shows the group and joins or asks to.
-5. **Own profile.** Settings shows and edits our name and about. The picture stays the phone's
+4. **Invitations and invite links.** A group that invites us (our account, or our number's
+   PNI) lists its chat as it reaches us, unless the inviter or the group is blocked
+   (`conversations.group_invited`). The chat offers Join, Decline (which also deletes it)
+   and Block instead of the composer. In the info panel, admins turn the link on (anyone
+   joins, or admins approve) or off, and reset it; members copy it while it's on. It holds
+   the group's key, so it is never shown or logged. Admins approve or deny requests to join.
+5. **Joining by link.** A pasted `signal.group` link shows the group and joins it, or asks
+   to; a pending request can be withdrawn.
+6. **Own profile.** Settings shows and edits our name and about. The picture stays the phone's
    (presage can't upload one).
 
 ## Testing

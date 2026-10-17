@@ -17,6 +17,7 @@ struct GroupInfoView: View {
     @State private var addingMembers = false
     @State private var confirmingLeave = false
     @State private var removing: GroupMember?
+    @State private var confirmingReset = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -77,6 +78,11 @@ struct GroupInfoView: View {
         ) { member in
             Button("Remove from Group", role: .destructive) { change([.removeMember(aci: member.aci)]) }
         }
+        .confirmationDialog("Reset the group link?", isPresented: $confirmingReset) {
+            Button("Reset Link", role: .destructive) { change([.resetLink]) }
+        } message: {
+            Text("The link given out so far stops working.")
+        }
     }
 
     @ViewBuilder
@@ -127,6 +133,8 @@ struct GroupInfoView: View {
                     }
                 }
             }
+            if info.admin && !info.requesting.isEmpty { requests(info) }
+            if info.admin || info.link != nil { link(info) }
             if info.member {
                 Button("Leave Group…", role: .destructive) { confirmingLeave = true }
                     .disabled(busy)
@@ -165,6 +173,51 @@ struct GroupInfoView: View {
                     }
                 }
                 .contextMenu { if manageable && !busy { memberActions(member) } }
+            }
+        }
+    }
+
+    /// People who asked to join through the link, for admins to let in or turn down.
+    private func requests(_ info: GroupInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Requests to join (\(info.requesting.count))").font(.system(size: 13, weight: .semibold))
+            ForEach(info.requesting, id: \.self) { aci in
+                HStack {
+                    row(id: aci, name: store.memberName(aci), admin: false)
+                    Button("Deny") { change([.denyRequest(aci: aci)]) }
+                    Button("Approve") { change([.approveRequest(aci: aci)]) }
+                }
+                .disabled(busy)
+            }
+        }
+    }
+
+    /// The invite link: admins turn it on or off and reset it; members copy it while it's on.
+    private func link(_ info: GroupInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Group link").font(.system(size: 13, weight: .semibold))
+            if info.admin {
+                Picker(
+                    "Who can join",
+                    selection: Binding(
+                        get: { info.linkAccess },
+                        set: { if $0 != info.linkAccess { change([.linkAccess(access: $0)]) } })
+                ) {
+                    Text("Off").tag(LinkAccess.off)
+                    Text("Anyone with the link").tag(LinkAccess.anyone)
+                    Text("Admins approve who joins").tag(LinkAccess.approval)
+                }
+                .disabled(busy)
+            }
+            // the link holds the group's key: copied, never shown or logged
+            if let link = info.link {
+                HStack {
+                    Button("Copy Link") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(link, forType: .string)
+                    }
+                    if info.admin { Button("Reset Link…") { confirmingReset = true }.disabled(busy) }
+                }
             }
         }
     }

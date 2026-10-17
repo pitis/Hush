@@ -36,6 +36,9 @@ final class ChatListTests: XCTestCase {
         blocked.blocked = true
         XCTAssertEqual(line(blocked), .message("Blocked", tick: nil))
         XCTAssertEqual(line(request, typing: true), .typing)
+        var invitation = last("g:00")
+        invitation.groupInvitation = true
+        XCTAssertEqual(line(invitation), .message("Group invitation", tick: nil))
     }
 
     func testTheRequestBarNamesThePersonOrTheGroup() {

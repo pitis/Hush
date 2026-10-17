@@ -23,7 +23,7 @@ struct ConversationView: View {
             .environment(\.chatColor, conversation.chatColor)
             .environment(\.onWallpaper, conversation.wallpaper != nil)
             .background { if let w = conversation.wallpaper { Wallpaper(wallpaper: w) } }
-            if conversation.blocked || conversation.messageRequest {
+            if conversation.blocked || conversation.messageRequest || conversation.groupInvitation {
                 RequestBar(store: store, conversation: conversation)
             } else {
                 ComposerView(store: store, conversationId: conversation.id)
@@ -36,7 +36,9 @@ struct ConversationView: View {
         .onDisappear { if let quickLook { Files.close(quickLook) } }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
-            guard !conversation.blocked, !conversation.messageRequest else { return false }
+            guard !conversation.blocked, !conversation.messageRequest, !conversation.groupInvitation else {
+                return false
+            }
             let files = Files.attachable(urls).map(Files.outgoing)
             store.addFiles(files)
             return !files.isEmpty
@@ -52,15 +54,17 @@ struct ConversationView: View {
     }
 }
 
-/// In place of the composer, as Desktop's: a message request's Accept, Delete and Block, or a
-/// blocked chat's Unblock and Delete. Block and Delete ask first.
+/// In place of the composer, as Desktop's: a message request's Accept, Delete and Block, a group
+/// invitation's Join, Decline and Block, or a blocked chat's Unblock and Delete. Block, Delete
+/// and Decline ask first.
 struct RequestBar: View {
     let store: AppStore
     let conversation: Conversation
     @State private var confirming: Confirm?
+    @State private var answering = false
 
     private enum Confirm: Identifiable {
-        case block, delete
+        case block, delete, decline
         var id: Self { self }
     }
 
@@ -77,6 +81,11 @@ struct RequestBar: View {
                     Button("Delete") { confirming = .delete }
                     Button("Unblock") { store.acceptRequest(conversation.id) }
                         .keyboardShortcut(.defaultAction)
+                } else if conversation.groupInvitation {
+                    Button("Block") { confirming = .block }
+                    Button("Decline") { confirming = .decline }.disabled(answering)
+                    Button("Join") { answer(accept: true) }
+                        .keyboardShortcut(.defaultAction).disabled(answering)
                 } else {
                     Button("Block") { confirming = .block }
                     Button("Delete") { confirming = .delete }
@@ -89,17 +98,21 @@ struct RequestBar: View {
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 18).padding(.vertical, 14)
         .confirmationDialog(
-            confirming == .block ? RequestBar.blockTitle(conversation, name: name) : "Delete this chat?",
+            confirming == .block
+                ? RequestBar.blockTitle(conversation, name: name)
+                : confirming == .decline ? "Decline the invitation?" : "Delete this chat?",
             isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
             presenting: confirming
         ) { c in
             switch c {
             case .block: Button("Block", role: .destructive) { store.block(conversation.id) }
             case .delete: Button("Delete", role: .destructive) { store.deleteChat(conversation.id) }
+            case .decline: Button("Decline", role: .destructive) { answer(accept: false) }
             }
         } message: { c in
             switch c {
             case .block: Text(RequestBar.blockMessage(conversation))
+            case .decline: Text("Its members see that you declined, and the chat is deleted from this Mac.")
             case .delete:
                 Text(
                     isGroup
@@ -109,10 +122,22 @@ struct RequestBar: View {
         }
     }
 
+    /// Joins or declines; a failure shows.
+    private func answer(accept: Bool) {
+        answering = true
+        Task {
+            if let failure = await store.answerInvitation(conversation.id, accept: accept) { store.showError(failure) }
+            answering = false
+        }
+    }
+
     /// What the bar says above its buttons.
     nonisolated static func prompt(_ c: Conversation, name: String) -> String {
         if c.blocked {
             return c.kind == .group ? "You blocked this group." : "You blocked \(name)."
+        }
+        if c.groupInvitation {
+            return "You're invited to join this group. Its members see your name and picture once you join."
         }
         return c.kind == .group
             ? "Join this group? They won't know you've seen their messages until you accept."
@@ -124,7 +149,8 @@ struct RequestBar: View {
     }
 
     nonisolated static func blockMessage(_ c: Conversation) -> String {
-        c.kind == .group
+        if c.groupInvitation { return "You won't get its messages or updates. The invitation stays unanswered." }
+        return c.kind == .group
             ? "You won't get its messages or updates. You stay a member: leave it from your phone."
             : "They won't be able to message or call you."
     }
