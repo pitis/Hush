@@ -152,6 +152,21 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
         return lock.withLock { usernames[username] }
     }
+    var stickerPackAnswers: [StickerPackInfo] = []
+    private(set) var sentStickers: [(conversationId: String, packId: String, stickerId: UInt32, quote: Quote?)] = []
+    private(set) var addedStickerLinks: [String] = []
+    func stickerPacks() async throws -> [StickerPackInfo] { lock.withLock { stickerPackAnswers } }
+    func addStickerPack(link: String) async throws {
+        if link == "bad" { throw CoreError.InvalidInput(message: "not a sticker pack link") }
+        lock.withLock { addedStickerLinks.append(link) }
+    }
+    func sendSticker(conversationId: String, packId: String, stickerId: UInt32, quote: Quote?) async throws
+        -> MessageKey
+    {
+        if let sendError { throw sendError }
+        lock.withLock { sentStickers.append((conversationId, packId, stickerId, quote)) }
+        return MessageKey(author: aci ?? "", sentAt: Int64(sentStickers.count))
+    }
     var polls: [MessageKey: Poll] = [:]
     func poll(key: MessageKey) async throws -> Poll? { lock.withLock { polls[key] } }
     func vote(key: MessageKey, options: [UInt32]) async throws { try await flag("vote \(key.sentAt) \(options)") }

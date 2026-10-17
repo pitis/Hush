@@ -150,6 +150,8 @@ final class AppStore {
     /// Files chosen, dropped or pasted for the open chat, sent with the next message.
     private(set) var outgoingFiles: [OutgoingFile] = []
     var replyTo: Message?
+    /// The installed sticker packs, as the picker last loaded them.
+    var stickerPacks: [StickerPackInfo] = []
     /// The message of ours being edited in the composer, if any.
     private(set) var editing: Message?
     /// Our reactions sent but not back from the core yet (nil: taken back), so a second click
@@ -556,6 +558,41 @@ final class AppStore {
             }
             select(id)
             refreshConversations()
+            return nil
+        } catch {
+            return Self.describe(error)
+        }
+    }
+
+    func loadStickerPacks() async {
+        guard let client else { return }
+        do {
+            stickerPacks = try await client.stickerPacks()
+        } catch {
+            append("sticker packs failed: \(error)")
+        }
+    }
+
+    /// Sends a sticker to the open chat, as a reply if one is set.
+    func sendSticker(pack: String, sticker: UInt32) async {
+        guard let client, let id = selectedId else { return }
+        let quote = replyTo.map { Quote(author: $0.author, sentAt: $0.sentAt, text: $0.body, ranges: $0.ranges) }
+        do {
+            // the core announces the new pending message itself
+            _ = try await client.sendSticker(conversationId: id, packId: pack, stickerId: sticker, quote: quote)
+            replyTo = nil
+        } catch {
+            lastError = Self.describe(error)
+            append("send failed: \(error)")
+        }
+    }
+
+    /// Adds the pack a sticker link names. Returns why it couldn't, or nil.
+    func addStickerPack(_ link: String) async -> String? {
+        guard let client else { return "Not linked yet." }
+        do {
+            try await client.addStickerPack(link: link)
+            await loadStickerPacks()
             return nil
         } catch {
             return Self.describe(error)

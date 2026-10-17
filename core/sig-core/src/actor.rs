@@ -96,7 +96,29 @@ pub enum Command {
         username: String,
         done: oneshot::Sender<Result<Option<String>, String>>,
     },
+    /// The installed sticker packs (images written under `stickers/`), each with its key and its
+    /// stickers' content types.
+    StickerPacks {
+        done: oneshot::Sender<Result<Vec<InstalledPack>, String>>,
+    },
+    /// Download and install a sticker pack (our other devices are told), then answer.
+    InstallStickerPack {
+        id: Vec<u8>,
+        key: Vec<u8>,
+        done: oneshot::Sender<Result<(), String>>,
+    },
 }
+
+/// An installed pack as the client needs it to send from it.
+pub(crate) struct InstalledPack {
+    pub info: crate::projection::model::StickerPackInfo,
+    pub key: Vec<u8>,
+    /// Each shown sticker's content type, by id (presage's, else empty).
+    pub content_types: std::collections::HashMap<u32, String>,
+}
+
+/// Downloading a pack's manifest and every sticker in it.
+const STICKER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Handles {
     pub commands: mpsc::UnboundedSender<Command>,
@@ -539,6 +561,25 @@ async fn run(
                     }
                 }
             }
+            Command::StickerPacks { done } => {
+                let packs = match &manager {
+                    Some(m) => installed_packs(m.store(), &dir.join("stickers")).await,
+                    None => Err("not linked yet".into()),
+                };
+                let _ = done.send(packs);
+            }
+            Command::InstallStickerPack { id, key, done } => match &manager {
+                Some(m) => {
+                    // a pack can take a while: commands go on meanwhile
+                    let mut m = m.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(install_pack(&mut m, &id, &key).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::LookupUsername { username, done } => {
                 let found = match &mut manager {
                     Some(m) => {
@@ -649,10 +690,19 @@ fn start_history(
         .await;
         running.set(false);
         match outcome {
-            Ok(_) => {
+            Ok(outcome) => {
                 // imported, none offered, or cancelled: live messages may flow now
                 if let Some(c) = commands.upgrade() {
                     let _ = c.send(Command::Start);
+                }
+                // then the phone's sticker packs, one at a time; a pack that fails is left out
+                if let crate::history::Outcome::Done { sticker_packs } = outcome {
+                    let mut m = m;
+                    for (id, key) in sticker_packs {
+                        if let Err(e) = install_pack(&mut m, &id, &key).await {
+                            tracing::warn!(error = %e, "a sticker pack from the phone wasn't installed");
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -684,6 +734,49 @@ fn start_history(
             });
         }
     });
+}
+
+async fn installed_packs(store: &SqliteStore, dir: &std::path::Path) -> Result<Vec<InstalledPack>, String> {
+    let mut packs = vec![];
+    for pack in store.sticker_packs().await.map_err(|e| e.to_string())? {
+        let pack = match pack {
+            Ok(p) => p,
+            Err(e) => {
+                // one unreadable pack doesn't hide the others
+                tracing::warn!(error = %e, "a sticker pack couldn't be read");
+                continue;
+            }
+        };
+        let info = crate::stickers::pack_info(&pack, dir);
+        if info.stickers.is_empty() {
+            continue;
+        }
+        let content_types = pack
+            .manifest
+            .stickers
+            .iter()
+            .map(|s| (s.id, s.content_type.clone().unwrap_or_default()))
+            .collect();
+        packs.push(InstalledPack {
+            info,
+            key: pack.key.clone(),
+            content_types,
+        });
+    }
+    packs.sort_by_key(|p| p.info.title.to_lowercase());
+    Ok(packs)
+}
+
+/// Installs a pack unless presage has it already.
+async fn install_pack(m: &mut Manager<SqliteStore, Registered>, id: &[u8], key: &[u8]) -> Result<(), String> {
+    if matches!(m.store().sticker_pack(id).await, Ok(Some(_))) {
+        return Ok(());
+    }
+    match tokio::time::timeout(STICKER_INSTALL_TIMEOUT, Box::pin(m.install_sticker_pack(id, key))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the download took too long".into()),
+    }
 }
 
 /// Local changes come in bursts (a few clicks): one sync after they settle.

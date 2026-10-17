@@ -1139,11 +1139,44 @@ impl ProjectionDb {
     /// Our own message with files: the message, and a copy of each file in the attachments
     /// folder (Ready to upload), all or nothing. False (and nothing stored) if a message with the
     /// same key exists.
+    /// The sticker our unsent message `key` is (see `insert_outgoing`), its emoji from the message.
+    pub async fn outgoing_sticker(&self, key: &MessageKey) -> Result<Option<crate::send::SendSticker>, sqlx::Error> {
+        // pack id, pack key, sticker id, the message's kind and its kind text (the emoji)
+        type Row = (Vec<u8>, Vec<u8>, i64, i64, Option<String>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT s.pack_id, s.pack_key, s.sticker_id, m.kind, m.kind_text FROM outgoing_stickers s
+             JOIN messages m ON m.author = s.author AND m.sent_at = s.sent_at
+             WHERE s.author = ?1 AND s.sent_at = ?2",
+        )
+        .bind(&key.author)
+        .bind(key.sent_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(pack_id, pack_key, sticker_id, kind, emoji)| {
+            Some(crate::send::SendSticker {
+                pack_id,
+                pack_key,
+                sticker_id: u32::try_from(sticker_id).ok()?,
+                emoji: if kind == 1 { emoji } else { None },
+            })
+        }))
+    }
+
+    pub async fn forget_outgoing_sticker(&self, key: &MessageKey) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM outgoing_stickers WHERE author = ?1 AND sent_at = ?2")
+            .bind(&key.author)
+            .bind(key.sent_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn insert_outgoing(
         &self,
         m: &Message,
         files: &[OutgoingFile],
         preview: Option<&PreviewDraft>,
+        sticker: Option<&crate::send::SendSticker>,
     ) -> Result<bool, sqlx::Error> {
         let dir = self
             .files
@@ -1183,6 +1216,16 @@ impl ProjectionDb {
                     .bind(&p.url)
                     .bind(&p.title)
                     .bind(&p.description)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if let Some(s) = sticker {
+                sqlx::query("INSERT OR REPLACE INTO outgoing_stickers VALUES (?1, ?2, ?3, ?4, ?5)")
+                    .bind(&m.author)
+                    .bind(m.sent_at)
+                    .bind(&s.pack_id)
+                    .bind(&s.pack_key)
+                    .bind(i64::from(s.sticker_id))
                     .execute(&mut *tx)
                     .await?;
             }
@@ -5967,16 +6010,54 @@ mod tests {
             is_voice_note: false,
         };
         let result = db
-            .insert_outgoing(&mine, &[file(&first), file(&src.0.join("gone.jpg"))], None)
+            .insert_outgoing(&mine, &[file(&first), file(&src.0.join("gone.jpg"))], None, None)
             .await;
         assert!(result.is_err());
         assert!(db.message(&k("me", 5)).await.unwrap().is_none());
         assert_eq!(std::fs::read_dir(&files.0).unwrap().count(), 0, "no copies left behind");
         // and with the file there, everything is stored
-        assert!(db.insert_outgoing(&mine, &[file(&first)], None).await.unwrap());
+        assert!(db.insert_outgoing(&mine, &[file(&first)], None, None).await.unwrap());
         let stored = db.attachments(&k("me", 5)).await.unwrap();
         assert_eq!((stored.len(), stored[0].size), (1, 1));
         assert_eq!(std::fs::read(stored[0].path.as_ref().unwrap()).unwrap(), b"1");
+    }
+
+    #[tokio::test]
+    async fn an_unsent_sticker_keeps_its_sticker_for_retry() {
+        let files = TempFiles::new("sticker");
+        let src = TempFiles::new("sticker-src");
+        std::fs::create_dir_all(&src.0).unwrap();
+        let image = src.0.join("7");
+        std::fs::write(&image, b"webp").unwrap();
+        let db = db().await.with_files(files.0.clone());
+        let mine = Message {
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            body: None,
+            kind: MessageKind::Sticker {
+                emoji: Some("🦊".into()),
+            },
+            ..msg("me", 6, "")
+        };
+        let sticker = crate::send::SendSticker {
+            pack_id: vec![1; 16],
+            pack_key: vec![2; 32],
+            sticker_id: 7,
+            emoji: Some("🦊".into()),
+        };
+        let file = OutgoingFile {
+            path: image.to_string_lossy().into(),
+            content_type: "image/webp".into(),
+            width: None,
+            height: None,
+            is_voice_note: false,
+        };
+        assert!(db.insert_outgoing(&mine, &[file], None, Some(&sticker)).await.unwrap());
+        assert_eq!(db.attachments(&k("me", 6)).await.unwrap().len(), 1, "its image");
+        assert_eq!(db.outgoing_sticker(&k("me", 6)).await.unwrap(), Some(sticker));
+        db.forget_outgoing_sticker(&k("me", 6)).await.unwrap();
+        assert_eq!(db.outgoing_sticker(&k("me", 6)).await.unwrap(), None);
+        assert_eq!(db.outgoing_sticker(&k("me", 99)).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -6004,7 +6085,7 @@ mod tests {
                 is_voice_note: false,
             }),
         };
-        assert!(db.insert_outgoing(&mine, &[], Some(&preview)).await.unwrap());
+        assert!(db.insert_outgoing(&mine, &[], Some(&preview), None).await.unwrap());
         // the image is the preview's, not one of the message's files
         assert!(db.attachments(&k("me", 6)).await.unwrap().is_empty());
         let stored = db.link_preview(&k("me", 6)).await.unwrap().unwrap();

@@ -12,6 +12,7 @@ use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
     Attachment, BodyRange, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey, MessageKind,
     MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
+    StickerPackInfo,
 };
 use crate::send::{self, Job, SendJob};
 
@@ -56,6 +57,110 @@ impl Drop for Client {
 }
 
 impl Client {
+    async fn installed_packs(&self) -> Result<Vec<crate::actor::InstalledPack>, CoreError> {
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::StickerPacks { done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Storage { message })
+    }
+    /// Files (or a sticker: its image is the one file) as a pending message; see `send_attachments`.
+    async fn queue_files(
+        &self,
+        conversation_id: String,
+        files: Vec<OutgoingFile>,
+        caption: Option<String>,
+        ranges: Vec<BodyRange>,
+        quote: Option<Quote>,
+        sticker: Option<crate::send::SendSticker>,
+    ) -> Result<MessageKey, CoreError> {
+        let invalid = |message: String| CoreError::InvalidInput { message };
+        if files.is_empty() || files.len() > MAX_ATTACHMENTS {
+            return Err(invalid(format!(
+                "between 1 and {MAX_ATTACHMENTS} files can be sent at once"
+            )));
+        }
+        for f in &files {
+            let name = std::path::Path::new(&f.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size = std::fs::metadata(&f.path)
+                .map_err(|e| invalid(format!("{name} can't be read: {e}")))?
+                .len();
+            if size > MAX_ATTACHMENT {
+                return Err(invalid(format!("{name} is larger than 100 MB")));
+            }
+        }
+        if crate::send::recipient(&conversation_id).is_none() {
+            return Err(invalid(format!("not a conversation: {conversation_id}")));
+        }
+        let author = self.own_aci().ok_or(CoreError::NotLinked)?;
+        // the chat's timer; ours start disappearing when sent
+        let expires_in = self.db.expire_timer(&conversation_id).await?;
+        let (body, ranges) = match caption.map(|c| trimmed(&c, ranges)) {
+            Some((c, r)) if !c.is_empty() => (Some(c), r),
+            _ => (None, vec![]),
+        };
+        let mut message = Message {
+            conversation_id: conversation_id.clone(),
+            author,
+            sent_at: self.next_sent_at(),
+            received_at: 0,
+            ranges: ranges.clone(),
+            body: body.clone(),
+            is_outgoing: true,
+            status: MessageStatus::Pending,
+            edited: false,
+            deleted: false,
+            quote: quote.clone(),
+            kind: match &sticker {
+                Some(s) => MessageKind::Sticker { emoji: s.emoji.clone() },
+                None => MessageKind::Normal,
+            },
+            expires_in,
+            expires_at: None,
+        };
+        let was_archived = self.is_archived(&conversation_id).await?;
+        // as in send_text: a timestamp collision takes the next one
+        for _ in 0..1000 {
+            message.received_at = message.sent_at;
+            message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
+            if self
+                .db
+                .insert_outgoing(&message, &files, None, sticker.as_ref())
+                .await?
+            {
+                break;
+            }
+            message.sent_at = self.next_sent_at();
+        }
+        self.unarchived_by_sending(&conversation_id, was_archived).await?;
+        let key = message.key();
+        self.listener.on_event(CoreEvent::MessageChanged {
+            conversation_id: conversation_id.clone(),
+            key: key.clone(),
+        });
+        let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
+        let queued = self.send(Command::Send(Job::Text(SendJob {
+            sticker: sticker.map(Box::new),
+            preview: None,
+            key: key.clone(),
+            conversation_id,
+            body,
+            ranges,
+            quote,
+            attachments,
+        })));
+        if let Err(e) = queued {
+            self.db.set_failed(&key).await?;
+            return Err(e);
+        }
+        Ok(key)
+    }
+
     fn next_sent_at(&self) -> i64 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -432,7 +537,7 @@ impl Client {
         for _ in 0..1000 {
             message.received_at = message.sent_at;
             message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
-            if self.db.insert_outgoing(&message, &[], preview.as_ref()).await? {
+            if self.db.insert_outgoing(&message, &[], preview.as_ref(), None).await? {
                 break;
             }
             message.sent_at = self.next_sent_at();
@@ -451,6 +556,7 @@ impl Client {
             key: key.clone(),
         });
         let queued = self.send(Command::Send(Job::Text(SendJob {
+            sticker: None,
             preview,
             key: key.clone(),
             conversation_id,
@@ -524,7 +630,9 @@ impl Client {
         });
         let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
         let preview = self.send_preview(&key).await?;
+        let sticker = self.db.outgoing_sticker(&key).await?.map(Box::new);
         self.send(Command::Send(Job::Text(SendJob {
+            sticker,
             preview,
             key,
             conversation_id: m.conversation_id,
@@ -546,81 +654,73 @@ impl Client {
         ranges: Vec<BodyRange>,
         quote: Option<Quote>,
     ) -> Result<MessageKey, CoreError> {
-        let invalid = |message: String| CoreError::InvalidInput { message };
-        if files.is_empty() || files.len() > MAX_ATTACHMENTS {
-            return Err(invalid(format!(
-                "between 1 and {MAX_ATTACHMENTS} files can be sent at once"
-            )));
-        }
-        for f in &files {
-            let name = std::path::Path::new(&f.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let size = std::fs::metadata(&f.path)
-                .map_err(|e| invalid(format!("{name} can't be read: {e}")))?
-                .len();
-            if size > MAX_ATTACHMENT {
-                return Err(invalid(format!("{name} is larger than 100 MB")));
-            }
-        }
-        if crate::send::recipient(&conversation_id).is_none() {
-            return Err(invalid(format!("not a conversation: {conversation_id}")));
-        }
-        let author = self.own_aci().ok_or(CoreError::NotLinked)?;
-        // the chat's timer; ours start disappearing when sent
-        let expires_in = self.db.expire_timer(&conversation_id).await?;
-        let (body, ranges) = match caption.map(|c| trimmed(&c, ranges)) {
-            Some((c, r)) if !c.is_empty() => (Some(c), r),
-            _ => (None, vec![]),
+        self.queue_files(conversation_id, files, caption, ranges, quote, None)
+            .await
+    }
+
+    /// The installed sticker packs, by title, for the picker: each sticker we have the image of.
+    pub async fn sticker_packs(&self) -> Result<Vec<StickerPackInfo>, CoreError> {
+        Ok(self.installed_packs().await?.into_iter().map(|p| p.info).collect())
+    }
+
+    /// Adds the sticker pack a sticker link names (signal.art's "add stickers" link); our other
+    /// devices are told, as when the phone adds one.
+    pub async fn add_sticker_pack(&self, link: String) -> Result<(), CoreError> {
+        let (id, key) = crate::stickers::parse_link(&link).ok_or(CoreError::InvalidInput {
+            message: "not a sticker pack link".into(),
+        })?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::InstallStickerPack { id, key, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })
+    }
+
+    /// Sends sticker `sticker_id` of the installed pack `pack_id` (hex, as listed): shown at once
+    /// as a pending message, like files.
+    pub async fn send_sticker(
+        &self,
+        conversation_id: String,
+        pack_id: String,
+        sticker_id: u32,
+        quote: Option<Quote>,
+    ) -> Result<MessageKey, CoreError> {
+        let invalid = |message: &str| CoreError::InvalidInput {
+            message: message.into(),
         };
-        let mut message = Message {
-            conversation_id: conversation_id.clone(),
-            author,
-            sent_at: self.next_sent_at(),
-            received_at: 0,
-            ranges: ranges.clone(),
-            body: body.clone(),
-            is_outgoing: true,
-            status: MessageStatus::Pending,
-            edited: false,
-            deleted: false,
-            quote: quote.clone(),
-            kind: MessageKind::Normal,
-            expires_in,
-            expires_at: None,
+        let pack = self
+            .installed_packs()
+            .await?
+            .into_iter()
+            .find(|p| p.info.id == pack_id)
+            .ok_or(invalid("that sticker pack isn't installed"))?;
+        let shown = pack
+            .info
+            .stickers
+            .iter()
+            .find(|s| s.id == sticker_id)
+            .ok_or(invalid("that sticker isn't in the pack"))?;
+        let content_type = match pack.content_types.get(&sticker_id) {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => "image/webp".into(),
         };
-        let was_archived = self.is_archived(&conversation_id).await?;
-        // as in send_text: a timestamp collision takes the next one
-        for _ in 0..1000 {
-            message.received_at = message.sent_at;
-            message.expires_at = (expires_in > 0).then(|| message.sent_at + i64::from(expires_in) * 1000);
-            if self.db.insert_outgoing(&message, &files, None).await? {
-                break;
-            }
-            message.sent_at = self.next_sent_at();
-        }
-        self.unarchived_by_sending(&conversation_id, was_archived).await?;
-        let key = message.key();
-        self.listener.on_event(CoreEvent::MessageChanged {
-            conversation_id: conversation_id.clone(),
-            key: key.clone(),
-        });
-        let attachments = self.db.attachments(&key).await?.iter().map(|a| a.id).collect();
-        let queued = self.send(Command::Send(Job::Text(SendJob {
-            preview: None,
-            key: key.clone(),
-            conversation_id,
-            body,
-            ranges,
-            quote,
-            attachments,
-        })));
-        if let Err(e) = queued {
-            self.db.set_failed(&key).await?;
-            return Err(e);
-        }
-        Ok(key)
+        let file = OutgoingFile {
+            path: shown.path.clone(),
+            content_type,
+            width: None,
+            height: None,
+            is_voice_note: false,
+        };
+        let sticker = crate::send::SendSticker {
+            pack_id: hex::decode(&pack_id).map_err(|_| invalid("that sticker pack isn't installed"))?,
+            pack_key: pack.key,
+            sticker_id,
+            emoji: shown.emoji.clone(),
+        };
+        self.queue_files(conversation_id, vec![file], None, vec![], quote, Some(sticker))
+            .await
     }
 
     /// Unlinks this Mac and removes all its Signal data (databases and files): after telling the

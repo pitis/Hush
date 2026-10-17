@@ -7,6 +7,7 @@ struct ComposerView: View {
     @State private var text = NSAttributedString()
     /// Bumped to put the caret in the field.
     @State private var focusRequest = 0
+    @State private var showStickers = false
     /// What was typed before editing started; back once the edit is saved or cancelled.
     @State private var draftBeforeEdit: NSAttributedString?
     @State private var mentions = MentionPicker()
@@ -83,6 +84,19 @@ struct ComposerView: View {
                 .accessibilityLabel("Emoji")
                 .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
                 .padding(.bottom, 8)
+                Button {
+                    showStickers = true
+                } label: {
+                    Image(systemName: "square.grid.2x2").font(.system(size: 18))
+                }
+                .accessibilityLabel("Stickers")
+                .help("Stickers")
+                .disabled(store.editing != nil)
+                .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
+                .padding(.bottom, 9)
+                .popover(isPresented: $showStickers, arrowEdge: .top) {
+                    StickerPicker(store: store) { showStickers = false }
+                }
                 ComposerField(
                     text: $text, focusRequest: focusRequest, onReturn: submit,
                     // ↑ in an empty field edits your last message, as in Desktop

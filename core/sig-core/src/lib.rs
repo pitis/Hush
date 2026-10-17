@@ -12,6 +12,7 @@ mod logging;
 mod net;
 pub mod projection;
 mod send;
+mod stickers;
 mod storage;
 mod typing;
 
