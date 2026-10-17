@@ -508,7 +508,7 @@ struct MessageRow: View {
             HStack(alignment: .lastTextBaseline, spacing: 8) {
                 Group {
                     if message.deleted {
-                        Text("This message was deleted").italic().foregroundStyle(.white.opacity(0.7))
+                        Text("This message was deleted").italic().foregroundStyle(.secondary)
                     } else if isViewOnce {
                         viewOnce
                     } else if let sticker = stickerImage {
@@ -548,7 +548,7 @@ struct MessageRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .foregroundStyle(.white)
+        .foregroundStyle(outgoing ? .white : Theme.incomingText)
         // as Desktop: a sticker stands on its own, without a bubble
         .background(
             stickerImage != nil ? .clear : outgoing ? Theme.outgoing : Theme.incoming,
@@ -610,7 +610,7 @@ struct MessageRow: View {
             }
         }
         .font(.system(size: 10))
-        .foregroundStyle(.white.opacity(0.7))
+        .foregroundStyle(.secondary)
         .fixedSize()
     }
 

@@ -34,7 +34,7 @@ struct PollCard: View {
         VStack(alignment: .leading, spacing: 8) {
             Label(question ?? "Poll", systemImage: "chart.bar.fill").font(.system(size: 14, weight: .semibold))
             Text(poll.allowMultiple ? "Choose one or more" : "Choose one").font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.7))
+                .foregroundStyle(.secondary)
             ForEach(Array(poll.options.enumerated()), id: \.offset) { i, option in
                 let chosen = me.map { option.voters.contains($0) } ?? false
                 Button {
@@ -48,9 +48,9 @@ struct PollCard: View {
                             Text("\(option.voters.count)").font(.system(size: 12)).monospacedDigit()
                         }
                         GeometryReader { g in
-                            Capsule().fill(.white.opacity(0.2))
+                            Capsule().fill(.quaternary)
                                 .overlay(alignment: .leading) {
-                                    Capsule().fill(.white.opacity(0.75))
+                                    Capsule().fill(.secondary)
                                         .frame(width: g.size.width * CGFloat(option.voters.count) / CGFloat(total))
                                 }
                         }
@@ -65,7 +65,7 @@ struct PollCard: View {
                 )
             }
             HStack {
-                Text(PollChoice.summary(poll)).font(.system(size: 11)).foregroundStyle(.white.opacity(0.7))
+                Text(PollChoice.summary(poll)).font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
                 if mine && !poll.ended {
                     Button("End poll", action: end).font(.system(size: 11)).buttonStyle(.bordered)

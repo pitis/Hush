@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @AppStorage(Appearance.key) private var appearance = Appearance.default
     let core: AppStore
     @Environment(\.openWindow) private var openWindow
 
@@ -48,7 +49,7 @@ struct ContentView: View {
         }
         .frame(minWidth: 820, minHeight: 520)
         .background(Theme.window)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(appearance.scheme)
         .task { await core.boot() }
         .onAppear { WindowOpener.open = openWindow }
         .task {
