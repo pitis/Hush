@@ -69,6 +69,17 @@ pub struct SendJob {
     pub attachments: Vec<i64>,
     /// Its link preview (the image by its stored file's id); boxed, as most messages have none.
     pub preview: Option<Box<SendPreview>>,
+    /// The sticker it is (its image is the one attachment).
+    pub sticker: Option<Box<SendSticker>>,
+}
+
+/// A sticker from an installed pack, as a message carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendSticker {
+    pub pack_id: Vec<u8>,
+    pub pack_key: Vec<u8>,
+    pub sticker_id: u32,
+    pub emoji: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -163,7 +174,15 @@ fn data_message(
             .collect(),
         body: job.body.clone(),
         body_ranges: body_ranges(&job.ranges),
-        attachments,
+        // a sticker's image goes in the sticker, not with the files
+        sticker: job.sticker.as_ref().map(|s| data_message::Sticker {
+            pack_id: Some(s.pack_id.clone()),
+            pack_key: Some(s.pack_key.clone()),
+            sticker_id: Some(s.sticker_id),
+            data: attachments.first().cloned(),
+            emoji: s.emoji.clone(),
+        }),
+        attachments: if job.sticker.is_some() { vec![] } else { attachments },
         timestamp: Some(job.key.sent_at as u64),
         quote: job.quote.as_ref().map(|q| data_message::Quote {
             id: Some(q.sent_at as u64),
@@ -274,6 +293,7 @@ pub fn delete(conversation_id: &str, target_sent_at: i64, at: u64) -> DataMessag
 /// Replaces the text of our own `original`; the new revision keeps its quote.
 pub fn edit(original: &Message, new_body: String, ranges: Vec<BodyRange>, at: u64) -> EditMessage {
     let revision = SendJob {
+        sticker: None,
         preview: None,
         key: MessageKey {
             author: original.author.clone(),
@@ -683,13 +703,17 @@ async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, 
         Err(e) => Err(format!("uploading failed: {e}")),
     };
     let stored = match &result {
-        Ok(()) => db
+        Ok(()) => match db
             .apply(&Op::SetStatus {
                 targets: vec![job.key.clone()],
                 status: MessageStatus::Sent,
             })
             .await
-            .map(|_| ()),
+        {
+            // sent: nothing to send again
+            Ok(_) if job.sticker.is_some() => db.forget_outgoing_sticker(&job.key).await,
+            r => r.map(|_| ()),
+        },
         Err(_) => db.set_failed(&job.key).await,
     };
     if let Err(e) = result {
@@ -1058,6 +1082,7 @@ mod tests {
     #[test]
     fn a_link_preview_goes_with_its_message() {
         let job = SendJob {
+            sticker: None,
             key: MessageKey {
                 author: "me".into(),
                 sent_at: 42,
@@ -1096,6 +1121,7 @@ mod tests {
     #[test]
     fn group_text_names_its_group_so_members_dont_get_it_as_a_direct_message() {
         let job = SendJob {
+            sticker: None,
             preview: None,
             key: MessageKey {
                 author: "me".into(),
@@ -1117,8 +1143,47 @@ mod tests {
     }
 
     #[test]
+    fn a_sticker_carries_its_image_in_the_sticker() {
+        let job = SendJob {
+            sticker: Some(Box::new(SendSticker {
+                pack_id: vec![1; 16],
+                pack_key: vec![2; 32],
+                sticker_id: 7,
+                emoji: Some("🦊".into()),
+            })),
+            preview: None,
+            key: MessageKey {
+                author: "me".into(),
+                sent_at: 42,
+            },
+            conversation_id: format!("c:{U}"),
+            body: None,
+            ranges: vec![],
+            quote: None,
+            attachments: vec![1],
+        };
+        let image = AttachmentPointer {
+            content_type: Some("image/webp".into()),
+            ..Default::default()
+        };
+        let dm = data_message(&job, vec![image.clone()], None);
+        assert_eq!(dm.attachments, vec![], "not a file as well");
+        assert_eq!(
+            dm.sticker,
+            Some(data_message::Sticker {
+                pack_id: Some(vec![1; 16]),
+                pack_key: Some(vec![2; 32]),
+                sticker_id: Some(7),
+                data: Some(image),
+                emoji: Some("🦊".into()),
+            })
+        );
+    }
+
+    #[test]
     fn files_go_out_in_order_with_their_caption() {
         let job = SendJob {
+            sticker: None,
             preview: None,
             key: MessageKey {
                 author: "me".into(),
@@ -1150,6 +1215,7 @@ mod tests {
     #[test]
     fn data_message_carries_body_timestamp_and_quote() {
         let job = SendJob {
+            sticker: None,
             preview: None,
             key: MessageKey {
                 author: "me".into(),

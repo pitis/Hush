@@ -112,6 +112,8 @@ pub(crate) struct Counts {
 pub(crate) struct Seed {
     pub contacts: Vec<presage::model::contacts::Contact>,
     pub groups: Vec<([u8; 32], presage::model::groups::Group)>,
+    /// The phone's installed sticker packs (id, key), to install here.
+    pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Who a recipient id stands for.
@@ -136,6 +138,7 @@ pub(crate) struct Importer {
     profile_keys: HashMap<Uuid, [u8; 32]>,
     /// Contact seeds: (ACI, name, recipient id), joined with chat timers in `finish`.
     contact_parts: Vec<(Uuid, String, u64)>,
+    sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
     /// Chat timers by recipient id, for the contact seeds.
     timer_by_recipient: HashMap<u64, u32>,
     /// Group snapshots wait for `finish`, so members can join profile keys seen later.
@@ -154,6 +157,7 @@ impl Importer {
             chats: HashMap::new(),
             profile_keys: HashMap::new(),
             contact_parts: Vec::new(),
+            sticker_packs: Vec::new(),
             timer_by_recipient: HashMap::new(),
             group_frames: Vec::new(),
             batch: HistoryBatch::default(),
@@ -167,8 +171,9 @@ impl Importer {
             Some(backup::frame::Item::Recipient(r)) => self.recipient(r),
             Some(backup::frame::Item::Chat(c)) => self.chat(c),
             Some(backup::frame::Item::ChatItem(i)) => self.chat_item(i),
-            // account data isn't ours to import; the rest (sticker packs, calls, notification
-            // profiles, chat folders) is out of scope
+            Some(backup::frame::Item::StickerPack(p)) => self.sticker_packs.push((p.packId, p.packKey)),
+            // account data isn't ours to import; the rest (calls, notification profiles, chat
+            // folders) is out of scope
             Some(backup::frame::Item::Account(_)) => {}
             Some(_) | None => self.counts.skipped += 1,
         }
@@ -239,6 +244,7 @@ impl Importer {
                 },
             ));
         }
+        seed.sticker_packs = std::mem::take(&mut self.sticker_packs);
         (std::mem::take(&mut self.batch), seed, self.counts)
     }
 
@@ -801,6 +807,19 @@ mod tests {
         assert!(imp.add(self_frame(2)).is_none());
         assert!(imp.add(chat_frame(10, 1, 0)).is_none());
         imp
+    }
+
+    #[test]
+    fn the_phones_sticker_packs_are_kept_to_install() {
+        let mut imp = Importer::new(ME, NOW);
+        imp.add(frame(backup::frame::Item::StickerPack(backup::StickerPack {
+            packId: vec![1; 16],
+            packKey: vec![2; 32],
+            ..Default::default()
+        })));
+        let (_, seed, counts) = imp.finish();
+        assert_eq!(seed.sticker_packs, vec![(vec![1; 16], vec![2; 32])]);
+        assert_eq!(counts.skipped, 0);
     }
 
     #[test]

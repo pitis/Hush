@@ -96,7 +96,35 @@ pub enum Command {
         username: String,
         done: oneshot::Sender<Result<Option<String>, String>>,
     },
+    /// The installed sticker packs (images written under `stickers/`), each with its key and its
+    /// stickers' content types.
+    StickerPacks {
+        done: oneshot::Sender<Result<Vec<crate::projection::model::StickerPackInfo>, String>>,
+    },
+    /// One installed sticker, to send: None if its pack isn't installed or it has no image.
+    Sticker {
+        pack_id: Vec<u8>,
+        sticker_id: u32,
+        done: oneshot::Sender<Result<Option<ChosenSticker>, String>>,
+    },
+    /// Download and install a sticker pack (our other devices are told), then answer.
+    InstallStickerPack {
+        id: Vec<u8>,
+        key: Vec<u8>,
+        done: oneshot::Sender<Result<(), String>>,
+    },
 }
+
+/// A sticker as the client needs it to send it.
+pub(crate) struct ChosenSticker {
+    pub pack_key: Vec<u8>,
+    pub info: crate::projection::model::StickerInfo,
+    /// presage's, else empty.
+    pub content_type: String,
+}
+
+/// Downloading a pack's manifest and every sticker in it.
+const STICKER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Handles {
     pub commands: mpsc::UnboundedSender<Command>,
@@ -539,6 +567,44 @@ async fn run(
                     }
                 }
             }
+            Command::StickerPacks { done } => match &manager {
+                Some(m) => {
+                    let (store, dir) = (m.store().clone(), dir.join("stickers"));
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(installed_packs(&store, dir).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
+            Command::Sticker {
+                pack_id,
+                sticker_id,
+                done,
+            } => match &manager {
+                Some(m) => {
+                    let (store, dir) = (m.store().clone(), dir.join("stickers"));
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(chosen_sticker(&store, dir, pack_id, sticker_id).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
+            Command::InstallStickerPack { id, key, done } => match &manager {
+                Some(m) => {
+                    // a pack can take a while: commands go on meanwhile
+                    let mut m = m.clone();
+                    tokio::task::spawn_local(async move {
+                        let _ = done.send(install_pack(&mut m, &id, &key).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::LookupUsername { username, done } => {
                 let found = match &mut manager {
                     Some(m) => {
@@ -649,10 +715,19 @@ fn start_history(
         .await;
         running.set(false);
         match outcome {
-            Ok(_) => {
+            Ok(outcome) => {
                 // imported, none offered, or cancelled: live messages may flow now
                 if let Some(c) = commands.upgrade() {
                     let _ = c.send(Command::Start);
+                }
+                // then the phone's sticker packs, one at a time; a pack that fails is left out
+                if let crate::history::Outcome::Done { sticker_packs } = outcome {
+                    let mut m = m;
+                    for (id, key) in sticker_packs {
+                        if let Err(e) = install_pack(&mut m, &id, &key).await {
+                            tracing::warn!(error = %e, "a sticker pack from the phone wasn't installed");
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -684,6 +759,70 @@ fn start_history(
             });
         }
     });
+}
+
+/// The installed packs with stickers we have images of, by title (images written off this thread).
+async fn installed_packs(
+    store: &SqliteStore,
+    dir: PathBuf,
+) -> Result<Vec<crate::projection::model::StickerPackInfo>, String> {
+    let mut packs = vec![];
+    for pack in store.sticker_packs().await.map_err(|e| e.to_string())? {
+        let pack = match pack {
+            Ok(p) => p,
+            Err(e) => {
+                // one unreadable pack doesn't hide the others
+                tracing::warn!(error = %e, "a sticker pack couldn't be read");
+                continue;
+            }
+        };
+        packs.push(pack);
+    }
+    let mut infos = tokio::task::spawn_blocking(move || {
+        packs
+            .iter()
+            .map(|p| crate::stickers::pack_info(p, &dir))
+            .filter(|i| !i.stickers.is_empty())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    infos.sort_by_key(|i| i.title.to_lowercase());
+    Ok(infos)
+}
+
+/// One sticker from its pack alone (not every pack), its image written off this thread.
+async fn chosen_sticker(
+    store: &SqliteStore,
+    dir: PathBuf,
+    pack_id: Vec<u8>,
+    sticker_id: u32,
+) -> Result<Option<ChosenSticker>, String> {
+    let Some(pack) = store.sticker_pack(&pack_id).await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || {
+        let s = pack.manifest.stickers.iter().find(|s| s.id == sticker_id)?;
+        Some(ChosenSticker {
+            info: crate::stickers::sticker_info(&pack, s, &dir)?,
+            content_type: s.content_type.clone().unwrap_or_default(),
+            pack_key: pack.key.clone(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Installs a pack unless presage has it already.
+async fn install_pack(m: &mut Manager<SqliteStore, Registered>, id: &[u8], key: &[u8]) -> Result<(), String> {
+    if matches!(m.store().sticker_pack(id).await, Ok(Some(_))) {
+        return Ok(());
+    }
+    match tokio::time::timeout(STICKER_INSTALL_TIMEOUT, Box::pin(m.install_sticker_pack(id, key))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the download took too long".into()),
+    }
 }
 
 /// Local changes come in bursts (a few clicks): one sync after they settle.

@@ -34,7 +34,10 @@ use crate::projection::{HistoryDbStage, ProjectionDb};
 /// How a finished import ended (failures are the `Err` side).
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    Done,
+    /// Imported: with the phone's sticker packs (id, key), to install once receiving runs.
+    Done {
+        sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
+    },
     /// There is no archive to import (declined, the phone gave up, or it expired).
     NoHistory,
     Cancelled,
@@ -170,7 +173,9 @@ pub(crate) async fn run(
         total: 0,
     });
     l.on_event(CoreEvent::ConversationsChanged);
-    Ok(Outcome::Done)
+    Ok(Outcome::Done {
+        sticker_packs: seed.sticker_packs,
+    })
 }
 
 async fn cleanup(db: &ProjectionDb, tmp: &Path) -> Result<(), sqlx::Error> {
@@ -387,7 +392,7 @@ mod driver_tests {
         let tmp = dir.0.join("history.tmp");
         let (_keep, mut cancel) = no_cancel();
         let out = run(&db, &mut store, &mut fake, &tmp, &sink, &mut cancel).await.unwrap();
-        assert!(matches!(out, Outcome::Done));
+        assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(db.history_state().await.unwrap(), None, "state row gone");
         assert!(!tmp.exists(), "temp file gone");
         let conversations = db.conversations().await.unwrap();
@@ -478,7 +483,7 @@ mod driver_tests {
         let out = run(&db, &mut store, &mut fake, &tmp, &Quiet, &mut cancel)
             .await
             .unwrap();
-        assert!(matches!(out, Outcome::Done));
+        assert!(matches!(out, Outcome::Done { .. }));
         assert_eq!(
             *fake.offsets_seen.lock().unwrap(),
             vec![state.bytes_done],

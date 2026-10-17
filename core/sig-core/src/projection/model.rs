@@ -486,6 +486,23 @@ pub struct LinkPreview {
     pub image: Option<Attachment>,
 }
 
+/// An installed sticker pack, for the picker: its id (hex) and the stickers we have images of.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct StickerPackInfo {
+    pub id: String,
+    pub title: String,
+    pub author: String,
+    pub stickers: Vec<StickerInfo>,
+}
+
+/// A sticker in a pack: its id in the pack, its emoji, and its image as a file.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct StickerInfo {
+    pub id: u32,
+    pub emoji: Option<String>,
+    pub path: String,
+}
+
 /// A link preview to send with a message: its link (which must be in the message's text), what
 /// its page says, and the page's image as a file to send.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
