@@ -1298,10 +1298,14 @@ async fn handle(
             if progress.drained() {
                 sync_titles(m, db, l).await;
             }
+            fetch_avatars(m, db, me, l).await;
             l.on_event(CoreEvent::Ready);
             let _ = queues.storage.send(storage::Trigger::Connected);
         }
-        Received::Contacts => sync_titles(m, db, l).await,
+        Received::Contacts => {
+            sync_titles(m, db, l).await;
+            fetch_avatars(m, db, me, l).await;
+        }
         // Ids only: never log message content.
         Received::DecryptionError(sender) => {
             l.on_event(CoreEvent::Error {
@@ -1483,6 +1487,78 @@ fn content_kind(body: &presage::libsignal_service::content::ContentBody) -> &'st
 }
 
 /// Copies contact names and group titles from presage's store into the projection.
+/// Fetches the pictures of the listed chats not looked at in the last day (a few per pass): a
+/// contact's profile avatar (with their profile key, ours for Note to Self), a group's avatar.
+/// presage caches both, so a changed picture shows once its profile key changes.
+async fn fetch_avatars(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, me: &str, l: &dyn EventListener) {
+    use presage::libsignal_service::prelude::ProfileKey;
+    let now = chrono::Utc::now().timestamp_millis();
+    let ids = match db.avatars_to_fetch(now, 20).await {
+        Ok(ids) => ids,
+        Err(e) => return tracing::warn!(error = %e, "couldn't list the chats to fetch pictures for"),
+    };
+    let mut m = m.clone();
+    let mut changed = false;
+    for id in ids {
+        let fetched: Result<Option<Vec<u8>>, String> = if let Some(aci) = id.strip_prefix("c:") {
+            let key = match presage::libsignal_service::prelude::Uuid::parse_str(aci) {
+                Ok(uuid) if aci == me => Some((uuid, m.registration_data().profile_key())),
+                Ok(uuid) => match m.store().contact_by_id(&Aci::from(uuid).into()).await {
+                    Ok(Some(c)) => <[u8; 32]>::try_from(c.profile_key.as_slice())
+                        .ok()
+                        .map(|k| (uuid, ProfileKey::create(k))),
+                    _ => None,
+                },
+                // a phone-number-only chat: no profile to ask
+                Err(_) => None,
+            };
+            match key {
+                Some((uuid, key)) => timed_avatar(Box::pin(m.retrieve_profile_avatar_by_uuid(uuid, key))).await,
+                None => Ok(None),
+            }
+        } else if let Some(hex_key) = id.strip_prefix("g:") {
+            match hex::decode(hex_key) {
+                Ok(master_key) => {
+                    let context = presage::proto::GroupContextV2 {
+                        master_key: Some(master_key),
+                        revision: Some(0),
+                        ..Default::default()
+                    };
+                    timed_avatar(Box::pin(m.retrieve_group_avatar(context))).await
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            Ok(None)
+        };
+        let stored = match fetched {
+            Ok(bytes) => db.store_avatar(&id, bytes.as_deref(), now).await,
+            Err(e) => {
+                // ids only; tried again in a day
+                tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be fetched");
+                db.set_avatar_checked(&id, now).await.map(|_| false)
+            }
+        };
+        match stored {
+            Ok(c) => changed |= c,
+            Err(e) => tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be kept"),
+        }
+    }
+    if changed {
+        l.on_event(CoreEvent::ConversationsChanged);
+    }
+}
+
+/// A picture fetch, given 10 s.
+async fn timed_avatar<E: std::fmt::Display>(
+    fetch: impl std::future::Future<Output = Result<Option<Vec<u8>>, E>>,
+) -> Result<Option<Vec<u8>>, String> {
+    match tokio::time::timeout(Duration::from_secs(10), fetch).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err("timed out".into()),
+    }
+}
+
 async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l: &dyn EventListener) {
     let mut problems: Vec<String> = vec![];
     match m.store().contacts().await {

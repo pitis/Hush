@@ -1463,6 +1463,8 @@ final class AppStore {
                     guard generation == listenerGeneration else { return }
                     conversations = found
                     conversationsLoaded = true
+                    AvatarPictures.shared.paths = Dictionary(
+                        found.compactMap { c in c.avatar.map { (c.id, $0) } }, uniquingKeysWith: { a, _ in a })
                     Self.logger.notice("conversations: \(self.conversations.count, privacy: .public)")
                     // group rows say who wrote the last message
                     for c in conversations where c.kind == .group && !c.lastMessageOutgoing {

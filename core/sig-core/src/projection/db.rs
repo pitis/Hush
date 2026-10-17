@@ -481,6 +481,72 @@ impl ProjectionDb {
             .await
     }
 
+    /// Listed chats (with messages) whose picture wasn't looked for in the last day, at most
+    /// `limit`, the most recent first.
+    pub async fn avatars_to_fetch(&self, now_ms: i64, limit: u32) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT id FROM conversations WHERE last_message_at > 0 AND avatar_checked_at <= ?1
+             ORDER BY last_message_at DESC, id LIMIT ?2",
+        )
+        .bind(now_ms - 24 * 3600 * 1000)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Keeps a chat's fetched picture as a file beside the attachments (None: it has none, and an
+    /// earlier one goes), as looked for at `now_ms`. True if the picture changed.
+    pub async fn store_avatar(&self, id: &str, bytes: Option<&[u8]>, now_ms: i64) -> Result<bool, sqlx::Error> {
+        let dir = self
+            .files
+            .clone()
+            .ok_or_else(|| sqlx::Error::Configuration("no attachments folder".into()))?;
+        let path = dir.join(format!("avatar-{}", id.replace(':', "-")));
+        match bytes {
+            Some(bytes) => {
+                let unchanged = std::fs::read(&path).is_ok_and(|old| old == bytes);
+                if !unchanged {
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(&path, bytes)?;
+                }
+                let stored = self.set_avatar(id, Some(&path.to_string_lossy()), now_ms).await?;
+                Ok(stored || !unchanged)
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+                self.set_avatar(id, None, now_ms).await
+            }
+        }
+    }
+
+    /// A chat's picture was looked for (and not found or not reachable) at `now_ms`.
+    pub async fn set_avatar_checked(&self, id: &str, now_ms: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE conversations SET avatar_checked_at = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(now_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Stores a chat's picture (None: it has none) as looked for at `now_ms`. True if the
+    /// picture changed.
+    pub async fn set_avatar(&self, id: &str, path: Option<&str>, now_ms: i64) -> Result<bool, sqlx::Error> {
+        let changed = sqlx::query("UPDATE conversations SET avatar = ?2 WHERE id = ?1 AND avatar IS NOT ?2")
+            .bind(id)
+            .bind(path)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1;
+        sqlx::query("UPDATE conversations SET avatar_checked_at = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(now_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(changed)
+    }
+
     /// Stores a contact's username (None: it has none). True if it changed.
     pub async fn set_username(&self, id: &str, username: Option<&str>) -> Result<bool, sqlx::Error> {
         let kind = kind_of(id)?;
@@ -3052,6 +3118,7 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         blocked: r.try_get("blocked")?,
         whitelisted: r.try_get("whitelisted")?,
         message_request: r.try_get("message_request")?,
+        avatar: r.try_get("avatar")?,
         username: r.try_get("username")?,
         id,
     })
@@ -4880,6 +4947,52 @@ mod tests {
         // a chat that has messages keeps its place
         db.open_found("c:alice", "alice.42", 60).await.unwrap();
         assert_eq!(conv(&db, "c:alice").await.last_message_at, 1);
+    }
+
+    #[tokio::test]
+    async fn listed_chats_are_asked_for_their_picture_once_a_day() {
+        let db = db().await;
+        let day = 24 * 3600 * 1000;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        db.insert_message(&in_conv("g:00", msg("bob", 2, "yo"))).await.unwrap();
+        // known but not listed (no messages): not asked about
+        db.upsert_conversation_title("c:carol", "Carol").await.unwrap();
+        assert_eq!(
+            db.avatars_to_fetch(day, 10).await.unwrap(),
+            vec!["g:00", "c:alice"],
+            "newest first"
+        );
+        assert!(db.set_avatar("c:alice", Some("/data/avatars/a"), day).await.unwrap());
+        db.set_avatar("g:00", None, day).await.unwrap(); // none set
+        assert_eq!(conv(&db, "c:alice").await.avatar.as_deref(), Some("/data/avatars/a"));
+        assert_eq!(conv(&db, "g:00").await.avatar, None);
+        assert!(
+            db.avatars_to_fetch(day + 1, 10).await.unwrap().is_empty(),
+            "checked today"
+        );
+        assert_eq!(
+            db.avatars_to_fetch(2 * day + 1, 1).await.unwrap().len(),
+            1,
+            "a day later, as many as asked"
+        );
+        // unchanged: no announcement needed
+        assert!(!db
+            .set_avatar("c:alice", Some("/data/avatars/a"), 2 * day)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_fetched_picture_is_kept_as_a_file_and_one_taken_away_goes() {
+        let files = TempFiles::new("avatars");
+        let db = db().await.with_files(files.0.clone());
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        assert!(db.store_avatar("c:alice", Some(b"jpeg"), 1).await.unwrap());
+        let path = conv(&db, "c:alice").await.avatar.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"jpeg");
+        assert!(db.store_avatar("c:alice", None, 2).await.unwrap());
+        assert_eq!(conv(&db, "c:alice").await.avatar, None);
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[tokio::test]
