@@ -350,7 +350,8 @@ struct NewGroupSheet: View {
             HStack {
                 if busy { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                // the group may be made by now: its outcome must be seen
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction).disabled(busy)
                 Button("Create") {
                     busy = true
                     problem = nil
@@ -366,6 +367,7 @@ struct NewGroupSheet: View {
         }
         .padding(20)
         .frame(width: 380)
+        .interactiveDismissDisabled(busy)
     }
 }
 

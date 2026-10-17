@@ -1215,8 +1215,8 @@ impl Client {
     }
 
     /// Makes a group with `members` (ACIs): those we have a profile key for join, the others are
-    /// invited. Answers its chat's id, listed once the server has the group (also after a
-    /// failure past that point).
+    /// invited. Answers its chat's id, listed once the server has the group; a failure past
+    /// that point (telling the members) goes out as an error event, the chat answered all the same.
     pub async fn create_group(&self, title: String, members: Vec<String>) -> Result<String, CoreError> {
         let (title, members) =
             crate::groups::new_group(&title, &members).map_err(|message| CoreError::InvalidInput { message })?;

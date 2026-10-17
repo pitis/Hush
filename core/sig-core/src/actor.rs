@@ -939,7 +939,7 @@ async fn settle_group(
 }
 
 /// Makes a group, then lists its chat. A failure after the server made it (telling the
-/// members, say) still lists it, found as the one group presage didn't have before.
+/// members, say) still lists and answers it, the failure going out as an error event.
 async fn create_group(
     m: &mut Manager<SqliteStore, Registered>,
     db: &ProjectionDb,
@@ -956,32 +956,45 @@ async fn create_group(
         failed => {
             let problem = match failed {
                 Ok(Err(e)) => e.to_string(),
-                _ => "the server didn't answer in time".into(),
+                // dropped midway, perhaps after the server made it but before presage stored it
+                _ => "the server didn't answer in time; the group may have been made, so look in your chats before trying again".into(),
             };
-            let made = match group_keys(m.store()).await {
-                Ok(after) => made_group(&before, &after),
-                Err(_) => None,
-            };
-            match made {
-                Some(key) => {
+            match our_new_group(m.store(), &before, title).await {
+                Ok(Some(key)) => {
                     list_new_group(m.store(), db, l, &key, chrono::Utc::now().timestamp_millis()).await;
-                    Err(format!(
-                        "the group was made, but its members may not know yet: {problem}"
-                    ))
+                    l.on_event(CoreEvent::Error {
+                        message: format!("The group was made, but its members may not know yet: {problem}"),
+                    });
+                    Ok(key)
                 }
-                None => Err(problem),
+                Ok(None) => Err(problem),
+                Err(e) => Err(format!(
+                    "{problem}; the group may have been made, so look in your chats before trying again \
+                     (reading the groups failed: {e})"
+                )),
             }
         }
     }
 }
 
-/// The master keys of the groups presage has.
+/// The group we just made, if presage has it though making it failed: the one group it didn't
+/// have `before`, under our `title` at its first revision (not one we were added to meanwhile).
+async fn our_new_group(
+    store: &SqliteStore,
+    before: &std::collections::HashSet<[u8; 32]>,
+    title: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(key) = made_group(before, &group_keys(store).await?) else {
+        return Ok(None);
+    };
+    let group = store.group(key).await.map_err(|e| e.to_string())?;
+    Ok(group.filter(|g| g.title == title && g.revision == 0).map(|_| key))
+}
+
+/// The master keys of the groups presage has (an unreadable one is left out: it isn't ours).
 async fn group_keys(store: &SqliteStore) -> Result<std::collections::HashSet<[u8; 32]>, String> {
-    let mut keys = std::collections::HashSet::new();
-    for group in store.groups().await.map_err(|e| e.to_string())? {
-        keys.insert(group.map_err(|e| e.to_string())?.0);
-    }
-    Ok(keys)
+    let groups = store.groups().await.map_err(|e| e.to_string())?;
+    Ok(groups.filter_map(|g| g.ok().map(|(key, _)| key)).collect())
 }
 
 /// The group made between two reads of presage's groups, if exactly one appeared.
@@ -2632,12 +2645,29 @@ mod tests {
             .unwrap();
         let key = [9u8; 32];
         let before = super::group_keys(&store).await.unwrap();
-        store.save_group(key, hikers(0)).await.unwrap();
+        store.save_group([8; 32], hikers(3)).await.unwrap();
         assert_eq!(
-            super::made_group(&before, &super::group_keys(&store).await.unwrap()),
+            super::our_new_group(&store, &before, "Hikers").await.unwrap(),
+            None,
+            "a group we were added to meanwhile isn't ours"
+        );
+        let before = super::group_keys(&store).await.unwrap();
+        store.save_group(key, hikers(0)).await.unwrap();
+        assert_eq!(super::our_new_group(&store, &before, "Climbers").await.unwrap(), None);
+        assert_eq!(
+            super::our_new_group(&store, &before, "Hikers").await.unwrap(),
             Some(key)
         );
         let sink = Sink(std::sync::Mutex::new(vec![]));
+        super::list_new_group(&store, &db, &sink, &[6; 32], 1234).await;
+        assert!(
+            matches!(
+                sink.0.lock().unwrap().as_slice(),
+                [CoreEvent::Error { .. }, CoreEvent::ConversationsChanged]
+            ),
+            "a group presage hasn't is said, and the list refreshed all the same"
+        );
+        sink.0.lock().unwrap().clear();
         super::list_new_group(&store, &db, &sink, &key, 1234).await;
         let chats = db.conversations().await.unwrap();
         let chat = chats
