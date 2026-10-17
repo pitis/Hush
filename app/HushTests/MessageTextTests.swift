@@ -162,4 +162,15 @@ final class MessageTextTests: XCTestCase {
         )
         XCTAssertEqual(MessageText.plain("👍", ranges: [range(1, 1, .mention(aci: "bob"))], name: name), "👍")
     }
+
+    func testOnlyAGroupsInviteLinkIsALinkAndNotUnderASpoiler() {
+        let body = "join https://signal.group/#CjQKIA_x-1 or see https://example.com"
+        let text = MessageText.attributed(body, ranges: [], name: name)
+        let links = text.runs.compactMap { $0.link }
+        XCTAssertEqual(links, [URL(string: "https://signal.group/#CjQKIA_x-1")!])
+        let hidden = MessageText.attributed(body, ranges: [range(5, 33, .spoiler)], name: name)
+        XCTAssertEqual(hidden.runs.compactMap { $0.link }, [], "covered: not clickable")
+        let shown = MessageText.attributed(body, ranges: [range(5, 33, .spoiler)], name: name, revealSpoilers: true)
+        XCTAssertEqual(shown.runs.compactMap { $0.link }.count, 1)
+    }
 }

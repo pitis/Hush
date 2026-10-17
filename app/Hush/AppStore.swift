@@ -121,6 +121,9 @@ final class AppStore {
     /// The core's recent errors, for the Core Log window (ids and reasons, never message text).
     private(set) var errors: [LogLine] = []
     private(set) var selectedId: String?
+    /// A group link clicked in a message, waiting for its join sheet (it holds the group's key:
+    /// never logged).
+    var joiningLink: String?
     /// The open conversation's loaded messages, oldest first.
     private(set) var messages: [Message] = [] {
         didSet { timelineItems = Timeline.items(for: messages, events: events) }
@@ -1489,6 +1492,70 @@ final class AppStore {
                 unnamedAuthors.insert(author)
             }
         } catch { append("query failed: \(error)") }
+    }
+
+    /// Reading a group's invite link.
+    enum LinkRead: Equatable {
+        case group(GroupPreview)
+        case failed(String)
+    }
+
+    /// What a group's invite link shows.
+    func previewGroupLink(_ link: String) async -> LinkRead {
+        guard let client else { return .failed("Not linked yet.") }
+        do {
+            return .group(try await client.groupLinkPreview(link: link))
+        } catch {
+            // never the link: it holds the group's key
+            append("group link preview failed: \(error)")
+            return .failed(Self.groupFailure("Couldn't read the link", error))
+        }
+    }
+
+    /// Joins a group through its link, or asks to, and opens its chat; nil, or why it failed.
+    func joinGroup(_ link: String) async -> String? {
+        guard let client else { return "Not linked yet." }
+        do {
+            let joined = try await client.joinGroup(link: link)
+            select(joined.conversationId)
+            refreshConversations()
+            return nil
+        } catch {
+            append("joining a group failed: \(error)")
+            return Self.groupFailure("Couldn't join the group", error)
+        }
+    }
+
+    /// Withdraws our request to join a group, and deletes its chat; nil, or why it failed (the
+    /// chat then stays).
+    func cancelJoinRequest(_ conversationId: String) async -> String? {
+        guard let client else { return "Not linked yet." }
+        do {
+            try await client.cancelJoinRequest(conversationId: conversationId)
+        } catch {
+            append("cancelling a join request failed: \(error)")
+            return Self.groupFailure("Couldn't cancel the request", error)
+        }
+        deleteChat(conversationId)
+        return nil
+    }
+
+    /// A clicked link: a group's invite link opens the join sheet (true); others are the
+    /// system's.
+    func handleLink(_ url: URL) -> Bool {
+        guard url.scheme == "https" || url.scheme == "sgnl", url.host() == "signal.group",
+            url.fragment?.isEmpty == false
+        else { return false }
+        joiningLink = url.absoluteString
+        return true
+    }
+
+    /// `what` failed: the core's reason (the server's refusal is not "couldn't be reached").
+    private static func groupFailure(_ what: String, _ error: Error) -> String {
+        switch error {
+        case CoreError.Network(let message): "\(what): \(message)"
+        default: "\(what): \(describe(error))"
+        }
     }
 
     /// Reading a group for its info panel.

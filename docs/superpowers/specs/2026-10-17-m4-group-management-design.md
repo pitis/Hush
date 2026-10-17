@@ -49,8 +49,15 @@ the stored group's fetches the group before the content reaches us.
    the composer. An answer that took counts as answered even if telling the group failed. In the info panel, admins turn the link on (anyone
    joins, or admins approve) or off, and reset it; members copy it while it's on. It holds
    the group's key, so it is never shown or logged. Admins approve or deny requests to join.
-5. **Joining by link.** A pasted `signal.group` link shows the group and joins it, or asks
-   to; a pending request can be withdrawn.
+5. **Joining by link.** A `signal.group` link, pasted (compose menu ▸ Join Group by Link) or
+   clicked in a message (group links are the only links a message's text makes clickable),
+   shows the group (title, description, member count; fetched again if our copy says
+   we're in it) and joins it, or asks to where admins approve. The chat is listed, opened
+   and accepted either way. While we wait, it says so and offers Cancel Request, which
+   also deletes it, and Delete (should cancelling fail for good) (`conversations.group_standing`: 0 neither, 1 invited, 2 asking).
+   A join the server took counts though telling the members failed (only if presage's copy
+   moved during this attempt). The link holds the group's key: it is never logged, nor is
+   its password in a server error.
 6. **Own profile.** Settings shows and edits our name and about. The picture stays the phone's
    (presage can't upload one).
 

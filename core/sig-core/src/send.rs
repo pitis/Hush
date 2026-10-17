@@ -601,7 +601,11 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
-                    let what = format!("telling the phone about the request from {conversation_id}");
+                    // a group's id is its key: not for the log
+                    let what = match conversation_id.starts_with("g:") {
+                        true => "telling the phone about a group's request".to_string(),
+                        false => format!("telling the phone about the request from {conversation_id}"),
+                    };
                     report(l.as_ref(), &what, &e);
                 }
             }

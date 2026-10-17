@@ -43,6 +43,65 @@ pub struct GroupMember {
     pub admin: bool,
 }
 
+/// A group as its invite link shows it to someone outside.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupPreview {
+    /// Its chat (`g:…`): it holds the group's key, so it is never logged.
+    pub conversation_id: String,
+    pub title: String,
+    pub description: String,
+    pub member_count: u32,
+    /// Joining asks an admin to let us in.
+    pub approval: bool,
+    /// We asked already and wait for an admin.
+    pub requested: bool,
+    /// We're in it already.
+    pub member: bool,
+}
+
+/// What a link shows of its group (`info`, as the server answers whoever has the link); an
+/// error if the link lets no one in any more.
+pub fn preview(
+    info: &presage::libsignal_service::groups_v2::GroupJoinInfo,
+    conversation_id: String,
+) -> Result<GroupPreview, String> {
+    let approval = match info.add_from_invite_link {
+        AccessRequired::Any => false,
+        AccessRequired::Administrator => true,
+        _ => return Err("this group link has been turned off".into()),
+    };
+    Ok(GroupPreview {
+        conversation_id,
+        title: info.title.clone(),
+        description: info.description_text.clone().unwrap_or_default(),
+        member_count: info.member_count,
+        approval,
+        requested: info.pending_admin_approval,
+        member: false,
+    })
+}
+
+/// A link's group we're in already, as we have it: its chat opens, whatever the link says.
+pub fn member_preview(group: &Group, conversation_id: String) -> GroupPreview {
+    GroupPreview {
+        conversation_id,
+        title: group.title.clone(),
+        description: group.description.clone().unwrap_or_default(),
+        member_count: group.members.len() as u32,
+        approval: false,
+        requested: false,
+        member: true,
+    }
+}
+
+/// How joining through a link went.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupJoined {
+    pub conversation_id: String,
+    /// We asked; an admin lets us in.
+    pub requested: bool,
+}
+
 /// A change to a group the app asks for.
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum GroupChange {
@@ -198,10 +257,47 @@ pub fn invited(group: &Group, aci: Uuid, pni: Uuid) -> bool {
     invitation(group, aci, pni).is_some()
 }
 
+/// Where we (our ACI, our number's PNI) stand in `group`: an invitation outranks a request.
+pub fn standing(group: &Group, aci: Uuid, pni: Uuid) -> crate::projection::GroupStanding {
+    use crate::projection::GroupStanding;
+    if invited(group, aci, pni) {
+        GroupStanding::Invited
+    } else if group
+        .requesting_members
+        .iter()
+        .any(|r| ServiceId::from(r.aci).raw_uuid() == aci)
+    {
+        GroupStanding::Requesting
+    } else {
+        GroupStanding::Other
+    }
+}
+
+/// We're one of `group`'s members.
+pub fn is_member(group: &Group, aci: Uuid) -> bool {
+    group.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == aci)
+}
+
+/// A server error's text without the invite link's password, which its requests carry
+/// (`/v1/groups/join/<password>`, `?inviteLinkPassword=<password>`): it may be logged.
+pub fn without_link(error: String) -> String {
+    let found = ["groups/join/", "inviteLinkPassword="]
+        .iter()
+        .filter_map(|marker| error.find(marker).map(|i| i + marker.len()))
+        .min();
+    let Some(start) = found else {
+        return error;
+    };
+    let end = error[start..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | '%')))
+        .map_or(error.len(), |i| start + i);
+    format!("{}…{}", &error[..start], without_link(error[end..].to_string()))
+}
+
 /// Our answer to an invitation shows in `group`: accepted, we're a member; declined, we're
 /// neither a member nor invited.
 pub fn answered(group: &Group, aci: Uuid, pni: Uuid, accept: bool) -> bool {
-    let member = group.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == aci);
+    let member = is_member(group, aci);
     if accept {
         member
     } else {
@@ -520,5 +616,76 @@ mod tests {
             GroupEdit::DenyRequest(super::aci(ALICE).unwrap()),
         );
         assert!(edit(GroupChange::ApproveRequest { aci: "x".into() }).is_err());
+    }
+
+    #[test]
+    fn a_link_shows_its_group_and_whether_joining_asks_an_admin() {
+        use presage::libsignal_service::groups_v2::GroupJoinInfo;
+        let mut info = GroupJoinInfo {
+            title: "Hikers".into(),
+            description_text: None,
+            avatar: String::new(),
+            member_count: 7,
+            add_from_invite_link: AccessRequired::Any,
+            version: 3,
+            pending_admin_approval: false,
+        };
+        let open = preview(&info, "g:x".into()).unwrap();
+        assert_eq!(
+            open,
+            GroupPreview {
+                conversation_id: "g:x".into(),
+                title: "Hikers".into(),
+                description: String::new(),
+                member_count: 7,
+                approval: false,
+                requested: false,
+                member: false,
+            }
+        );
+        info.add_from_invite_link = AccessRequired::Administrator;
+        info.pending_admin_approval = true;
+        let asked = preview(&info, "g:x".into()).unwrap();
+        assert!(asked.approval && asked.requested);
+        info.add_from_invite_link = AccessRequired::Unsatisfiable;
+        assert!(preview(&info, "g:x".into()).is_err(), "turned off");
+        let ours = member_preview(&group(vec![member(ME, Role::Default)], None), "g:x".into());
+        assert!(ours.member && ours.member_count == 1 && ours.title == "Hikers");
+    }
+
+    #[test]
+    fn where_we_stand_invited_asking_or_neither() {
+        use crate::projection::GroupStanding;
+        use presage::model::groups::RequestingMember;
+        let carol = Uuid::parse_str(CAROL).unwrap();
+        let me = Uuid::parse_str(ME).unwrap();
+        let mut g = group(vec![member(ALICE, Role::Administrator)], None);
+        assert_eq!(standing(&g, carol, Uuid::nil()), GroupStanding::Invited);
+        g.requesting_members = vec![RequestingMember {
+            aci: super::aci(ME).unwrap(),
+            profile_key: ProfileKey::create([0; 32]),
+            timestamp: 0,
+        }];
+        assert_eq!(standing(&g, me, Uuid::nil()), GroupStanding::Requesting);
+        g.requesting_members[0].aci = super::aci(CAROL).unwrap();
+        assert_eq!(standing(&g, carol, Uuid::nil()), GroupStanding::Invited, "invited wins");
+        g.requesting_members.clear();
+        g.members.push(member(ME, Role::Default));
+        assert_eq!(standing(&g, me, Uuid::nil()), GroupStanding::Other, "let in");
+        assert!(is_member(&g, me));
+    }
+
+    #[test]
+    fn a_link_password_never_leaves_in_an_error() {
+        assert_eq!(
+            without_link("error sending request for url (https://x/v1/groups/join/Ab-c_9%3D): timed out".into()),
+            "error sending request for url (https://x/v1/groups/join/…): timed out"
+        );
+        assert_eq!(without_link("refused".into()), "refused");
+        assert_eq!(without_link("groups/join/abc".into()), "groups/join/…");
+        assert_eq!(
+            without_link("PATCH https://x/v1/groups/?inviteLinkPassword=Zm9v%3D&a=1 and /groups/join/b".into()),
+            "PATCH https://x/v1/groups/?inviteLinkPassword=…&a=1 and /groups/join/…"
+        );
     }
 }

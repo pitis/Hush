@@ -21,6 +21,7 @@ enum ChatList {
         // as Desktop: what the chat is, not what was said in it
         if c.blocked { return .message("Blocked", tick: nil) }
         if c.groupInvitation { return .message("Group invitation", tick: nil) }
+        if c.groupJoinRequested { return .message("Asked to join", tick: nil) }
         if c.messageRequest { return .message("Message request", tick: nil) }
         if !selected, Composer.canSend(draft) { return .draft(oneLine(draft)) }
         guard c.lastMessageAt > 0 else { return .message("", tick: nil) }

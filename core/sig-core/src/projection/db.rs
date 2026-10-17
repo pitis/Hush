@@ -43,9 +43,20 @@ pub const STORY_LIFETIME_MS: i64 = 24 * 3600 * 1000;
 macro_rules! is_request {
     () => {
         "(EXISTS (SELECT 1 FROM storage_sync WHERE version > 0)
-           AND NOT c.whitelisted AND NOT c.blocked AND NOT c.phone_contact AND NOT c.group_invited
+           AND NOT c.whitelisted AND NOT c.blocked AND NOT c.phone_contact AND c.group_standing = 0
            AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = c.id AND o.is_outgoing = 1))"
     };
+}
+
+/// Where we stand in a group, beyond being in it or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupStanding {
+    /// Neither invited nor asking: a member, or not one any more.
+    Other = 0,
+    /// Invited and not answered.
+    Invited = 1,
+    /// Asked to join through its link; an admin lets us in.
+    Requesting = 2,
 }
 
 /// Encrypted SQLite store the UI reads from. Separate from presage's database because both use
@@ -178,7 +189,7 @@ impl ProjectionDb {
     }
 
     /// Stores a group as presage has it at `revision`: its title (an empty one never replaces a
-    /// known one), members (ACIs, replaced whole), timer and whether we're `invited`. Nothing happens when that revision
+    /// known one), members (ACIs, replaced whole), timer and where we stand. Nothing happens when that revision
     /// or a later one is stored already; returns whether it was stored.
     pub async fn set_group(
         &self,
@@ -187,7 +198,7 @@ impl ProjectionDb {
         title: &str,
         acis: &[String],
         timer: u32,
-        invited: bool,
+        standing: GroupStanding,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let stored: Option<Option<i64>> = sqlx::query_scalar("SELECT group_revision FROM conversations WHERE id = ?1")
@@ -198,17 +209,17 @@ impl ProjectionDb {
             return Ok(false);
         }
         sqlx::query(
-            "INSERT INTO conversations(id, kind, title, expire_timer, group_revision, group_invited)
+            "INSERT INTO conversations(id, kind, title, expire_timer, group_revision, group_standing)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET title = CASE WHEN ?3 = '' THEN title ELSE ?3 END,
-               expire_timer = ?4, group_revision = ?5, group_invited = ?6",
+               expire_timer = ?4, group_revision = ?5, group_standing = ?6",
         )
         .bind(conversation_id)
         .bind(kind_to_i64(kind_of(conversation_id)?))
         .bind(title)
         .bind(i64::from(timer))
         .bind(i64::from(revision))
-        .bind(invited)
+        .bind(standing as i64)
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM group_members WHERE conversation_id = ?1")
@@ -3356,7 +3367,8 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         blocked: r.try_get("blocked")?,
         whitelisted: r.try_get("whitelisted")?,
         message_request: r.try_get("message_request")?,
-        group_invitation: r.try_get("group_invited")?,
+        group_invitation: r.try_get::<i64, _>("group_standing")? == GroupStanding::Invited as i64,
+        group_join_requested: r.try_get::<i64, _>("group_standing")? == GroupStanding::Requesting as i64,
         avatar: r.try_get("avatar")?,
         username: r.try_get("username")?,
         note: r.try_get("note")?,
@@ -4949,7 +4961,14 @@ mod tests {
         let g = format!("g:{}", "ab".repeat(32));
         assert_eq!(db.group_members(&g).await.unwrap(), Vec::<String>::new());
         assert!(db
-            .set_group(&g, 2, "Hikers", &["bob".into(), "alice".into()], 60, true)
+            .set_group(
+                &g,
+                2,
+                "Hikers",
+                &["bob".into(), "alice".into()],
+                60,
+                GroupStanding::Invited
+            )
             .await
             .unwrap());
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
@@ -4959,12 +4978,14 @@ mod tests {
         let invitation = |chats: Vec<Conversation>| chats.iter().find(|c| c.id == g).map(|c| c.group_invitation);
         assert_eq!(invitation(db.conversations().await.unwrap()), Some(true));
         assert!(
-            !db.set_group(&g, 2, "Old", &["carol".into()], 0, false).await.unwrap(),
+            !db.set_group(&g, 2, "Old", &["carol".into()], 0, GroupStanding::Other)
+                .await
+                .unwrap(),
             "the same revision is already stored"
         );
         assert_eq!(db.group_members(&g).await.unwrap(), vec!["alice", "bob"]);
         assert!(db
-            .set_group(&g, 3, "Climbers", &["carol".into()], 0, false)
+            .set_group(&g, 3, "Climbers", &["carol".into()], 0, GroupStanding::Other)
             .await
             .unwrap());
         assert_eq!(invitation(db.conversations().await.unwrap()), Some(false), "answered");
@@ -6968,6 +6989,20 @@ mod tests {
         assert!(!conv(&db, "c:alice").await.message_request);
     }
 
+    /// A group we asked to join waits for an admin, not for us: it isn't a message request.
+    #[tokio::test]
+    async fn a_request_to_join_is_not_a_message_request() {
+        let db = db().await;
+        phone_state_known(&db).await;
+        let g = format!("g:{}", "ab".repeat(32));
+        db.set_group(&g, 4, "Hikers", &[], 0, GroupStanding::Requesting)
+            .await
+            .unwrap();
+        db.list_chat(&g, 5).await.unwrap();
+        let c = conv(&db, &g).await;
+        assert!(c.group_join_requested && !c.group_invitation && !c.message_request);
+    }
+
     /// An invitation is answered with Join or Decline, not as a message request; joining
     /// accepts the chat too (or it would ask again).
     #[tokio::test]
@@ -6975,12 +7010,14 @@ mod tests {
         let db = db().await;
         phone_state_known(&db).await;
         let g = format!("g:{}", "ab".repeat(32));
-        db.set_group(&g, 1, "Hikers", &["alice".into()], 0, true).await.unwrap();
+        db.set_group(&g, 1, "Hikers", &["alice".into()], 0, GroupStanding::Invited)
+            .await
+            .unwrap();
         assert!(db.list_chat(&g, 5).await.unwrap());
         assert!(!db.list_chat(&g, 6).await.unwrap(), "listed already");
         let c = conv(&db, &g).await;
         assert!(c.group_invitation && !c.message_request);
-        db.set_group(&g, 2, "Hikers", &["alice".into(), "me".into()], 0, false)
+        db.set_group(&g, 2, "Hikers", &["alice".into(), "me".into()], 0, GroupStanding::Other)
             .await
             .unwrap();
         assert!(conv(&db, &g).await.message_request, "joined, not accepted");

@@ -174,6 +174,28 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let createGroupError { throw createGroupError }
         return "g:" + String(repeating: "cd", count: 32)
     }
+    /// Link previews by link; any other link is "not a group link".
+    var linkPreviews: [String: GroupPreview] = [:]
+    var joinAnswers: [String: GroupJoined] = [:]
+    var joinError: CoreError?
+    private(set) var joinedLinks: [String] = []
+    var cancelError: CoreError?
+    private(set) var cancelledRequests: [String] = []
+    func groupLinkPreview(link: String) async throws -> GroupPreview {
+        guard let preview = lock.withLock({ linkPreviews[link] }) else {
+            throw CoreError.InvalidInput(message: "that isn't a group link")
+        }
+        return preview
+    }
+    func joinGroup(link: String) async throws -> GroupJoined {
+        lock.withLock { joinedLinks.append(link) }
+        if let joinError { throw joinError }
+        return lock.withLock { joinAnswers[link]! }
+    }
+    func cancelJoinRequest(conversationId: String) async throws {
+        lock.withLock { cancelledRequests.append(conversationId) }
+        if let cancelError { throw cancelError }
+    }
     func findUsername(username: String) async throws -> String? {
         if username == "bad" { throw CoreError.InvalidInput(message: "a username looks like name.42") }
         return lock.withLock { usernames[username] }
@@ -390,7 +412,8 @@ func conversation(_ id: String, unread: UInt32 = 0) -> Conversation {
         lastMessageDeleted: false, lastMessageFile: nil, expireTimer: 0, lastMessageKind: .normal,
         lastMessageUndecryptable: false, archived: false, pinnedOrder: nil, muteUntil: 0, markedUnread: false,
         blocked: false,
-        whitelisted: false, messageRequest: false, groupInvitation: false, avatar: nil, username: nil, note: nil,
+        whitelisted: false, messageRequest: false, groupInvitation: false, groupJoinRequested: false, avatar: nil,
+        username: nil, note: nil,
         chatColor: nil, wallpaper: nil
     )
 }

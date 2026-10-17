@@ -430,6 +430,108 @@ struct NewGroupSheet: View {
     }
 }
 
+/// Joins a group through its invite link, pasted or clicked in a message: shows the group,
+/// then joins it or asks to. The link holds the group's key: never logged.
+struct JoinGroupSheet: View {
+    let store: AppStore
+    @State private var link: String
+    @State private var read: AppStore.LinkRead?
+    @State private var busy = false
+    @State private var problem: String?
+    @Environment(\.dismiss) private var dismiss
+
+    init(store: AppStore, link: String = "") {
+        self.store = store
+        _link = State(initialValue: link)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Join a group").font(.system(size: 17, weight: .semibold))
+            TextField("Group link", text: $link).textFieldStyle(.roundedBorder)
+                .onSubmit(show)
+                .disabled(busy)
+                .onChange(of: link) {
+                    read = nil
+                    problem = nil
+                }
+            switch read {
+            case .group(let group): preview(group)
+            case .failed(let why): Text(why).font(.system(size: 12)).foregroundStyle(.red)
+            case nil: EmptyView()
+            }
+            if let problem {
+                Text(problem).font(.system(size: 12)).foregroundStyle(.red)
+            }
+            HStack {
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction).disabled(busy)
+                primary.keyboardShortcut(.defaultAction).disabled(busy)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+        .interactiveDismissDisabled(busy)
+        .task { if !link.isEmpty { show() } }
+    }
+
+    private func preview(_ group: GroupPreview) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(group.title.isEmpty ? "Unnamed group" : group.title).font(.system(size: 15, weight: .semibold))
+            if !group.description.isEmpty {
+                Text(group.description).font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+            }
+            Text(group.memberCount == 1 ? "1 member" : "\(group.memberCount) members").font(.system(size: 12))
+            Text(
+                group.member
+                    ? "You're in this group."
+                    : group.requested
+                        ? "You asked to join: an admin has to let you in."
+                        : group.approval ? "An admin has to approve you." : ""
+            )
+            .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+        }
+    }
+
+    @ViewBuilder private var primary: some View {
+        if case .group(let group) = read {
+            // asked from another device (no chat here): asking again lists it
+            if group.member || (group.requested && store.conversations.contains { $0.id == group.conversationId }) {
+                Button("Open Chat") {
+                    store.select(group.conversationId)
+                    dismiss()
+                }
+            } else {
+                Button(group.approval ? "Ask to Join" : "Join", action: join)
+            }
+        } else {
+            Button("Show Group", action: show).disabled(link.trimmingCharacters(in: .whitespaces).isEmpty)
+        }
+    }
+
+    private func show() {
+        busy = true
+        let asked = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            let answer = await store.previewGroupLink(asked)
+            // the link changed meanwhile: this preview isn't the one to join from
+            if link.trimmingCharacters(in: .whitespacesAndNewlines) == asked { read = answer }
+            busy = false
+        }
+    }
+
+    private func join() {
+        busy = true
+        problem = nil
+        Task {
+            problem = await store.joinGroup(link.trimmingCharacters(in: .whitespacesAndNewlines))
+            busy = false
+            if problem == nil { dismiss() }
+        }
+    }
+}
+
 /// People to tick, with a search over their names.
 private struct PeoplePicker: View {
     let candidates: [(aci: String, name: String)]

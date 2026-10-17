@@ -23,7 +23,9 @@ struct ConversationView: View {
             .environment(\.chatColor, conversation.chatColor)
             .environment(\.onWallpaper, conversation.wallpaper != nil)
             .background { if let w = conversation.wallpaper { Wallpaper(wallpaper: w) } }
-            if conversation.blocked || conversation.messageRequest || conversation.groupInvitation {
+            if conversation.blocked || conversation.messageRequest || conversation.groupInvitation
+                || conversation.groupJoinRequested
+            {
                 RequestBar(store: store, conversation: conversation)
             } else {
                 ComposerView(store: store, conversationId: conversation.id)
@@ -36,7 +38,9 @@ struct ConversationView: View {
         .onDisappear { if let quickLook { Files.close(quickLook) } }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
-            guard !conversation.blocked, !conversation.messageRequest, !conversation.groupInvitation else {
+            guard !conversation.blocked, !conversation.messageRequest, !conversation.groupInvitation,
+                !conversation.groupJoinRequested
+            else {
                 return false
             }
             let files = Files.attachable(urls).map(Files.outgoing)
@@ -64,7 +68,7 @@ struct RequestBar: View {
     @State private var answering = false
 
     private enum Confirm: Identifiable {
-        case block, delete, decline
+        case block, delete, decline, cancelRequest
         var id: Self { self }
     }
 
@@ -81,6 +85,10 @@ struct RequestBar: View {
                     Button("Delete") { confirming = .delete }
                     Button("Unblock") { store.acceptRequest(conversation.id) }
                         .keyboardShortcut(.defaultAction)
+                } else if conversation.groupJoinRequested {
+                    // here only, should cancelling fail for good (the request stays)
+                    Button("Delete") { confirming = .delete }
+                    Button("Cancel Request") { confirming = .cancelRequest }.disabled(answering)
                 } else if conversation.groupInvitation {
                     Button("Block") { confirming = .block }
                     Button("Decline") { confirming = .decline }.disabled(answering)
@@ -100,7 +108,9 @@ struct RequestBar: View {
         .confirmationDialog(
             confirming == .block
                 ? RequestBar.blockTitle(conversation, name: name)
-                : confirming == .decline ? "Decline the invitation?" : "Delete this chat?",
+                : confirming == .decline
+                    ? "Decline the invitation?"
+                    : confirming == .cancelRequest ? "Cancel your request to join?" : "Delete this chat?",
             isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
             presenting: confirming
         ) { c in
@@ -108,11 +118,13 @@ struct RequestBar: View {
             case .block: Button("Block", role: .destructive) { store.block(conversation.id) }
             case .delete: Button("Delete", role: .destructive) { store.deleteChat(conversation.id) }
             case .decline: Button("Decline", role: .destructive) { answer(accept: false) }
+            case .cancelRequest: Button("Cancel Request", role: .destructive) { cancelRequest() }
             }
         } message: { c in
             switch c {
             case .block: Text(RequestBar.blockMessage(conversation))
             case .decline: Text("Its members see that you declined, and the chat is deleted from this Mac.")
+            case .cancelRequest: Text("The chat is deleted from this Mac. You can ask again with the link.")
             case .delete:
                 Text(
                     isGroup
@@ -131,11 +143,21 @@ struct RequestBar: View {
         }
     }
 
+    /// Withdraws our request to join; a failure shows.
+    private func cancelRequest() {
+        answering = true
+        Task {
+            if let failure = await store.cancelJoinRequest(conversation.id) { store.showError(failure) }
+            answering = false
+        }
+    }
+
     /// What the bar says above its buttons.
     nonisolated static func prompt(_ c: Conversation, name: String) -> String {
         if c.blocked {
             return c.kind == .group ? "You blocked this group." : "You blocked \(name)."
         }
+        if c.groupJoinRequested { return "You asked to join this group. An admin has to let you in." }
         if c.groupInvitation {
             return "You're invited to join this group. Its members see your name and picture once you join."
         }
