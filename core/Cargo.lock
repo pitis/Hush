@@ -3844,6 +3844,7 @@ dependencies = [
  "tracing-subscriber",
  "uniffi",
  "url",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
 ]
 
 [[package]]

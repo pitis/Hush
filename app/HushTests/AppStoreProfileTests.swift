@@ -24,8 +24,10 @@ final class AppStoreProfileTests: XCTestCase {
     func testASavedProfileReachesTheCoreAndAFailureSaysWhy() async {
         let fake = FakeClient(linked: true)
         let store = await linkedStore(fake)
-        let saved = await store.saveProfile(givenName: "Ada", familyName: "Lovelace", about: "counting")
-        XCTAssertEqual(saved, .profile(OwnProfile(givenName: "Ada", familyName: "Lovelace", about: "counting")))
+        let saved = await store.saveProfile(givenName: " Ada ", familyName: "Lovelace", about: "counting ")
+        XCTAssertEqual(
+            saved, .profile(OwnProfile(givenName: "Ada", familyName: "Lovelace", about: "counting")),
+            "the core's answer, trimmed")
         XCTAssertEqual(fake.savedProfiles, [OwnProfile(givenName: "Ada", familyName: "Lovelace", about: "counting")])
         fake.profileError = CoreError.InvalidInput(message: "a first name is needed")
         let refused = await store.saveProfile(givenName: " ", familyName: "", about: "")

@@ -1311,11 +1311,7 @@ impl Client {
         let (name, about) = crate::profile::edit(&given_name, &family_name, &about)
             .map_err(|message| CoreError::InvalidInput { message })?;
         self.own_aci().ok_or(CoreError::NotLinked)?;
-        let saved = crate::profile::OwnProfile {
-            given_name: name.given_name.clone(),
-            family_name: name.family_name.clone().unwrap_or_default(),
-            about: about.clone().unwrap_or_default(),
-        };
+        let saved = crate::profile::saved(&name, &about);
         let (done, answer) = tokio::sync::oneshot::channel();
         self.send(Command::SetProfile { name, about, done })?;
         answer

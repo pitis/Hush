@@ -151,8 +151,8 @@ pub enum Command {
     OwnProfile {
         done: oneshot::Sender<Result<crate::profile::OwnProfile, String>>,
     },
-    /// Uploads our name and about (the picture and the about's emoji kept), then tells our
-    /// other devices.
+    /// Writes our name and about (the picture, the about's emoji, the payment address and the
+    /// phone number setting kept), then tells our other devices.
     SetProfile {
         name: presage::libsignal_service::profile_name::ProfileName<String>,
         about: Option<String>,
@@ -752,7 +752,7 @@ async fn run(
                 Some(m) => {
                     let m = m.clone();
                     tokio::task::spawn_local(async move {
-                        let _ = done.send(fetch_own_profile(&m).await.map(|p| crate::profile::own(&p)));
+                        let _ = done.send(fetch_own_profile(&m).await.map(|(p, _)| crate::profile::own(&p)));
                     });
                 }
                 None => {
@@ -1124,41 +1124,54 @@ async fn our_new_group(
     Ok(group.filter(ours).map(|_| key))
 }
 
-/// Our profile as the server has it now. presage answers ours from a copy nothing refreshes,
-/// and fetching it anew through presage's websocket isn't offered (a second one would displace
-/// it): it's asked over HTTPS, and presage's copy replaced.
-async fn fetch_own_profile(
+/// One call on our profile over HTTPS, 20 s at most: the answer's body on a 200.
+async fn profile_call(
     m: &Manager<SqliteStore, Registered>,
-) -> Result<presage::libsignal_service::Profile, String> {
+    method: reqwest::Method,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<Vec<u8>, String> {
     use presage::libsignal_service::configuration::Endpoint;
     use presage::libsignal_service::push_service::HttpAuthOverride;
-    let data = m.registration_data();
-    let (aci, key) = (data.service_ids.aci(), data.profile_key());
-    let push = crate::net::push_service(data)?;
-    let request = push
-        .request(
-            reqwest::Method::GET,
-            Endpoint::service(crate::profile::path(aci, key)),
-            HttpAuthOverride::NoOverride,
-        )
+    let push = crate::net::push_service(m.registration_data())?;
+    let mut request = push
+        .request(method, Endpoint::service(path), HttpAuthOverride::NoOverride)
         .map_err(|e| e.to_string())?;
-    let fetch = async {
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let call = async {
         // reqwest's error text carries the URL, our ACI in it: not for the log
         let response = request.send().await.map_err(|e| e.without_url().to_string())?;
         match response.status().as_u16() {
-            200 => response.bytes().await.map_err(|e| e.without_url().to_string()),
+            200 => Ok(response
+                .bytes()
+                .await
+                .map_err(|e| e.without_url().to_string())?
+                .to_vec()),
             status => Err(format!("the server answered {status}")),
         }
     };
-    let body = tokio::time::timeout(Duration::from_secs(20), fetch)
+    tokio::time::timeout(Duration::from_secs(20), call)
         .await
-        .map_err(|_| "the server didn't answer in time".to_string())??;
-    let profile = crate::profile::decrypt(&body, key)?;
+        .map_err(|_| "the server didn't answer in time".to_string())?
+}
+
+/// Our profile as the server has it now, and what a write must send back. presage answers ours
+/// from a copy nothing refreshes, and fetching it anew through presage's websocket isn't
+/// offered (a second one would displace it): it's asked over HTTPS, and presage's copy replaced.
+async fn fetch_own_profile(
+    m: &Manager<SqliteStore, Registered>,
+) -> Result<(presage::libsignal_service::Profile, crate::profile::Kept), String> {
+    let data = m.registration_data();
+    let (aci, key) = (data.service_ids.aci(), data.profile_key());
+    let body = profile_call(m, reqwest::Method::GET, crate::profile::path(aci, key), None).await?;
+    let (profile, kept) = (crate::profile::decrypt(&body, key)?, crate::profile::kept(&body)?);
     // what presage answers from its copy (Note to Self's picture) follows
     if let Err(e) = m.store().clone().save_profile(aci.into(), key, profile.clone()).await {
         tracing::warn!(error = %e, "our fetched profile wasn't stored");
     }
-    Ok(profile)
+    Ok((profile, kept))
 }
 
 async fn set_profile(
@@ -1167,11 +1180,19 @@ async fn set_profile(
     name: presage::libsignal_service::profile_name::ProfileName<String>,
     about: Option<String>,
 ) -> Result<(), String> {
-    // the emoji as it is now: the phone may have changed it since Settings read the profile
-    let emoji = crate::profile::kept_emoji(&about, fetch_own_profile(m).await?.about_emoji);
-    match tokio::time::timeout(Duration::from_secs(30), Box::pin(m.update_profile(name, about, emoji))).await {
-        Ok(r) => r.map_err(|e| e.to_string())?,
-        Err(_) => return Err("the server didn't answer in time".into()),
+    // the emoji and what we keep as they are now: the phone may have changed them since
+    let (current, kept) = fetch_own_profile(m).await?;
+    let emoji = crate::profile::kept_emoji(&about, current.about_emoji);
+    let data = m.registration_data();
+    let body = crate::profile::write(data.service_ids.aci(), data.profile_key(), &name, &about, &emoji, &kept)?;
+    let written = profile_call(m, reqwest::Method::PUT, "/v1/profile".into(), Some(body)).await;
+    // read back either way: presage's copy follows, and a write whose answer was lost may have taken
+    match (written, fetch_own_profile(m).await) {
+        (Ok(_), _) => {}
+        (Err(e), Ok((p, _))) if crate::profile::took(&p, &name, &about) => {
+            tracing::warn!(error = %e, "saving our profile answered an error, but it took");
+        }
+        (Err(e), _) => return Err(e),
     }
     // as Signal Desktop does, so the phone shows (and keeps) the new name
     let me = m.registration_data().service_ids.aci();
@@ -1181,8 +1202,13 @@ async fn set_profile(
         Box::pin(m.send_message(me, sync, chrono::Utc::now().timestamp_millis() as u64)),
     )
     .await;
-    if !matches!(told, Ok(Ok(_))) {
-        tracing::warn!("the phone wasn't told our profile changed");
+    let failed = match told {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some("timed out".to_string()),
+    };
+    if let Some(e) = failed {
+        tracing::warn!(error = %e, "the phone wasn't told our profile changed");
         l.on_event(CoreEvent::Error {
             message: "Your profile is saved, but your phone wasn't told: it may show the old one for a while.".into(),
         });

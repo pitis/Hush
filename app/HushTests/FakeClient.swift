@@ -205,7 +205,9 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     }
     func setProfile(givenName: String, familyName: String, about: String) async throws -> OwnProfile {
         if let profileError { throw profileError }
-        let saved = OwnProfile(givenName: givenName, familyName: familyName, about: about)
+        // trimmed, as the core answers
+        let trim = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
+        let saved = OwnProfile(givenName: trim(givenName), familyName: trim(familyName), about: trim(about))
         lock.withLock {
             savedProfiles.append(saved)
             profile = saved
