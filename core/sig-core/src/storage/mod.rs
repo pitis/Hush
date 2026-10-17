@@ -29,6 +29,8 @@ pub(crate) enum Remote {
         conversation_id: String,
         flags: ChatFlags,
         phone_contact: bool,
+        /// A contact's username ("name.42"), when it has one.
+        username: Option<String>,
     },
     /// The account: the pinned list, and Note to Self's (archived, marked unread).
     Account { pins: Vec<Pin>, note_to_self: (bool, bool) },

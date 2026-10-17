@@ -105,6 +105,23 @@ final class AppStoreConversationTests: XCTestCase {
         XCTAssertTrue(direct.isEmpty)
     }
 
+    func testFindingAUsernameOpensItsChatOrSaysWhy() async {
+        let fake = FakeClient(linked: true)
+        fake.usernames["bob.7"] = "c:bob"
+        let store = await linkedStore(fake)
+        var unnamed = conversation("c:bob")
+        unnamed.title = ""
+        unnamed.username = "bob.7"
+        XCTAssertEqual(AppStore.displayTitle(unnamed), "@bob.7", "until their name is known")
+        let found = await store.findUsername("bob.7")
+        XCTAssertNil(found)
+        XCTAssertEqual(store.selectedId, "c:bob")
+        let nobody = await store.findUsername("nobody.12")
+        XCTAssertEqual(nobody, "No one has this username.")
+        let bad = await store.findUsername("bad")
+        XCTAssertEqual(bad, "a username looks like name.42")
+    }
+
     func testRetryAsksTheCore() async {
         let fake = FakeClient(linked: true)
         let store = await linkedStore(fake)

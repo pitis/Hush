@@ -8,6 +8,7 @@ struct SidebarView: View {
     @State private var resultIndex: Int?
     /// The chat whose "Block…" waits for confirmation.
     @State private var blocking: Conversation?
+    @State private var findingUsername = false
     @State private var showingStories = false
 
     private var searching: Bool { store.isSearching }
@@ -33,6 +34,17 @@ struct SidebarView: View {
                 }
                 Text(inArchive ? "Archived" : "Chats").font(.system(size: 22, weight: .bold))
                 Spacer()
+                if !inArchive {
+                    Button {
+                        findingUsername = true
+                    } label: {
+                        Image(systemName: "square.and.pencil").font(.system(size: 16))
+                    }
+                    .buttonStyle(.plain)
+                    .help("New chat by username")
+                    .accessibilityLabel("New chat by username")
+                    .sheet(isPresented: $findingUsername) { FindUsernameSheet(store: store) }
+                }
                 if !inArchive && !store.stories.isEmpty {
                     let unseen = StoryList.unseenCount(store.stories, me: store.ownAci)
                     Button {
@@ -377,6 +389,46 @@ struct ConversationRow: View {
         case .message(let text, let tick):
             if let tick { TickIcon(tick: tick) }
             Text(text).italic(conversation.lastMessageDeleted)
+        }
+    }
+}
+
+/// Finds someone by their username ("name.42") and opens a chat with them.
+struct FindUsernameSheet: View {
+    let store: AppStore
+    @State private var username = ""
+    @State private var problem: String?
+    @State private var searching = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("New chat").font(.system(size: 17, weight: .semibold))
+            Text("Enter their username, as it shows in their profile.")
+                .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+            TextField("name.42", text: $username)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(find)
+                .disabled(searching)
+            if let problem { Text(problem).font(.system(size: 12)).foregroundStyle(.red) }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Find", action: find).keyboardShortcut(.defaultAction)
+                    .disabled(username.trimmingCharacters(in: .whitespaces).isEmpty || searching)
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+    }
+
+    private func find() {
+        searching = true
+        problem = nil
+        Task {
+            problem = await store.findUsername(username)
+            searching = false
+            if problem == nil { dismiss() }
         }
     }
 }

@@ -1022,6 +1022,34 @@ impl Client {
         Ok(self.db.story_viewed(&key).await?)
     }
 
+    /// Finds who has `username` ("name.42", as Signal shows it) and opens a chat with them:
+    /// returns its id, or None if no one has it.
+    pub async fn find_username(&self, username: String) -> Result<Option<String>, CoreError> {
+        let username = username.trim().trim_start_matches('@').to_string();
+        // Signal's own rules (a name, a dot, a number; lengths, characters, zeros): a username
+        // that breaks them isn't asked about
+        if presage::libsignal_service::protocol::Username::new(&username).is_err() {
+            return Err(CoreError::InvalidInput {
+                message: "a username looks like name.42".into(),
+            });
+        }
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::LookupUsername {
+            username: username.clone(),
+            done,
+        })?;
+        let found = answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Network { message })?;
+        let Some(aci) = found else { return Ok(None) };
+        let id = format!("c:{aci}");
+        self.db.open_found(&id, &username, now_ms()).await?;
+        self.listener.on_event(CoreEvent::ConversationsChanged);
+        Ok(Some(id))
+    }
+
     /// A group's members (ACIs) as last synced, for the mention picker; empty for a direct chat.
     pub async fn group_members(&self, conversation_id: String) -> Result<Vec<String>, CoreError> {
         Ok(self.db.group_members(&conversation_id).await?)
@@ -2128,6 +2156,18 @@ mod tests {
                     .unwrap(),
                 None
             );
+        });
+    }
+
+    #[test]
+    fn a_username_must_look_like_one_before_its_asked_about() {
+        let (_dir, _sink, client, rt) = as_me("client-username");
+        rt.block_on(async {
+            for bad in [
+                "", "alice", "alice.", "alice.4", ".42", "alice.4x", "abc.00", "abc.007", "1abc.42", "ab-c.42",
+            ] {
+                assert!(invalid(client.find_username(bad.into()).await), "{bad:?}");
+            }
         });
     }
 

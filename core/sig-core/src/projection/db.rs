@@ -481,6 +481,34 @@ impl ProjectionDb {
             .await
     }
 
+    /// Stores a contact's username (None: it has none). True if it changed.
+    pub async fn set_username(&self, id: &str, username: Option<&str>) -> Result<bool, sqlx::Error> {
+        let kind = kind_of(id)?;
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(id)
+            .bind(kind_to_i64(kind))
+            .execute(&self.pool)
+            .await?;
+        let res = sqlx::query("UPDATE conversations SET username = ?2 WHERE id = ?1 AND username IS NOT ?2")
+            .bind(id)
+            .bind(username)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// A chat found by `username`: listed now (`at`) so it can be opened and written in, unless
+    /// it already has messages.
+    pub async fn open_found(&self, id: &str, username: &str, at: i64) -> Result<(), sqlx::Error> {
+        self.set_username(id, Some(username)).await?;
+        sqlx::query("UPDATE conversations SET last_message_at = ?2 WHERE id = ?1 AND last_message_at = 0")
+            .bind(id)
+            .bind(at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Whether the contact is in the phone's address book (its storage record carries system
     /// names), which makes it never a request. The chat is created if needed.
     /// True if it changed.
@@ -3024,6 +3052,7 @@ fn row_to_conversation(r: &SqliteRow) -> Result<Conversation, sqlx::Error> {
         blocked: r.try_get("blocked")?,
         whitelisted: r.try_get("whitelisted")?,
         message_request: r.try_get("message_request")?,
+        username: r.try_get("username")?,
         id,
     })
 }
@@ -4832,6 +4861,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["me"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_contacts_username_shows_and_a_found_one_opens_a_chat() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        assert!(db.set_username("c:alice", Some("alice.42")).await.unwrap());
+        assert!(
+            !db.set_username("c:alice", Some("alice.42")).await.unwrap(),
+            "unchanged"
+        );
+        assert_eq!(conv(&db, "c:alice").await.username.as_deref(), Some("alice.42"));
+        // found by username: listed at once, to write in
+        db.open_found("c:bob", "bob.7", 50).await.unwrap();
+        let bob = conv(&db, "c:bob").await;
+        assert_eq!((bob.username.as_deref(), bob.last_message_at), (Some("bob.7"), 50));
+        // a chat that has messages keeps its place
+        db.open_found("c:alice", "alice.42", 60).await.unwrap();
+        assert_eq!(conv(&db, "c:alice").await.last_message_at, 1);
     }
 
     #[tokio::test]

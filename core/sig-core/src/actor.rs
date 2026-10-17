@@ -91,6 +91,11 @@ pub enum Command {
     },
     /// A chat setting changed here (or Storage Service writes were turned on): sync soon.
     StorageSync,
+    /// Who has `username` ("name.42"): their ACI, None if no one, an error if it can't be asked.
+    LookupUsername {
+        username: String,
+        done: oneshot::Sender<Result<Option<String>, String>>,
+    },
 }
 
 pub struct Handles {
@@ -533,6 +538,21 @@ async fn run(
                         }
                     }
                 }
+            }
+            Command::LookupUsername { username, done } => {
+                let found = match &mut manager {
+                    Some(m) => {
+                        match tokio::time::timeout(Duration::from_secs(15), Box::pin(m.lookup_username(&username)))
+                            .await
+                        {
+                            Ok(Ok(aci)) => Ok(aci.map(|a| ServiceId::from(a).raw_uuid().to_string())),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err("the server didn't answer".into()),
+                        }
+                    }
+                    None => Err("not linked yet".into()),
+                };
+                let _ = done.send(found);
             }
             Command::Relink { done } => {
                 if let Some(m) = &manager {

@@ -547,6 +547,21 @@ final class AppStore {
         } catch { append("couldn't mark a story seen: \(error)") }
     }
 
+    /// Finds who has `username` and opens the chat with them. Returns why it didn't, or nil.
+    func findUsername(_ username: String) async -> String? {
+        guard let client else { return "Not linked yet." }
+        do {
+            guard let id = try await client.findUsername(username: username) else {
+                return "No one has this username."
+            }
+            select(id)
+            refreshConversations()
+            return nil
+        } catch {
+            return Self.describe(error)
+        }
+    }
+
     /// Votes on a poll (none takes our vote back); it shows once sent.
     func vote(_ m: Message, options: [UInt32]) async {
         guard let client else { return }
@@ -1275,6 +1290,7 @@ final class AppStore {
         if let ownAci, c.id == "c:\(ownAci)" { return "Note to Self" }
         if !c.title.isEmpty { return c.title }
         if c.id.hasPrefix("g:") { return "Group" }
+        if let username = c.username { return "@\(username)" }
         return String(c.id.dropFirst(2).prefix(8))
     }
 
