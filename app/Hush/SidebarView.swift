@@ -11,6 +11,7 @@ struct SidebarView: View {
     @State private var makingGroup = false
     @State private var joiningByLink = false
     @State private var showingStories = false
+    @State private var clicks: Any?
 
     private var searching: Bool { store.isSearching }
     /// The archive is on show (a search covers every chat, so it counts as the inbox).
@@ -110,17 +111,40 @@ struct SidebarView: View {
             Text(RequestBar.blockMessage(c))
         }
         .onChange(of: store.searchFocusRequest) { _, _ in searchFocused = true }
+        // a click on the chat already open changes no selection, yet puts the caret in its composer
+        .onAppear {
+            clicks = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+                if let list = Self.selectableList(under: event), list.selectedRow >= 0,
+                    list.row(at: list.convert(event.locationInWindow, from: nil)) == list.selectedRow
+                {
+                    store.focusComposer()
+                }
+                return event
+            }
+        }
+        .onDisappear { clicks.map(NSEvent.removeMonitor) }
         .onChange(of: store.searchResults) { _, _ in resultIndex = nil }
     }
 
-    /// The list's selection is the open chat (arrows keep focus in the list).
+    /// The list's selection is the open chat. A click puts the caret in its composer (a gesture
+    /// on the rows would swallow the list's clicks; the open chat's is seen by `clicks`); arrows
+    /// keep focus in the list.
     private var selection: Binding<String?> {
         Binding(
             get: { store.selectedId },
             set: { id in
                 guard let id, id != store.selectedId else { return }
                 store.select(id)
+                // the list reports a click's selection as the button comes up
+                if [.leftMouseDown, .leftMouseUp].contains(NSApp.currentEvent?.type) { store.focusComposer() }
             })
+    }
+
+    /// The list a click lands in (the chat list: the app's only selectable one).
+    private static func selectableList(under event: NSEvent) -> NSTableView? {
+        var view = event.window?.contentView?.hitTest(event.locationInWindow)
+        while let v = view, !(v is NSTableView) { view = v.superview }
+        return view as? NSTableView
     }
 
     /// Searching one chat (⇧⌘F): which, and the way back to every chat.
@@ -211,8 +235,6 @@ struct SidebarView: View {
                 authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
         )
         .tag(c.id)
-        // a click (even on the open chat) puts the caret in its composer
-        .simultaneousGesture(TapGesture().onEnded { store.focusComposer() })
         .contextMenu { chatMenu(c) }
         .id(c.id)
     }
