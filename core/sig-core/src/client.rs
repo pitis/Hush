@@ -288,6 +288,7 @@ impl Client {
 
 /// Writes the export of the chat `title` (see `Client::export_chat`) into a new folder in
 /// `folder`; `files` are each message's attachments, `names` names ACIs. Returns its path.
+/// Built in a hidden folder and named when done: a failure leaves nothing behind.
 fn write_export(
     folder: &std::path::Path,
     title: &str,
@@ -296,11 +297,41 @@ fn write_export(
     names: &std::collections::HashMap<String, String>,
 ) -> Result<String, CoreError> {
     let base = crate::export::file_name(title);
-    // a new folder: an earlier export stays as it was
-    let dir = (1..)
-        .map(|n| folder.join(if n == 1 { base.clone() } else { format!("{base} {n}") }))
-        .find(|d| !d.exists())
-        .expect("some name is free");
+    let staging = folder.join(format!(".{base}.partial-{}", std::process::id()));
+    remove(&staging, true).map_err(storage("can't clear an earlier attempt"))?;
+    let built = fill_export(&staging, title, messages, files, names).and_then(|()| {
+        // a new name, claimed atomically: an earlier export stays as it was
+        for n in 1.. {
+            let dir = folder.join(if n == 1 { base.clone() } else { format!("{base} {n}") });
+            match std::fs::create_dir(&dir) {
+                // (renaming over the empty folder just made is allowed)
+                Ok(()) => {
+                    return std::fs::rename(&staging, &dir)
+                        .map(|()| dir.to_string_lossy().into_owned())
+                        .map_err(storage("can't name the export folder"))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(storage("can't make the export folder")(e)),
+            }
+        }
+        unreachable!("some name is free")
+    });
+    if built.is_err() {
+        if let Err(e) = remove(&staging, true) {
+            tracing::warn!(error = %e, "a half-written export stayed");
+        }
+    }
+    built
+}
+
+/// The export's page and files, in `dir` (made).
+fn fill_export(
+    dir: &std::path::Path,
+    title: &str,
+    messages: &[Message],
+    files: &[Vec<crate::projection::Attachment>],
+    names: &std::collections::HashMap<String, String>,
+) -> Result<(), CoreError> {
     std::fs::create_dir_all(dir.join("files")).map_err(storage("can't make the export folder"))?;
     let name = |aci: &str| names.get(aci).cloned().unwrap_or_else(|| aci.chars().take(8).collect());
     let mut exported = vec![];
@@ -308,16 +339,22 @@ fn write_export(
         let mut out = vec![];
         for a in attachments {
             let shown = a.file_name.clone().unwrap_or_else(|| format!("file {}", a.id));
-            let path = match &a.path {
-                Some(source) => {
-                    let to = format!("files/{}-{}", a.id, crate::export::file_name(&shown));
-                    std::fs::copy(source, dir.join(&to)).map_err(storage("can't copy a file"))?;
-                    Some(to)
+            let (mut path, mut missing) = (None, false);
+            if let Some(source) = &a.path {
+                let to = format!("files/{}-{}", a.id, crate::export::file_name(&shown));
+                match std::fs::copy(source, dir.join(&to)) {
+                    Ok(_) => path = Some(to),
+                    // gone from disk since: the page says so, and the rest still exports
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::warn!(attachment = a.id, "an exported file is missing");
+                        missing = true;
+                    }
+                    Err(e) => return Err(storage(&format!("can't copy file {}", a.id))(e)),
                 }
-                None => None,
-            };
+            }
             out.push(crate::export::ExportedFile {
                 path,
+                missing,
                 content_type: a.content_type.clone(),
                 name: shown,
             });
@@ -329,8 +366,7 @@ fn write_export(
         });
     }
     let html = crate::export::page(title, &exported, &chrono::Local, name);
-    std::fs::write(dir.join("chat.html"), html).map_err(storage("can't write the transcript"))?;
-    Ok(dir.to_string_lossy().into_owned())
+    std::fs::write(dir.join("chat.html"), html).map_err(storage("can't write the transcript"))
 }
 
 /// Work folders in the data directory while backing up and restoring. In the latter, `RESTORED`
@@ -1142,15 +1178,17 @@ impl Client {
     /// new folder's path.
     pub async fn export_chat(&self, conversation_id: String, folder: String) -> Result<String, CoreError> {
         self.known_conversation(&conversation_id).await?;
-        let mut messages: Vec<Message> = vec![];
+        // newest page first, each oldest first
+        let mut pages: Vec<Vec<Message>> = vec![];
         loop {
-            let before = messages.first().map(Message::key);
+            let before = pages.last().and_then(|p| p.first()).map(Message::key);
             let page = self.db.messages(&conversation_id, before, 500).await?;
             if page.is_empty() {
                 break;
             }
-            messages.splice(0..0, page);
+            pages.push(page);
         }
+        let messages: Vec<Message> = pages.into_iter().rev().flatten().collect();
         // everyone the page names: authors, quoted authors, mentions
         let me = self.own_aci();
         let mut named = std::collections::BTreeSet::new();
@@ -1163,10 +1201,12 @@ impl Client {
                     named.insert(aci.clone());
                 }
             }
-            files.push(if m.deleted {
-                vec![]
-            } else {
+            // a deleted message's files are gone; view-once media is never kept
+            let kept = !m.deleted && !matches!(m.kind, crate::projection::MessageKind::ViewOnce { .. });
+            files.push(if kept {
                 self.db.attachments(&m.key()).await?
+            } else {
+                vec![]
             });
         }
         let mut names = std::collections::HashMap::new();
@@ -1182,7 +1222,12 @@ impl Client {
         let title = self.db.title(&conversation_id).await?.unwrap_or_else(|| "Chat".into());
         tokio::task::spawn_blocking(move || write_export(&PathBuf::from(folder), &title, &messages, &files, &names))
             .await
-            .map_err(|e| CoreError::Storage { message: e.to_string() })?
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "the export stopped");
+                Err(CoreError::Storage {
+                    message: "the export stopped unexpectedly".into(),
+                })
+            })
     }
 
     /// A chat's events (e.g. undecryptable messages) from `since` (ms) on.
@@ -2922,6 +2967,105 @@ mod tests {
             let nobody = "c:00000000-0000-4000-8000-000000000009".to_string();
             assert!(invalid(client.export_chat(nobody, out.to_string_lossy().into()).await));
         });
+    }
+
+    /// The only folder `export_chat` made in `out`, and its page.
+    fn exported(out: &std::path::Path) -> (std::path::PathBuf, String) {
+        let dirs: Vec<_> = std::fs::read_dir(out).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        let html = std::fs::read_to_string(dirs[0].join("chat.html")).unwrap();
+        (dirs[0].clone(), html)
+    }
+
+    #[test]
+    fn an_export_leaves_out_view_once_media_and_survives_a_missing_file() {
+        let (dir, _sink, client, rt) = as_me("client-export-files");
+        let src = dir.0.join("src");
+        let conv = format!("c:{ALICE}");
+        let out = dir.0.join("exports");
+        std::fs::create_dir_all(&out).unwrap();
+        rt.block_on(async {
+            let gone = file_in(&src, "gone.pdf", b"pdf");
+            let once = file_in(&src, "once.jpg", b"jpg");
+            client
+                .send_attachments(
+                    conv.clone(),
+                    vec![outgoing(gone.clone(), "application/pdf")],
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            let key = client
+                .send_attachments(conv.clone(), vec![outgoing(once, "image/jpeg")], None, vec![], None)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE messages SET kind = 6 WHERE sent_at = ?1")
+                .bind(key.sent_at)
+                .execute(client.db.pool())
+                .await
+                .unwrap();
+            // the sent copy of the pdf is gone from disk
+            let first = &client
+                .attachments(client.messages(conv.clone(), None, 10).await.unwrap()[0].key())
+                .await
+                .unwrap()[0];
+            std::fs::remove_file(first.path.as_ref().unwrap()).unwrap();
+            client
+                .export_chat(conv.clone(), out.to_string_lossy().into())
+                .await
+                .unwrap();
+        });
+        let (made, html) = exported(&out);
+        assert!(html.contains("gone.pdf (file missing)"));
+        assert!(html.contains("View-once media") && !html.contains("once.jpg"));
+        assert_eq!(std::fs::read_dir(made.join("files")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_failed_export_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _sink, client, rt) = as_me("client-export-failed");
+        let src = dir.0.join("src");
+        let conv = format!("c:{ALICE}");
+        let out = dir.0.join("exports");
+        std::fs::create_dir_all(&out).unwrap();
+        rt.block_on(async {
+            let photo = file_in(&src, "beach.heic", b"heic");
+            let key = client
+                .send_attachments(conv.clone(), vec![outgoing(photo, "image/heic")], None, vec![], None)
+                .await
+                .unwrap();
+            let copy = client.attachments(key).await.unwrap()[0].path.clone().unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let e = client.export_chat(conv.clone(), out.to_string_lossy().into()).await;
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(e, Err(CoreError::Storage { .. })), "{e:?}");
+        });
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            0,
+            "no folder, not even a hidden one"
+        );
+    }
+
+    #[test]
+    fn a_long_chat_exports_whole() {
+        let (dir, _sink, client, rt) = as_me("client-export-long");
+        let out = dir.0.join("exports");
+        std::fs::create_dir_all(&out).unwrap();
+        rt.block_on(async {
+            for i in 1..=1203 {
+                client.db.insert_message(&stored(ALICE, i)).await.unwrap();
+            }
+            client
+                .export_chat(format!("c:{ALICE}"), out.to_string_lossy().into())
+                .await
+                .unwrap();
+        });
+        let (_, html) = exported(&out);
+        assert_eq!(html.matches("<div class=\"m\">").count(), 1203);
     }
 
     #[test]

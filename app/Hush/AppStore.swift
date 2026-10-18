@@ -1158,7 +1158,10 @@ final class AppStore {
     /// A chat's Export chat…: a new folder in `folder` with a readable transcript and the chat's
     /// files. The new folder, or nil (the error is shown).
     func exportChat(_ id: String, to folder: URL) async -> URL? {
-        guard let client else { return nil }
+        guard let client else {
+            showError("Couldn't export the chat: Hush isn't running.")
+            return nil
+        }
         do {
             return URL(fileURLWithPath: try await client.exportChat(conversationId: id, folder: folder.path))
         } catch {

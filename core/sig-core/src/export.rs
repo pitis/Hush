@@ -13,6 +13,8 @@ pub(crate) struct Exported<'a> {
 
 pub(crate) struct ExportedFile {
     pub path: Option<String>,
+    /// Downloaded once, but its file is gone (only with no `path`).
+    pub missing: bool,
     pub content_type: String,
     pub name: String,
 }
@@ -32,18 +34,31 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// A file or folder name for `s`: no path separators or control characters, not hidden,
-/// not empty.
+/// A file or folder name for `s`: no path separators, control characters or characters that
+/// mean something in a link (`#?%`), not hidden, not empty, at most 200 bytes (names may have
+/// 255).
 pub(crate) fn file_name(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c == '/' || c == ':' || c.is_control() { '-' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | ':' | '#' | '?' | '%') || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
-    let trimmed = cleaned.trim().trim_start_matches('.');
-    if trimmed.is_empty() {
+    let mut out = String::new();
+    for c in cleaned.trim().trim_start_matches('.').chars() {
+        if out.len() + c.len_utf8() > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
         "chat".into()
     } else {
-        trimmed.chars().take(100).collect()
+        out
     }
 }
 
@@ -64,7 +79,7 @@ pub(crate) fn with_mentions(
     let mut names = mentions.into_iter().map(|(_, aci)| name(aci));
     text.chars()
         .map(|c| match c {
-            '\u{fffc}' => names.next().map(|n| format!("@{n}")).unwrap_or_default(),
+            '\u{fffc}' => names.next().map(|n| format!("@{n}")).unwrap_or_else(|| "@?".into()),
             c => c.to_string(),
         })
         .collect()
@@ -110,19 +125,20 @@ where
     let mut day = String::new();
     for e in messages {
         let m = e.message;
-        let Some(at) = tz.timestamp_millis_opt(m.sent_at).single() else {
-            continue;
-        };
-        let this_day = at.format("%A, %-d %B %Y").to_string();
-        if this_day != day {
-            out.push_str(&format!("<div class=\"day\">{}</div>\n", escape(&this_day)));
-            day = this_day;
+        // a time out of range still shows its message, under the day before it
+        let at = tz.timestamp_millis_opt(m.sent_at).single();
+        if let Some(at) = &at {
+            let this_day = at.format("%A, %-d %B %Y").to_string();
+            if this_day != day {
+                out.push_str(&format!("<div class=\"day\">{}</div>\n", escape(&this_day)));
+                day = this_day;
+            }
         }
         out.push_str(&format!(
             "<div class=\"m{}\"><span class=\"who\">{}</span><span class=\"at\">{}{}</span>",
             if m.is_outgoing { " out" } else { "" },
             escape(&e.author),
-            at.format("%H:%M"),
+            at.map_or_else(|| "unknown time".into(), |at| at.format("%H:%M").to_string()),
             if m.edited && !m.deleted { " · edited" } else { "" },
         ));
         if m.deleted {
@@ -157,8 +173,9 @@ where
                     escape(&f.name)
                 )),
                 None => out.push_str(&format!(
-                    "<div class=\"note\">{} (not downloaded)</div>",
-                    escape(&f.name)
+                    "<div class=\"note\">{} ({})</div>",
+                    escape(&f.name),
+                    if f.missing { "file missing" } else { "not downloaded" }
                 )),
             }
         }
@@ -262,6 +279,17 @@ mod tests {
     }
 
     #[test]
+    fn a_placeholder_without_its_mention_stays_visible() {
+        assert_eq!(with_mentions("hi \u{fffc}", &[], |a| a.into()), "hi @?");
+    }
+
+    #[test]
+    fn a_message_with_an_impossible_time_still_shows() {
+        let html = one(&msg(i64::MAX, "still here"), vec![]);
+        assert!(html.contains("still here") && html.contains("unknown time"));
+    }
+
+    #[test]
     fn a_deleted_message_shows_nothing_of_itself() {
         let mut m = msg(0, "secret");
         m.deleted = true;
@@ -275,17 +303,26 @@ mod tests {
             &msg(0, ""),
             vec![
                 ExportedFile {
+                    path: None,
+                    missing: true,
+                    content_type: "image/png".into(),
+                    name: "gone.png".into(),
+                },
+                ExportedFile {
                     path: Some("files/1-cat.jpg".into()),
+                    missing: false,
                     content_type: "image/jpeg".into(),
                     name: "cat.jpg".into(),
                 },
                 ExportedFile {
                     path: Some("files/2-notes.pdf".into()),
+                    missing: false,
                     content_type: "application/pdf".into(),
                     name: "notes.pdf".into(),
                 },
                 ExportedFile {
                     path: None,
+                    missing: false,
                     content_type: "video/mp4".into(),
                     name: "clip.mp4".into(),
                 },
@@ -294,6 +331,7 @@ mod tests {
         assert!(html.contains("<img src=\"files/1-cat.jpg\""));
         assert!(html.contains("<a href=\"files/2-notes.pdf\">notes.pdf</a>"));
         assert!(html.contains("clip.mp4 (not downloaded)"));
+        assert!(html.contains("gone.png (file missing)"));
     }
 
     #[test]
@@ -310,6 +348,16 @@ mod tests {
         assert_eq!(file_name("Ada / Bob: plans"), "Ada - Bob- plans");
         assert_eq!(file_name("..hidden"), "hidden");
         assert_eq!(file_name("  "), "chat");
-        assert_eq!(file_name(&"x".repeat(300)).len(), 100);
+        assert_eq!(
+            file_name("Q3 #2? 100%.pdf"),
+            "Q3 -2- 100-.pdf",
+            "nothing a link reads as more"
+        );
+        assert_eq!(file_name(&"x".repeat(300)).len(), 200);
+        let cjk = file_name(&"雨".repeat(100));
+        assert!(
+            cjk.len() <= 200 && cjk.chars().all(|c| c == '雨'),
+            "cut by bytes, at a character"
+        );
     }
 }

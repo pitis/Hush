@@ -177,6 +177,12 @@ impl ProjectionDb {
         })
     }
 
+    /// For tests that set up rows no public call makes.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
+    }
+
     /// Closes the database: later calls fail. Before its file is removed (unlinking).
     pub async fn close(&self) {
         self.pool.close().await;
