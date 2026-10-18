@@ -66,15 +66,16 @@ struct ComposerField: NSViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView scroll: NSScrollView, context: Context) -> CGSize? {
-        guard let view = scroll.documentView as? NSTextView, let layout = view.layoutManager,
-            let container = view.textContainer
-        else { return nil }
+        guard let view = scroll.documentView as? NSTextView else { return nil }
         let width = proposal.width ?? 300
-        // SwiftUI also asks about widths it won't use (0, ∞): text left laid out at one resizes the
-        // view while it draws, and the window lays out again, endlessly
-        let own = container.containerSize
-        defer { container.containerSize = own }
-        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        // measured on a copy: sizing the view's own container resizes the view, SwiftUI then measures again
+        // (at 0, ∞, none and the real width), and the window lays out in a loop until AppKit throws
+        let storage = NSTextStorage(attributedString: view.attributedString())
+        let layout = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        layout.addTextContainer(container)
+        storage.addLayoutManager(layout)
         layout.ensureLayout(for: container)
         let line = layout.defaultLineHeight(for: NSFont.systemFont(ofSize: ComposerText.size))
         let used = layout.usedRect(for: container).height
