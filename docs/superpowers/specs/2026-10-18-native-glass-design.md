@@ -109,6 +109,10 @@ handling (`onKeyPress`) if it does.
 - **Search keys:** the ↑↓ handlers sit on both the list and the searchable container; ↩ is
   `onSubmit(of: .search)`; leaving the field empty (Esc, a click elsewhere) ends the search and
   its chat scope. Whether the system's search field passes ↑↓ on is checked in the running app.
+- **Clicking a chat** opens it through the list's own selection and then puts the caret in its
+  composer (the selection is reported with the mouse-up current). A tap gesture on the rows did
+  this first, but it swallowed clicks on the picture, name and last message. So a click on the
+  chat already open no longer moves the caret; Focus Composer (⇧⌘T) does.
 - **Reset in progress** is the store's (`resettingSessions`): cleared when the reset is recorded
   or anything fails, so a failed reset is offered again.
 - **The Core Log window** no longer lists decryption failures: the chat shows them, and the
