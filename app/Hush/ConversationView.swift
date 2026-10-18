@@ -374,8 +374,11 @@ struct TimelineList: View {
             let own = store.messages.last?.isOutgoing ?? false
             switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
             case .scrollToBottom:
-                // at the bottom, the follow keeps the end in view: a scroll of its own would race it
-                if !atBottom { withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) } }
+                // at the bottom, the follow keeps the end in view (a scroll of its own would race it),
+                // but it waits while a search result shows
+                if !atBottom || store.highlighted != nil {
+                    withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) }
+                }
                 unseenNew = false
             case .showPill: unseenNew = true
             }
@@ -387,7 +390,8 @@ struct TimelineList: View {
         // a search result opened: to the message, in the middle
         .onChange(of: store.scrollRequest) { _, _ in
             guard let k = store.scrollTarget else { return }
-            // once the page it came with is laid out: a row not there yet can't be scrolled to
+            // a turn later, so the page it came with is usually laid out: a row not there yet can't be
+            // scrolled to
             Task {
                 withAnimation(.easeOut(duration: 0.2)) {
                     position.scrollTo(id: "\(k.author)-\(k.sentAt)", anchor: .center)
@@ -762,7 +766,8 @@ struct MessageRow: View {
 }
 
 /// Drawn again only when what it shows changed: the timeline's body runs again on any reaction,
-/// file or preview in the chat, and a row's closures (to the store) never compare equal.
+/// file or preview in the chat, and a row's closures (to the store) never compare equal. Names
+/// (mentioned, reactors) aren't compared: its body reads them from the store, which redraws it.
 extension MessageRow: @MainActor Equatable {
     static func == (a: MessageRow, b: MessageRow) -> Bool {
         a.message == b.message && a.first == b.first && a.last == b.last && a.isGroup == b.isGroup
@@ -770,13 +775,6 @@ extension MessageRow: @MainActor Equatable {
             && a.preview == b.preview && a.poll == b.poll && a.highlighted == b.highlighted
             && a.actions.me == b.actions.me && a.actions.mine == b.actions.mine
             && a.actions.canEdit == b.actions.canEdit && a.actions.canDelete == b.actions.canDelete
-            && a.names == b.names
-    }
-
-    /// The names it shows through its closures: of whom it mentions, and of who reacted.
-    private var names: [String] {
-        MessageText.mentioned(message.ranges + (message.quote?.ranges ?? [])).map(mentionName)
-            + reactions.map { actions.name($0.reactor) }
     }
 }
 

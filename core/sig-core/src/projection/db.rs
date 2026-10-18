@@ -325,7 +325,7 @@ impl ProjectionDb {
             return Ok(None);
         };
         let texts: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("options")?)
-            .map_err(|e| decode_err(format!("poll options: {e}")))?;
+            .map_err(|e| decode_err(format!("poll options, line {} column {}", e.line(), e.column())))?;
         if texts.is_empty() {
             return Ok(None); // only its end is here
         }
@@ -2614,19 +2614,27 @@ impl ProjectionDb {
     }
 
     /// The details of messages, in the order of `keys`: for a page in one call from the app, as a
-    /// call per message and detail was hundreds of hops for a page.
-    pub async fn details(&self, keys: &[MessageKey]) -> Result<Vec<MessageDetails>, sqlx::Error> {
+    /// call per message and detail was hundreds of hops for a page. A message whose details don't
+    /// read is left out, so the app keeps what it showed for it and the rest of the page comes.
+    pub async fn details(&self, keys: &[MessageKey]) -> Vec<MessageDetails> {
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            out.push(MessageDetails {
-                key: key.clone(),
-                reactions: self.reactions(key).await?,
-                attachments: self.attachments(key).await?,
-                preview: self.link_preview(key).await?,
-                poll: self.poll(key).await?,
-            });
+            match self.details_of(key).await {
+                Ok(d) => out.push(d),
+                Err(e) => tracing::warn!(sent_at = key.sent_at, error = %e, "a message's details didn't read"),
+            }
         }
-        Ok(out)
+        out
+    }
+
+    async fn details_of(&self, key: &MessageKey) -> Result<MessageDetails, sqlx::Error> {
+        Ok(MessageDetails {
+            key: key.clone(),
+            reactions: self.reactions(key).await?,
+            attachments: self.attachments(key).await?,
+            preview: self.link_preview(key).await?,
+            poll: self.poll(key).await?,
+        })
     }
 
     /// Reactions on a message, one per reactor, ordered by reactor.
@@ -6252,10 +6260,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let details = db
-            .details(&[k("alice", 3), k("alice", 1), k("alice", 2)])
-            .await
-            .unwrap();
+        let details = db.details(&[k("alice", 3), k("alice", 1), k("alice", 2)]).await;
         assert_eq!(details.iter().map(|d| d.key.sent_at).collect::<Vec<_>>(), [3, 1, 2]);
         assert!(details[0].reactions.is_empty() && details[0].attachments.is_empty());
         assert!(details[0].preview.is_none() && details[0].poll.is_none());
@@ -6265,6 +6270,13 @@ mod tests {
             Some("https://example.org")
         );
         assert_eq!(details[2].reactions.len(), 1);
+        // a message whose details don't read is left out: the others still come
+        sqlx::query("UPDATE attachments SET state = 99")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let details = db.details(&[k("alice", 1), k("alice", 2)]).await;
+        assert_eq!(details.iter().map(|d| d.key.sent_at).collect::<Vec<_>>(), [2]);
     }
 
     #[tokio::test]

@@ -1764,8 +1764,8 @@ impl Client {
     }
 
     /// The details of messages (reactions, files, link preview, poll), in the order of `keys`.
-    pub async fn details(&self, keys: Vec<MessageKey>) -> Result<Vec<MessageDetails>, CoreError> {
-        Ok(self.db.details(&keys).await?)
+    pub async fn details(&self, keys: Vec<MessageKey>) -> Vec<MessageDetails> {
+        self.db.details(&keys).await
     }
 }
 
@@ -3261,10 +3261,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let p = client.details(vec![key.clone()]).await.unwrap()[0]
-                .preview
-                .clone()
-                .unwrap();
+            let p = client.details(vec![key.clone()]).await[0].preview.clone().unwrap();
             assert_eq!(
                 (p.url.as_str(), p.title.as_deref()),
                 ("https://example.com/a", Some("A page"))
@@ -3274,7 +3271,7 @@ mod tests {
                 .send_text(conv.clone(), "no link".into(), vec![], None, Some(draft()))
                 .await
                 .unwrap();
-            assert_eq!(client.details(vec![key.clone()]).await.unwrap()[0].preview, None);
+            assert_eq!(client.details(vec![key.clone()]).await[0].preview, None);
             // the fetched image is the message's own copy once sent: the fetched file goes
             let fetched = client.data_dir.join("previews").join("1");
             std::fs::create_dir_all(fetched.parent().unwrap()).unwrap();
@@ -3300,7 +3297,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!fetched.exists());
-            let image = client.details(vec![key.clone()]).await.unwrap()[0]
+            let image = client.details(vec![key.clone()]).await[0]
                 .preview
                 .clone()
                 .unwrap()

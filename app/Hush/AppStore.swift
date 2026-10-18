@@ -1540,16 +1540,15 @@ final class AppStore {
         var loadedFiles: [MessageKey: [Attachment]?] = [:]
         var loadedPreviews: [MessageKey: LinkPreview?] = [:]
         var loadedPolls: [MessageKey: Poll?] = [:]
-        do {
-            // one call for the page: a call per message and detail kept photos seconds late
-            let keys = page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) }
-            for d in try await client.details(keys: keys) {
-                loadedReactions[d.key] = d.reactions.isEmpty ? nil : d.reactions
-                loadedFiles[d.key] = d.attachments.isEmpty ? nil : d.attachments
-                loadedPreviews[d.key] = d.preview
-                loadedPolls[d.key] = d.poll
-            }
-        } catch { append("query failed: \(error)") }  // the page's details stay as they were
+        // one call for the page: a call per message and detail kept photos seconds late. A message
+        // the core couldn't read isn't in it, and keeps what it showed.
+        let keys = page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) }
+        for d in await client.details(keys: keys) {
+            loadedReactions[d.key] = d.reactions.isEmpty ? nil : d.reactions
+            loadedFiles[d.key] = d.attachments.isEmpty ? nil : d.attachments
+            loadedPreviews[d.key] = d.preview
+            loadedPolls[d.key] = d.poll
+        }
         for m in page {
             guard generation == selectionGeneration else { return }
             if isGroup, !m.isOutgoing { await loadName(m.author) }

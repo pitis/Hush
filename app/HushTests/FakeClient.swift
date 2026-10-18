@@ -343,13 +343,14 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         return answer
     }
     /// A message after another, as the core reads them.
-    func details(keys: [MessageKey]) async throws -> [MessageDetails] {
+    func details(keys: [MessageKey]) async -> [MessageDetails] {
         var out: [MessageDetails] = []
         for key in keys {
             out.append(
                 MessageDetails(
-                    key: key, reactions: try await reactions(key: key), attachments: try await attachments(key: key),
-                    preview: try await linkPreview(key: key), poll: try await poll(key: key)))
+                    key: key, reactions: (try? await reactions(key: key)) ?? [],
+                    attachments: (try? await attachments(key: key)) ?? [], preview: try? await linkPreview(key: key),
+                    poll: try? await poll(key: key)))
         }
         return out
     }

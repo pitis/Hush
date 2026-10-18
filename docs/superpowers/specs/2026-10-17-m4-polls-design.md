@@ -29,7 +29,7 @@ votes and `hasEnded`.
 - `Client.vote(key, options)` (checked against the poll: open, its options, one choice unless
   several) sends our next `voteCount` (above what's stored and what was already handed out: our
   vote is stored only once sent); `Client.end_poll(key)` (ours, open); both apply here once
-  sent, like a reaction. `Client.poll(key)` for the app.
+  sent, like a reaction. The app reads polls with a page's other details, `Client.details(keys)`.
 - App: `PollCard` in the bubble; `PollChoice` decides what a click votes.
 
 ## Testing
