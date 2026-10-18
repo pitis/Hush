@@ -16,7 +16,7 @@ use futures::{channel::oneshot as fut_oneshot, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::Content;
 use presage::libsignal_service::groups_v2::GroupInviteLink;
-use presage::libsignal_service::protocol::{Aci, ServiceId};
+use presage::libsignal_service::protocol::{Aci, ServiceId, SignalProtocolError};
 use presage::libsignal_service::push_service::ServiceIds;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
@@ -2034,8 +2034,11 @@ async fn handle(
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
-        Received::DecryptionError(sender) => {
-            tracing::warn!(sender = %sender.service_id_string(), "a message couldn't be decrypted")
+        Received::DecryptionError { sender, error } => {
+            tracing::warn!(sender = %sender.service_id_string(), %error, "a message couldn't be decrypted")
+        }
+        Received::RetryReceipt { sender, .. } => {
+            tracing::info!(sender = %sender.service_id_string(), "a message of ours couldn't be decrypted there")
         }
         Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
     }
@@ -2048,21 +2051,9 @@ async fn handle(
             let _ = queues.storage.send(storage::Trigger::Connected);
         }
         Received::Contacts => sync_titles(m, db, l).await,
-        Received::DecryptionError(sender) => {
-            // shown in the chat (not as an error banner), with a way to reset the session
-            let conversation_id = direct_id(&sender);
-            let at = chrono::Utc::now().timestamp_millis();
-            let author = sender.raw_uuid().to_string();
-            match db
-                .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author, None)
-                .await
-            {
-                Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
-                Err(e) => l.on_event(CoreEvent::Error {
-                    message: format!("recording an undecryptable message failed: {e}"),
-                }),
-            }
-        }
+        Received::DecryptionError { sender, error } => decryption_failed(db, l, sender, &error).await,
+        // their client asks for a resend, which Hush doesn't do yet: nothing failed here
+        Received::RetryReceipt { .. } => {}
         Received::Content(content) => {
             sync_group(m, db, l, &mut progress.refetches, &content).await;
             match drop_blocked(db, &content, me).await {
@@ -2215,6 +2206,27 @@ async fn apply_received(
         }
     }
     outcome
+}
+
+/// A message from `sender` that couldn't be decrypted: shown in the chat (not as an error
+/// banner), with a way to reset the session. A duplicate isn't one: its first copy was
+/// decrypted, then the server delivered it again (the run stopped before acknowledging it).
+async fn decryption_failed(db: &ProjectionDb, l: &dyn EventListener, sender: ServiceId, error: &SignalProtocolError) {
+    if matches!(error, SignalProtocolError::DuplicatedMessage(..)) {
+        return;
+    }
+    let conversation_id = direct_id(&sender);
+    let at = chrono::Utc::now().timestamp_millis();
+    let author = sender.raw_uuid().to_string();
+    match db
+        .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author, None)
+        .await
+    {
+        Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+        Err(e) => l.on_event(CoreEvent::Error {
+            message: format!("recording an undecryptable message failed: {e}"),
+        }),
+    }
 }
 
 fn content_kind(body: &presage::libsignal_service::content::ContentBody) -> &'static str {
@@ -2606,6 +2618,33 @@ mod tests {
         assert_eq!(announced(&sink), 0);
         super::apply_received(&db, &sink, &[msg(2)], "alice", "me", true).await;
         assert_eq!(announced(&sink), 1);
+    }
+
+    /// A message delivered again (its first copy was decrypted, then the run stopped before the
+    /// server heard so) is dropped like Signal's clients do: no event in the chat, no reset.
+    #[tokio::test]
+    async fn only_a_real_decryption_failure_is_shown() {
+        use presage::libsignal_service::protocol::{Aci, CiphertextMessageType, SignalProtocolError};
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let sink = Sink(Default::default());
+        let alice = Aci::from_uuid_bytes([1; 16]);
+        let chat = crate::projection::ids::direct_id(&alice.into());
+        super::decryption_failed(
+            &db,
+            &sink,
+            alice.into(),
+            &SignalProtocolError::DuplicatedMessage(61, 58),
+        )
+        .await;
+        assert!(db.chat_events(&chat, 0).await.unwrap().is_empty());
+        assert!(sink.0.lock().unwrap().is_empty());
+        let broken = SignalProtocolError::InvalidMessage(CiphertextMessageType::Whisper, "decryption failed".into());
+        super::decryption_failed(&db, &sink, alice.into(), &broken).await;
+        assert_eq!(db.chat_events(&chat, 0).await.unwrap().len(), 1);
+        assert!(matches!(
+            &sink.0.lock().unwrap()[..],
+            [CoreEvent::ChatEventAdded { .. }]
+        ));
     }
 
     /// The receipts flush is queued after this returns, so the new setting must already be stored.
