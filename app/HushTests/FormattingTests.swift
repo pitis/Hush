@@ -136,7 +136,7 @@ final class ScrollDecisionTests: XCTestCase {
         XCTAssertEqual(Timeline.onNewLastMessage(atBottom: false, isOwn: false), .showPill)
     }
 
-    /// As the app's window reports it: 465pt between a 52pt toolbar and a 55pt composer.
+    /// As the app's window reports it: a 465pt container between a 52pt toolbar and a 55pt composer.
     private func geometry(offset: CGFloat, content: CGFloat, top: CGFloat = 52) -> ScrollGeometry {
         ScrollGeometry(
             contentOffset: CGPoint(x: 0, y: offset), contentSize: CGSize(width: 500, height: content),
@@ -145,7 +145,7 @@ final class ScrollDecisionTests: XCTestCase {
     }
 
     func testEdges() {
-        // scrolled to the end: 3104 + 52 + 465
+        // scrolled to the end: 3104 + 52 + 465 = 3621, the content's height; then 50 and 100pt short
         XCTAssertTrue(Timeline.isAtBottom(geometry(offset: 3104, content: 3621)))
         XCTAssertTrue(Timeline.isAtBottom(geometry(offset: 3054, content: 3621)))
         XCTAssertFalse(Timeline.isAtBottom(geometry(offset: 3004, content: 3621)))

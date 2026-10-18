@@ -95,8 +95,9 @@ enum Timeline {
     /// Within this many points of the edge counts as being there.
     static let edgeThreshold: CGFloat = 80
 
-    /// The end of the content is in view, above the composer floating over it. The container
-    /// leaves out the insets (the toolbar's and the composer's); the offset starts above the top one.
+    /// The end of the content is in view, above the composer floating over it. The container is the
+    /// height between the toolbar and the composer; the offset is the view's top, behind the top
+    /// inset (the toolbar's, and what pushes a short chat down).
     static func isAtBottom(_ g: ScrollGeometry) -> Bool {
         g.contentOffset.y + g.contentInsets.top + g.containerSize.height >= g.contentSize.height - edgeThreshold
     }

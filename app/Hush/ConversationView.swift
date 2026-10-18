@@ -289,7 +289,7 @@ struct TimelineList: View {
     @State private var position = ScrollPosition(edge: .bottom)
     @Environment(\.controlActiveState) private var activeState
 
-    /// What the timeline follows of its scroll geometry.
+    /// What the timeline reads off its scroll geometry; the height, to see the content grow.
     private struct Edges: Equatable {
         var atBottom: Bool
         var nearTop: Bool
@@ -298,115 +298,114 @@ struct TimelineList: View {
 
     var body: some View {
         let isGroup = conversation.kind == .group
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if store.hasOlder { ProgressView().controlSize(.small).padding(8) }
-                    ForEach(store.timelineItems) { item in
-                        switch item {
-                        case .day(let title, _):
-                            Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.secondaryText)
-                                .wallpaperBacked()
-                                .padding(.vertical, 10)
-                        case .event(let e):
-                            ChatEventRow(event: e, name: name(e), me: store.ownAci)
-                        case .failures(let e, let count, let reset):
-                            // presage resets sessions by ACI only
-                            let direct = e.conversationId.hasPrefix("c:") && !e.conversationId.hasPrefix("c:PNI:")
-                            DecryptionNotice(
-                                name: name(e), count: count, canReset: direct && !reset,
-                                resetting: store.resettingSessions.contains(e.conversationId),
-                                reset: { store.resetSession(e.conversationId) })
-                        case .message(let m, let first, let last):
-                            let key = MessageKey(author: m.author, sentAt: m.sentAt)
-                            MessageRow(
-                                message: m, first: first, last: last, isGroup: isGroup,
-                                senderName: store.senderName(m.author), mentionName: store.mentionName,
-                                reactions: store.reactions[key] ?? [],
-                                files: store.attachments[key] ?? [], preview: store.previews[key],
-                                poll: store.polls[key],
-                                highlighted: store.highlighted == key,
-                                reply: { store.reply(to: m) },
-                                retry: { Task { await store.retry(key) } },
-                                download: store.download, open: open,
-                                actions: MessageRow.Actions(
-                                    me: store.ownAci, mine: store.myReaction(to: m),
-                                    canEdit: MessageActions.canEdit(m, me: store.ownAci),
-                                    canDelete: MessageActions.canDelete(m, me: store.ownAci),
-                                    react: { emoji in Task { await store.react(to: m, with: emoji) } },
-                                    edit: { store.startEditing(m) },
-                                    delete: { Task { await store.deleteForEveryone(m) } },
-                                    viewOnce: { Task { await store.viewOnceOpened(m) } },
-                                    vote: { options in Task { await store.vote(m, options: options) } },
-                                    endPoll: { Task { await store.endPoll(m) } },
-                                    name: store.senderName))
-                        }
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                if store.hasOlder { ProgressView().controlSize(.small).padding(8) }
+                ForEach(store.timelineItems) { item in
+                    switch item {
+                    case .day(let title, _):
+                        Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.secondaryText)
+                            .wallpaperBacked()
+                            .padding(.vertical, 10)
+                    case .event(let e):
+                        ChatEventRow(event: e, name: name(e), me: store.ownAci)
+                    case .failures(let e, let count, let reset):
+                        // presage resets sessions by ACI only
+                        let direct = e.conversationId.hasPrefix("c:") && !e.conversationId.hasPrefix("c:PNI:")
+                        DecryptionNotice(
+                            name: name(e), count: count, canReset: direct && !reset,
+                            resetting: store.resettingSessions.contains(e.conversationId),
+                            reset: { store.resetSession(e.conversationId) })
+                    case .message(let m, let first, let last):
+                        let key = MessageKey(author: m.author, sentAt: m.sentAt)
+                        MessageRow(
+                            message: m, first: first, last: last, isGroup: isGroup,
+                            senderName: store.senderName(m.author), mentionName: store.mentionName,
+                            reactions: store.reactions[key] ?? [],
+                            files: store.attachments[key] ?? [], preview: store.previews[key],
+                            poll: store.polls[key],
+                            highlighted: store.highlighted == key,
+                            reply: { store.reply(to: m) },
+                            retry: { Task { await store.retry(key) } },
+                            download: store.download, open: open,
+                            actions: MessageRow.Actions(
+                                me: store.ownAci, mine: store.myReaction(to: m),
+                                canEdit: MessageActions.canEdit(m, me: store.ownAci),
+                                canDelete: MessageActions.canDelete(m, me: store.ownAci),
+                                react: { emoji in Task { await store.react(to: m, with: emoji) } },
+                                edit: { store.startEditing(m) },
+                                delete: { Task { await store.deleteForEveryone(m) } },
+                                viewOnce: { Task { await store.viewOnceOpened(m) } },
+                                vote: { options in Task { await store.vote(m, options: options) } },
+                                endPoll: { Task { await store.endPoll(m) } },
+                                name: store.senderName))
                     }
-                    TypingRow(store: store, conversationId: conversation.id, isGroup: isGroup)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                TypingRow(store: store, conversationId: conversation.id, isGroup: isGroup)
             }
-            .scrollPosition($position)
-            .defaultScrollAnchor(.bottom)
-            .onScrollGeometryChange(for: Edges.self) { g in
-                Edges(
-                    atBottom: Timeline.isAtBottom(g), nearTop: Timeline.isNearTop(offsetY: g.contentOffset.y),
-                    contentHeight: g.contentSize.height)
-            } action: { old, new in
-                // what grows at the bottom (a page's files and previews, the typing bubble) stays in
-                // view: the bottom anchor doesn't follow it
-                let follow = old.atBottom && new.contentHeight > old.contentHeight
-                if follow { position.scrollTo(edge: .bottom) }
-                atBottom = follow || new.atBottom
-                if atBottom { unseenNew = false }
-                nearTop = new.nearTop
-            }
-            .onChange(of: nearTop) { _, near in if near { loadOlder() } }
-            .onChange(of: store.messages.first?.sentAt) { old, _ in
-                // still at the top after a page arrived (short messages): keep paging. Not for a
-                // chat's first page: the empty timeline before it counts as at the top.
-                if nearTop, old != nil { loadOlder() }
-            }
-            .onChange(of: store.messages.last?.sentAt) { _, _ in
-                let own = store.messages.last?.isOutgoing ?? false
-                switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
-                case .scrollToBottom:
-                    withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) }
-                    unseenNew = false
-                case .showPill: unseenNew = true
-                case .nothing: break
-                }
-            }
-            .onChange(of: conversation.id) { _, _ in
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+        }
+        .scrollPosition($position)
+        .defaultScrollAnchor(.bottom)
+        .onScrollGeometryChange(for: Edges.self) { g in
+            Edges(
+                atBottom: Timeline.isAtBottom(g), nearTop: Timeline.isNearTop(offsetY: g.contentOffset.y),
+                contentHeight: g.contentSize.height)
+        } action: { old, new in
+            // at the bottom, content that grows (a page's files and previews, which come after
+            // its messages; the typing bubble) keeps the end in view: defaultScrollAnchor(.bottom)
+            // doesn't follow it. Not while a search result shows: its page grows the timeline too.
+            let follow = old.atBottom && store.highlighted == nil && new.contentHeight > old.contentHeight
+            if follow { position.scrollTo(edge: .bottom) }
+            atBottom = follow || new.atBottom
+            if atBottom { unseenNew = false }
+            nearTop = new.nearTop
+        }
+        .onChange(of: nearTop) { _, near in if near { loadOlder() } }
+        .onChange(of: store.messages.first?.sentAt) { old, _ in
+            // still at the top after a page arrived (short messages): keep paging. Not for a
+            // chat's first page: the empty timeline before it counts as at the top.
+            if nearTop, old != nil { loadOlder() }
+        }
+        .onChange(of: store.messages.last?.sentAt) { _, _ in
+            let own = store.messages.last?.isOutgoing ?? false
+            switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
+            case .scrollToBottom:
+                withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) }
                 unseenNew = false
-                position.scrollTo(edge: .bottom)
+            case .showPill: unseenNew = true
+            case .nothing: break
             }
-            // a search result opened: to the message, in the middle
-            .onChange(of: store.scrollRequest) { _, _ in
-                guard let k = store.scrollTarget else { return }
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("\(k.author)-\(k.sentAt)", anchor: .center) }
-            }
-            // read once the newest message is on screen in the key window, like Desktop
-            .onChange(of: atBottom) { _, _ in markReadIfSeen() }
-            .onChange(of: activeState) { _, _ in markReadIfSeen() }
-            .onChange(of: conversation.unreadCount) { _, _ in markReadIfSeen() }
-            .onChange(of: conversation.id) { _, _ in markReadIfSeen() }
-            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) {
-                _ in markReadIfSeen()
-            }
-            .onAppear { markReadIfSeen() }
-            .overlay(alignment: .bottomTrailing) {
-                if unseenNew {
-                    Button {
-                        position.scrollTo(edge: .bottom)
-                        unseenNew = false
-                    } label: {
-                        Label("New messages", systemImage: "arrow.down")
-                    }
-                    .buttonStyle(.glassProminent)
-                    .padding(16)
+        }
+        .onChange(of: conversation.id) { _, _ in
+            unseenNew = false
+            position.scrollTo(edge: .bottom)
+        }
+        // a search result opened: to the message, in the middle
+        .onChange(of: store.scrollRequest) { _, _ in
+            guard let k = store.scrollTarget else { return }
+            withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(id: "\(k.author)-\(k.sentAt)", anchor: .center) }
+        }
+        // read once the newest message is on screen in the key window, like Desktop
+        .onChange(of: atBottom) { _, _ in markReadIfSeen() }
+        .onChange(of: activeState) { _, _ in markReadIfSeen() }
+        .onChange(of: conversation.unreadCount) { _, _ in markReadIfSeen() }
+        .onChange(of: conversation.id) { _, _ in markReadIfSeen() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) {
+            _ in markReadIfSeen()
+        }
+        .onAppear { markReadIfSeen() }
+        .overlay(alignment: .bottomTrailing) {
+            if unseenNew {
+                Button {
+                    position.scrollTo(edge: .bottom)
+                    unseenNew = false
+                } label: {
+                    Label("New messages", systemImage: "arrow.down")
                 }
+                .buttonStyle(.glassProminent)
+                .padding(16)
             }
         }
     }
