@@ -3,7 +3,6 @@ import SwiftUI
 struct SidebarView: View {
     @Bindable var store: AppStore
     @FocusState private var searchFocused: Bool
-    @FocusState private var listFocused: Bool
     /// The message result picked with the arrows while browsing results.
     @State private var resultIndex: Int?
     /// The chat whose "Block…" waits for confirmation.
@@ -23,132 +22,117 @@ struct SidebarView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                if inArchive {
+        ScrollViewReader { proxy in
+            List(selection: selection) {
+                if let scope = store.searchScope { scopeRow(scope) }
+                if store.searchScope == nil {
+                    chatRows
+                    if !searching, !store.showingArchive, store.archivedCount > 0 { archiveRow }
+                }
+                if searching { messageResults }
+            }
+            .listStyle(.sidebar)
+            // arrows step through message results while browsing them; through chats natively
+            .onKeyPress(.downArrow) { browsingResults ? moveInSearch(1) : .ignored }
+            .onKeyPress(.upArrow) { browsingResults ? moveInSearch(-1) : .ignored }
+            .onChange(of: store.selectedId) { _, id in
+                // keyboard navigation can select a chat that is scrolled out of view
+                if let id, !browsingResults { proxy.scrollTo(id) }
+            }
+            .onChange(of: resultIndex) { _, i in if let i { proxy.scrollTo("result-\(i)") } }
+        }
+        // like Desktop's search: arrows pick a chat or message, ↩ opens it
+        .searchable(text: $store.searchQuery, placement: .sidebar, prompt: "Search")
+        .searchFocused($searchFocused)
+        .onKeyPress(.downArrow) { searchFocused ? moveInSearch(1) : .ignored }
+        .onKeyPress(.upArrow) { searchFocused ? moveInSearch(-1) : .ignored }
+        .onSubmit(of: .search) {
+            if browsingResults, let i = resultIndex, store.searchResults.indices.contains(i) {
+                Task { await store.open(store.searchResults[i]) }
+            } else {
+                store.openSearchResult()
+            }
+        }
+        // leaving the field empty (Esc, a click elsewhere) ends the search and its chat scope
+        .onChange(of: searchFocused) { _, focused in
+            if !focused, store.searchQuery.isEmpty { store.endSearch() }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) { ErrorBanner(store: store) }
+        .safeAreaInset(edge: .bottom, spacing: 0) { ConnectionStatus(store: store) }
+        .toolbar {
+            if inArchive {
+                ToolbarItem(placement: .navigation) {
                     Button {
                         store.showArchive(false)
                     } label: {
-                        Image(systemName: "chevron.left")
+                        Label("Back to Chats", systemImage: "chevron.left")
                     }
-                    .buttonStyle(.plain).font(.system(size: 16, weight: .semibold))
-                    .accessibilityLabel("Back to chats")
+                    .help("Back to chats")
                 }
-                Text(inArchive ? "Archived" : "Chats").font(.system(size: 22, weight: .bold))
-                Spacer()
-                if !inArchive {
+            } else {
+                ToolbarItem {
                     Menu {
                         Button("New Chat by Username…") { findingUsername = true }
                         Button("New Group…") { makingGroup = true }
                         Button("Join Group by Link…") { joiningByLink = true }
                     } label: {
-                        Image(systemName: "square.and.pencil").font(.system(size: 16))
+                        Label("New Chat", systemImage: "square.and.pencil")
                     }
-                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                    .menuIndicator(.hidden)
                     .help("New chat")
-                    .accessibilityLabel("New chat")
-                    .sheet(isPresented: $findingUsername) { FindUsernameSheet(store: store) }
-                    .sheet(isPresented: $makingGroup) { NewGroupSheet(store: store) }
-                    .sheet(isPresented: $joiningByLink) { JoinGroupSheet(store: store) }
                 }
-                if !inArchive && !store.stories.isEmpty {
-                    let unseen = StoryList.unseenCount(store.stories, me: store.ownAci)
-                    Button {
-                        showingStories = true
-                    } label: {
-                        Image(systemName: unseen > 0 ? "circle.dashed.inset.filled" : "circle.dashed")
-                            .font(.system(size: 17))
-                            .overlay(alignment: .topTrailing) {
-                                if unseen > 0 {
-                                    Text("\(unseen)").font(.system(size: 9, weight: .bold)).padding(3)
-                                        .background(Theme.outgoing, in: Circle()).offset(x: 6, y: -6)
-                                }
-                            }
-                    }
-                    .buttonStyle(.plain)
-                    .help("Stories")
-                    .accessibilityLabel(unseen > 0 ? "Stories, \(unseen) new" : "Stories")
-                }
-            }
-            .sheet(isPresented: $showingStories) { StoriesView(store: store) }
-            .padding(.horizontal, 18)
-            .padding(.top, 14)
-            .padding(.bottom, 10)
-            searchField
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        if store.searchScope == nil {
-                            if searching && !store.visibleConversations.isEmpty { SectionTitle("Chats") }
-                            chatRows
-                            if !searching, !store.showingArchive, store.archivedCount > 0 { archiveRow }
+                if !store.stories.isEmpty {
+                    ToolbarItem {
+                        let unseen = StoryList.unseenCount(store.stories, me: store.ownAci)
+                        Button {
+                            showingStories = true
+                        } label: {
+                            Label(
+                                unseen > 0 ? "Stories, \(unseen) new" : "Stories",
+                                systemImage: unseen > 0 ? "circle.dashed.inset.filled" : "circle.dashed")
                         }
-                        if searching { messageResults }
+                        .help(unseen > 0 ? "Stories, \(unseen) new" : "Stories")
                     }
-                    .padding(.horizontal, 8)
                 }
-                .focusable()
-                .focused($listFocused)
-                .focusEffectDisabled()
-                .onKeyPress(.downArrow) { moveInSearch(1) }
-                .onKeyPress(.upArrow) { moveInSearch(-1) }
-                .onChange(of: store.selectedId) { _, id in
-                    // keyboard navigation can select a chat that is scrolled out of view
-                    if let id, !browsingResults { proxy.scrollTo(id) }
-                }
-                .onChange(of: resultIndex) { _, i in if let i { proxy.scrollTo("result-\(i)") } }
-            }
-            .confirmationDialog(
-                blocking.map { RequestBar.blockTitle($0, name: store.title($0)) } ?? "",
-                isPresented: Binding(get: { blocking != nil }, set: { if !$0 { blocking = nil } }),
-                presenting: blocking
-            ) { c in
-                Button("Block", role: .destructive) { store.block(c.id) }
-            } message: { c in
-                Text(RequestBar.blockMessage(c))
             }
         }
-        .background(Theme.sidebar)
+        .sheet(isPresented: $findingUsername) { FindUsernameSheet(store: store) }
+        .sheet(isPresented: $makingGroup) { NewGroupSheet(store: store) }
+        .sheet(isPresented: $joiningByLink) { JoinGroupSheet(store: store) }
+        .sheet(isPresented: $showingStories) { StoriesView(store: store) }
+        .confirmationDialog(
+            blocking.map { RequestBar.blockTitle($0, name: store.title($0)) } ?? "",
+            isPresented: Binding(get: { blocking != nil }, set: { if !$0 { blocking = nil } }),
+            presenting: blocking
+        ) { c in
+            Button("Block", role: .destructive) { store.block(c.id) }
+        } message: { c in
+            Text(RequestBar.blockMessage(c))
+        }
         .onChange(of: store.searchFocusRequest) { _, _ in searchFocused = true }
         .onChange(of: store.searchResults) { _, _ in resultIndex = nil }
     }
 
-    private var searchField: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondaryText)
-            if let scope = store.searchScope {
-                let title = store.conversations.first { $0.id == scope }.map(store.title) ?? "this chat"
-                HStack(spacing: 3) {
-                    Text("In \(title)").font(.system(size: 12, weight: .medium)).lineLimit(1)
-                    Button(action: store.endSearch) { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Search all chats")
-                }
-                .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Theme.selection, in: Capsule())
-            }
-            TextField("Search", text: $store.searchQuery).textFieldStyle(.plain).focused($searchFocused)
-                // like Desktop's search: arrows pick a chat or message, ↩ opens it, Esc ends the search
-                .onKeyPress(.downArrow) { moveInSearch(1) }
-                .onKeyPress(.upArrow) { moveInSearch(-1) }
-                .onKeyPress(.return) {
-                    if browsingResults, let i = resultIndex, store.searchResults.indices.contains(i) {
-                        Task { await store.open(store.searchResults[i]) }
-                    } else {
-                        store.openSearchResult()
-                    }
-                    return .handled
-                }
-                .onExitCommand {
-                    store.endSearch()
-                    searchFocused = false
-                }
+    /// The list's selection is the open chat (arrows keep focus in the list).
+    private var selection: Binding<String?> {
+        Binding(
+            get: { store.selectedId },
+            set: { id in
+                guard let id, id != store.selectedId else { return }
+                store.select(id)
+            })
+    }
+
+    /// Searching one chat (⇧⌘F): which, and the way back to every chat.
+    private func scopeRow(_ scope: String) -> some View {
+        let title = store.conversations.first { $0.id == scope }.map(store.title) ?? "this chat"
+        return HStack {
+            Label("In \(title)", systemImage: "text.magnifyingglass").lineLimit(1)
+            Spacer(minLength: 6)
+            Button("All Chats", action: store.endSearch).buttonStyle(.link)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(Theme.field, in: RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal, 14)
-        .padding(.bottom, 8)
+        .font(.callout)
+        .foregroundStyle(.secondary)
     }
 
     @ViewBuilder private var messageResults: some View {
@@ -162,36 +146,39 @@ struct SidebarView: View {
                     Text("No messages found")
                 }
             }
-            .font(.system(size: 13)).foregroundStyle(Theme.secondaryText)
-            .padding(.horizontal, 10).padding(.vertical, 12)
+            .font(.callout).foregroundStyle(.secondary)
         } else {
-            SectionTitle("Messages")
-            ForEach(Array(store.searchResults.enumerated()), id: \.offset) { i, hit in
-                Button {
-                    resultIndex = i
-                    Task { await store.open(hit) }
-                } label: {
-                    SearchResultRow(
-                        hit: hit, chatTitle: chatTitle(hit.message.conversationId),
-                        sender: hit.message.isOutgoing ? "You" : store.senderName(hit.message.author),
-                        selected: resultIndex == i)
+            Section("Messages") {
+                ForEach(Array(store.searchResults.enumerated()), id: \.offset) { i, hit in
+                    Button {
+                        resultIndex = i
+                        Task { await store.open(hit) }
+                    } label: {
+                        SearchResultRow(
+                            hit: hit, chatTitle: chatTitle(hit.message.conversationId),
+                            sender: hit.message.isOutgoing ? "You" : store.senderName(hit.message.author),
+                            selected: resultIndex == i)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(resultIndex == i ? .isSelected : [])
+                    .id("result-\(i)")
                 }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(resultIndex == i ? .isSelected : [])
-                .id("result-\(i)")
             }
         }
     }
 
-    /// Pinned chats under their own title when there are any (as Desktop), then the rest.
+    /// Pinned chats under their own title when there are any (as Desktop), then the rest; the
+    /// archive, or the chats matching a search, under theirs.
     @ViewBuilder private var chatRows: some View {
         let list = store.visibleConversations
         let pinned = list.filter { $0.pinnedOrder != nil }
         if !searching, !store.showingArchive, !pinned.isEmpty {
-            SectionTitle("Pinned")
-            ForEach(pinned, id: \.id) { c in chatRow(c) }
-            SectionTitle("Chats")
-            ForEach(list.filter { $0.pinnedOrder == nil }, id: \.id) { c in chatRow(c) }
+            Section("Pinned") { ForEach(pinned, id: \.id) { c in chatRow(c) } }
+            Section("Chats") { ForEach(list.filter { $0.pinnedOrder == nil }, id: \.id) { c in chatRow(c) } }
+        } else if inArchive {
+            Section("Archived") { ForEach(list, id: \.id) { c in chatRow(c) } }
+        } else if searching && !list.isEmpty {
+            Section("Chats") { ForEach(list, id: \.id) { c in chatRow(c) } }
         } else {
             ForEach(list, id: \.id) { c in chatRow(c) }
         }
@@ -202,37 +189,31 @@ struct SidebarView: View {
         Button {
             store.showArchive(true)
         } label: {
-            HStack(spacing: 12) {
-                Image(systemName: "archivebox").font(.system(size: 18)).foregroundStyle(Theme.secondaryText)
-                    .frame(width: 44, height: 44)
-                Text("Archived chats").font(.system(size: 14, weight: .semibold))
-                Spacer(minLength: 6)
-                Text("\(store.archivedCount)").font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+            Label {
+                HStack {
+                    Text("Archived Chats")
+                    Spacer(minLength: 6)
+                    Text("\(store.archivedCount)").foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "archivebox")
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
     private func chatRow(_ c: Conversation) -> some View {
-        let selected = c.id == store.selectedId
-        return Button {
-            store.select(c.id)
-            store.focusComposer()
-        } label: {
-            ConversationRow(
-                conversation: c, title: store.title(c), selected: selected,
-                line: ChatList.line(
-                    c, selected: selected, typing: store.isTyping(c.id), draft: Composer.draft(for: c.id),
-                    authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
+        ConversationRow(
+            conversation: c, title: store.title(c),
+            line: ChatList.line(
+                c, selected: c.id == store.selectedId, typing: store.isTyping(c.id), draft: Composer.draft(for: c.id),
+                authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
+        )
+        .tag(c.id)
+        // a click (even on the open chat) puts the caret in its composer
+        .simultaneousGesture(TapGesture().onEnded { store.focusComposer() })
         .contextMenu { chatMenu(c) }
-        .accessibilityAddTraits(selected ? .isSelected : [])
         .id(c.id)
     }
 
@@ -300,7 +281,7 @@ struct SidebarView: View {
         return .handled
     }
 
-    /// In the search field: through message results when browsing them (each opens as it is
+    /// Through message results when browsing them (each opens as it is
     /// picked, like stepping through matches), else through the chats.
     private func moveInSearch(_ step: Int) -> KeyPress.Result {
         guard browsingResults, !store.searchResults.isEmpty else { return move(step) }
@@ -309,17 +290,6 @@ struct SidebarView: View {
         resultIndex = next
         Task { await store.open(store.searchResults[next]) }
         return .handled
-    }
-}
-
-struct SectionTitle: View {
-    let title: String
-    init(_ title: String) { self.title = title }
-
-    var body: some View {
-        Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.secondaryText)
-            .padding(.horizontal, 10).padding(.top, 10).padding(.bottom, 2)
-            .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -343,9 +313,9 @@ struct SearchResultRow: View {
                             .foregroundStyle(Theme.secondaryText)
                     }
                 }
-                (m.conversationId.hasPrefix("g:") || m.isOutgoing ? Text("\(sender): ") : Text(""))
-                    .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
-                    + Text(SearchText.highlighted(hit.snippet)).font(.system(size: 12))
+                let who = m.conversationId.hasPrefix("g:") || m.isOutgoing ? "\(sender): " : ""
+                Text("\(Text(who).foregroundStyle(Theme.secondaryText))\(Text(SearchText.highlighted(hit.snippet)))")
+                    .font(.system(size: 12))
             }
             .lineLimit(2)
         }
@@ -357,28 +327,31 @@ struct SearchResultRow: View {
     }
 }
 
+/// A chat in the list; the list draws the selection, and the colours follow it.
 struct ConversationRow: View {
     let conversation: Conversation
     let title: String
-    let selected: Bool
     let line: ChatList.Line
+    /// Increased on the accent-filled selection: an accent badge would vanish into it.
+    @Environment(\.backgroundProminence) private var prominence
 
     var body: some View {
         let unread = ChatList.isUnread(conversation)
-        HStack(spacing: 12) {
-            Avatar(id: conversation.id, name: title)
-            VStack(alignment: .leading, spacing: 3) {
+        let onAccent = prominence == .increased
+        HStack(spacing: 10) {
+            Avatar(id: conversation.id, name: title, size: 40)
+            VStack(alignment: .leading, spacing: 2) {
                 HStack {
-                    Text(title).font(.system(size: 14, weight: unread ? .bold : .semibold)).lineLimit(1)
+                    Text(title).font(.system(size: 13, weight: unread ? .bold : .semibold)).lineLimit(1)
                     Spacer(minLength: 6)
                     if ChatList.isMuted(conversation, now: Date()) {
                         Image(systemName: "bell.slash.fill").font(.system(size: 10))
-                            .foregroundStyle(Theme.secondaryText).accessibilityLabel("Muted")
+                            .foregroundStyle(.secondary).accessibilityLabel("Muted")
                     }
                     // relative times ("Now", "5m", "Yesterday"…) move on by themselves
                     TimelineView(.everyMinute) { context in
                         Text(Formatting().listTime(conversation.lastMessageAt, now: context.date))
-                            .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }
                 HStack(spacing: 4) {
@@ -387,19 +360,18 @@ struct ConversationRow: View {
                     if conversation.unreadCount > 0 {
                         Text("\(conversation.unreadCount)").font(.system(size: 11, weight: .bold))
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Theme.outgoing, in: Capsule())
-                            .foregroundStyle(.white)
+                            .background(onAccent ? Color.white : Color.accentColor, in: Capsule())
+                            .foregroundStyle(onAccent ? Color.accentColor : Color.white)
                     } else if conversation.markedUnread {
                         // marked by hand: a dot, no count (as Desktop)
-                        Circle().fill(Theme.outgoing).frame(width: 8, height: 8).accessibilityLabel("Unread")
+                        Circle().fill(onAccent ? Color.white : Color.accentColor).frame(width: 8, height: 8)
+                            .accessibilityLabel("Unread")
                     }
                 }
-                .foregroundStyle(unread ? .primary : Theme.secondaryText)
+                .foregroundStyle(unread ? .primary : .secondary)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
-        .background(selected ? Theme.selection : .clear, in: RoundedRectangle(cornerRadius: 10))
+        .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
     }
 
@@ -408,7 +380,7 @@ struct ConversationRow: View {
         case .typing:
             Text("typing…").italic()
         case .draft(let text):
-            Text("Draft: ").italic().bold() + Text(text)
+            Text("\(Text("Draft: ").italic().bold())\(text)")
         case .message(let text, let tick):
             if let tick { TickIcon(tick: tick) }
             Text(text).italic(conversation.lastMessageDeleted)

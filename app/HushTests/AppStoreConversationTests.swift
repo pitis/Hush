@@ -222,6 +222,7 @@ final class AppStoreConversationTests: XCTestCase {
         store.handle(.typing(conversationId: "g:1", who: "b", started: true))
         store.handle(.typing(conversationId: "g:1", who: "a", started: false))
         XCTAssertTrue(store.isTyping("g:1"))  // b still typing
+        XCTAssertEqual(store.typers("g:1"), ["b"], "who, for the typing bubble's picture")
         store.handle(.typing(conversationId: "c:x", who: "x", started: true), now: .now.addingTimeInterval(-14.9))
         await eventually { !store.isTyping("c:x") }
     }

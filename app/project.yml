@@ -1,7 +1,7 @@
 name: Hush
 options:
   bundleIdPrefix: dev.pitis
-  deploymentTarget: { macOS: "15.0" }
+  deploymentTarget: { macOS: "26.0" }
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -28,7 +28,7 @@ targets:
       path: Hush/Info.plist
       properties:
         CFBundleDisplayName: Hush
-        LSMinimumSystemVersion: "15.0"
+        LSMinimumSystemVersion: "26.0"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.hush

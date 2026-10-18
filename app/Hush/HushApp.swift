@@ -187,6 +187,9 @@ struct ChatCommands: Commands {
                 Divider()
                 Button("Focus Composer") { store.focusComposer() }.keyboardShortcut("t", modifiers: [.command, .shift])
                     .disabled(store.selectedId == nil)
+                Button("Attach Files…") { store.requestAttach() }.keyboardShortcut("a", modifiers: [.command, .shift])
+                    .disabled(
+                        store.selectedConversation.map(RequestBar.replacesComposer) ?? true || store.editing != nil)
                 Button("Close Chat") { store.select(nil) }.keyboardShortcut("c", modifiers: [.command, .shift])
                     .disabled(store.selectedId == nil)
             }

@@ -114,12 +114,17 @@ final class ComposerFieldTests: XCTestCase {
     func testMeasuringNeverResizesTheTextView() {
         box.text = NSAttributedString(
             string: String(repeating: "lorem ipsum ", count: 12), attributes: ComposerText.display([]))
-        let row = HStack(alignment: .bottom, spacing: 10) {
-            Button {
-            } label: {
-                Image(systemName: "paperclip")
+        // as the composer: a glass + menu beside the glass field
+        let row = GlassEffectContainer(spacing: 8) {
+            HStack(alignment: .bottom, spacing: 8) {
+                Menu {
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.glass).buttonBorderShape(.circle)
+                field().padding(.horizontal, 14).padding(.vertical, 9)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
             }
-            field().padding(.horizontal, 14)
         }
         let hosting = NSHostingView(rootView: AnyView(row))
         window = NSWindow(
@@ -128,10 +133,18 @@ final class ComposerFieldTests: XCTestCase {
         window.contentView = hosting
         hosting.layoutSubtreeIfNeeded()
         let view = Self.find(in: hosting)!
+        let size = view.frame.size
         let resized = XCTNSNotificationExpectation(name: NSView.frameDidChangeNotification, object: view)
+        // a move isn't a resize (layer backing for the glass nudges the origin once)
+        resized.handler = { _ in MainActor.assumeIsolated { view.frame.size != size } }
         resized.isInverted = true
         _ = hosting.fittingSize
         wait(for: [resized], timeout: 0.1)
+    }
+
+    func testThePlusIsAsTallAsTheFieldWithOneLine() {
+        let (hosting, _) = host(field())
+        XCTAssertEqual(hosting.fittingSize.height + 2 * ComposerView.fieldInset, ComposerView.oneLine)
     }
 
     func testPasteIsOfferedForAnImageOnlyClipboardAndAttachesIt() throws {

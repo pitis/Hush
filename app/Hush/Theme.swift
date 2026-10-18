@@ -5,8 +5,7 @@ enum Appearance: String, CaseIterable, Identifiable {
     case system, light, dark
 
     static let key = "appearance"
-    /// As before there was a choice: the app was dark only.
-    static let `default` = Appearance.dark
+    static let `default` = Appearance.system
 
     var id: String { rawValue }
     var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
@@ -30,10 +29,10 @@ enum Appearance: String, CaseIterable, Identifiable {
     @MainActor func apply() { NSApp.appearance = nsAppearance }
 }
 
-/// Colors after Signal Desktop's light and dark themes, following the window's appearance.
+/// Hush's own colours, following the window's appearance. The main window's chrome (sidebar,
+/// toolbar, backgrounds) is the system's.
 enum Theme {
     static let window = adaptive(light: 0xFFFFFF, dark: 0x1B1B1D)
-    static let sidebar = adaptive(light: 0xF6F6F6, dark: 0x1F1F21)
     static let selection = adaptive(light: 0xE3E3E3, dark: 0x2C2C2E)
     static let outgoing = Color(red: 0x2C / 255, green: 0x6B / 255, blue: 0xED / 255)
     static let incoming = adaptive(light: 0xE9E9E9, dark: 0x3B3B3D)

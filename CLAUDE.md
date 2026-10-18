@@ -73,7 +73,7 @@ answer, never for mechanics.
 - Never log message content; ids and errors only.
 - Swift bindings and the xcframework are generated (`make core`); never edit `app/Generated/`.
 - The Xcode project is generated from `app/project.yml` (`make project`); never commit it.
-- arm64 only, macOS 15+. No "Signal" name or logo in the app.
+- arm64 only, macOS 26+ (Liquid Glass, no fallback). No "Signal" name or logo in the app.
 - The app is signed with the owner's Apple Development certificate (team `95KQ82C586`,
   `app/project.yml`): the Keychain trusts rebuilds only under a stable signature. Builds need
   that certificate in the login keychain.

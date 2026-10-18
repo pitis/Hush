@@ -97,6 +97,8 @@ final class AppStore {
     private(set) var scrollRequest = 0
     /// Bumped to ask the sidebar to focus the search field.
     private(set) var searchFocusRequest = 0
+    /// Bumped to ask the composer to choose files to attach (⇧⌘A).
+    private(set) var attachRequest = 0
     /// Set to move focus to the composer (a click on a chat, ↩ in the search, a shortcut); the
     /// composer clears it. Switching chats with the arrows in the list or the search leaves focus
     /// there.
@@ -341,6 +343,7 @@ final class AppStore {
         case .typing(let conversationId, let who, let started):
             setTyping(conversationId, who: who, until: started ? now.addingTimeInterval(Self.typingTimeout) : nil)
         case .chatEventAdded(let conversationId):
+            resettingSessions.remove(conversationId)
             refreshConversations()
             if conversationId == selectedId { reloadEvents() }
         case .callChanged(let conversationId, let phase, let reason):
@@ -361,6 +364,8 @@ final class AppStore {
             // error text can mention ids or numbers: keep it out of the system log
             Self.logger.error("core error: \(message, privacy: .private)")
             lastError = message
+            // the reset may be what failed: offer it again (a second one does no harm)
+            resettingSessions.removeAll()
             append("error: \(message)")
             errors.append(LogLine(id: nextLogId, text: message))
             if errors.count > Self.logLimit { errors.removeFirst(errors.count - Self.logLimit) }
@@ -948,7 +953,7 @@ final class AppStore {
 
     // MARK: Connection and linking
 
-    /// "Retry" on the connection banner: reconnects now.
+    /// "Retry" under the chat list while offline: reconnects now.
     func retryConnection() {
         do {
             // receiving may have stopped (it is restarted only on request); starting is idempotent
@@ -962,9 +967,15 @@ final class AppStore {
         if screen == .chats { retryConnection() }
     }
 
+    /// Chats whose secure-session reset is on its way: until it's recorded, or anything fails.
+    private(set) var resettingSessions: Set<String> = []
+
     /// Starts a new secure session with a contact whose messages couldn't be decrypted.
     func resetSession(_ conversationId: String) {
-        do { try client?.resetSession(conversationId: conversationId) } catch {
+        do {
+            try client?.resetSession(conversationId: conversationId)
+            resettingSessions.insert(conversationId)
+        } catch {
             showError("Couldn't reset the session: \(Self.describe(error))")
         }
     }
@@ -1369,12 +1380,18 @@ final class AppStore {
     }
     func focusComposer() { composerWantsFocus = true }
     func composerTookFocus() { composerWantsFocus = false }
+    func requestAttach() { attachRequest += 1 }
 
     /// Recomputes day separators ("Today" becomes "Yesterday" after midnight).
     func refreshDays() { timelineItems = Timeline.items(for: messages, events: events) }
 
     func isTyping(_ conversationId: String, now: Date = .now) -> Bool {
         typingUntil[conversationId]?.values.contains { $0 > now } ?? false
+    }
+
+    /// Who is typing in a chat now (ACIs, in order).
+    func typers(_ conversationId: String, now: Date = .now) -> [String] {
+        (typingUntil[conversationId] ?? [:]).filter { $0.value > now }.keys.sorted()
     }
 
     var selectedConversation: Conversation? {

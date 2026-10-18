@@ -13,6 +13,43 @@ final class TimelineEventTests: XCTestCase {
         XCTAssertEqual(ids, ["a-10", "event-1", "a-20"])
     }
 
+    func testRepeatedDecryptionFailuresShowAsOneNoticeThatAResetAnswers() {
+        let failed = { (id: Int64, at: Int64) in
+            ChatEvent(id: id, conversationId: "c:a", at: at, kind: .decryptionFailed, author: "a", value: nil)
+        }
+        let reset = ChatEvent(id: 9, conversationId: "c:a", at: 30, kind: .sessionReset, author: "a", value: nil)
+        let items = Timeline.items(
+            for: [message("c:a", "a", 10), message("c:a", "a", 20)],
+            events: [failed(1, 11), failed(2, 12), failed(3, 13), failed(4, 25), reset, failed(5, 40)])
+        let notices = items.compactMap { item -> String? in
+            guard case .failures(let first, let count, let answered) = item else { return nil }
+            return "\(first.id)×\(count)\(answered ? " reset" : "")"
+        }
+        // a message between failures splits them; a reset answers the failures before it
+        XCTAssertEqual(notices, ["1×3 reset", "4×1 reset", "5×1"])
+        XCTAssertTrue(items.contains { $0.id == "event-1" })
+        XCTAssertEqual(
+            DecryptionNotice.text(count: 1, name: "Ann"), "A message between you and Ann couldn't be decrypted")
+        XCTAssertEqual(
+            DecryptionNotice.text(count: 3, name: "Ann"), "3 messages between you and Ann couldn't be decrypted")
+    }
+
+    func testFailuresEitherSideOfMidnightAreNoticedUnderTheirOwnDays() {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let midnight: Int64 = 86_400_000
+        let failed = { (id: Int64, at: Int64) in
+            ChatEvent(id: id, conversationId: "c:a", at: at, kind: .decryptionFailed, author: "a", value: nil)
+        }
+        let items = Timeline.items(
+            for: [], events: [failed(1, midnight - 60_000), failed(2, midnight + 60_000)], calendar: utc)
+        let kinds = items.map { item -> String in
+            if case .failures(_, let count, _) = item { return "failures×\(count)" }
+            return "day"
+        }
+        XCTAssertEqual(kinds, ["day", "failures×1", "day", "failures×1"])
+    }
+
     func testOnlyTheNetworkComingBackReconnects() {
         XCTAssertTrue(NetworkWatch.shouldReconnect(was: false, now: true))
         XCTAssertFalse(NetworkWatch.shouldReconnect(was: true, now: true))
@@ -108,6 +145,22 @@ final class AppStoreResilienceTests: XCTestCase {
         XCTAssertTrue(store.timelineItems.contains { $0.id == "event-1" })
         store.resetSession("c:a")
         XCTAssertEqual(fake.sessionResets, ["c:a"])
+    }
+
+    func testAResetShowsAsGoingUntilItIsRecordedOrSomethingFails() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.resetSession("c:a")
+        XCTAssertTrue(store.resettingSessions.contains("c:a"))
+        store.handle(.chatEventAdded(conversationId: "c:a"))  // the reset, recorded
+        XCTAssertFalse(store.resettingSessions.contains("c:a"))
+        store.resetSession("c:a")
+        store.handle(.error(message: "resetting the session failed: offline"))
+        XCTAssertFalse(store.resettingSessions.contains("c:a"), "a failure offers the reset again")
+        fake.resetError = CoreError.Network(message: "offline")
+        store.resetSession("c:a")
+        XCTAssertFalse(store.resettingSessions.contains("c:a"))
+        XCTAssertNotNil(store.lastError)
     }
 
     func testAWipeThatFailsAfterTheCoreStoppedSaysSoInsteadOfHanging() async {
