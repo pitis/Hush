@@ -42,7 +42,7 @@ struct ComposerView: View {
                         mentions: conversationId.hasPrefix("g:") ? mentions : nil
                     )
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
+                    .padding(.vertical, Self.fieldInset)
                     .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
                 }
             }
@@ -86,18 +86,27 @@ struct ComposerView: View {
         .onChange(of: store.composerWantsFocus) { _, _ in takeFocusIfAsked() }
     }
 
+    /// Above and below the field's text.
+    static let fieldInset: CGFloat = 9
+    /// The field's height with one line (as `ComposerField` measures it): the + is as tall, so it
+    /// sits centred on one line and stays by the last as the field grows.
+    static let oneLine =
+        NSLayoutManager().defaultLineHeight(for: .systemFont(ofSize: ComposerText.size)).rounded(.up) + 2 * fieldInset
+
     /// Attach Files… and Stickers…; emoji are under Edit ▸ Emoji & Symbols (⌃⌘Space).
     private var addMenu: some View {
         Menu {
             Button("Attach Files…", action: chooseFiles)
             Button("Stickers…") { showStickers = true }
         } label: {
-            Image(systemName: "plus").font(.system(size: 15, weight: .medium)).frame(width: 22, height: 22)
+            Image(systemName: "plus").font(.system(size: 15, weight: .medium))
+                .frame(width: Self.oneLine, height: Self.oneLine)
+                .contentShape(Circle())
         }
         .menuStyle(.button)
         .menuIndicator(.hidden)
-        .buttonStyle(.glass)
-        .buttonBorderShape(.circle)
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
         .disabled(store.editing != nil)
         .help("Attach files or a sticker")
         .accessibilityLabel("Attach")

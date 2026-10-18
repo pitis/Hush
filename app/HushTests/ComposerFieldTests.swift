@@ -142,6 +142,11 @@ final class ComposerFieldTests: XCTestCase {
         wait(for: [resized], timeout: 0.1)
     }
 
+    func testThePlusIsAsTallAsTheFieldWithOneLine() {
+        let (hosting, _) = host(field())
+        XCTAssertEqual(hosting.fittingSize.height + 2 * ComposerView.fieldInset, ComposerView.oneLine)
+    }
+
     func testPasteIsOfferedForAnImageOnlyClipboardAndAttachesIt() throws {
         var pasted: [URL] = []
         let box = box!
