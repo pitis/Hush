@@ -1519,37 +1519,53 @@ final class AppStore {
         return older + page
     }
 
-    /// Reactions and unknown group-sender names for the given messages.
+    /// Reactions and unknown group-sender names for the given messages. Each kind is written once
+    /// for the page: every write redraws the timeline.
     private func loadDetails(for page: [Message], generation: Int) async {
         guard let client else { return }
         let isGroup = selectedId?.hasPrefix("g:") == true
+        // nil: none (the key is removed)
+        var loadedReactions: [MessageKey: [Reaction]?] = [:]
+        var loadedFiles: [MessageKey: [Attachment]?] = [:]
+        var loadedPreviews: [MessageKey: LinkPreview?] = [:]
+        var loadedPolls: [MessageKey: Poll?] = [:]
         for m in page {
+            guard generation == selectionGeneration else { return }
             let key = MessageKey(author: m.author, sentAt: m.sentAt)
             // separately: one failing query doesn't take the others' details with it
             do {
                 let r = try await client.reactions(key: key)
-                if generation == selectionGeneration {
-                    reactions[key] = r.isEmpty ? nil : r
-                    pendingReactions[key] = nil  // the core's word now
-                }
+                loadedReactions[key] = r.isEmpty ? nil : r
             } catch { append("query failed: \(error)") }
             do {
                 let files = try await client.attachments(key: key)
-                if generation == selectionGeneration { attachments[key] = files.isEmpty ? nil : files }
+                loadedFiles[key] = files.isEmpty ? nil : files
             } catch { append("query failed: \(error)") }
             do {
-                let preview = try await client.linkPreview(key: key)
-                if generation == selectionGeneration { previews[key] = preview }
+                loadedPreviews[key] = try await client.linkPreview(key: key)
             } catch { append("query failed: \(error)") }
             if case .poll = m.kind {
                 do {
-                    let poll = try await client.poll(key: key)
-                    if generation == selectionGeneration { polls[key] = poll }
+                    loadedPolls[key] = try await client.poll(key: key)
                 } catch { append("query failed: \(error)") }
             }
             if isGroup, !m.isOutgoing { await loadName(m.author) }
             for aci in MessageText.mentioned(m.ranges + (m.quote?.ranges ?? [])) { await loadName(aci) }
         }
+        guard generation == selectionGeneration else { return }
+        reactions = Self.applied(loadedReactions, to: reactions)
+        // the core's word now
+        pendingReactions = pendingReactions.filter { loadedReactions[$0.key] == nil }
+        attachments = Self.applied(loadedFiles, to: attachments)
+        previews = Self.applied(loadedPreviews, to: previews)
+        polls = Self.applied(loadedPolls, to: polls)
+    }
+
+    /// `values` written over `dict`, a nil removing its key.
+    private static func applied<V>(_ values: [MessageKey: V?], to dict: [MessageKey: V]) -> [MessageKey: V] {
+        var dict = dict
+        for (key, value) in values { dict[key] = value }
+        return dict
     }
 
     /// Looks up a group member's contact name once.
