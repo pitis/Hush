@@ -1,6 +1,7 @@
 uniffi::setup_scaffolding!();
 
 mod actor;
+mod backup;
 mod calls;
 mod client;
 mod download;

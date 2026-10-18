@@ -41,6 +41,8 @@ hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.11"
 base64 = "0.22"
+# backups: the key from the passphrase (already in the tree)
+argon2 = "0.5"
 # fresh IVs for the items we write
 rand = "0.9"
 chrono = "0.4"

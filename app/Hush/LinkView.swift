@@ -3,7 +3,10 @@ import SwiftUI
 struct LinkView: View {
     let url: String?
     let error: String?
+    /// How restoring a backup went, if one was just restored.
+    let note: String?
     let retry: () -> Void
+    let restore: (URL, String) async -> String?
 
     var body: some View {
         VStack(spacing: 18) {
@@ -17,6 +20,9 @@ struct LinkView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 360)
+            if let note {
+                Text(note).font(.callout.bold()).multilineTextAlignment(.center).frame(maxWidth: 360)
+            }
             Group {
                 if let url, let image = QRCode.image(for: url) {
                     Image(nsImage: image).interpolation(.none).resizable()
@@ -33,6 +39,7 @@ struct LinkView: View {
                     .frame(maxWidth: 360)
                 Button("Try again", action: retry).keyboardShortcut(.defaultAction)
             }
+            RestoreButton(restore: restore)
         }
         .padding(40)
     }

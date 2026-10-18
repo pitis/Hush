@@ -182,6 +182,66 @@ impl ProjectionDb {
         self.pool.close().await;
     }
 
+    /// Copies the whole database to a new file at `path`, encrypted with the 64-hex-char `key`.
+    /// Consistent: the copy holds the only connection, so nothing writes meanwhile.
+    pub async fn export_to(&self, path: &std::path::Path, key: &str) -> Result<(), sqlx::Error> {
+        if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(sqlx::Error::Configuration(
+                "database key must be 64 hex characters".into(),
+            ));
+        }
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("ATTACH DATABASE ?1 AS export KEY ?2")
+            .bind(path.to_string_lossy())
+            .bind(format!("x'{key}'"))
+            .execute(&mut *conn)
+            .await?;
+        let exported = sqlx::query("SELECT sqlcipher_export('export')")
+            .execute(&mut *conn)
+            .await;
+        let detached = sqlx::query("DETACH DATABASE export").execute(&mut *conn).await;
+        if detached.is_err() {
+            // still attached: this connection mustn't be reused
+            drop(conn.detach());
+        }
+        exported?;
+        detached.map(|_| ())
+    }
+
+    /// Every table, index, view and trigger, as created: a restored database must have exactly
+    /// a fresh one's.
+    pub async fn schema(&self) -> Result<Vec<(String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Whether every attachment in a restored database is a plain file name; chat pictures that
+    /// aren't one of the restored files (in `files`) are dropped, to be looked for again.
+    pub async fn restored_files_are_plain(&self, files: &std::path::Path) -> Result<bool, sqlx::Error> {
+        let plain = |name: &str| !name.is_empty() && !name.contains('/') && !name.starts_with('.');
+        let names: Vec<(String,)> = sqlx::query_as("SELECT file FROM attachments WHERE file IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await?;
+        if !names.iter().all(|(n,)| plain(n)) {
+            return Ok(false);
+        }
+        let avatars: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, avatar FROM conversations WHERE avatar IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        for (id, avatar) in avatars {
+            let name = std::path::Path::new(&avatar).file_name().and_then(|n| n.to_str());
+            if !name.is_some_and(|n| plain(n) && files.join(n).is_file()) {
+                sqlx::query("UPDATE conversations SET avatar = NULL, avatar_checked_at = 0 WHERE id = ?1")
+                    .bind(&id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Keeps attachment files in `dir` (created when the first one is written).
     pub fn with_files(mut self, dir: PathBuf) -> Self {
         self.files = Some(dir);
@@ -3488,6 +3548,25 @@ mod tests {
                 (ChatEventKind::IncomingCall, Some(125))
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn an_export_is_encrypted_and_needs_a_raw_key() {
+        let dir = std::env::temp_dir().join(format!("hush-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}", dir.join("main.db").display());
+        let db = ProjectionDb::open(&url, Some(&"cd".repeat(32))).await.unwrap();
+        let out = dir.join("copy.db");
+        assert!(db.export_to(&out, "not a key").await.is_err());
+        assert!(!out.exists(), "refused before anything is written");
+        db.export_to(&out, &"ab".repeat(32)).await.unwrap();
+        assert!(!std::fs::read(&out).unwrap().starts_with(b"SQLite format 3"));
+        let copy = ProjectionDb::open(&format!("sqlite://{}", out.display()), Some(&"ab".repeat(32)))
+            .await
+            .unwrap();
+        assert_eq!(copy.schema().await.unwrap(), db.schema().await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
