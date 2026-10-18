@@ -1168,8 +1168,8 @@ final class AppStore {
 
     /// The link screen's Restore from a Backup…: the backup at `url` replaces everything here,
     /// and a new linking code follows. Why it failed while the code stays (a wrong passphrase, a
-    /// damaged file), or nil: the core stopped and started over, and `restoreNote` says how it
-    /// went.
+    /// damaged or unreadable file, linked meanwhile), or nil: the core stopped and started over
+    /// (finishing a swap cut short), and `restoreNote` says how it went.
     func restoreBackup(from url: URL, passphrase: String) async -> String? {
         guard let client else { return "Hush isn't running." }
         restoreNote = nil
@@ -1178,6 +1178,8 @@ final class AppStore {
             try await client.restoreBackup(path: url.path, passphrase: passphrase)
             note = "Your backup is restored. Link this Mac to your phone to finish."
         } catch CoreError.InvalidInput(let message) {
+            // nothing changed, and the core runs on
+            append("restoring a backup was refused: \(message)")
             return message
         } catch {
             append("restoring a backup failed: \(error)")

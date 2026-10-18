@@ -7,7 +7,8 @@
 //! data. A missing last chunk (a cut-off file) or one out of order fails to decrypt.
 //!
 //! Inside, entries `name length (u16 LE) | name | size (u64 LE) | bytes`, ended by a zero length:
-//! `MANIFEST` first, then `DATABASE` and the files as `attachments/<name>`.
+//! `MANIFEST` first, then `DATABASE` and the files as `attachments/<name>`. The manifest carries
+//! the database copy's key, so it is never written out on restore.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
@@ -42,19 +43,29 @@ pub(crate) enum BackupError {
     Io(String),
 }
 
+/// A short read is a cut-off file (`cut`); any other read error is the disk's, as it is.
+fn reading(e: std::io::Error, cut: BackupError) -> BackupError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        cut
+    } else {
+        e.into()
+    }
+}
+
 impl From<std::io::Error> for BackupError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e.to_string())
     }
 }
 
-fn key(passphrase: &str, salt: &[u8], memory: u32, passes: u32, lanes: u32) -> Result<[u8; 32], BackupError> {
-    let params = argon2::Params::new(memory, passes, lanes, Some(32)).map_err(|_| BackupError::NotABackup)?;
+/// The key, or None if the parameters aren't usable.
+fn key(passphrase: &str, salt: &[u8], memory: u32, passes: u32, lanes: u32) -> Option<[u8; 32]> {
+    let params = argon2::Params::new(memory, passes, lanes, Some(32)).ok()?;
     let mut key = [0; 32];
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
         .hash_password_into(passphrase.as_bytes(), salt, &mut key)
-        .map_err(|_| BackupError::NotABackup)?;
-    Ok(key)
+        .ok()?;
+    Some(key)
 }
 
 fn nonce(n: u64, last: bool) -> [u8; 12] {
@@ -63,6 +74,8 @@ fn nonce(n: u64, last: bool) -> [u8; 12] {
     nonce[8..].copy_from_slice(&u32::from(last).to_be_bytes());
     nonce
 }
+
+const UNDECRYPTABLE: &str = "a chunk doesn't decrypt";
 
 /// Writes a backup to `out`: add entries, then `finish`.
 pub(crate) struct Writer<W: Write> {
@@ -82,7 +95,8 @@ impl<W: Write> Writer<W> {
         header[24..28].copy_from_slice(&MEMORY_KIB.to_le_bytes());
         header[28..32].copy_from_slice(&PASSES.to_le_bytes());
         header[32..36].copy_from_slice(&LANES.to_le_bytes());
-        let cipher = Aes256Gcm::new((&key(passphrase, &salt, MEMORY_KIB, PASSES, LANES)?).into());
+        let key = key(passphrase, &salt, MEMORY_KIB, PASSES, LANES).expect("our parameters are valid");
+        let cipher = Aes256Gcm::new((&key).into());
         out.write_all(&header)?;
         Ok(Self {
             out,
@@ -178,7 +192,9 @@ struct Plain<R: Read> {
 impl<R: Read> Plain<R> {
     fn open(mut input: R, passphrase: &str) -> Result<Self, BackupError> {
         let mut header = [0; HEADER_LEN];
-        input.read_exact(&mut header).map_err(|_| BackupError::NotABackup)?;
+        input
+            .read_exact(&mut header)
+            .map_err(|e| reading(e, BackupError::NotABackup))?;
         if &header[..8] != MAGIC {
             return Err(BackupError::NotABackup);
         }
@@ -187,7 +203,8 @@ impl<R: Read> Plain<R> {
         if memory > MAX_MEMORY_KIB || passes > 16 || lanes > 16 {
             return Err(BackupError::NotABackup);
         }
-        let cipher = Aes256Gcm::new((&key(passphrase, &header[8..24], memory, passes, lanes)?).into());
+        let key = key(passphrase, &header[8..24], memory, passes, lanes).ok_or(BackupError::NotABackup)?;
+        let cipher = Aes256Gcm::new((&key).into());
         let mut plain = Self {
             input,
             cipher,
@@ -197,16 +214,16 @@ impl<R: Read> Plain<R> {
             n: 0,
             ended: false,
         };
-        // the first chunk tells a wrong passphrase from damage further in
+        // the first chunk that doesn't decrypt is a wrong passphrase (or damage right there)
         plain.next_chunk().map_err(|e| match e {
-            BackupError::Damaged(_) => BackupError::Undecryptable,
+            BackupError::Damaged(why) if why == UNDECRYPTABLE => BackupError::Undecryptable,
             e => e,
         })?;
         Ok(plain)
     }
 
     fn next_chunk(&mut self) -> Result<(), BackupError> {
-        let cut = |_| BackupError::Damaged("it ends too early".into());
+        let cut = |e| reading(e, BackupError::Damaged("it ends too early".into()));
         let mut head = [0; 5];
         self.input.read_exact(&mut head).map_err(cut)?;
         let last = match head[0] {
@@ -229,7 +246,7 @@ impl<R: Read> Plain<R> {
                     aad: &self.header,
                 },
             )
-            .map_err(|_| BackupError::Damaged("a chunk doesn't decrypt".into()))?;
+            .map_err(|_| BackupError::Damaged(UNDECRYPTABLE.into()))?;
         self.at = 0;
         self.n += 1;
         self.ended = last;
@@ -269,12 +286,12 @@ fn place(name: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Decrypts the backup in `input` into `dest` (created), with `MANIFEST` first. Errors leave a
-/// partial `dest` for the caller to remove.
-pub(crate) fn extract(input: impl Read, passphrase: &str, dest: &Path) -> Result<(), BackupError> {
+/// Decrypts the backup in `input` into `dest` (created) and returns its manifest, which stays
+/// in memory. Errors leave a partial `dest` for the caller to remove.
+pub(crate) fn extract(input: impl Read, passphrase: &str, dest: &Path) -> Result<Vec<u8>, BackupError> {
     let mut plain = Plain::open(input, passphrase)?;
     std::fs::create_dir_all(dest.join(FILES))?;
-    let mut first = true;
+    let mut manifest = None;
     loop {
         let mut len = [0; 2];
         plain.read_exact(&mut len)?;
@@ -286,13 +303,24 @@ pub(crate) fn extract(input: impl Read, passphrase: &str, dest: &Path) -> Result
         plain.read_exact(&mut name)?;
         let name = String::from_utf8(name).map_err(|_| BackupError::Damaged("an entry's name is malformed".into()))?;
         let path = place(&name).ok_or_else(|| BackupError::Damaged(format!("it holds an unexpected {name}")))?;
-        if first != (name == MANIFEST) {
+        if manifest.is_none() != (name == MANIFEST) {
             return Err(BackupError::Damaged("its manifest isn't first".into()));
         }
-        first = false;
         let mut size = [0; 8];
         plain.read_exact(&mut size)?;
         let mut left = u64::from_le_bytes(size);
+        if manifest.is_none() {
+            let mut bytes = vec![
+                0;
+                usize::try_from(left)
+                    .ok()
+                    .filter(|n| *n <= 64 * 1024)
+                    .ok_or_else(|| BackupError::Damaged("its manifest is too big".into()))?
+            ];
+            plain.read_exact(&mut bytes)?;
+            manifest = Some(bytes);
+            continue;
+        }
         let mut file = std::fs::File::create(dest.join(path))?;
         let mut buf = vec![0; 64 * 1024];
         while left > 0 {
@@ -302,13 +330,11 @@ pub(crate) fn extract(input: impl Read, passphrase: &str, dest: &Path) -> Result
             left -= take as u64;
         }
     }
-    if first {
-        return Err(BackupError::Damaged("it is empty".into()));
-    }
+    let manifest = manifest.ok_or_else(|| BackupError::Damaged("it is empty".into()))?;
     if plain.at != plain.chunk.len() || !plain.ended {
         return Err(BackupError::Damaged("there is more after its end".into()));
     }
-    Ok(())
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -341,8 +367,9 @@ mod tests {
     #[test]
     fn a_backup_restores_what_went_in() {
         let dest = temp_dir("roundtrip");
-        extract(sample("correct horse").as_slice(), "correct horse", &dest).unwrap();
-        assert_eq!(std::fs::read(dest.join(MANIFEST)).unwrap(), b"{}");
+        let manifest = extract(sample("correct horse").as_slice(), "correct horse", &dest).unwrap();
+        assert_eq!(manifest, b"{}");
+        assert!(!dest.join(MANIFEST).exists(), "the database's key isn't written out");
         let db = std::fs::read(dest.join(DATABASE)).unwrap();
         assert_eq!(db.len(), CHUNK * 2 + 17);
         assert!(db.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
@@ -383,6 +410,52 @@ mod tests {
             let e = extract(&bytes[..cut], "correct horse", &dest);
             assert!(matches!(e, Err(BackupError::Damaged(_))), "{cut}: {e:?}");
         }
+    }
+
+    #[test]
+    fn every_size_around_a_chunk_restores() {
+        // 77 bytes besides the database's: the end marker split across chunks or not, the
+        // first chunk exactly full, an empty file
+        for size in [CHUNK - 79, CHUNK - 78, CHUNK - 77, CHUNK - 76, CHUNK - 75, CHUNK] {
+            let mut w = Writer::new(Vec::new(), "correct horse").unwrap();
+            w.add_bytes(MANIFEST, b"{}").unwrap();
+            w.add_bytes("attachments/empty", b"").unwrap();
+            w.add_bytes(DATABASE, &vec![7; size]).unwrap();
+            let dest = temp_dir("sizes");
+            extract(w.finish().unwrap().as_slice(), "correct horse", &dest).unwrap_or_else(|e| panic!("{size}: {e}"));
+            assert_eq!(std::fs::read(dest.join(DATABASE)).unwrap().len(), size);
+            assert!(std::fs::read(dest.join("attachments/empty")).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_chunk_out_of_place_fails() {
+        let bytes = sample("correct horse");
+        let len = 5 + CHUNK + TAG;
+        let (first, second) = (HEADER_LEN, HEADER_LEN + len);
+        let mut swapped = bytes.clone();
+        swapped[second..second + len].copy_from_slice(&bytes[first..first + len]);
+        let dest = temp_dir("swap");
+        assert!(matches!(
+            extract(swapped.as_slice(), "correct horse", &dest),
+            Err(BackupError::Damaged(_))
+        ));
+        // the second chunk passed off as the last
+        let mut early = bytes[..second + len].to_vec();
+        early[second] = 1;
+        let dest = temp_dir("early");
+        assert!(matches!(
+            extract(early.as_slice(), "correct horse", &dest),
+            Err(BackupError::Damaged(_))
+        ));
+    }
+
+    #[test]
+    fn a_file_cut_after_its_header_is_damaged_not_a_wrong_passphrase() {
+        let bytes = sample("correct horse");
+        let dest = temp_dir("header-only");
+        let e = extract(&bytes[..HEADER_LEN + 3], "correct horse", &dest);
+        assert!(matches!(e, Err(BackupError::Damaged(_))), "{e:?}");
     }
 
     #[test]

@@ -91,6 +91,11 @@ pub enum Command {
     Relink {
         done: oneshot::Sender<()>,
     },
+    /// Stops the core if it isn't linked (true), for restoring a backup; a linked one (the code
+    /// was scanned meanwhile) keeps running (false).
+    StopUnlinked {
+        done: oneshot::Sender<bool>,
+    },
     /// A chat setting changed here (or Storage Service writes were turned on): sync soon.
     StorageSync,
     /// Who has `username` ("name.42"): their ACI, None if no one, an error if it can't be asked.
@@ -408,25 +413,10 @@ async fn run(
                     continue;
                 }
                 // boxed to keep the large provisioning future off the stack (the stack size is the real fix)
-                let mut linking = Box::pin(link(&store, device_name, listener.as_ref()));
-                // waiting for the scan, the core can still be stopped (to restore a backup, or
-                // quit); anything else waits for the link
-                let linked_or = loop {
-                    tokio::select! {
-                        r = &mut linking => break r,
-                        cmd = rx.recv() => match cmd {
-                            Some(Command::Relink { done }) => {
-                                let _ = done.send(());
-                                return;
-                            }
-                            Some(Command::Unlink { done, .. }) => {
-                                let _ = done.send(Ok(()));
-                                return;
-                            }
-                            Some(cmd) => queued.push_back(cmd),
-                            None => return,
-                        },
-                    }
+                let linking = Box::pin(link(&store, device_name, listener.as_ref()));
+                let linked_or = match race_link(linking, &mut rx, &mut queued).await {
+                    Raced::Linked(r) => r,
+                    Raced::Stopped | Raced::Closed => return,
                 };
                 match linked_or {
                     Ok(m) => {
@@ -799,6 +789,14 @@ async fn run(
                     let _ = done.send(Err("not linked yet".into()));
                 }
             },
+            Command::StopUnlinked { done } => {
+                if manager.is_some() {
+                    let _ = done.send(false);
+                    continue;
+                }
+                let _ = done.send(true);
+                return;
+            }
             Command::Relink { done } => {
                 if let Some(m) = &manager {
                     // Best effort: the new link works either way, but each failure leaves a
@@ -1615,6 +1613,46 @@ fn spawn_call_router(
 
 /// Links as a secondary device: emits `LinkUrl`, waits (bounded) for the phone to scan, then asks
 /// the phone for contacts. Returns a message for the user on failure.
+/// How waiting for a link to be scanned ended.
+#[derive(Debug, PartialEq)]
+enum Raced<T> {
+    Linked(T),
+    /// A command stopped the core (it was answered).
+    Stopped,
+    /// The Client is gone.
+    Closed,
+}
+
+/// Waits for `linking`, meanwhile answering the commands that stop an unlinked core (to restore
+/// a backup, relink or unlink) and queuing the rest for after the link.
+async fn race_link<T>(
+    mut linking: std::pin::Pin<Box<impl std::future::Future<Output = T>>>,
+    rx: &mut mpsc::UnboundedReceiver<Command>,
+    queued: &mut std::collections::VecDeque<Command>,
+) -> Raced<T> {
+    loop {
+        tokio::select! {
+            r = &mut linking => return Raced::Linked(r),
+            cmd = rx.recv() => match cmd {
+                Some(Command::Relink { done }) => {
+                    let _ = done.send(());
+                    return Raced::Stopped;
+                }
+                Some(Command::StopUnlinked { done }) => {
+                    let _ = done.send(true);
+                    return Raced::Stopped;
+                }
+                Some(Command::Unlink { done, .. }) => {
+                    let _ = done.send(Ok(()));
+                    return Raced::Stopped;
+                }
+                Some(cmd) => queued.push_back(cmd),
+                None => return Raced::Closed,
+            },
+        }
+    }
+}
+
 async fn link(
     store: &SqliteStore,
     device_name: String,
@@ -2456,8 +2494,10 @@ async fn sync_titles(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, l:
 mod tests {
     use presage::libsignal_service::protocol::kem::{KeyPair, KeyType};
 
+    use super::{race_link, Command, Raced};
     use crate::events::{CoreEvent, EventListener};
     use crate::projection::{Op, ProjectionDb, Settings};
+    use tokio::sync::{mpsc, oneshot};
 
     struct Quiet;
     impl EventListener for Quiet {
@@ -3189,5 +3229,67 @@ mod tests {
         assert!(store.message(&thread, 200).await.unwrap().is_none());
         assert!(db.presage_forget_threads().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link that is never scanned, with the commands `send` puts in first.
+    async fn race_pending(send: impl FnOnce(&mpsc::UnboundedSender<Command>)) -> (Raced<()>, Vec<Command>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send(&tx);
+        drop(tx);
+        let mut queued = std::collections::VecDeque::new();
+        let raced = race_link(Box::pin(futures::future::pending::<()>()), &mut rx, &mut queued).await;
+        (raced, queued.into_iter().collect())
+    }
+
+    #[tokio::test]
+    async fn a_code_waiting_for_a_scan_stops_for_a_restore_and_queues_the_rest() {
+        let (done, stopped) = oneshot::channel();
+        let (raced, queued) = race_pending(|tx| {
+            tx.send(Command::Start).unwrap();
+            tx.send(Command::StopUnlinked { done }).unwrap();
+        })
+        .await;
+        assert_eq!(raced, Raced::Stopped);
+        assert!(stopped.await.unwrap(), "stopped unlinked");
+        assert!(matches!(queued[..], [Command::Start]));
+    }
+
+    #[tokio::test]
+    async fn relinking_or_unlinking_stop_a_code_too() {
+        let (done, relinked) = oneshot::channel();
+        let (raced, _) = race_pending(|tx| tx.send(Command::Relink { done }).unwrap()).await;
+        assert_eq!(raced, Raced::Stopped);
+        relinked.await.unwrap();
+        let (done, unlinked) = oneshot::channel();
+        let (raced, _) = race_pending(|tx| {
+            tx.send(Command::Unlink {
+                tell_server: true,
+                done,
+            })
+            .unwrap()
+        })
+        .await;
+        assert_eq!(raced, Raced::Stopped);
+        assert_eq!(unlinked.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_closed_client_ends_the_wait() {
+        let (raced, _) = race_pending(|_| {}).await;
+        assert_eq!(raced, Raced::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_finished_link_keeps_what_was_queued() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Command::Start).unwrap();
+        let mut queued = std::collections::VecDeque::new();
+        let link = Box::pin(async {
+            tokio::task::yield_now().await;
+            7
+        });
+        assert_eq!(race_link(link, &mut rx, &mut queued).await, Raced::Linked(7));
+        // the queued Start is either taken in or still in the channel: never lost
+        assert_eq!(queued.len() + usize::from(rx.try_recv().is_ok()), 1);
     }
 }
