@@ -14,105 +14,43 @@ struct ComposerView: View {
     /// Waits for a pause in typing before asking for a link preview.
     @State private var previewWait: Task<Void, Never>?
 
+    /// Something shows above the field: picker, link preview, reply, edit or files.
+    private var hasAccessories: Bool {
+        mentions.isOpen || store.previewDraft != nil || store.replyTo != nil || store.editing != nil
+            || !store.outgoingFiles.isEmpty
+    }
+
     var body: some View {
-        VStack(spacing: 6) {
-            if mentions.isOpen { MentionList(picker: mentions) }
-            if let draft = store.previewDraft { PreviewDraftCard(draft: draft, dismiss: store.dismissPreview) }
-            if let reply = store.replyTo {
-                HStack {
-                    Rectangle().fill(Theme.outgoing).frame(width: 3)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(
-                            reply.isOutgoing ? "Replying to yourself" : "Replying to \(store.senderName(reply.author))"
-                        )
-                        .font(.system(size: 11, weight: .semibold))
-                        Text(
-                            reply.body.map { MessageText.plain($0, ranges: reply.ranges, name: store.mentionName) }
-                                ?? "Attachment"
-                        )
-                        .font(.system(size: 12)).lineLimit(1)
-                        .foregroundStyle(Theme.secondaryText)
-                    }
-                    Spacer()
-                    Button {
-                        store.replyTo = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                    .keyboardShortcut(mentions.isOpen ? nil : .cancelAction)
+        // glass for the floating controls only; the timeline scrolls on under them
+        GlassEffectContainer(spacing: 8) {
+            VStack(spacing: 8) {
+                if hasAccessories {
+                    accessories
+                        .padding(8)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 16, style: .continuous))
                 }
-                .frame(height: 34)
-                .padding(.horizontal, 12)
+                HStack(alignment: .bottom, spacing: 8) {
+                    addMenu
+                    ComposerField(
+                        text: $text, focusRequest: focusRequest, onReturn: submit,
+                        // ↑ in an empty field edits your last message, as in Desktop
+                        onUpInEmpty: { store.editing == nil && store.editLast() },
+                        onPasteFiles: { store.addFiles($0.map(Files.outgoing)) },
+                        onPasteError: {
+                            store.showError("Couldn't attach what you pasted: \($0.localizedDescription)")
+                        },
+                        mentions: conversationId.hasPrefix("g:") ? mentions : nil
+                    )
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
+                }
             }
-            if let editing = store.editing {
-                HStack {
-                    Rectangle().fill(Theme.outgoing).frame(width: 3)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Editing message").font(.system(size: 11, weight: .semibold))
-                        Text(
-                            editing.body.map { MessageText.plain($0, ranges: editing.ranges, name: store.mentionName) }
-                                ?? ""
-                        )
-                        .font(.system(size: 12)).lineLimit(1)
-                        .foregroundStyle(Theme.secondaryText)
-                    }
-                    Spacer()
-                    Button(action: store.cancelEditing) { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                        .keyboardShortcut(mentions.isOpen ? nil : .cancelAction)
-                        .accessibilityLabel("Cancel editing")
-                }
-                .frame(height: 34)
-                .padding(.horizontal, 12)
-            }
-            if !store.outgoingFiles.isEmpty { FileTray(store: store) }
-            HStack(alignment: .bottom, spacing: 10) {
-                Button(action: chooseFiles) {
-                    Image(systemName: "paperclip").font(.system(size: 18))
-                }
-                .accessibilityLabel("Attach files")
-                .disabled(store.editing != nil)
-                .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                .padding(.bottom, 9)
-                Button {
-                    focusRequest += 1  // the palette types into the focused field
-                    DispatchQueue.main.async { NSApp.orderFrontCharacterPalette(nil) }
-                } label: {
-                    Image(systemName: "face.smiling").font(.system(size: 20))
-                }
-                .accessibilityLabel("Emoji")
-                .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                .padding(.bottom, 8)
-                Button {
-                    showStickers = true
-                } label: {
-                    Image(systemName: "square.grid.2x2").font(.system(size: 18))
-                }
-                .accessibilityLabel("Stickers")
-                .help("Stickers")
-                .disabled(store.editing != nil)
-                .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
-                .padding(.bottom, 9)
-                .popover(isPresented: $showStickers, arrowEdge: .top) {
-                    StickerPicker(store: store) { showStickers = false }
-                }
-                ComposerField(
-                    text: $text, focusRequest: focusRequest, onReturn: submit,
-                    // ↑ in an empty field edits your last message, as in Desktop
-                    onUpInEmpty: { store.editing == nil && store.editLast() },
-                    onPasteFiles: { store.addFiles($0.map(Files.outgoing)) },
-                    onPasteError: { store.showError("Couldn't attach what you pasted: \($0.localizedDescription)") },
-                    mentions: conversationId.hasPrefix("g:") ? mentions : nil
-                )
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(Theme.field, in: RoundedRectangle(cornerRadius: 18))
-            }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 12)
-            .padding(.top, store.replyTo == nil ? 8 : 0)
         }
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 12)
+        .onChange(of: store.attachRequest) { _, _ in chooseFiles() }
         .onAppear {
             text = Self.plain(Composer.draft(for: conversationId))
             takeFocusIfAsked()
@@ -146,6 +84,52 @@ struct ComposerView: View {
             }
         }
         .onChange(of: store.composerWantsFocus) { _, _ in takeFocusIfAsked() }
+    }
+
+    /// Attach Files… and Stickers…; emoji are under Edit ▸ Emoji & Symbols (⌃⌘Space).
+    private var addMenu: some View {
+        Menu {
+            Button("Attach Files…", action: chooseFiles)
+            Button("Stickers…") { showStickers = true }
+        } label: {
+            Image(systemName: "plus").font(.system(size: 15, weight: .medium)).frame(width: 22, height: 22)
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .disabled(store.editing != nil)
+        .help("Attach files or a sticker")
+        .accessibilityLabel("Attach")
+        .popover(isPresented: $showStickers, arrowEdge: .top) {
+            StickerPicker(store: store) { showStickers = false }
+        }
+    }
+
+    /// What goes with the next message, above the field.
+    @ViewBuilder private var accessories: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if mentions.isOpen { MentionList(picker: mentions) }
+            if let draft = store.previewDraft { PreviewDraftCard(draft: draft, dismiss: store.dismissPreview) }
+            if let reply = store.replyTo {
+                AccessoryBar(
+                    icon: "arrowshape.turn.up.left",
+                    title: reply.isOutgoing ? "Replying to yourself" : "Replying to \(store.senderName(reply.author))",
+                    detail: reply.body.map { MessageText.plain($0, ranges: reply.ranges, name: store.mentionName) }
+                        ?? "Attachment",
+                    close: "Cancel reply", cancelsWithEsc: !mentions.isOpen
+                ) { store.replyTo = nil }
+            }
+            if let editing = store.editing {
+                AccessoryBar(
+                    icon: "pencil", title: "Editing message",
+                    detail: editing.body.map {
+                        MessageText.plain($0, ranges: editing.ranges, name: store.mentionName)
+                    } ?? "",
+                    close: "Cancel editing", cancelsWithEsc: !mentions.isOpen, action: store.cancelEditing)
+            }
+            if !store.outgoingFiles.isEmpty { FileTray(store: store) }
+        }
     }
 
     private func takeFocusIfAsked() {
@@ -232,6 +216,34 @@ enum Composer {
     }
 }
 
+/// A reply or an edit in progress, above the field, with ✕ (or Esc) to drop it.
+struct AccessoryBar: View {
+    let icon: String
+    let title: String
+    let detail: String
+    /// What ✕ is called, for VoiceOver.
+    let close: String
+    /// Esc drops it (not while the mention picker has Esc).
+    let cancelsWithEsc: Bool
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon).foregroundStyle(.secondary).frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 11, weight: .semibold))
+                Text(detail).font(.system(size: 12)).lineLimit(1).foregroundStyle(Theme.secondaryText)
+            }
+            Spacer()
+            Button(action: action) { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
+                .keyboardShortcut(cancelsWithEsc ? .cancelAction : nil)
+                .accessibilityLabel(close)
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
 /// The link preview that will go with the message, with ✕ to leave it off.
 struct PreviewDraftCard: View {
     let draft: PreviewDraft
@@ -257,9 +269,6 @@ struct PreviewDraftCard: View {
                 .buttonStyle(.plain).foregroundStyle(Theme.secondaryText)
                 .accessibilityLabel("Remove the link preview")
         }
-        .padding(8)
-        .background(Theme.field, in: RoundedRectangle(cornerRadius: 12))
-        .padding(.horizontal, 14)
     }
 }
 
@@ -279,15 +288,15 @@ struct MentionList: View {
                         Spacer()
                     }
                     .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(i == picker.selected ? Theme.outgoing.opacity(0.35) : .clear)
+                    .background(
+                        i == picker.selected ? Color.accentColor.opacity(0.3) : .clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.vertical, 4)
-        .background(Theme.field, in: RoundedRectangle(cornerRadius: 12))
-        .padding(.horizontal, 14)
         .accessibilityLabel("Mention someone")
     }
 }
@@ -321,7 +330,6 @@ struct FileTray: View {
                     .background(Theme.field, in: RoundedRectangle(cornerRadius: 10))
                 }
             }
-            .padding(.horizontal, 14)
         }
         .scrollIndicators(.never)
     }

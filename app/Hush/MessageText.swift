@@ -164,7 +164,7 @@ enum MessageText {
                 .font(.system(size: size, design: styles.contains(.monospace) ? .monospaced : .default))
             if styles.contains(.bold) { piece = piece.bold() }
             if styles.contains(.italic) { piece = piece.italic() }
-            return text + piece
+            return Text("\(text)\(piece)")
         }
     }
 

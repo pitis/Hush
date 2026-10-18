@@ -8,12 +8,15 @@ enum Timeline {
         /// `first`/`last`: the message starts/ends a run of the same sender.
         case message(Message, first: Bool, last: Bool)
         case event(ChatEvent)
+        /// Messages that couldn't be decrypted, one after another: one notice, from the first.
+        /// `reset`: the secure session was reset after them.
+        case failures(ChatEvent, count: Int, reset: Bool)
 
         var id: String {
             switch self {
             case .day(_, let ms): "day-\(ms)"
             case .message(let m, _, _): "\(m.author)-\(m.sentAt)"
-            case .event(let e): "event-\(e.id)"
+            case .event(let e), .failures(let e, _, _): "event-\(e.id)"
             }
         }
     }
@@ -37,6 +40,12 @@ enum Timeline {
             let newDay = prev.map { !calendar.isDate(date($0.at), inSameDayAs: date(entry.at)) } ?? true
             if newDay { items.append(.day(fmt.dayTitle(entry.at, now: now), ms: entry.at)) }
             switch entry {
+            case .event(let e) where e.kind == .decryptionFailed:
+                if !newDay, case .failures(let first, let count, _) = items.last {
+                    items[items.count - 1] = .failures(first, count: count + 1, reset: false)
+                } else {
+                    items.append(.failures(e, count: 1, reset: false))
+                }
             case .event(let e):
                 items.append(.event(e))
             case .message(let m):
@@ -44,6 +53,15 @@ enum Timeline {
                 let first = newDay || !sameRun(prev?.message, m, calendar)
                 let last = next.map { !sameRun(m, $0, calendar) } ?? true
                 items.append(.message(m, first: first, last: last))
+            }
+        }
+        // a reset answers the failures before it
+        var resetLater = false
+        for i in items.indices.reversed() {
+            switch items[i] {
+            case .event(let e) where e.kind == .sessionReset: resetLater = true
+            case .failures(let e, let count, _): items[i] = .failures(e, count: count, reset: resetLater)
+            default: break
             }
         }
         return items

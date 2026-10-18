@@ -7,7 +7,7 @@ import XCTest
 final class AppearanceTests: XCTestCase {
     func testTheChoicesMapToColorSchemesDarkFirst() {
         XCTAssertEqual(Appearance.allCases.map(\.label), ["System", "Light", "Dark"])
-        XCTAssertEqual(Appearance.default, .dark, "as before: the app was dark only")
+        XCTAssertEqual(Appearance.default, .system, "light or dark like the rest of the Mac")
         XCTAssertNil(Appearance.system.scheme)
         XCTAssertEqual(Appearance.light.scheme, .light)
         XCTAssertEqual(Appearance.dark.scheme, .dark)

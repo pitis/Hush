@@ -22,12 +22,8 @@ struct ContentView: View {
             case .chats:
                 ZStack {
                     NavigationSplitView {
-                        VStack(spacing: 0) {
-                            ConnectionBanner(store: core)
-                            ErrorBanner(store: core)
-                            SidebarView(store: core)
-                        }
-                        .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
+                        SidebarView(store: core)
+                            .navigationSplitViewColumnWidth(min: 300, ideal: 340, max: 460)
                     } detail: {
                         if let c = core.selectedConversation {
                             ConversationView(store: core, conversation: c)
@@ -41,7 +37,6 @@ struct ContentView: View {
                                     core.conversations.isEmpty ? "New messages appear here as they arrive." : ""))
                         }
                     }
-                    .navigationTitle("")
                     // a group link clicked in a message joins here, not in the browser
                     .environment(\.openURL, OpenURLAction { core.handleLink($0) ? .handled : .systemAction })
                     .sheet(
@@ -58,7 +53,6 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 520)
-        .background(Theme.window)
         .onChange(of: appearance, initial: true) { _, chosen in chosen.apply() }
         .task { await core.boot() }
         .onAppear { WindowOpener.open = openWindow }
@@ -77,8 +71,9 @@ struct ContentView: View {
     }
 }
 
-/// Shown over the chat list while not connected, like Desktop's: what is going on, and Retry.
-struct ConnectionBanner: View {
+/// One quiet line at the foot of the chat list while not connected (as Mail): what is going on,
+/// and Retry.
+struct ConnectionStatus: View {
     let store: AppStore
 
     var body: some View {
@@ -86,42 +81,46 @@ struct ConnectionBanner: View {
         case .online, .unlinked:
             EmptyView()
         case .connecting:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Connecting…").font(.system(size: 12))
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Connecting…")
                 Spacer()
             }
-            .padding(10)
-            .background(Theme.selection)
+            .font(.callout).foregroundStyle(.secondary)
+            .padding(.horizontal, 16).padding(.vertical, 8)
         case .offline:
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: "wifi.slash")
-                Text("Offline. Messages will arrive once you're connected.").font(.system(size: 12))
+                Text("Offline")
                 Spacer(minLength: 4)
-                Button("Retry", action: store.retryConnection).controlSize(.small)
+                Button("Retry", action: store.retryConnection).buttonStyle(.link)
             }
-            .padding(10)
-            .background(Color.orange.opacity(0.25))
+            .font(.callout).foregroundStyle(.secondary)
+            .help("Messages will arrive once you're connected.")
+            .padding(.horizontal, 16).padding(.vertical, 8)
         }
     }
 }
 
-/// The last thing that failed (a pin, a mute, marking a chat read, a core error), over the chat
-/// list until dismissed or until the next change works.
+/// The last thing that failed (a pin, a mute, marking a chat read, a core error), at the top of
+/// the chat list until dismissed or until the next change works.
 struct ErrorBanner: View {
     let store: AppStore
 
     var body: some View {
         if let error = store.lastError {
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle")
-                Text(error).font(.system(size: 12)).lineLimit(3)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                Text(error).font(.callout).lineLimit(3)
                 Spacer(minLength: 4)
                 Button(action: store.dismissError) { Image(systemName: "xmark") }
-                    .buttonStyle(.plain).accessibilityLabel("Dismiss")
+                    .buttonStyle(.borderless).accessibilityLabel("Dismiss")
             }
             .padding(10)
-            .background(Color.yellow.opacity(0.2))
+            // in a shape: never a fill reaching into the title bar
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, 10)
+            .padding(.bottom, 6)
         }
     }
 }

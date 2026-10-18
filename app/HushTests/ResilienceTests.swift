@@ -13,6 +13,23 @@ final class TimelineEventTests: XCTestCase {
         XCTAssertEqual(ids, ["a-10", "event-1", "a-20"])
     }
 
+    func testRepeatedDecryptionFailuresShowAsOneNoticeThatAResetAnswers() {
+        let failed = { (id: Int64, at: Int64) in
+            ChatEvent(id: id, conversationId: "c:a", at: at, kind: .decryptionFailed, author: "a", value: nil)
+        }
+        let reset = ChatEvent(id: 9, conversationId: "c:a", at: 30, kind: .sessionReset, author: "a", value: nil)
+        let items = Timeline.items(
+            for: [message("c:a", "a", 10), message("c:a", "a", 20)],
+            events: [failed(1, 11), failed(2, 12), failed(3, 13), failed(4, 25), reset, failed(5, 40)])
+        let notices = items.compactMap { item -> String? in
+            guard case .failures(let first, let count, let answered) = item else { return nil }
+            return "\(first.id)×\(count)\(answered ? " reset" : "")"
+        }
+        // a message between failures splits them; a reset answers the failures before it
+        XCTAssertEqual(notices, ["1×3 reset", "4×1 reset", "5×1"])
+        XCTAssertTrue(items.contains { $0.id == "event-1" })
+    }
+
     func testOnlyTheNetworkComingBackReconnects() {
         XCTAssertTrue(NetworkWatch.shouldReconnect(was: false, now: true))
         XCTAssertFalse(NetworkWatch.shouldReconnect(was: true, now: true))

@@ -2034,7 +2034,9 @@ async fn handle(
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
-        Received::DecryptionError(_) => {}
+        Received::DecryptionError(sender) => {
+            tracing::warn!(sender = %sender.service_id_string(), "a message couldn't be decrypted")
+        }
         Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
     }
     match received {
@@ -2048,10 +2050,7 @@ async fn handle(
         Received::Contacts => sync_titles(m, db, l).await,
         // Ids only: never log message content.
         Received::DecryptionError(sender) => {
-            l.on_event(CoreEvent::Error {
-                message: format!("a message from {} couldn't be decrypted", sender.service_id_string()),
-            });
-            // shown in the chat, with a way to reset the session
+            // shown in the chat (not as an error banner), with a way to reset the session
             let conversation_id = direct_id(&sender);
             let at = chrono::Utc::now().timestamp_millis();
             let author = sender.raw_uuid().to_string();

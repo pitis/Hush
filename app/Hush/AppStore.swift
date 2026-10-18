@@ -97,6 +97,8 @@ final class AppStore {
     private(set) var scrollRequest = 0
     /// Bumped to ask the sidebar to focus the search field.
     private(set) var searchFocusRequest = 0
+    /// Bumped to ask the composer to choose files to attach (⇧⌘A).
+    private(set) var attachRequest = 0
     /// Set to move focus to the composer (a click on a chat, ↩ in the search, a shortcut); the
     /// composer clears it. Switching chats with the arrows in the list or the search leaves focus
     /// there.
@@ -1369,6 +1371,7 @@ final class AppStore {
     }
     func focusComposer() { composerWantsFocus = true }
     func composerTookFocus() { composerWantsFocus = false }
+    func requestAttach() { attachRequest += 1 }
 
     /// Recomputes day separators ("Today" becomes "Yesterday" after midnight).
     func refreshDays() { timelineItems = Timeline.items(for: messages, events: events) }

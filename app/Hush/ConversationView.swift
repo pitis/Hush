@@ -8,21 +8,20 @@ struct ConversationView: View {
     @State private var dropTargeted = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            ConversationHeader(store: store, conversation: conversation)
-            Divider().overlay(Color.black.opacity(0.4))
-            TimelineList(store: store, conversation: conversation) { a in
-                do {
-                    quickLook = try Files.openable(a)
-                    return true
-                } catch {
-                    store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
-                    return false
-                }
+        TimelineList(store: store, conversation: conversation) { a in
+            do {
+                quickLook = try Files.openable(a)
+                return true
+            } catch {
+                store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
+                return false
             }
-            .environment(\.chatColor, conversation.chatColor)
-            .environment(\.onWallpaper, conversation.wallpaper != nil)
-            .background { if let w = conversation.wallpaper { Wallpaper(wallpaper: w) } }
+        }
+        .environment(\.chatColor, conversation.chatColor)
+        .environment(\.onWallpaper, conversation.wallpaper != nil)
+        .background { if let w = conversation.wallpaper { Wallpaper(wallpaper: w) } }
+        // floats over the timeline: messages scroll on under it
+        .safeAreaBar(edge: .bottom) {
             if conversation.blocked || conversation.messageRequest || conversation.groupInvitation
                 || conversation.groupJoinRequested
             {
@@ -31,7 +30,7 @@ struct ConversationView: View {
                 ComposerView(store: store, conversationId: conversation.id)
             }
         }
-        .background(Theme.window)
+        .modifier(ConversationChrome(store: store, conversation: conversation))
         .quickLookPreview($quickLook)
         // the preview closed: its link goes
         .onChange(of: quickLook) { old, _ in if let old { Files.close(old) } }
@@ -178,8 +177,9 @@ struct RequestBar: View {
     }
 }
 
-/// Header in its own view so typing/connection changes don't re-render the timeline.
-struct ConversationHeader: View {
+/// The chat's name, subtitle and actions in the window toolbar; a modifier of its own so typing
+/// and connection changes don't re-render the timeline.
+struct ConversationChrome: ViewModifier {
     let store: AppStore
     let conversation: Conversation
     @State private var choosingColor = false
@@ -198,101 +198,84 @@ struct ConversationHeader: View {
             && conversation.id != store.ownAci.map { "c:\($0)" }
     }
 
-    var body: some View {
-        let title = store.title(conversation)
-        HStack(spacing: 12) {
-            Avatar(id: conversation.id, name: title, size: 36)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
-                    Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
-                    // the note written about them on the phone
-                    if let note = conversation.note {
-                        Image(systemName: "note.text").font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
-                            .help(note)
-                            .accessibilityLabel("Note: \(note)")
-                    }
-                }
-                if let username = conversation.username, conversation.kind == .direct {
-                    Text("@\(username)").font(.system(size: 12)).foregroundStyle(Theme.secondaryText).lineLimit(1)
-                        .textSelection(.enabled)
-                }
-                if conversation.expireTimer > 0 {
-                    Label(Placeholder.duration(Int64(conversation.expireTimer)), systemImage: "hourglass")
-                        .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
-                        .accessibilityLabel(
-                            "Disappearing messages: \(Placeholder.duration(Int64(conversation.expireTimer)))")
-                }
-                if store.isTyping(conversation.id) {
-                    Text("typing…").font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
-                } else if store.connection != .online {
-                    Text(String(describing: store.connection)).font(.system(size: 12))
-                        .foregroundStyle(Theme.secondaryText)
+    func body(content: Content) -> some View {
+        content
+            .navigationTitle(store.title(conversation))
+            .navigationSubtitle(
+                Self.subtitle(
+                    typing: store.isTyping(conversation.id), connection: store.connection,
+                    timer: Int64(conversation.expireTimer),
+                    username: conversation.kind == .direct ? conversation.username : nil)
+            )
+            .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if canCall { callButton }
+                    optionsMenu
                 }
             }
-            Spacer()
-            if canSetTimer {
-                Menu {
-                    Picker(
-                        "Disappearing messages",
-                        selection: Binding(
-                            get: { conversation.expireTimer },
-                            set: { store.setTimer(conversation.id, seconds: $0) })
-                    ) {
-                        ForEach(Placeholder.timerChoices(current: conversation.expireTimer), id: \.self) {
-                            Text(Placeholder.timerChoice($0)).tag($0)
-                        }
-                    }
-                    .pickerStyle(.inline)
-                } label: {
-                    Image(systemName: conversation.expireTimer > 0 ? "hourglass.circle.fill" : "hourglass")
-                        .font(.system(size: 15))
-                }
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("Disappearing messages")
-                .accessibilityLabel("Disappearing messages")
-            }
-            if conversation.kind == .group {
-                Button {
-                    showingGroupInfo = true
-                } label: {
-                    Image(systemName: "info.circle").font(.system(size: 15))
-                }
-                .buttonStyle(.plain)
-                .help("Group info")
-                .accessibilityLabel("Group info")
-                .sheet(isPresented: $showingGroupInfo) { GroupInfoView(store: store, conversation: conversation) }
-            }
-            Button {
-                choosingColor = true
-            } label: {
-                Image(systemName: "paintpalette").font(.system(size: 15))
-            }
-            .buttonStyle(.plain)
-            .help("Chat colour and wallpaper")
-            .accessibilityLabel("Chat colour and wallpaper")
-            .popover(isPresented: $choosingColor, arrowEdge: .bottom) {
-                ChatStylePicker(
-                    chatColor: conversation.chatColor, wallpaper: conversation.wallpaper,
-                    chooseColor: { store.setChatColor(conversation.id, $0) },
-                    chooseWallpaper: { store.setWallpaper(conversation.id, $0) })
-            }
-            if canCall {
-                let inCall = store.call != nil && store.call?.phase != .ended
-                Button {
-                    if inCall { store.showCallWindow() } else { store.startCall(conversation.id) }
-                } label: {
-                    Image(systemName: inCall ? "phone.fill" : "phone").font(.system(size: 15))
-                }
-                .buttonStyle(.bordered)
-                // signaling rides the message pipeline: no call before it is connected
-                .disabled(!inCall && store.connection != .online)
-                .help(inCall ? "Show the call" : "Voice call")
-                .accessibilityLabel(inCall ? "Show the call" : "Start a voice call")
-            }
+            .sheet(isPresented: $showingGroupInfo) { GroupInfoView(store: store, conversation: conversation) }
+    }
+
+    private var callButton: some View {
+        let inCall = store.call != nil && store.call?.phase != .ended
+        return Button {
+            if inCall { store.showCallWindow() } else { store.startCall(conversation.id) }
+        } label: {
+            Label(inCall ? "Show the Call" : "Voice Call", systemImage: inCall ? "phone.fill" : "phone")
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
+        // signaling rides the message pipeline: no call before it is connected
+        .disabled(!inCall && store.connection != .online)
+        .help(inCall ? "Show the call" : "Voice call")
+    }
+
+    private var optionsMenu: some View {
+        Menu {
+            if canSetTimer {
+                Picker(
+                    "Disappearing Messages",
+                    selection: Binding(
+                        get: { conversation.expireTimer },
+                        set: { store.setTimer(conversation.id, seconds: $0) })
+                ) {
+                    ForEach(Placeholder.timerChoices(current: conversation.expireTimer), id: \.self) {
+                        Text(Placeholder.timerChoice($0)).tag($0)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+            Button("Chat Colour and Wallpaper…") { choosingColor = true }
+            Button("Search in Chat") { store.searchInChat() }
+            if conversation.kind == .group { Button("Group Info…") { showingGroupInfo = true } }
+            // the note written about them on the phone
+            if let note = conversation.note {
+                Divider()
+                Text("Note: \(note)")
+            }
+        } label: {
+            Label("Chat Options", systemImage: "info.circle")
+        }
+        .menuIndicator(.hidden)
+        .help("Chat options")
+        .popover(isPresented: $choosingColor, arrowEdge: .bottom) {
+            ChatStylePicker(
+                chatColor: conversation.chatColor, wallpaper: conversation.wallpaper,
+                chooseColor: { store.setChatColor(conversation.id, $0) },
+                chooseWallpaper: { store.setWallpaper(conversation.id, $0) })
+        }
+    }
+
+    /// Under the chat's name: what matters most now, in words ("" for nothing).
+    nonisolated static func subtitle(typing: Bool, connection: ConnectionState, timer: Int64, username: String?)
+        -> String
+    {
+        if typing { return "typing…" }
+        switch connection {
+        case .offline: return "Offline"
+        case .connecting: return "Connecting…"
+        case .online, .unlinked: break
+        }
+        if timer > 0 { return "Disappearing messages: \(Placeholder.duration(timer))" }
+        return username.map { "@\($0)" } ?? ""
     }
 }
 
@@ -319,8 +302,12 @@ struct TimelineList: View {
                                 .wallpaperBacked()
                                 .padding(.vertical, 10)
                         case .event(let e):
-                            ChatEventRow(
-                                event: e, name: store.senderName(e.author), me: store.ownAci,
+                            ChatEventRow(event: e, name: name(e), me: store.ownAci)
+                        case .failures(let e, let count, let reset):
+                            // presage resets sessions by ACI only
+                            let direct = e.conversationId.hasPrefix("c:") && !e.conversationId.hasPrefix("c:PNI:")
+                            DecryptionNotice(
+                                name: name(e), count: count, canReset: direct && !reset,
                                 reset: { store.resetSession(e.conversationId) })
                         case .message(let m, let first, let last):
                             let key = MessageKey(author: m.author, sentAt: m.sentAt)
@@ -404,15 +391,18 @@ struct TimelineList: View {
                         proxy.scrollTo("bottom", anchor: .bottom)
                         unseenNew = false
                     } label: {
-                        Label("New messages", systemImage: "arrow.down").font(.system(size: 12, weight: .semibold))
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(Theme.outgoing, in: Capsule()).foregroundStyle(.white)
+                        Label("New messages", systemImage: "arrow.down")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.glassProminent)
                     .padding(16)
                 }
             }
         }
+    }
+
+    /// Who an event is about: the chat's own name in a direct chat (never an id).
+    private func name(_ e: ChatEvent) -> String {
+        conversation.kind == .group ? store.senderName(e.author) : store.title(conversation)
     }
 
     private func markReadIfSeen() {
@@ -778,19 +768,12 @@ struct ChatEventRow: View {
     let name: String
     /// Our ACI, to word our own changes ("You set…").
     var me: String?
-    let reset: () -> Void
 
     var body: some View {
         VStack(spacing: 6) {
             switch event.kind {
             case .decryptionFailed:
-                // presage doesn't say whose side failed: worded for both
-                Label("A message between you and \(name) couldn't be decrypted", systemImage: "exclamationmark.lock")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.secondaryText)
-                if event.conversationId.hasPrefix("c:") && !event.conversationId.hasPrefix("c:PNI:") {
-                    Button("Reset Secure Session", action: reset).controlSize(.small)
-                }
+                EmptyView()  // the timeline collapses these into a `DecryptionNotice`
             case .timerChanged:
                 Label(
                     Placeholder.timerChange(event, who: event.author == me ? nil : name), systemImage: "hourglass"
@@ -822,6 +805,50 @@ struct ChatEventRow: View {
         .wallpaperBacked()
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
+    }
+}
+
+/// Messages that couldn't be decrypted, counted, with one way to start the session over.
+struct DecryptionNotice: View {
+    let name: String
+    let count: Int
+    /// A direct chat whose session hasn't been reset since.
+    let canReset: Bool
+    let reset: () -> Void
+    @State private var confirming = false
+    @State private var resetting = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Label(Self.text(count: count, name: name), systemImage: "exclamationmark.lock")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondaryText)
+            if canReset {
+                Button(resetting ? "Resetting…" : "Reset Secure Session…") { confirming = true }
+                    .buttonStyle(.link).font(.system(size: 12))
+                    .disabled(resetting)
+            }
+        }
+        .wallpaperBacked()
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .confirmationDialog("Reset the secure session with \(name)?", isPresented: $confirming) {
+            Button("Reset") {
+                resetting = true
+                reset()
+            }
+        } message: {
+            Text(
+                "Hush starts a new encrypted session. \(name) will see that it was reset. Messages that "
+                    + "couldn't be decrypted stay unreadable: ask them to resend anything important.")
+        }
+    }
+
+    /// presage doesn't say whose side failed: worded for both.
+    nonisolated static func text(count: Int, name: String) -> String {
+        count == 1
+            ? "A message between you and \(name) couldn't be decrypted"
+            : "\(count) messages between you and \(name) couldn't be decrypted"
     }
 }
 
