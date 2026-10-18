@@ -888,7 +888,7 @@ struct DecryptionNotice: View {
         }
     }
 
-    /// presage doesn't say whose side failed: worded for both.
+    /// Their failures (retry receipts) show as ours do: worded for both.
     nonisolated static func text(count: Int, name: String) -> String {
         count == 1
             ? "A message between you and \(name) couldn't be decrypted"

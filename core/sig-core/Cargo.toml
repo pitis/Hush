@@ -9,8 +9,8 @@ crate-type = ["staticlib", "lib"]
 
 [dependencies]
 uniffi = { workspace = true, features = ["tokio"] }
-# whisperfish/presage#448 (group management, on whisperfish/libsignal-service-rs#473) and
-# barafael/presage's pr/decryption-error-kind, one commit on the other in pitis/presage's
+# whisperfish/presage#448 (group management, on whisperfish/libsignal-service-rs#473) with
+# whisperfish/presage#461 (decryption error kinds) on top, in pitis/presage's
 # hush/decryption-error-kind: back to whisperfish/presage once both land.
 presage = { git = "https://github.com/pitis/presage", rev = "e7f0c11fe17034a0ee07f7ad13859f5b30574f2b" }
 presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "e7f0c11fe17034a0ee07f7ad13859f5b30574f2b" }
