@@ -31,18 +31,21 @@ struct ComposerView: View {
                 }
                 HStack(alignment: .bottom, spacing: 8) {
                     addMenu
-                    ComposerField(
-                        text: $text, focusRequest: focusRequest, onReturn: submit,
-                        // ↑ in an empty field edits your last message, as in Desktop
-                        onUpInEmpty: { store.editing == nil && store.editLast() },
-                        onPasteFiles: { store.addFiles($0.map(Files.outgoing)) },
-                        onPasteError: {
-                            store.showError("Couldn't attach what you pasted: \($0.localizedDescription)")
-                        },
-                        mentions: conversationId.hasPrefix("g:") ? mentions : nil
-                    )
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, Self.fieldInset)
+                    HStack(alignment: .bottom, spacing: 0) {
+                        ComposerField(
+                            text: $text, focusRequest: focusRequest, onReturn: submit,
+                            // ↑ in an empty field edits your last message, as in Desktop
+                            onUpInEmpty: { store.editing == nil && store.editLast() },
+                            onPasteFiles: { store.addFiles($0.map(Files.outgoing)) },
+                            onPasteError: {
+                                store.showError("Couldn't attach what you pasted: \($0.localizedDescription)")
+                            },
+                            mentions: conversationId.hasPrefix("g:") ? mentions : nil
+                        )
+                        .padding(.leading, 14)
+                        .padding(.vertical, Self.fieldInset)
+                        if canSend { sendButton } else { Spacer().frame(width: 14, height: 0) }
+                    }
                     .glassEffect(.regular, in: .rect(cornerRadius: 18, style: .continuous))
                 }
             }
@@ -92,6 +95,24 @@ struct ComposerView: View {
     /// sits centred on one line and stays by the last as the field grows.
     static let oneLine =
         NSLayoutManager().defaultLineHeight(for: .systemFont(ofSize: ComposerText.size)).rounded(.up) + 2 * fieldInset
+
+    /// What ↩ would send: words, or files waiting in the tray.
+    private var canSend: Bool { Composer.canSend(text.string) || !store.outgoingFiles.isEmpty }
+
+    /// Does what ↩ does; as tall as one line of the field, so it sits by the last line.
+    private var sendButton: some View {
+        let editing = store.editing != nil
+        return Button(action: submit) {
+            Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
+                .symbolRenderingMode(.palette).foregroundStyle(.white, Color.accentColor)
+                .frame(height: Self.oneLine)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 6)
+        .help(editing ? "Save the edit (↩)" : "Send (↩)")
+        .accessibilityLabel(editing ? "Save edit" : "Send")
+    }
 
     /// Attach Files… and Stickers…; emoji are under Edit ▸ Emoji & Symbols (⌃⌘Space).
     private var addMenu: some View {

@@ -106,7 +106,10 @@ bubbles, notices, rows, search results or cards inside the content.
 
 ### Composer
 - One `GlassEffectContainer`: a round glass "+" menu (Attach Files… ⇧⌘A, Stickers…) and the
-  glass message field (continuous 18pt corners, 9×14 padding).
+  glass message field (continuous 18pt corners, 9×14 padding). The "+" is as tall as a one-line
+  field, so it sits centred beside it and stays by the last line as the field grows.
+- A send button (accent `arrow.up.circle.fill`, 24pt) appears at the field's trailing edge while
+  there is something to send, centred on the last line; ↩ does the same.
 - Accessories (mention picker, link preview, reply and edit bars, file tray) share one glass
   panel above the field (continuous 16pt corners, 8pt padding). Reply and edit bars lead with an
   icon, never a coloured stripe.
