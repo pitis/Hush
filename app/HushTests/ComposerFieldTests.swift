@@ -103,6 +103,32 @@ final class ComposerFieldTests: XCTestCase {
         XCTAssertEqual(hosting.fittingSize.height / one, 6, accuracy: 0.2)
     }
 
+    /// Measuring the field at other widths (SwiftUI's probes) left its text laid out at the last
+    /// width asked, so the view resized while drawing and the window looped until AppKit threw.
+    func testMeasuringAtAnotherWidthLeavesTheTextLaidOutAtItsOwn() {
+        box.text = NSAttributedString(string: "hello world", attributes: ComposerText.display([]))
+        let row = HStack(alignment: .bottom, spacing: 10) {
+            Button {
+            } label: {
+                Image(systemName: "paperclip")
+            }
+            field().padding(.horizontal, 14)
+        }
+        let hosting = NSHostingView(rootView: AnyView(row))
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        let view = Self.find(in: hosting)!
+        _ = hosting.fittingSize  // measures with no width proposed
+        let container = view.textContainer!
+        XCTAssertEqual(container.size.width, view.bounds.width)
+        view.layoutManager!.ensureLayout(for: container)
+        let line = view.layoutManager!.defaultLineHeight(for: NSFont.systemFont(ofSize: ComposerText.size))
+        XCTAssertEqual(view.layoutManager!.usedRect(for: container).height, line, accuracy: 1)
+    }
+
     func testPasteIsOfferedForAnImageOnlyClipboardAndAttachesIt() throws {
         var pasted: [URL] = []
         let box = box!

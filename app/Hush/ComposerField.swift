@@ -70,6 +70,10 @@ struct ComposerField: NSViewRepresentable {
             let container = view.textContainer
         else { return nil }
         let width = proposal.width ?? 300
+        // SwiftUI also asks about widths it won't use (0, ∞): text left laid out at one resizes the
+        // view while it draws, and the window lays out again, endlessly
+        let own = container.containerSize
+        defer { container.containerSize = own }
         container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
         layout.ensureLayout(for: container)
         let line = layout.defaultLineHeight(for: NSFont.systemFont(ofSize: ComposerText.size))
