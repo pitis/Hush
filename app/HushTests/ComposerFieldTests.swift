@@ -97,10 +97,41 @@ final class ComposerFieldTests: XCTestCase {
         hosting.layoutSubtreeIfNeeded()
         let three = hosting.fittingSize.height
         XCTAssertEqual(three / one, 3, accuracy: 0.2)
+        // ⇧↩ at the end: the empty line counts
+        view.insertText("\n", replacementRange: NSRange(location: NSNotFound, length: 0))
+        hosting.rootView = AnyView(field().frame(width: 300))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(hosting.fittingSize.height / one, 4, accuracy: 0.2)
+        view.deleteBackward(nil)
         view.insertText("\nd\ne\nf\ng\nh\ni", replacementRange: NSRange(location: NSNotFound, length: 0))
         hosting.rootView = AnyView(field().frame(width: 300))
         hosting.layoutSubtreeIfNeeded()
         XCTAssertEqual(hosting.fittingSize.height / one, 6, accuracy: 0.2)
+    }
+
+    /// SwiftUI measures the field at widths it won't use (0, ∞, none) many times per layout pass. Measuring must
+    /// leave the text view alone: each resize makes SwiftUI lay out and measure again, until AppKit throws.
+    func testMeasuringNeverResizesTheTextView() {
+        box.text = NSAttributedString(
+            string: String(repeating: "lorem ipsum ", count: 12), attributes: ComposerText.display([]))
+        let row = HStack(alignment: .bottom, spacing: 10) {
+            Button {
+            } label: {
+                Image(systemName: "paperclip")
+            }
+            field().padding(.horizontal, 14)
+        }
+        let hosting = NSHostingView(rootView: AnyView(row))
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        let view = Self.find(in: hosting)!
+        let resized = XCTNSNotificationExpectation(name: NSView.frameDidChangeNotification, object: view)
+        resized.isInverted = true
+        _ = hosting.fittingSize
+        wait(for: [resized], timeout: 0.1)
     }
 
     func testPasteIsOfferedForAnImageOnlyClipboardAndAttachesIt() throws {
