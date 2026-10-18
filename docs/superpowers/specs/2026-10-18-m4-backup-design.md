@@ -65,3 +65,26 @@ This covers the backup; the export is its own PR.
 - App: the backup reaches the core and a failure says why; a restore keeps the key and asks for
   a new code; a wrong passphrase keeps the code; a failure after the core stopped starts over
   and the note survives the new code.
+
+## Export (second PR)
+- A chat's right-click menu ▸ Export chat… asks for a folder, writes a new folder there named
+  after the chat (`Name`, `Name 2`, …: an earlier export is never overwritten), and shows it in
+  the Finder.
+- `Client.export_chat` (`export.rs` renders): `chat.html`, a self-contained page (inline style,
+  light and dark) with day headings, each message's time, author ("You" for ours, contact names
+  otherwise), quote, "edited", and its files; mentions read "@name"; deleted messages say so
+  and show nothing of themselves; stickers, polls and the like say what they were. Every text is
+  HTML-escaped. Downloaded files are copied to `files/<id>-<name>` (pictures inline, the rest as
+  links); the others say "not downloaded".
+- The folder is built hidden (`.Name.partial-<pid>`) and named when done, the name claimed
+  with an atomic `mkdir`: a failure leaves nothing. A file gone from disk reads "file missing"
+  and the rest exports; names lose `/ : # ? %` and are cut at 200 bytes.
+- View-once media is never exported (only its note), nor a deleted message's files.
+- Not exported: reactions, text styles, chat events (calls, timer changes), link previews.
+- Disappearing messages still in the chat are exported like any other: the export doesn't
+  disappear.
+- Testing: export.rs renders escaped text, days and times, mentions and quotes, deletions, files
+  and other kinds, and safe folder names; the client exports a chat with a copy of its file and
+  a second export beside the first; an unknown chat is refused; view-once media stays out; a
+  missing file is said and the rest exports; a failed export leaves nothing; 1203 messages
+  export whole; the app shows a failure.

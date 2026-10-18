@@ -7,6 +7,7 @@ mod client;
 mod download;
 mod error;
 mod events;
+mod export;
 mod groups;
 mod history;
 mod link_preview;

@@ -259,6 +259,7 @@ struct SidebarView: View {
         } else {
             Button("Mark as unread") { store.setMarkedUnread(c.id, true) }
         }
+        Button("Export chat…") { export(c) }
         Divider()
         if c.archived {
             Button("Unarchive chat") { store.setArchived(c.id, false) }
@@ -270,6 +271,22 @@ struct SidebarView: View {
                 Button("Unblock") { store.acceptRequest(c.id) }
             } else {
                 Button("Block…", role: .destructive) { blocking = c }
+            }
+        }
+    }
+
+    /// Asks where, then exports the chat there and shows the new folder.
+    private func export(_ c: Conversation) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        panel.message = "Choose where to put the chat: a readable page and its files, in a new folder."
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        Task {
+            if let made = await store.exportChat(c.id, to: folder) {
+                NSWorkspace.shared.activateFileViewerSelecting([made])
             }
         }
     }
