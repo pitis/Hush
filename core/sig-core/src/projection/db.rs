@@ -182,6 +182,27 @@ impl ProjectionDb {
         self.pool.close().await;
     }
 
+    /// Copies the whole database to a new file at `path`, encrypted with the 64-hex-char `key`.
+    /// Consistent: the copy holds the only connection, so nothing writes meanwhile.
+    pub async fn export_to(&self, path: &std::path::Path, key: &str) -> Result<(), sqlx::Error> {
+        if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(sqlx::Error::Configuration(
+                "database key must be 64 hex characters".into(),
+            ));
+        }
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("ATTACH DATABASE ?1 AS export KEY ?2")
+            .bind(path.to_string_lossy())
+            .bind(format!("x'{key}'"))
+            .execute(&mut *conn)
+            .await?;
+        let exported = sqlx::query("SELECT sqlcipher_export('export')")
+            .execute(&mut *conn)
+            .await;
+        sqlx::query("DETACH DATABASE export").execute(&mut *conn).await?;
+        exported.map(|_| ())
+    }
+
     /// Keeps attachment files in `dir` (created when the first one is written).
     pub fn with_files(mut self, dir: PathBuf) -> Self {
         self.files = Some(dir);

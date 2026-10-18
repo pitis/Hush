@@ -14,7 +14,9 @@ struct ContentView: View {
                 ContentUnavailableView(
                     "Hush couldn't start", systemImage: "exclamationmark.octagon", description: Text(message))
             case .link:
-                LinkView(url: core.linkURL, error: core.lastError, retry: core.retryLink)
+                LinkView(
+                    url: core.linkURL, error: core.lastError, note: core.restoreNote, retry: core.retryLink,
+                    restore: { await core.restoreBackup(from: $0, passphrase: $1) })
             case .unlinked:
                 UnlinkedView(store: core)
             case .chats:

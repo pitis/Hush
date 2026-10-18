@@ -96,6 +96,7 @@ struct SettingsView: View {
                 LabeledContent("Message history") {
                     Button("Transfer Message History…") { confirmRelink = true }.disabled(working)
                 }
+                BackupSettings(store: store)
                 Toggle(
                     "Sync chat settings to your phone",
                     isOn: Binding(get: { store.storageWrites }, set: { store.setStorageWrites($0) }))

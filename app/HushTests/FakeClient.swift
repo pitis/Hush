@@ -416,6 +416,21 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         setLinked(false)
     }
 
+    private(set) var backups: [(path: String, passphrase: String)] = []
+    var backUpError: Error?
+    private(set) var restores: [String] = []
+    var restoreError: Error?
+
+    func backUp(path: String, passphrase: String) async throws {
+        if let backUpError { throw backUpError }
+        lock.withLock { backups.append((path, passphrase)) }
+    }
+
+    func restoreBackup(path: String, passphrase: String) async throws {
+        if let restoreError { throw restoreError }
+        lock.withLock { restores.append(path) }
+    }
+
     func countNewer(conversationId: String, key: MessageKey) async throws -> UInt32 {
         if let delay = lock.withLock({ countDelays[key] }) { try? await Task.sleep(for: delay) }
         return lock.withLock { newerCounts[key] ?? 0 }

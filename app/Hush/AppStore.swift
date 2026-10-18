@@ -116,6 +116,8 @@ final class AppStore {
     private let forgetKey: () -> Void
     private(set) var log: [LogLine] = []
     private(set) var lastError: String?
+    /// How restoring a backup went, on the link screen after it (the old one is gone).
+    private(set) var restoreNote: String?
     /// Chat settings changed here are written to the phone's account (the Storage Service).
     private(set) var storageWrites = true
     /// The core's recent errors, for the Core Log window (ids and reasons, never message text).
@@ -1153,6 +1155,39 @@ final class AppStore {
         return nil
     }
 
+    /// Settings ▸ Back Up…: writes every chat and file here to `url`, encrypted with
+    /// `passphrase`. Why it failed, or nil.
+    func backUp(to url: URL, passphrase: String) async -> String? {
+        guard let client else { return "Hush isn't running." }
+        do { try await client.backUp(path: url.path, passphrase: passphrase) } catch {
+            append("backing up failed: \(error)")
+            return "Couldn't back up: \(Self.fileFailure(error))"
+        }
+        return nil
+    }
+
+    /// The link screen's Restore from a Backup…: the backup at `url` replaces everything here,
+    /// and a new linking code follows. Why it failed while the code stays (a wrong passphrase, a
+    /// damaged file), or nil: the core stopped and started over, and `restoreNote` says how it
+    /// went.
+    func restoreBackup(from url: URL, passphrase: String) async -> String? {
+        guard let client else { return "Hush isn't running." }
+        restoreNote = nil
+        let note: String
+        do {
+            try await client.restoreBackup(path: url.path, passphrase: passphrase)
+            note = "Your backup is restored. Link this Mac to your phone to finish."
+        } catch CoreError.InvalidInput(let message) {
+            return message
+        } catch {
+            append("restoring a backup failed: \(error)")
+            note = "Couldn't restore the backup: \(Self.fileFailure(error))"
+        }
+        await restart(keepKey: true)
+        restoreNote = note
+        return nil
+    }
+
     /// Unlinks this Mac and removes all its data, telling the server first if `tellServer`.
     /// Returns why the server couldn't be told (nothing is removed then: the caller can offer to
     /// unlink anyway), or nil: done and a new linking code is on its way, or the core stopped but
@@ -1738,6 +1773,11 @@ final class AppStore {
         log.append(LogLine(id: nextLogId, text: text))
         nextLogId += 1
         if log.count > Self.logLimit { log.removeFirst(log.count - Self.logLimit) }
+    }
+
+    /// A backup's file error as it is ("disk full"), not as a failure to open Hush's data.
+    private static func fileFailure(_ error: Error) -> String {
+        if case CoreError.Storage(let message) = error { message } else { describe(error) }
     }
 
     private static func describe(_ error: Error) -> String {

@@ -6,6 +6,7 @@ use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 
 use crate::actor::{self, Command};
+use crate::backup;
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::groups::{GroupChange, GroupInfo, GroupJoined, GroupPreview};
@@ -33,6 +34,8 @@ pub struct Client {
     own_aci: Arc<Mutex<Option<String>>>,
     listener: Arc<dyn EventListener>,
     data_dir: PathBuf,
+    /// The databases' key: a restored backup is re-encrypted with it.
+    db_key: String,
     /// Last `sent_at` handed out: own messages need unique timestamps (they are their identity).
     last_sent_at: Mutex<i64>,
     /// The highest vote count handed out per poll (author, sent_at): our vote is stored only once
@@ -283,6 +286,96 @@ impl Client {
     }
 }
 
+/// Work folders in the data directory while backing up and restoring (removed at the next open
+/// if left over); `RESTORED` is the restored projection, under this Mac's key, in the latter.
+const BACKING_UP: &str = "backup.tmp";
+const RESTORING: &str = "restore.tmp";
+const RESTORED: &str = "restored.db";
+
+impl From<backup::BackupError> for CoreError {
+    fn from(e: backup::BackupError) -> Self {
+        match e {
+            backup::BackupError::Io(message) => Self::Storage { message },
+            e => Self::InvalidInput { message: e.to_string() },
+        }
+    }
+}
+
+/// The backup at `out`: `manifest`, the exported projection in `work` and every file in `files`.
+fn write_backup(
+    out: &std::path::Path,
+    passphrase: &str,
+    manifest: &serde_json::Value,
+    work: &std::path::Path,
+    files: &std::path::Path,
+) -> Result<(), CoreError> {
+    let file = std::fs::File::create(out).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+    let mut w = backup::Writer::new(std::io::BufWriter::new(file), passphrase)?;
+    w.add_bytes(backup::MANIFEST, manifest.to_string().as_bytes())?;
+    let db =
+        std::fs::File::open(work.join(backup::DATABASE)).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+    w.add_file(backup::DATABASE, db)?;
+    let entries = match std::fs::read_dir(files) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e),
+    }
+    .map_err(|e| CoreError::Storage { message: e.to_string() })?;
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // half-written copies (`.part`) and anything hidden aren't the chats' files
+        if name.starts_with('.') || name.ends_with(".part") || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        match std::fs::File::open(entry.path()) {
+            Ok(file) => w.add_file(&format!("{}/{name}", backup::FILES), file)?,
+            // removed meanwhile (its message deleted): the copied database doesn't need it
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Storage { message: e.to_string() }),
+        }
+    }
+    let file = w
+        .finish()?
+        .into_inner()
+        .map_err(|e| CoreError::Storage { message: e.to_string() })?;
+    file.sync_all()
+        .map_err(|e| CoreError::Storage { message: e.to_string() })
+}
+
+impl Client {
+    /// Decrypts the backup at `path` into `work` and leaves its projection there as `RESTORED`,
+    /// migrated and under this Mac's key, without the old link's pending history import.
+    async fn read_backup(&self, path: &str, passphrase: String, work: &std::path::Path) -> Result<(), CoreError> {
+        let storage = |e: std::io::Error| CoreError::Storage { message: e.to_string() };
+        let input = std::fs::File::open(path).map_err(storage)?;
+        let dest = work.to_path_buf();
+        tokio::task::spawn_blocking(move || backup::extract(std::io::BufReader::new(input), &passphrase, &dest))
+            .await
+            .map_err(|e| CoreError::Storage { message: e.to_string() })??;
+        let damaged = || CoreError::InvalidInput {
+            message: "the backup is damaged: its manifest is unreadable".into(),
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(work.join(backup::MANIFEST)).map_err(storage)?)
+                .map_err(|_| damaged())?;
+        if manifest["format"] != 1 {
+            return Err(CoreError::InvalidInput {
+                message: "the backup is from a newer Hush".into(),
+            });
+        }
+        let key = manifest["key"].as_str().ok_or_else(damaged)?;
+        let url = format!("sqlite://{}", work.join(backup::DATABASE).display());
+        let db = ProjectionDb::open(&url, Some(key)).await.map_err(|_| damaged())?;
+        let ready = async {
+            db.clear_history_state().await?;
+            db.export_to(&work.join(RESTORED), &self.db_key).await
+        }
+        .await;
+        db.close().await;
+        Ok(ready?)
+    }
+}
+
 #[uniffi::export]
 impl Client {
     /// Opens (creating if needed) the data in `data_dir` with the 64-hex-char `db_key_hex`.
@@ -296,11 +389,13 @@ impl Client {
         let linked = Arc::new(AtomicBool::new(false));
         let own_aci = Arc::new(Mutex::new(None));
         let data_dir = PathBuf::from(data_dir);
-        // preview images of drafts from before (never sent) don't stay
-        let _ = std::fs::remove_dir_all(data_dir.join("previews"));
+        // preview images of drafts from before (never sent) don't stay, nor a backup's leftovers
+        for left in ["previews", BACKING_UP, RESTORING] {
+            let _ = std::fs::remove_dir_all(data_dir.join(left));
+        }
         let h = actor::spawn(
             data_dir.clone(),
-            db_key_hex,
+            db_key_hex.clone(),
             listener.clone(),
             linked.clone(),
             own_aci.clone(),
@@ -313,6 +408,7 @@ impl Client {
             own_aci,
             listener,
             data_dir,
+            db_key: db_key_hex,
             last_sent_at: Mutex::new(0),
             vote_counts: Default::default(),
             #[cfg(test)]
@@ -814,6 +910,75 @@ impl Client {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(e)),
             _ => Ok(()),
         }
+    }
+
+    /// Writes a backup of every chat and file here to `path` (replaced), encrypted with
+    /// `passphrase` (at least 8 characters). Linked or not.
+    pub async fn back_up(&self, path: String, passphrase: String) -> Result<(), CoreError> {
+        if passphrase.chars().count() < backup::MIN_PASSPHRASE {
+            return Err(CoreError::InvalidInput {
+                message: format!("the passphrase needs at least {} characters", backup::MIN_PASSPHRASE),
+            });
+        }
+        let storage = |e: std::io::Error| CoreError::Storage { message: e.to_string() };
+        let work = self.data_dir.join(BACKING_UP);
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).map_err(storage)?;
+        // the database is copied under a key of its own, which the manifest carries inside
+        let key = hex::encode(rand::random::<[u8; 32]>());
+        let written = match self.db.export_to(&work.join(backup::DATABASE), &key).await {
+            Ok(()) => {
+                let manifest =
+                    serde_json::json!({ "format": 1, "key": key, "createdAt": chrono::Utc::now().timestamp_millis() });
+                let (work, files, out) = (work.clone(), self.data_dir.join(backup::FILES), PathBuf::from(&path));
+                tokio::task::spawn_blocking(move || write_backup(&out, &passphrase, &manifest, &work, &files))
+                    .await
+                    .map_err(|e| CoreError::Storage { message: e.to_string() })?
+            }
+            Err(e) => Err(e.into()),
+        };
+        let _ = std::fs::remove_dir_all(&work);
+        if let Err(e) = &written {
+            tracing::error!(error = %e, "backing up failed");
+            let _ = std::fs::remove_file(&path);
+        }
+        written
+    }
+
+    /// Replaces every chat and file here with the backup at `path`, before linking: open a new
+    /// `Client` and `link` afterwards (the phone's history merges in, as when relinking). A
+    /// wrong passphrase or a damaged backup changes nothing; once it is read, the core stops
+    /// (`Closed` from then on).
+    pub async fn restore_backup(&self, path: String, passphrase: String) -> Result<(), CoreError> {
+        if self.is_linked() {
+            return Err(CoreError::InvalidInput {
+                message: "a backup can only be restored before linking".into(),
+            });
+        }
+        let storage = |e: std::io::Error| CoreError::Storage { message: e.to_string() };
+        let work = self.data_dir.join(RESTORING);
+        let _ = std::fs::remove_dir_all(&work);
+        let read = self.read_backup(&path, passphrase, &work).await;
+        if let Err(e) = read {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
+        // nothing may write the projection while it is swapped
+        self.relink().await?;
+        for suffix in ["", "-wal", "-shm"] {
+            match std::fs::remove_file(self.data_dir.join(format!("projection.db{suffix}"))) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
+                _ => {}
+            }
+        }
+        std::fs::rename(work.join(RESTORED), self.data_dir.join("projection.db")).map_err(storage)?;
+        match std::fs::remove_dir_all(self.data_dir.join(backup::FILES)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
+            _ => {}
+        }
+        std::fs::rename(work.join(backup::FILES), self.data_dir.join(backup::FILES)).map_err(storage)?;
+        let _ = std::fs::remove_dir_all(&work);
+        Ok(())
     }
 
     /// A chat's events (e.g. undecryptable messages) from `since` (ms) on.
@@ -1478,6 +1643,97 @@ mod tests {
         // the data directory is free again: a fresh client can link anew
         drop(client);
         assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
+    }
+
+    /// A backup made on one Mac restores on another (another key), before linking: the chats
+    /// and files come back, the old link's pending import doesn't.
+    #[test]
+    fn a_backup_moves_the_chats_to_another_mac() {
+        let (from, _sink, client, rt) = as_me("client-backup-from");
+        let file = from.0.join("backup.hushbackup");
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client
+                .db
+                .set_history_state(&crate::projection::HistoryImportState {
+                    stage: crate::projection::HistoryDbStage::Waiting,
+                    key: vec![1; 32],
+                    aci: ME.into(),
+                    cdn: None,
+                    cdn_key: None,
+                    bytes_done: 0,
+                    total_bytes: None,
+                })
+                .await
+                .unwrap();
+            std::fs::create_dir_all(from.0.join("attachments")).unwrap();
+            std::fs::write(from.0.join("attachments").join("1"), b"photo").unwrap();
+            std::fs::write(from.0.join("attachments").join("2.part"), b"half").unwrap();
+            client
+                .back_up(file.to_string_lossy().into(), "correct horse".into())
+                .await
+                .unwrap();
+        });
+        assert!(!from.0.join(BACKING_UP).exists(), "the work folder goes");
+
+        let to = temp_dir("client-backup-to");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let fresh = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink.clone()).unwrap();
+        rt.block_on(async {
+            fresh
+                .restore_backup(file.to_string_lossy().into(), "correct horse".into())
+                .await
+                .unwrap();
+            assert!(fresh.conversations().await.is_err(), "the core stopped");
+        });
+        drop(fresh);
+        assert!(!to.0.join(RESTORING).exists() && !to.0.join("presage.db").exists());
+        assert_eq!(std::fs::read(to.0.join("attachments").join("1")).unwrap(), b"photo");
+        assert!(!to.0.join("attachments").join("2.part").exists());
+        let reopened = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
+        rt.block_on(async {
+            assert_eq!(reopened.conversations().await.unwrap().len(), 1);
+            assert!(!reopened.history_pending().await.unwrap());
+        });
+    }
+
+    #[test]
+    fn a_wrong_passphrase_restores_nothing() {
+        let (from, _sink, client, rt) = as_me("client-backup-wrong");
+        let file = from.0.join("backup.hushbackup");
+        let to = temp_dir("client-backup-wrong-to");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let fresh = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client
+                .back_up(file.to_string_lossy().into(), "correct horse".into())
+                .await
+                .unwrap();
+            fresh.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            fresh.db.insert_message(&stored(ALICE, 2)).await.unwrap();
+            let e = fresh
+                .restore_backup(file.to_string_lossy().into(), "battery staple".into())
+                .await;
+            assert!(matches!(e, Err(CoreError::InvalidInput { .. })), "{e:?}");
+            // still running, with what it had
+            assert_eq!(fresh.conversations().await.unwrap()[0].last_message_at, 2);
+        });
+        assert!(!to.0.join(RESTORING).exists());
+    }
+
+    #[test]
+    fn a_short_passphrase_or_a_linked_mac_is_refused() {
+        let (dir, _sink, client, rt) = as_me("client-backup-refused");
+        let file = dir.0.join("backup.hushbackup").to_string_lossy().into_owned();
+        rt.block_on(async {
+            let short = client.back_up(file.clone(), "1234567".into()).await;
+            assert!(matches!(short, Err(CoreError::InvalidInput { .. })));
+            assert!(!std::path::Path::new(&file).exists());
+            client.back_up(file.clone(), "12345678".into()).await.unwrap();
+            let linked = client.restore_backup(file, "12345678".into()).await;
+            assert!(matches!(linked, Err(CoreError::InvalidInput { .. })));
+        });
     }
 
     #[test]

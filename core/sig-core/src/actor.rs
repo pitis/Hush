@@ -389,7 +389,16 @@ async fn run(
     // The history import between linking and receiving, if the phone offered one.
     let history_running = Rc::new(Cell::new(false));
     let history_cancel: Rc<RefCell<watch::Sender<bool>>> = Rc::new(RefCell::new(watch::channel(false).0));
-    while let Some(cmd) = rx.recv().await {
+    // commands that came while a link code waited to be scanned
+    let mut queued = std::collections::VecDeque::new();
+    loop {
+        let cmd = match queued.pop_front() {
+            Some(cmd) => cmd,
+            None => match rx.recv().await {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
         match cmd {
             Command::Link { device_name } => {
                 if manager.is_some() {
@@ -399,7 +408,27 @@ async fn run(
                     continue;
                 }
                 // boxed to keep the large provisioning future off the stack (the stack size is the real fix)
-                match Box::pin(link(&store, device_name, listener.as_ref())).await {
+                let mut linking = Box::pin(link(&store, device_name, listener.as_ref()));
+                // waiting for the scan, the core can still be stopped (to restore a backup, or
+                // quit); anything else waits for the link
+                let linked_or = loop {
+                    tokio::select! {
+                        r = &mut linking => break r,
+                        cmd = rx.recv() => match cmd {
+                            Some(Command::Relink { done }) => {
+                                let _ = done.send(());
+                                return;
+                            }
+                            Some(Command::Unlink { done, .. }) => {
+                                let _ = done.send(Ok(()));
+                                return;
+                            }
+                            Some(cmd) => queued.push_back(cmd),
+                            None => return,
+                        },
+                    }
+                };
+                match linked_or {
                     Ok(m) => {
                         // the key is one-time and lives only in memory: keep it (encrypted)
                         // before anything else, or a crash loses the offered history
