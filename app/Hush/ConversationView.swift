@@ -286,7 +286,15 @@ struct TimelineList: View {
     @State private var atBottom = true
     @State private var nearTop = false
     @State private var unseenNew = false
+    @State private var position = ScrollPosition(edge: .bottom)
     @Environment(\.controlActiveState) private var activeState
+
+    /// What the timeline follows of its scroll geometry.
+    private struct Edges: Equatable {
+        var atBottom: Bool
+        var nearTop: Bool
+        var contentHeight: CGFloat
+    }
 
     var body: some View {
         let isGroup = conversation.kind == .group
@@ -335,23 +343,24 @@ struct TimelineList: View {
                         }
                     }
                     TypingRow(store: store, conversationId: conversation.id, isGroup: isGroup)
-                    Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
             }
+            .scrollPosition($position)
             .defaultScrollAnchor(.bottom)
-            .onScrollGeometryChange(for: [Bool].self) { g in
-                [
-                    Timeline.isAtBottom(
-                        offsetY: g.contentOffset.y, visibleHeight: g.containerSize.height,
-                        contentHeight: g.contentSize.height, hiddenBelow: g.contentInsets.bottom),
-                    Timeline.isNearTop(offsetY: g.contentOffset.y),
-                ]
-            } action: { _, edges in
-                atBottom = edges[0]
+            .onScrollGeometryChange(for: Edges.self) { g in
+                Edges(
+                    atBottom: Timeline.isAtBottom(g), nearTop: Timeline.isNearTop(offsetY: g.contentOffset.y),
+                    contentHeight: g.contentSize.height)
+            } action: { old, new in
+                // what grows at the bottom (a page's files and previews, the typing bubble) stays in
+                // view: the bottom anchor doesn't follow it
+                let follow = old.atBottom && new.contentHeight > old.contentHeight
+                if follow { position.scrollTo(edge: .bottom) }
+                atBottom = follow || new.atBottom
                 if atBottom { unseenNew = false }
-                nearTop = edges[1]
+                nearTop = new.nearTop
             }
             .onChange(of: nearTop) { _, near in if near { loadOlder() } }
             .onChange(of: store.messages.first?.sentAt) { old, _ in
@@ -363,7 +372,7 @@ struct TimelineList: View {
                 let own = store.messages.last?.isOutgoing ?? false
                 switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
                 case .scrollToBottom:
-                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) }
                     unseenNew = false
                 case .showPill: unseenNew = true
                 case .nothing: break
@@ -371,7 +380,7 @@ struct TimelineList: View {
             }
             .onChange(of: conversation.id) { _, _ in
                 unseenNew = false
-                proxy.scrollTo("bottom", anchor: .bottom)
+                position.scrollTo(edge: .bottom)
             }
             // a search result opened: to the message, in the middle
             .onChange(of: store.scrollRequest) { _, _ in
@@ -390,7 +399,7 @@ struct TimelineList: View {
             .overlay(alignment: .bottomTrailing) {
                 if unseenNew {
                     Button {
-                        proxy.scrollTo("bottom", anchor: .bottom)
+                        position.scrollTo(edge: .bottom)
                         unseenNew = false
                     } label: {
                         Label("New messages", systemImage: "arrow.down")

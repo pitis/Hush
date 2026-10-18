@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 
 /// The rows of a conversation: day separators and messages, with grouping of runs from the same
 /// sender (tight spacing, name and avatar once).
@@ -95,11 +95,10 @@ enum Timeline {
     /// Within this many points of the edge counts as being there.
     static let edgeThreshold: CGFloat = 80
 
-    /// `hiddenBelow`: how much of the visible height something floats over (the composer).
-    static func isAtBottom(
-        offsetY: CGFloat, visibleHeight: CGFloat, contentHeight: CGFloat, hiddenBelow: CGFloat = 0
-    ) -> Bool {
-        offsetY + visibleHeight - hiddenBelow >= contentHeight - edgeThreshold
+    /// The end of the content is in view, above the composer floating over it. The container
+    /// leaves out the insets (the toolbar's and the composer's); the offset starts above the top one.
+    static func isAtBottom(_ g: ScrollGeometry) -> Bool {
+        g.contentOffset.y + g.contentInsets.top + g.containerSize.height >= g.contentSize.height - edgeThreshold
     }
 
     static func isNearTop(offsetY: CGFloat) -> Bool { offsetY <= edgeThreshold }

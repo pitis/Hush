@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 
 @testable import Hush
@@ -135,12 +136,21 @@ final class ScrollDecisionTests: XCTestCase {
         XCTAssertEqual(Timeline.onNewLastMessage(atBottom: false, isOwn: false), .showPill)
     }
 
+    /// As the app's window reports it: 465pt between a 52pt toolbar and a 55pt composer.
+    private func geometry(offset: CGFloat, content: CGFloat, top: CGFloat = 52) -> ScrollGeometry {
+        ScrollGeometry(
+            contentOffset: CGPoint(x: 0, y: offset), contentSize: CGSize(width: 500, height: content),
+            contentInsets: EdgeInsets(top: top, leading: 0, bottom: 55, trailing: 0),
+            containerSize: CGSize(width: 500, height: 465))
+    }
+
     func testEdges() {
-        XCTAssertTrue(Timeline.isAtBottom(offsetY: 920, visibleHeight: 600, contentHeight: 1600))
-        XCTAssertFalse(Timeline.isAtBottom(offsetY: 500, visibleHeight: 600, contentHeight: 1600))
-        // the composer floats over the last 200pt: they aren't seen
-        XCTAssertFalse(Timeline.isAtBottom(offsetY: 800, visibleHeight: 600, contentHeight: 1600, hiddenBelow: 200))
-        XCTAssertTrue(Timeline.isAtBottom(offsetY: 1120, visibleHeight: 600, contentHeight: 1600, hiddenBelow: 200))
+        // scrolled to the end: 3104 + 52 + 465
+        XCTAssertTrue(Timeline.isAtBottom(geometry(offset: 3104, content: 3621)))
+        XCTAssertTrue(Timeline.isAtBottom(geometry(offset: 3054, content: 3621)))
+        XCTAssertFalse(Timeline.isAtBottom(geometry(offset: 3004, content: 3621)))
+        // a short chat, pushed to the bottom by the top inset
+        XCTAssertTrue(Timeline.isAtBottom(geometry(offset: -500, content: 17, top: 500)))
         XCTAssertTrue(Timeline.isNearTop(offsetY: 40))
         XCTAssertFalse(Timeline.isNearTop(offsetY: 400))
     }
