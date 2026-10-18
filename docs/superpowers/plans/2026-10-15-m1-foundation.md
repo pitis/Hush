@@ -1024,7 +1024,7 @@ The `Receipt` test relies on the `messages_au` trigger only firing for `body` up
 ### Task 5: Actor + UniFFI `Client` — open, link, receive loop, events, queries
 
 > **As built (PR #26, after review):**
-> - **Swift API:** `Client.open(dataDir:dbKeyHex:listener:)`, `isLinked()`, `link(deviceName:) throws`, `start() throws`, async `conversations()`, `messages(conversationId:before: MessageKey?, limit:)`, `search(query:limit:)`, `reactions(key:)`.
+> - **Swift API:** `Client.open(dataDir:dbKeyHex:listener:)`, `isLinked()`, `link(deviceName:) throws`, `start() throws`, async `conversations()`, `messages(conversationId:before: MessageKey?, limit:)`, `search(query:limit:)`, `details(keys:)` (a page's reactions, files, previews and polls in one call; it was `reactions(key:)` per message).
 > - **Errors:** `CoreError` is `Storage`, `AlreadyOpen` or `Closed`.
 > - **Open:**
 >   - takes a file lock on `<dataDir>/.lock` (a second open → `AlreadyOpen`);

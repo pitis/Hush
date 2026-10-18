@@ -12,8 +12,8 @@ use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::groups::{GroupChange, GroupInfo, GroupJoined, GroupPreview};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
-    Attachment, BodyRange, ChatColor, ChatEvent, Conversation, ConversationKind, LinkPreview, Message, MessageKey,
-    MessageKind, MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, Reaction, RequestResponse, SearchHit,
+    Attachment, BodyRange, ChatColor, ChatEvent, Conversation, ConversationKind, Message, MessageDetails, MessageKey,
+    MessageKind, MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, RequestResponse, SearchHit,
     StickerPackInfo,
 };
 use crate::send::{self, Job, SendJob};
@@ -1244,10 +1244,6 @@ impl Client {
         Ok(self.db.attachment(id).await?)
     }
 
-    pub async fn link_preview(&self, key: MessageKey) -> Result<Option<LinkPreview>, CoreError> {
-        Ok(self.db.link_preview(&key).await?)
-    }
-
     /// Reacts to a message with `emoji`, or takes back our reaction `emoji` (`remove`). It shows
     /// here once sent (`MessageChanged`); a failed send is reported as `Error`.
     pub async fn react(&self, target: MessageKey, emoji: String, remove: bool) -> Result<(), CoreError> {
@@ -1347,11 +1343,6 @@ impl Client {
         let at = self.next_sent_at() as u64;
         let body = send::poll_end(&m.conversation_id, m.sent_at, at);
         self.send_mutation(m.conversation_id, body, at)
-    }
-
-    /// The poll in message `key` as its votes stand (None if it isn't one).
-    pub async fn poll(&self, key: MessageKey) -> Result<Option<crate::projection::Poll>, CoreError> {
-        Ok(self.db.poll(&key).await?)
     }
 
     /// View-once media was opened here: it's dropped (its files too) and our phone is told.
@@ -1772,8 +1763,9 @@ impl Client {
         Ok(self.db.message(&key).await?)
     }
 
-    pub async fn reactions(&self, key: MessageKey) -> Result<Vec<Reaction>, CoreError> {
-        Ok(self.db.reactions(&key).await?)
+    /// The details of messages (reactions, files, link preview, poll), in the order of `keys`.
+    pub async fn details(&self, keys: Vec<MessageKey>) -> Result<Vec<MessageDetails>, CoreError> {
+        Ok(self.db.details(&keys).await?)
     }
 }
 
@@ -3269,7 +3261,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let p = client.link_preview(key).await.unwrap().unwrap();
+            let p = client.details(vec![key.clone()]).await.unwrap()[0]
+                .preview
+                .clone()
+                .unwrap();
             assert_eq!(
                 (p.url.as_str(), p.title.as_deref()),
                 ("https://example.com/a", Some("A page"))
@@ -3279,7 +3274,7 @@ mod tests {
                 .send_text(conv.clone(), "no link".into(), vec![], None, Some(draft()))
                 .await
                 .unwrap();
-            assert_eq!(client.link_preview(key).await.unwrap(), None);
+            assert_eq!(client.details(vec![key.clone()]).await.unwrap()[0].preview, None);
             // the fetched image is the message's own copy once sent: the fetched file goes
             let fetched = client.data_dir.join("previews").join("1");
             std::fs::create_dir_all(fetched.parent().unwrap()).unwrap();
@@ -3305,7 +3300,12 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!fetched.exists());
-            let image = client.link_preview(key).await.unwrap().unwrap().image.unwrap();
+            let image = client.details(vec![key.clone()]).await.unwrap()[0]
+                .preview
+                .clone()
+                .unwrap()
+                .image
+                .unwrap();
             assert_eq!(std::fs::read(image.path.unwrap()).unwrap(), b"jpg");
             // no page is fetched while the phone hasn't allowed link previews
             assert_eq!(

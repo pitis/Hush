@@ -524,6 +524,16 @@ pub struct LinkPreview {
     pub image: Option<Attachment>,
 }
 
+/// What a message shows besides its text: its reactions, files, link preview and poll.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageDetails {
+    pub key: MessageKey,
+    pub reactions: Vec<Reaction>,
+    pub attachments: Vec<Attachment>,
+    pub preview: Option<LinkPreview>,
+    pub poll: Option<Poll>,
+}
+
 /// An installed sticker pack, for the picker: its id (hex) and the stickers we have images of.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct StickerPackInfo {

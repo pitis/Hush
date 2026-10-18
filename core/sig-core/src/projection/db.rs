@@ -2613,6 +2613,22 @@ impl ProjectionDb {
         row.as_ref().map(row_to_message).transpose()
     }
 
+    /// The details of messages, in the order of `keys`: for a page in one call from the app, as a
+    /// call per message and detail was hundreds of hops for a page.
+    pub async fn details(&self, keys: &[MessageKey]) -> Result<Vec<MessageDetails>, sqlx::Error> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(MessageDetails {
+                key: key.clone(),
+                reactions: self.reactions(key).await?,
+                attachments: self.attachments(key).await?,
+                preview: self.link_preview(key).await?,
+                poll: self.poll(key).await?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Reactions on a message, one per reactor, ordered by reactor.
     pub async fn reactions(&self, key: &MessageKey) -> Result<Vec<Reaction>, sqlx::Error> {
         let rows = sqlx::query(
@@ -6208,6 +6224,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn a_pages_details_come_in_one_call_in_the_order_asked() {
+        let db = db().await;
+        for i in 1..=3 {
+            db.insert_message(&msg("alice", i, "x")).await.unwrap();
+        }
+        let preview = NewPreview {
+            url: "https://example.org".into(),
+            title: None,
+            description: None,
+            image: None,
+        };
+        db.apply(&add(
+            k("alice", 1),
+            vec![new_attachment("image/jpeg", 100, false)],
+            Some(preview),
+        ))
+        .await
+        .unwrap();
+        db.apply(&Op::React {
+            target: k("alice", 2),
+            reactor: "bob".into(),
+            emoji: Some("👍".into()),
+        })
+        .await
+        .unwrap();
+        let details = db
+            .details(&[k("alice", 3), k("alice", 1), k("alice", 2)])
+            .await
+            .unwrap();
+        assert_eq!(details.iter().map(|d| d.key.sent_at).collect::<Vec<_>>(), [3, 1, 2]);
+        assert!(details[0].reactions.is_empty() && details[0].attachments.is_empty());
+        assert!(details[0].preview.is_none() && details[0].poll.is_none());
+        assert_eq!(details[1].attachments.len(), 1);
+        assert_eq!(
+            details[1].preview.as_ref().map(|p| p.url.as_str()),
+            Some("https://example.org")
+        );
+        assert_eq!(details[2].reactions.len(), 1);
     }
 
     #[tokio::test]

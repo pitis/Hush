@@ -86,7 +86,7 @@ enum Timeline {
 
     /// What the timeline does when its last message changes: follow it when the reader is at the
     /// bottom or it is their own message, otherwise show the "New messages" pill.
-    enum NewMessageAction: Equatable { case scrollToBottom, showPill, nothing }
+    enum NewMessageAction: Equatable { case scrollToBottom, showPill }
 
     static func onNewLastMessage(atBottom: Bool, isOwn: Bool) -> NewMessageAction {
         atBottom || isOwn ? .scrollToBottom : .showPill

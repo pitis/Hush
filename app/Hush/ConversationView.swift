@@ -338,7 +338,9 @@ struct TimelineList: View {
                                 viewOnce: { Task { await store.viewOnceOpened(m) } },
                                 vote: { options in Task { await store.vote(m, options: options) } },
                                 endPoll: { Task { await store.endPoll(m) } },
-                                name: store.senderName))
+                                name: store.senderName)
+                        )
+                        .equatable()
                     }
                 }
                 TypingRow(store: store, conversationId: conversation.id, isGroup: isGroup)
@@ -372,10 +374,10 @@ struct TimelineList: View {
             let own = store.messages.last?.isOutgoing ?? false
             switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
             case .scrollToBottom:
-                withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) }
+                // at the bottom, the follow keeps the end in view: a scroll of its own would race it
+                if !atBottom { withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) } }
                 unseenNew = false
             case .showPill: unseenNew = true
-            case .nothing: break
             }
         }
         .onChange(of: conversation.id) { _, _ in
@@ -385,7 +387,12 @@ struct TimelineList: View {
         // a search result opened: to the message, in the middle
         .onChange(of: store.scrollRequest) { _, _ in
             guard let k = store.scrollTarget else { return }
-            withAnimation(.easeOut(duration: 0.2)) { position.scrollTo(id: "\(k.author)-\(k.sentAt)", anchor: .center) }
+            // once the page it came with is laid out: a row not there yet can't be scrolled to
+            Task {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    position.scrollTo(id: "\(k.author)-\(k.sentAt)", anchor: .center)
+                }
+            }
         }
         // read once the newest message is on screen in the key window, like Desktop
         .onChange(of: atBottom) { _, _ in markReadIfSeen() }
@@ -751,6 +758,25 @@ struct MessageRow: View {
             .padding(12)
             .frame(minWidth: 200)
         }
+    }
+}
+
+/// Drawn again only when what it shows changed: the timeline's body runs again on any reaction,
+/// file or preview in the chat, and a row's closures (to the store) never compare equal.
+extension MessageRow: @MainActor Equatable {
+    static func == (a: MessageRow, b: MessageRow) -> Bool {
+        a.message == b.message && a.first == b.first && a.last == b.last && a.isGroup == b.isGroup
+            && a.senderName == b.senderName && a.reactions == b.reactions && a.files == b.files
+            && a.preview == b.preview && a.poll == b.poll && a.highlighted == b.highlighted
+            && a.actions.me == b.actions.me && a.actions.mine == b.actions.mine
+            && a.actions.canEdit == b.actions.canEdit && a.actions.canDelete == b.actions.canDelete
+            && a.names == b.names
+    }
+
+    /// The names it shows through its closures: of whom it mentions, and of who reacted.
+    private var names: [String] {
+        MessageText.mentioned(message.ranges + (message.quote?.ranges ?? [])).map(mentionName)
+            + reactions.map { actions.name($0.reactor) }
     }
 }
 
