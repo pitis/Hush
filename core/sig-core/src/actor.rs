@@ -2030,7 +2030,7 @@ async fn handle(
     l: &dyn EventListener,
     queues: &Queues,
 ) {
-    // Kinds and counts only: never message content.
+    // Kinds, counts and ids only: never message content.
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
@@ -2048,7 +2048,6 @@ async fn handle(
             let _ = queues.storage.send(storage::Trigger::Connected);
         }
         Received::Contacts => sync_titles(m, db, l).await,
-        // Ids only: never log message content.
         Received::DecryptionError(sender) => {
             // shown in the chat (not as an error banner), with a way to reset the session
             let conversation_id = direct_id(&sender);

@@ -37,18 +37,18 @@ presage; its own issue). `DESIGN.md` is written from the result.
   detail on the window background.
 - **Sidebar:**
   - The chat list is a native `List(selection:)` with `.listStyle(.sidebar)`. Each row has the
-    avatar, the name, a one-line preview and the time, in text styles; the system draws the
-    selection.
+    avatar, the name, a one-line preview and the time; the system draws the selection.
   - Search is `.searchable(placement: .sidebar)`.
-  - Compose and Stories are sidebar toolbar items. The archive is a pushed list titled "Archived"
-    with the standard back button.
+  - Compose and Stories are sidebar toolbar items. The archive shows under an "Archived" heading,
+    with a "Back to Chats" toolbar button.
   - No large "Chats" title.
   - Connection status is one quiet line at the foot of the sidebar, shown only while not online.
 - **Header (Messages style):**
   - It lives in the window toolbar. The title is the chat's name. The subtitle shows, in order of
     priority: typing, offline/connecting in words, the disappearing timer, @username.
   - Trailing items: Call, and one info menu holding Disappearing Messages ▸, Chat Colour and
-    Wallpaper…, Search in Chat (⇧⌘F), and group or contact info.
+    Wallpaper…, Search in Chat (⇧⌘F), Group Info… in a group, and the note about them if there is
+    one.
   - No header inside the content and no divider: the scroll-edge effect separates them.
 - **Composer:**
   - It floats over the timeline (`safeAreaBar` at the bottom), and messages scroll under it.
@@ -91,7 +91,8 @@ handling (`onKeyPress`) if it does.
 
 ## Copy
 
-- No raw ids or enum names anywhere on screen.
+- No enum names on screen, and names wherever they are known (a chat whose name isn't known yet
+  still shows a short form of its id, as before).
 - **Subtitles:** "typing…", "Offline", "Connecting…", "Disappearing messages: 1 day",
   "@username".
 - **Notice and confirmation:** as written under Layout.
@@ -105,6 +106,16 @@ handling (`onKeyPress`) if it does.
   side failed.
 - **Stories:** a filled icon, not a number badge, marks unseen stories (a badge would clip in
   the toolbar); the count is in its label.
+- **Search keys:** the ↑↓ handlers sit on both the list and the searchable container; ↩ is
+  `onSubmit(of: .search)`; leaving the field empty (Esc, a click elsewhere) ends the search and
+  its chat scope. Whether the system's search field passes ↑↓ on is checked in the running app.
+- **Reset in progress** is the store's (`resettingSessions`): cleared when the reset is recorded
+  or anything fails, so a failed reset is offered again.
+- **The Core Log window** no longer lists decryption failures: the chat shows them, and the
+  unified log keeps the sender id.
+- **The Rust core** is still built for macOS 15 (`scripts/build-core.sh`): objects built for an
+  older target link into the macOS 26 app without warnings, and a rebuild of the C dependencies
+  isn't worth it.
 - **Visual source of truth:** `DESIGN.md`.
 
 ## Constraints

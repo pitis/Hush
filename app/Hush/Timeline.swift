@@ -95,8 +95,11 @@ enum Timeline {
     /// Within this many points of the edge counts as being there.
     static let edgeThreshold: CGFloat = 80
 
-    static func isAtBottom(offsetY: CGFloat, visibleHeight: CGFloat, contentHeight: CGFloat) -> Bool {
-        offsetY + visibleHeight >= contentHeight - edgeThreshold
+    /// `hiddenBelow`: how much of the visible height something floats over (the composer).
+    static func isAtBottom(
+        offsetY: CGFloat, visibleHeight: CGFloat, contentHeight: CGFloat, hiddenBelow: CGFloat = 0
+    ) -> Bool {
+        offsetY + visibleHeight - hiddenBelow >= contentHeight - edgeThreshold
     }
 
     static func isNearTop(offsetY: CGFloat) -> Bool { offsetY <= edgeThreshold }

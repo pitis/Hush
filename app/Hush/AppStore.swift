@@ -343,6 +343,7 @@ final class AppStore {
         case .typing(let conversationId, let who, let started):
             setTyping(conversationId, who: who, until: started ? now.addingTimeInterval(Self.typingTimeout) : nil)
         case .chatEventAdded(let conversationId):
+            resettingSessions.remove(conversationId)
             refreshConversations()
             if conversationId == selectedId { reloadEvents() }
         case .callChanged(let conversationId, let phase, let reason):
@@ -363,6 +364,8 @@ final class AppStore {
             // error text can mention ids or numbers: keep it out of the system log
             Self.logger.error("core error: \(message, privacy: .private)")
             lastError = message
+            // the reset may be what failed: offer it again (a second one does no harm)
+            resettingSessions.removeAll()
             append("error: \(message)")
             errors.append(LogLine(id: nextLogId, text: message))
             if errors.count > Self.logLimit { errors.removeFirst(errors.count - Self.logLimit) }
@@ -950,7 +953,7 @@ final class AppStore {
 
     // MARK: Connection and linking
 
-    /// "Retry" on the connection banner: reconnects now.
+    /// "Retry" under the chat list while offline: reconnects now.
     func retryConnection() {
         do {
             // receiving may have stopped (it is restarted only on request); starting is idempotent
@@ -964,9 +967,15 @@ final class AppStore {
         if screen == .chats { retryConnection() }
     }
 
+    /// Chats whose secure-session reset is on its way: until it's recorded, or anything fails.
+    private(set) var resettingSessions: Set<String> = []
+
     /// Starts a new secure session with a contact whose messages couldn't be decrypted.
     func resetSession(_ conversationId: String) {
-        do { try client?.resetSession(conversationId: conversationId) } catch {
+        do {
+            try client?.resetSession(conversationId: conversationId)
+            resettingSessions.insert(conversationId)
+        } catch {
             showError("Couldn't reset the session: \(Self.describe(error))")
         }
     }

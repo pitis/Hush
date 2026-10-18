@@ -138,6 +138,9 @@ final class ScrollDecisionTests: XCTestCase {
     func testEdges() {
         XCTAssertTrue(Timeline.isAtBottom(offsetY: 920, visibleHeight: 600, contentHeight: 1600))
         XCTAssertFalse(Timeline.isAtBottom(offsetY: 500, visibleHeight: 600, contentHeight: 1600))
+        // the composer floats over the last 200pt: they aren't seen
+        XCTAssertFalse(Timeline.isAtBottom(offsetY: 800, visibleHeight: 600, contentHeight: 1600, hiddenBelow: 200))
+        XCTAssertTrue(Timeline.isAtBottom(offsetY: 1120, visibleHeight: 600, contentHeight: 1600, hiddenBelow: 200))
         XCTAssertTrue(Timeline.isNearTop(offsetY: 40))
         XCTAssertFalse(Timeline.isNearTop(offsetY: 400))
     }

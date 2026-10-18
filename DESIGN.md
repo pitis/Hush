@@ -12,13 +12,21 @@ typography:
     fontFamily: "SF Pro (system)"
     fontSize: "13px"
     fontWeight: 600
-  body:
+  message:
+    fontFamily: "SF Pro (system)"
+    fontSize: "14px"
+    fontWeight: 400
+  preview:
     fontFamily: "SF Pro (system)"
     fontSize: "13px"
     fontWeight: 400
   meta:
     fontFamily: "SF Pro (system)"
     fontSize: "12px"
+    fontWeight: 400
+  bubble-time:
+    fontFamily: "SF Pro (system)"
+    fontSize: "10px"
     fontWeight: 400
 rounded:
   field: "18px"
@@ -62,8 +70,11 @@ Restrained: system neutrals and materials everywhere, with colour reserved for m
 ### Neutral
 - **Incoming Grey** (#E9E9E9 light / #3B3B3D dark): incoming bubbles.
 - **Secondary Text** (#6B6B6B light / #9E9E9E dark): timestamps, notices, meta lines.
-- Everything else is a system colour: window and sidebar backgrounds, selection, separators,
-  the accent (selection, unread badges, picked mention).
+- The main window's chrome is the system's: window and sidebar backgrounds, the chat list's
+  selection, separators, the accent (unread badges, the picked mention).
+- In-content greys stay Hush's for now (`Theme.field`, `Theme.selection`): the reaction pill,
+  file chips, the search result picked with the arrows, the sticker picker. `Theme.window` is
+  left only in the call window and the history overlay.
 
 **The Content Carries Colour Rule.** If a fill sits behind chrome (a sidebar, a header, a
 banner), it is the system's, or it is wrong.
@@ -74,8 +85,11 @@ banner), it is the system's, or it is wrong.
 
 ### Hierarchy
 - **Chat title** (semibold 13, bold when unread): chat list rows.
-- **Body** (regular 13): message text, previews.
-- **Meta** (regular 12): times, notices, accessory details; semibold 11 for accessory titles.
+- **Message** (regular 14): message text in bubbles and in the composer.
+- **Preview** (regular 13): the chat list's second line.
+- **Meta** (regular 12): list times, notices, accessory details; semibold 11 for accessory
+  titles; 11 and 12 in search results and the link preview card.
+- **Bubble time** (regular 10): the time and ticks inside a bubble.
 - **Window title and subtitle:** the system's (`navigationTitle` / `navigationSubtitle`).
 
 ## 4. Elevation
@@ -121,9 +135,10 @@ bubbles, notices, rows, search results or cards inside the content.
 
 ### Do:
 - **Do** let the system draw the window, sidebar, toolbar, search and selection.
-- **Do** name people by name; never show an id or an enum case.
+- **Do** name people by name wherever the name is known; never show an enum case.
 - **Do** collapse repeated notices into one, with one action.
-- **Do** keep every keyboard path (⌘K, ⌘F, ⇧⌘F, ⌥↑↓, ⌘1–9, ↩, ⇧↩, ↑, Esc, ⇧⌘A).
+- **Do** keep every keyboard path, including ⌘K, ⌘F, ⇧⌘F, ⌥↑↓, ⌥⇧↑↓, ⌘1–9, ⇧⌘T, ⇧⌘C, ↩, ⇧↩, ↑,
+  Esc and ⇧⌘A.
 
 ### Don't:
 - **Don't** look like a web app in a window: no opaque panel fills, no custom title bars, no

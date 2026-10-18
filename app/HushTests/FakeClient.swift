@@ -356,9 +356,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     private(set) var sessionResets: [String] = []
     private(set) var unlinks: [Bool] = []
     var unlinkError: Error?
+    var resetError: Error?
     var eventAnswers: [String: [ChatEvent]] = [:]
     func reconnect() throws { lock.withLock { reconnects += 1 } }
-    func resetSession(conversationId: String) throws { lock.withLock { sessionResets.append(conversationId) } }
+    func resetSession(conversationId: String) throws {
+        if let resetError { throw resetError }
+        lock.withLock { sessionResets.append(conversationId) }
+    }
     func unlink(tellServer: Bool) async throws {
         lock.withLock { unlinks.append(tellServer) }
         if let unlinkError { throw unlinkError }

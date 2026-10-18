@@ -72,7 +72,7 @@ struct ContentView: View {
 }
 
 /// One quiet line at the foot of the chat list while not connected (as Mail): what is going on,
-/// and Retry.
+/// and Retry while offline.
 struct ConnectionStatus: View {
     let store: AppStore
 

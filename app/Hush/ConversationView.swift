@@ -22,9 +22,7 @@ struct ConversationView: View {
         .background { if let w = conversation.wallpaper { Wallpaper(wallpaper: w) } }
         // floats over the timeline: messages scroll on under it
         .safeAreaBar(edge: .bottom) {
-            if conversation.blocked || conversation.messageRequest || conversation.groupInvitation
-                || conversation.groupJoinRequested
-            {
+            if RequestBar.replacesComposer(conversation) {
                 RequestBar(store: store, conversation: conversation)
             } else {
                 ComposerView(store: store, conversationId: conversation.id)
@@ -37,11 +35,7 @@ struct ConversationView: View {
         .onDisappear { if let quickLook { Files.close(quickLook) } }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
-            guard !conversation.blocked, !conversation.messageRequest, !conversation.groupInvitation,
-                !conversation.groupJoinRequested
-            else {
-                return false
-            }
+            guard !RequestBar.replacesComposer(conversation) else { return false }
             let files = Files.attachable(urls).map(Files.outgoing)
             store.addFiles(files)
             return !files.isEmpty
@@ -149,6 +143,11 @@ struct RequestBar: View {
             if let failure = await store.cancelJoinRequest(conversation.id) { store.showError(failure) }
             answering = false
         }
+    }
+
+    /// A blocked chat, a request or an invitation to answer: the bar, not the composer.
+    nonisolated static func replacesComposer(_ c: Conversation) -> Bool {
+        c.blocked || c.messageRequest || c.groupInvitation || c.groupJoinRequested
     }
 
     /// What the bar says above its buttons.
@@ -308,6 +307,7 @@ struct TimelineList: View {
                             let direct = e.conversationId.hasPrefix("c:") && !e.conversationId.hasPrefix("c:PNI:")
                             DecryptionNotice(
                                 name: name(e), count: count, canReset: direct && !reset,
+                                resetting: store.resettingSessions.contains(e.conversationId),
                                 reset: { store.resetSession(e.conversationId) })
                         case .message(let m, let first, let last):
                             let key = MessageKey(author: m.author, sentAt: m.sentAt)
@@ -344,7 +344,7 @@ struct TimelineList: View {
                 [
                     Timeline.isAtBottom(
                         offsetY: g.contentOffset.y, visibleHeight: g.containerSize.height,
-                        contentHeight: g.contentSize.height),
+                        contentHeight: g.contentSize.height, hiddenBelow: g.contentInsets.bottom),
                     Timeline.isNearTop(offsetY: g.contentOffset.y),
                 ]
             } action: { _, edges in
@@ -714,7 +714,7 @@ struct MessageRow: View {
             }
             .padding(.horizontal, 8).padding(.vertical, 3)
             .background(Theme.field, in: Capsule())
-            .overlay(Capsule().stroke(Theme.window, lineWidth: 2))
+            .overlay(Capsule().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 2))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(
@@ -814,9 +814,10 @@ struct DecryptionNotice: View {
     let count: Int
     /// A direct chat whose session hasn't been reset since.
     let canReset: Bool
+    /// A reset is on its way (the store's: a failure offers it again).
+    let resetting: Bool
     let reset: () -> Void
     @State private var confirming = false
-    @State private var resetting = false
 
     var body: some View {
         VStack(spacing: 4) {
@@ -833,10 +834,7 @@ struct DecryptionNotice: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
         .confirmationDialog("Reset the secure session with \(name)?", isPresented: $confirming) {
-            Button("Reset") {
-                resetting = true
-                reset()
-            }
+            Button("Reset", action: reset)
         } message: {
             Text(
                 "Hush starts a new encrypted session. \(name) will see that it was reset. Messages that "

@@ -41,7 +41,7 @@ struct SidebarView: View {
             }
             .onChange(of: resultIndex) { _, i in if let i { proxy.scrollTo("result-\(i)") } }
         }
-        // like Desktop's search: arrows pick a chat or message, ↩ opens it, Esc ends the search
+        // like Desktop's search: arrows pick a chat or message, ↩ opens it
         .searchable(text: $store.searchQuery, placement: .sidebar, prompt: "Search")
         .searchFocused($searchFocused)
         .onKeyPress(.downArrow) { searchFocused ? moveInSearch(1) : .ignored }
@@ -53,7 +53,7 @@ struct SidebarView: View {
                 store.openSearchResult()
             }
         }
-        // Esc in an empty field leaves it: the search (and its chat scope) ends
+        // leaving the field empty (Esc, a click elsewhere) ends the search and its chat scope
         .onChange(of: searchFocused) { _, focused in
             if !focused, store.searchQuery.isEmpty { store.endSearch() }
         }
@@ -113,15 +113,13 @@ struct SidebarView: View {
         .onChange(of: store.searchResults) { _, _ in resultIndex = nil }
     }
 
-    /// The list's selection is the open chat. A click puts the caret in its composer; arrows keep
-    /// focus in the list.
+    /// The list's selection is the open chat (arrows keep focus in the list).
     private var selection: Binding<String?> {
         Binding(
             get: { store.selectedId },
             set: { id in
                 guard let id, id != store.selectedId else { return }
                 store.select(id)
-                if [.leftMouseDown, .leftMouseUp].contains(NSApp.currentEvent?.type) { store.focusComposer() }
             })
     }
 
@@ -169,7 +167,8 @@ struct SidebarView: View {
         }
     }
 
-    /// Pinned chats under their own title when there are any (as Desktop), then the rest.
+    /// Pinned chats under their own title when there are any (as Desktop), then the rest; the
+    /// archive, or the chats matching a search, under theirs.
     @ViewBuilder private var chatRows: some View {
         let list = store.visibleConversations
         let pinned = list.filter { $0.pinnedOrder != nil }
@@ -212,6 +211,8 @@ struct SidebarView: View {
                 authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
         )
         .tag(c.id)
+        // a click (even on the open chat) puts the caret in its composer
+        .simultaneousGesture(TapGesture().onEnded { store.focusComposer() })
         .contextMenu { chatMenu(c) }
         .id(c.id)
     }
@@ -280,7 +281,7 @@ struct SidebarView: View {
         return .handled
     }
 
-    /// In the search field: through message results when browsing them (each opens as it is
+    /// Through message results when browsing them (each opens as it is
     /// picked, like stepping through matches), else through the chats.
     private func moveInSearch(_ step: Int) -> KeyPress.Result {
         guard browsingResults, !store.searchResults.isEmpty else { return move(step) }
@@ -326,14 +327,17 @@ struct SearchResultRow: View {
     }
 }
 
-/// A chat in the list; the list draws the selection.
+/// A chat in the list; the list draws the selection, and the colours follow it.
 struct ConversationRow: View {
     let conversation: Conversation
     let title: String
     let line: ChatList.Line
+    /// Increased on the accent-filled selection: an accent badge would vanish into it.
+    @Environment(\.backgroundProminence) private var prominence
 
     var body: some View {
         let unread = ChatList.isUnread(conversation)
+        let onAccent = prominence == .increased
         HStack(spacing: 10) {
             Avatar(id: conversation.id, name: title, size: 40)
             VStack(alignment: .leading, spacing: 2) {
@@ -342,12 +346,12 @@ struct ConversationRow: View {
                     Spacer(minLength: 6)
                     if ChatList.isMuted(conversation, now: Date()) {
                         Image(systemName: "bell.slash.fill").font(.system(size: 10))
-                            .foregroundStyle(Theme.secondaryText).accessibilityLabel("Muted")
+                            .foregroundStyle(.secondary).accessibilityLabel("Muted")
                     }
                     // relative times ("Now", "5m", "Yesterday"…) move on by themselves
                     TimelineView(.everyMinute) { context in
                         Text(Formatting().listTime(conversation.lastMessageAt, now: context.date))
-                            .font(.system(size: 12)).foregroundStyle(Theme.secondaryText)
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }
                 HStack(spacing: 4) {
@@ -356,14 +360,15 @@ struct ConversationRow: View {
                     if conversation.unreadCount > 0 {
                         Text("\(conversation.unreadCount)").font(.system(size: 11, weight: .bold))
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.accentColor, in: Capsule())
-                            .foregroundStyle(.white)
+                            .background(onAccent ? Color.white : Color.accentColor, in: Capsule())
+                            .foregroundStyle(onAccent ? Color.accentColor : Color.white)
                     } else if conversation.markedUnread {
                         // marked by hand: a dot, no count (as Desktop)
-                        Circle().fill(Color.accentColor).frame(width: 8, height: 8).accessibilityLabel("Unread")
+                        Circle().fill(onAccent ? Color.white : Color.accentColor).frame(width: 8, height: 8)
+                            .accessibilityLabel("Unread")
                     }
                 }
-                .foregroundStyle(unread ? .primary : Theme.secondaryText)
+                .foregroundStyle(unread ? .primary : .secondary)
             }
         }
         .padding(.vertical, 4)
