@@ -113,13 +113,16 @@ struct SidebarView: View {
         .onChange(of: store.searchResults) { _, _ in resultIndex = nil }
     }
 
-    /// The list's selection is the open chat (arrows keep focus in the list).
+    /// The list's selection is the open chat. A click puts the caret in its composer (a gesture
+    /// on the rows would swallow the list's clicks); arrows keep focus in the list.
     private var selection: Binding<String?> {
         Binding(
             get: { store.selectedId },
             set: { id in
                 guard let id, id != store.selectedId else { return }
                 store.select(id)
+                // the list reports a click's selection as the button comes up
+                if [.leftMouseDown, .leftMouseUp].contains(NSApp.currentEvent?.type) { store.focusComposer() }
             })
     }
 
@@ -211,8 +214,6 @@ struct SidebarView: View {
                 authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
         )
         .tag(c.id)
-        // a click (even on the open chat) puts the caret in its composer
-        .simultaneousGesture(TapGesture().onEnded { store.focusComposer() })
         .contextMenu { chatMenu(c) }
         .id(c.id)
     }
