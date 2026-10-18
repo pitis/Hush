@@ -81,6 +81,8 @@ This covers the backup; the export is its own PR.
   and the rest exports; names lose `/ : # ? %` and are cut at 200 bytes.
 - View-once media is never exported (only its note), nor a deleted message's files.
 - Not exported: reactions, text styles, chat events (calls, timer changes), link previews.
+- Disappearing messages still in the chat are exported like any other: the export doesn't
+  disappear.
 - Testing: export.rs renders escaped text, days and times, mentions and quotes, deletions, files
   and other kinds, and safe folder names; the client exports a chat with a copy of its file and
   a second export beside the first; an unknown chat is refused; view-once media stays out; a
