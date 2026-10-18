@@ -1389,6 +1389,11 @@ final class AppStore {
         typingUntil[conversationId]?.values.contains { $0 > now } ?? false
     }
 
+    /// Who is typing in a chat now (ACIs, in order).
+    func typers(_ conversationId: String, now: Date = .now) -> [String] {
+        (typingUntil[conversationId] ?? [:]).filter { $0.value > now }.keys.sorted()
+    }
+
     var selectedConversation: Conversation? {
         selectedId.flatMap { id in conversations.first { $0.id == id } }
     }

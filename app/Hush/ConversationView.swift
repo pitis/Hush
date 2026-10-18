@@ -334,6 +334,7 @@ struct TimelineList: View {
                                     name: store.senderName))
                         }
                     }
+                    TypingRow(store: store, conversationId: conversation.id, isGroup: isGroup)
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 16)
@@ -805,6 +806,51 @@ struct ChatEventRow: View {
         .wallpaperBacked()
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
+    }
+}
+
+/// Someone typing, as the last thing in the timeline; a view of its own so typing doesn't
+/// re-render the messages.
+struct TypingRow: View {
+    let store: AppStore
+    let conversationId: String
+    let isGroup: Bool
+
+    var body: some View {
+        if let who = store.typers(conversationId).first {
+            TypingBubble(typer: isGroup ? (who, store.senderName(who)) : nil).padding(.top, 6)
+        }
+    }
+}
+
+/// An incoming bubble of three pulsing dots (still under Reduce Motion), after the typer's
+/// picture in a group.
+struct TypingBubble: View {
+    /// Who, in a group (ACI and name).
+    let typer: (id: String, name: String)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            if let typer { Avatar(id: "c:\(typer.id)", name: typer.name, size: 28) }
+            TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
+                let t = context.date.timeIntervalSinceReferenceDate
+                HStack(spacing: 4) {
+                    ForEach(0..<3, id: \.self) { i in
+                        // a wave from left to right, once every 1.25s
+                        let wave = max(0, sin(t * .pi * 1.6 - Double(i) * 0.7))
+                        Circle().frame(width: 7, height: 7).opacity(reduceMotion ? 0.6 : 0.35 + 0.65 * wave)
+                    }
+                }
+            }
+            .foregroundStyle(Theme.secondaryText)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Theme.incoming, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+            Spacer(minLength: 80)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(typer.map { "\($0.name) is typing" } ?? "Typing")
     }
 }
 

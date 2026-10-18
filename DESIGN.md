@@ -126,6 +126,11 @@ bubbles, notices, rows, search results or cards inside the content.
 - Trailing: Voice Call and one Chat Options menu (timer, colour and wallpaper, search in chat,
   group info, the note).
 
+### Typing bubble
+- While someone types, the timeline ends with an incoming bubble of three dots pulsing left to
+  right (still under Reduce Motion), after the typer's picture in a group. The toolbar subtitle
+  also says "typing…", for when the bottom is scrolled out of view.
+
 ### Notices
 - Centred, secondary 12pt with an SF Symbol. Repeated decryption failures collapse into one
   notice with one link-style action that asks before it acts.
