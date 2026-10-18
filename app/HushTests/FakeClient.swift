@@ -332,11 +332,15 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         let older = before.map { b in all.filter { ($0.sentAt, $0.author) < (b.sentAt, b.author) } } ?? all
         return Array(older.suffix(Int(limit)))
     }
+    /// Each `reactions()` call takes this long (a slow core).
+    var reactionDelay: Duration?
     func reactions(key: MessageKey) async throws -> [Reaction] {
-        lock.withLock {
+        let answer = lock.withLock {
             reactionCalls += 1
             return reactionAnswers[key] ?? []
         }
+        if let reactionDelay { try? await Task.sleep(for: reactionDelay) }
+        return answer
     }
     private(set) var searches: [(query: String, conversationId: String?)] = []
     var searchAnswers: [String: [SearchHit]] = [:]

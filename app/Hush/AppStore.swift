@@ -172,6 +172,10 @@ final class AppStore {
     private var loadingOlder = false
     /// Keys whose message or reactions changed since the last reload of the open chat.
     private var changedKeys: Set<MessageKey> = []
+    /// When each of the open chat's messages last changed or was reacted to (a count of changes):
+    /// a details load that began before doesn't write over what is newer.
+    private var changes = 0
+    private var changedAt: [MessageKey: Int] = [:]
     private var selectionGeneration = 0
     /// The selection generation the in-flight messages load belongs to, if any.
     private var loadingGeneration: Int?
@@ -311,10 +315,7 @@ final class AppStore {
         case .messageChanged(let conversationId, let key):
             append("message \(conversationId) \(key.author.prefix(8)) @\(key.sentAt)")
             refreshConversations()
-            if conversationId == selectedId {
-                changedKeys.insert(key)
-                reloadMessages()
-            }
+            if conversationId == selectedId { changed(key) }
             if notifiedMessages[key] != nil { Task { await removeIfDeleted(key) } }
         case .messageExpired(let conversationId, let key):
             // its disappearing timer ran out: nothing of it may stay on screen
@@ -334,10 +335,7 @@ final class AppStore {
                 Task { await refreshStories() }
             }
             // a download finished (or started, or failed): its message in the open chat updates
-            if conversationId == selectedId {
-                changedKeys.insert(message)
-                reloadMessages()
-            }
+            if conversationId == selectedId { changed(message) }
         case .newReaction(let conversationId, let target, let reactor, let emoji):
             Task { await notify(conversationId, about: target, reaction: (reactor, emoji)) }
         case .typing(let conversationId, let who, let started):
@@ -392,6 +390,7 @@ final class AppStore {
         dismissedPreviews = []
         outgoingFiles = []
         changedKeys = []
+        changedAt = [:]
         hasOlder = false
         replyTo = nil
         editing = nil
@@ -496,6 +495,9 @@ final class AppStore {
         do {
             try await client.react(target: key, emoji: emoji, remove: remove)
             pendingReactions[key] = .some(remove ? nil : emoji)
+            // a details load already under way read the reactions before this
+            changes += 1
+            changedAt[key] = changes
         } catch {
             showError("Couldn't react: \(Self.describe(error))")
         }
@@ -1369,14 +1371,14 @@ final class AppStore {
             try? await Task.sleep(for: .seconds(2))
             if highlighted == key { highlighted = nil }
         }
+        // nearest first, a page at a time: each page's details show as it's done
         let at = page.firstIndex { $0.author == key.author && $0.sentAt == key.sentAt } ?? page.count
-        let near = Array(page[max(0, at - 30)..<min(page.count, at + 30)])
-        let nearKeys = Set(near.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
-        await loadDetails(for: near, generation: generation)
-        guard current() else { return }
-        await loadDetails(
-            for: page.filter { !nearKeys.contains(MessageKey(author: $0.author, sentAt: $0.sentAt)) },
-            generation: generation)
+        let byDistance = page.indices.sorted { abs($0 - at) < abs($1 - at) }
+        for start in stride(from: 0, to: byDistance.count, by: Int(Self.pageSize)) {
+            guard current() else { return }
+            let chunk = byDistance[start..<min(start + Int(Self.pageSize), byDistance.count)]
+            await loadDetails(for: chunk.map { page[$0] }, generation: generation)
+        }
     }
     func focusComposer() { composerWantsFocus = true }
     func composerTookFocus() { composerWantsFocus = false }
@@ -1519,37 +1521,67 @@ final class AppStore {
         return older + page
     }
 
-    /// Reactions and unknown group-sender names for the given messages.
+    /// A message of the open chat changed: it reloads.
+    private func changed(_ key: MessageKey) {
+        changes += 1
+        changedAt[key] = changes
+        changedKeys.insert(key)
+        reloadMessages()
+    }
+
+    /// Reactions and unknown group-sender names for the given messages. Each kind is written once
+    /// for the page: every write redraws the timeline.
     private func loadDetails(for page: [Message], generation: Int) async {
         guard let client else { return }
+        let started = changes
         let isGroup = selectedId?.hasPrefix("g:") == true
+        // nil: none (the key is removed)
+        var loadedReactions: [MessageKey: [Reaction]?] = [:]
+        var loadedFiles: [MessageKey: [Attachment]?] = [:]
+        var loadedPreviews: [MessageKey: LinkPreview?] = [:]
+        var loadedPolls: [MessageKey: Poll?] = [:]
         for m in page {
+            guard generation == selectionGeneration else { return }
             let key = MessageKey(author: m.author, sentAt: m.sentAt)
             // separately: one failing query doesn't take the others' details with it
             do {
                 let r = try await client.reactions(key: key)
-                if generation == selectionGeneration {
-                    reactions[key] = r.isEmpty ? nil : r
-                    pendingReactions[key] = nil  // the core's word now
-                }
+                loadedReactions[key] = r.isEmpty ? nil : r
             } catch { append("query failed: \(error)") }
             do {
                 let files = try await client.attachments(key: key)
-                if generation == selectionGeneration { attachments[key] = files.isEmpty ? nil : files }
+                loadedFiles[key] = files.isEmpty ? nil : files
             } catch { append("query failed: \(error)") }
             do {
-                let preview = try await client.linkPreview(key: key)
-                if generation == selectionGeneration { previews[key] = preview }
+                loadedPreviews[key] = try await client.linkPreview(key: key)
             } catch { append("query failed: \(error)") }
             if case .poll = m.kind {
                 do {
-                    let poll = try await client.poll(key: key)
-                    if generation == selectionGeneration { polls[key] = poll }
+                    loadedPolls[key] = try await client.poll(key: key)
                 } catch { append("query failed: \(error)") }
             }
             if isGroup, !m.isOutgoing { await loadName(m.author) }
             for aci in MessageText.mentioned(m.ranges + (m.quote?.ranges ?? [])) { await loadName(aci) }
         }
+        guard generation == selectionGeneration else { return }
+        // changed meanwhile: the reload that change started reads them afresh
+        let stale = Set(changedAt.filter { $0.value > started }.keys)
+        for key in stale {
+            (loadedReactions[key], loadedFiles[key], loadedPreviews[key], loadedPolls[key]) = (nil, nil, nil, nil)
+        }
+        reactions = Self.applied(loadedReactions, to: reactions)
+        // the core's word now
+        pendingReactions = pendingReactions.filter { loadedReactions[$0.key] == nil }
+        attachments = Self.applied(loadedFiles, to: attachments)
+        previews = Self.applied(loadedPreviews, to: previews)
+        polls = Self.applied(loadedPolls, to: polls)
+    }
+
+    /// `values` written over `dict`, a nil removing its key.
+    private static func applied<V>(_ values: [MessageKey: V?], to dict: [MessageKey: V]) -> [MessageKey: V] {
+        var dict = dict
+        for (key, value) in values { dict[key] = value }
+        return dict
     }
 
     /// Looks up a group member's contact name once.

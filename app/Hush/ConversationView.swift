@@ -354,9 +354,10 @@ struct TimelineList: View {
                 nearTop = edges[1]
             }
             .onChange(of: nearTop) { _, near in if near { loadOlder() } }
-            .onChange(of: store.messages.first?.sentAt) { _, _ in
-                // still at the top after a page arrived (short messages): keep paging
-                if nearTop { loadOlder() }
+            .onChange(of: store.messages.first?.sentAt) { old, _ in
+                // still at the top after a page arrived (short messages): keep paging. Not for a
+                // chat's first page: the empty timeline before it counts as at the top.
+                if nearTop, old != nil { loadOlder() }
             }
             .onChange(of: store.messages.last?.sentAt) { _, _ in
                 let own = store.messages.last?.isOutgoing ?? false

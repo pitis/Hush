@@ -20,6 +20,24 @@ final class AppStoreConversationTests: XCTestCase {
         XCTAssertEqual(store.selectedId, "c:a")
     }
 
+    /// Each kind of detail lands in one write: a write per message redraws the whole timeline each
+    /// time, and a chat took seconds to open.
+    func testOpeningAChatWritesEachKindOfDetailOnce() async throws {
+        let fake = FakeClient(linked: true)
+        fake.messageAnswers["c:a"] = (1...100).map { message("c:a", "a", Int64($0)) }
+        for i in 1...100 {
+            fake.reactionAnswers[MessageKey(author: "a", sentAt: Int64(i))] = [Reaction(reactor: "b", emoji: "👍")]
+        }
+        let store = await linkedStore(fake)
+        let writes = Writes(store)
+        store.select("c:a")
+        writes.watch()
+        await eventually { fake.reactionCalls == 100 }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertGreaterThan(writes.count, 0)
+        XCTAssertLessThanOrEqual(writes.count, 4)
+    }
+
     func testLoadOlderPrependsThePreviousPage() async {
         let fake = FakeClient(linked: true)
         fake.messageAnswers["c:a"] = (1...150).map { message("c:a", "a", Int64($0)) }
@@ -190,6 +208,58 @@ final class AppStoreConversationTests: XCTestCase {
         await eventually { store.reactions[MessageKey(author: "a", sentAt: 5)]?.count == 1 }
     }
 
+    func testAReactionOrFileThatGoesIsRemovedOnReload() async {
+        let fake = FakeClient(linked: true)
+        let key = MessageKey(author: "a", sentAt: 1)
+        fake.messageAnswers["c:a"] = [message("c:a", "a", 1)]
+        fake.reactionAnswers[key] = [Reaction(reactor: "b", emoji: "👍")]
+        fake.attachmentAnswers[key] = [attachment(1, key)]
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        await eventually { store.reactions[key] != nil && store.attachments[key] != nil }
+        fake.reactionAnswers[key] = []
+        fake.attachmentAnswers[key] = []
+        store.handle(.messageChanged(conversationId: "c:a", key: key))
+        await eventually { store.reactions[key] == nil && store.attachments[key] == nil }
+    }
+
+    /// A page's details are written when the whole page is done: a message that changed meanwhile
+    /// keeps what its own reload read.
+    func testASlowPageDoesntWriteOverAMessageThatChangedMeanwhile() async throws {
+        let fake = FakeClient(linked: true)
+        fake.messageAnswers["c:a"] = (1...150).map { message("c:a", "a", Int64($0)) }
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        await eventually { fake.reactionCalls == 100 }
+        fake.reactionDelay = .milliseconds(5)
+        let older = Task { await store.loadOlder() }
+        // the older page's first message has been read (no reactions) when someone reacts to it
+        await eventually { fake.reactionCalls > 105 }
+        let key = MessageKey(author: "a", sentAt: 1)
+        fake.reactionAnswers[key] = [Reaction(reactor: "b", emoji: "👍")]
+        store.handle(.messageChanged(conversationId: "c:a", key: key))
+        await eventually { store.reactions[key]?.count == 1 }
+        await older.value
+        XCTAssertEqual(store.reactions[key]?.count, 1)
+    }
+
+    /// Our reaction shows until the core has it: a page read before we reacted doesn't take it away.
+    func testAReactionMadeWhileAPageLoadsStaysOurs() async throws {
+        let fake = FakeClient(linked: true)
+        fake.messageAnswers["c:a"] = (1...150).map { message("c:a", "a", Int64($0)) }
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        await eventually { fake.reactionCalls == 100 }
+        fake.reactionDelay = .milliseconds(5)
+        let older = Task { await store.loadOlder() }
+        await eventually { fake.reactionCalls > 105 }
+        let first = try XCTUnwrap(store.messages.first)
+        XCTAssertEqual(first.sentAt, 1)
+        await store.react(to: first, with: "👍")
+        await older.value
+        XCTAssertEqual(store.myReaction(to: first), "👍")
+    }
+
     func testOnlyNewOrChangedMessagesGetTheirReactionsFetched() async {
         let fake = FakeClient(linked: true)
         fake.messageAnswers["c:a"] = (1...10).map { message("c:a", "a", Int64($0)) }
@@ -236,5 +306,24 @@ final class AppStoreConversationTests: XCTestCase {
         store.handle(.typing(conversationId: "c:a", who: "a", started: true), now: t0)
         store.handle(.typing(conversationId: "c:a", who: "a", started: false), now: t0)
         XCTAssertFalse(store.isTyping("c:a", now: t0))
+    }
+}
+
+/// Counts writes to the open chat's details (one per observation round: a lower bound).
+@MainActor
+private final class Writes {
+    let store: AppStore
+    var count = 0
+    init(_ store: AppStore) { self.store = store }
+
+    func watch() {
+        withObservationTracking {
+            _ = (store.reactions, store.attachments, store.previews, store.polls)
+        } onChange: {
+            Task { @MainActor in
+                self.count += 1
+                self.watch()
+            }
+        }
     }
 }
