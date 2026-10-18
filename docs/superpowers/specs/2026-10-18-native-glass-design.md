@@ -96,6 +96,17 @@ handling (`onKeyPress`) if it does.
   "@username".
 - **Notice and confirmation:** as written under Layout.
 
+## As built
+
+- **`Theme`** loses the window and sidebar fills from the main window. Its remaining greys
+  (field, selection, secondary text) stay for in-content use; replacing them with system
+  colours (and so honouring Increase Contrast) is left for a later pass.
+- **The decryption notice** says "between you and …", not "from …": presage doesn't say whose
+  side failed.
+- **Stories:** a filled icon, not a number badge, marks unseen stories (a badge would clip in
+  the toolbar); the count is in its label.
+- **Visual source of truth:** `DESIGN.md`.
+
 ## Constraints
 
 - `deploymentTarget` becomes macOS 26.0 (`app/project.yml`); the stack rules in `CLAUDE.md` follow.
