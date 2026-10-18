@@ -59,4 +59,17 @@ final class AppStoreBackupTests: XCTestCase {
         store.handle(.linkUrl(url: "sgnl://linkdevice?x"))
         XCTAssertEqual(store.restoreNote, "Couldn't restore the backup: disk full", "the new code doesn't hide it")
     }
+
+    func testAnExportReachesTheCoreAndAFailureIsShown() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        let made = await store.exportChat("c:a", to: URL(fileURLWithPath: "/tmp/out"))
+        XCTAssertEqual(made?.path, "/tmp/out/Chat")
+        XCTAssertEqual(fake.exports.map(\.conversationId), ["c:a"])
+        fake.exportError = CoreError.Storage(message: "can't copy a file: disk full")
+        let failed = await store.exportChat("c:a", to: URL(fileURLWithPath: "/tmp/out"))
+        XCTAssertNil(failed)
+        XCTAssertEqual(store.lastError, "Couldn't export the chat: can't copy a file: disk full")
+    }
 }

@@ -286,6 +286,53 @@ impl Client {
     }
 }
 
+/// Writes the export of the chat `title` (see `Client::export_chat`) into a new folder in
+/// `folder`; `files` are each message's attachments, `names` names ACIs. Returns its path.
+fn write_export(
+    folder: &std::path::Path,
+    title: &str,
+    messages: &[Message],
+    files: &[Vec<crate::projection::Attachment>],
+    names: &std::collections::HashMap<String, String>,
+) -> Result<String, CoreError> {
+    let base = crate::export::file_name(title);
+    // a new folder: an earlier export stays as it was
+    let dir = (1..)
+        .map(|n| folder.join(if n == 1 { base.clone() } else { format!("{base} {n}") }))
+        .find(|d| !d.exists())
+        .expect("some name is free");
+    std::fs::create_dir_all(dir.join("files")).map_err(storage("can't make the export folder"))?;
+    let name = |aci: &str| names.get(aci).cloned().unwrap_or_else(|| aci.chars().take(8).collect());
+    let mut exported = vec![];
+    for (m, attachments) in messages.iter().zip(files) {
+        let mut out = vec![];
+        for a in attachments {
+            let shown = a.file_name.clone().unwrap_or_else(|| format!("file {}", a.id));
+            let path = match &a.path {
+                Some(source) => {
+                    let to = format!("files/{}-{}", a.id, crate::export::file_name(&shown));
+                    std::fs::copy(source, dir.join(&to)).map_err(storage("can't copy a file"))?;
+                    Some(to)
+                }
+                None => None,
+            };
+            out.push(crate::export::ExportedFile {
+                path,
+                content_type: a.content_type.clone(),
+                name: shown,
+            });
+        }
+        exported.push(crate::export::Exported {
+            message: m,
+            author: name(&m.author),
+            files: out,
+        });
+    }
+    let html = crate::export::page(title, &exported, &chrono::Local, name);
+    std::fs::write(dir.join("chat.html"), html).map_err(storage("can't write the transcript"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 /// Work folders in the data directory while backing up and restoring. In the latter, `RESTORED`
 /// is the restored projection under this Mac's key and `READY` marks a backup read and the core
 /// stopped: an open finishes that swap, and removes the folders otherwise.
@@ -1088,6 +1135,54 @@ impl Client {
             }
         }
         restored
+    }
+
+    /// Exports the chat `conversation_id` into a new folder in `folder`, named after it: a
+    /// `chat.html` transcript anyone can open and its downloaded files in `files/`. Returns the
+    /// new folder's path.
+    pub async fn export_chat(&self, conversation_id: String, folder: String) -> Result<String, CoreError> {
+        self.known_conversation(&conversation_id).await?;
+        let mut messages: Vec<Message> = vec![];
+        loop {
+            let before = messages.first().map(Message::key);
+            let page = self.db.messages(&conversation_id, before, 500).await?;
+            if page.is_empty() {
+                break;
+            }
+            messages.splice(0..0, page);
+        }
+        // everyone the page names: authors, quoted authors, mentions
+        let me = self.own_aci();
+        let mut named = std::collections::BTreeSet::new();
+        let mut files = vec![];
+        for m in &messages {
+            named.insert(m.author.clone());
+            named.extend(m.quote.iter().map(|q| q.author.clone()));
+            for r in m.ranges.iter().chain(m.quote.iter().flat_map(|q| q.ranges.iter())) {
+                if let crate::projection::TextStyle::Mention { aci } = &r.style {
+                    named.insert(aci.clone());
+                }
+            }
+            files.push(if m.deleted {
+                vec![]
+            } else {
+                self.db.attachments(&m.key()).await?
+            });
+        }
+        let mut names = std::collections::HashMap::new();
+        for aci in named {
+            let name = match me.as_deref() == Some(aci.as_str()) {
+                true => Some("You".to_string()),
+                false => self.db.title(&format!("c:{aci}")).await?,
+            };
+            if let Some(name) = name {
+                names.insert(aci, name);
+            }
+        }
+        let title = self.db.title(&conversation_id).await?.unwrap_or_else(|| "Chat".into());
+        tokio::task::spawn_blocking(move || write_export(&PathBuf::from(folder), &title, &messages, &files, &names))
+            .await
+            .map_err(|e| CoreError::Storage { message: e.to_string() })?
     }
 
     /// A chat's events (e.g. undecryptable messages) from `since` (ms) on.
@@ -2779,6 +2874,54 @@ mod tests {
             height: Some(3),
             is_voice_note: false,
         }
+    }
+
+    #[test]
+    fn a_chat_exports_to_a_page_with_its_files_and_a_second_export_keeps_the_first() {
+        let (dir, _sink, client, rt) = as_me("client-export");
+        let src = dir.0.join("src");
+        let photo = file_in(&src, "beach.heic", b"heic");
+        let conv = format!("c:{ALICE}");
+        let out = dir.0.join("exports");
+        std::fs::create_dir_all(&out).unwrap();
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            client
+                .send_attachments(
+                    conv.clone(),
+                    vec![outgoing(photo, "image/heic")],
+                    Some("sunset".into()),
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            let first = client
+                .export_chat(conv.clone(), out.to_string_lossy().into())
+                .await
+                .unwrap();
+            let html = std::fs::read_to_string(std::path::Path::new(&first).join("chat.html")).unwrap();
+            assert!(html.contains("sunset") && html.contains(">You<"), "ours, named");
+            let files: Vec<_> = std::fs::read_dir(std::path::Path::new(&first).join("files"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(files.len(), 1);
+            assert!(files[0].ends_with("-beach.heic"));
+            assert!(html.contains(&format!("files/{}", files[0])), "the page links its copy");
+            assert_eq!(
+                std::fs::read(std::path::Path::new(&first).join("files").join(&files[0])).unwrap(),
+                b"heic"
+            );
+            let second = client
+                .export_chat(conv.clone(), out.to_string_lossy().into())
+                .await
+                .unwrap();
+            assert_ne!(first, second);
+            assert!(std::path::Path::new(&first).join("chat.html").exists());
+            let nobody = "c:00000000-0000-4000-8000-000000000009".to_string();
+            assert!(invalid(client.export_chat(nobody, out.to_string_lossy().into()).await));
+        });
     }
 
     #[test]

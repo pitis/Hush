@@ -426,6 +426,15 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         lock.withLock { backups.append((path, passphrase)) }
     }
 
+    private(set) var exports: [(conversationId: String, folder: String)] = []
+    var exportError: Error?
+
+    func exportChat(conversationId: String, folder: String) async throws -> String {
+        if let exportError { throw exportError }
+        lock.withLock { exports.append((conversationId, folder)) }
+        return folder + "/Chat"
+    }
+
     func restoreBackup(path: String, passphrase: String) async throws {
         if let restoreError { throw restoreError }
         lock.withLock { restores.append(path) }

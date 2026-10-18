@@ -1155,6 +1155,19 @@ final class AppStore {
         return nil
     }
 
+    /// A chat's Export chat…: a new folder in `folder` with a readable transcript and the chat's
+    /// files. The new folder, or nil (the error is shown).
+    func exportChat(_ id: String, to folder: URL) async -> URL? {
+        guard let client else { return nil }
+        do {
+            return URL(fileURLWithPath: try await client.exportChat(conversationId: id, folder: folder.path))
+        } catch {
+            append("exporting a chat failed: \(error)")
+            showError("Couldn't export the chat: \(Self.fileFailure(error))")
+            return nil
+        }
+    }
+
     /// Settings ▸ Back Up…: writes every chat and file here to `url`, encrypted with
     /// `passphrase`. Why it failed, or nil.
     func backUp(to url: URL, passphrase: String) async -> String? {
