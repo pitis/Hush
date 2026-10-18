@@ -407,8 +407,8 @@ impl Message {
 /// Something that happened in a chat that isn't a message.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatEventKind {
-    /// A message between us and `author` couldn't be decrypted, by us or by them (presage
-    /// doesn't tell which): a broken session.
+    /// A message between us and `author` couldn't be decrypted, by us or by them (a retry
+    /// receipt): a broken session.
     DecryptionFailed,
     /// We started a new secure session with `author`.
     SessionReset,

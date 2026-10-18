@@ -102,8 +102,8 @@ handling (`onKeyPress`) if it does.
 - **`Theme`** loses the window and sidebar fills from the main window. Its remaining greys
   (field, selection, secondary text) stay for in-content use; replacing them with system
   colours (and so honouring Increase Contrast) is left for a later pass.
-- **The decryption notice** says "between you and …", not "from …": presage doesn't say whose
-  side failed.
+- **The decryption notice** says "between you and …", not "from …": a contact's failure (a
+  retry receipt) shows as ours does.
 - **Stories:** a filled icon, not a number badge, marks unseen stories (a badge would clip in
   the toolbar); the count is in its label.
 - **Search keys:** the ↑↓ handlers sit on both the list and the searchable container; ↩ is
