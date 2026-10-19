@@ -1,25 +1,14 @@
 {
   "fill" : {
-    "linear-gradient" : [
-      "extended-srgb:0.16471,0.17255,0.21569,1.00000",
-      "extended-srgb:0.07059,0.07059,0.09020,1.00000"
-    ],
-    "orientation" : {
-      "start" : { "x" : 0.5, "y" : 0 },
-      "stop" : { "x" : 0.5, "y" : 1 }
-    }
+    "solid" : "extended-srgb:1.00000,1.00000,1.00000,1.00000"
   },
   "groups" : [
     {
       "layers" : [
         {
-          "glass" : true,
-          "image-name" : "hush.svg",
-          "name" : "hush",
-          "position" : {
-            "scale" : 1.2,
-            "translation-in-points" : [ 0, 0 ]
-          }
+          "glass" : false,
+          "image-name" : "girl.svg",
+          "name" : "girl"
         }
       ],
       "shadow" : {
@@ -27,7 +16,7 @@
         "opacity" : 0.5
       },
       "translucency" : {
-        "enabled" : true,
+        "enabled" : false,
         "value" : 0.5
       }
     }
