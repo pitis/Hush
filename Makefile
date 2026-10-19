@@ -37,6 +37,8 @@ release: ## Build the Release app (release core: thin LTO, stripped) and install
 	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; rm -rf /Applications/Semaphore.app
 	rm -rf /Applications/Hush.app
 	ditto build/Build/Products/Release/Hush.app /Applications/Hush.app
+	@# macOS refreshes a cached app icon only when the bundle's own date changes; ditto keeps the old one
+	touch /Applications/Hush.app
 	@echo "✓ /Applications/Hush.app"
 
 perf: ## Measure the installed app against the M1 budget (size, cold launch, idle RAM and CPU)
