@@ -332,7 +332,7 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         let older = before.map { b in all.filter { ($0.sentAt, $0.author) < (b.sentAt, b.author) } } ?? all
         return Array(older.suffix(Int(limit)))
     }
-    /// Each `reactions()` call takes this long (a slow core).
+    /// Reading each message's reactions takes this long (a slow core).
     var reactionDelay: Duration?
     func reactions(key: MessageKey) async throws -> [Reaction] {
         let answer = lock.withLock {
@@ -341,6 +341,18 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         }
         if let reactionDelay { try? await Task.sleep(for: reactionDelay) }
         return answer
+    }
+    /// A message after another, as the core reads them.
+    func details(keys: [MessageKey]) async -> [MessageDetails] {
+        var out: [MessageDetails] = []
+        for key in keys {
+            out.append(
+                MessageDetails(
+                    key: key, reactions: (try? await reactions(key: key)) ?? [],
+                    attachments: (try? await attachments(key: key)) ?? [], preview: try? await linkPreview(key: key),
+                    poll: try? await poll(key: key)))
+        }
+        return out
     }
     private(set) var searches: [(query: String, conversationId: String?)] = []
     var searchAnswers: [String: [SearchHit]] = [:]

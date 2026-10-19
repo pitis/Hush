@@ -1529,8 +1529,8 @@ final class AppStore {
         reloadMessages()
     }
 
-    /// Reactions and unknown group-sender names for the given messages. Each kind is written once
-    /// for the page: every write redraws the timeline.
+    /// The given messages' details (reactions, files, previews, polls) and unknown group-sender
+    /// names. Each kind is written once for the page: every write redraws the timeline.
     private func loadDetails(for page: [Message], generation: Int) async {
         guard let client else { return }
         let started = changes
@@ -1540,26 +1540,17 @@ final class AppStore {
         var loadedFiles: [MessageKey: [Attachment]?] = [:]
         var loadedPreviews: [MessageKey: LinkPreview?] = [:]
         var loadedPolls: [MessageKey: Poll?] = [:]
+        // one call for the page: a call per message and detail kept photos seconds late. A message
+        // the core couldn't read isn't in it, and keeps what it showed.
+        let keys = page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) }
+        for d in await client.details(keys: keys) {
+            loadedReactions[d.key] = d.reactions.isEmpty ? nil : d.reactions
+            loadedFiles[d.key] = d.attachments.isEmpty ? nil : d.attachments
+            loadedPreviews[d.key] = d.preview
+            loadedPolls[d.key] = d.poll
+        }
         for m in page {
             guard generation == selectionGeneration else { return }
-            let key = MessageKey(author: m.author, sentAt: m.sentAt)
-            // separately: one failing query doesn't take the others' details with it
-            do {
-                let r = try await client.reactions(key: key)
-                loadedReactions[key] = r.isEmpty ? nil : r
-            } catch { append("query failed: \(error)") }
-            do {
-                let files = try await client.attachments(key: key)
-                loadedFiles[key] = files.isEmpty ? nil : files
-            } catch { append("query failed: \(error)") }
-            do {
-                loadedPreviews[key] = try await client.linkPreview(key: key)
-            } catch { append("query failed: \(error)") }
-            if case .poll = m.kind {
-                do {
-                    loadedPolls[key] = try await client.poll(key: key)
-                } catch { append("query failed: \(error)") }
-            }
             if isGroup, !m.isOutgoing { await loadName(m.author) }
             for aci in MessageText.mentioned(m.ranges + (m.quote?.ranges ?? [])) { await loadName(aci) }
         }

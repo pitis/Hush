@@ -15,3 +15,20 @@ final class ConversationChromeTests: XCTestCase {
         XCTAssertEqual(subtitle(false, .online, 0, nil), "")
     }
 }
+
+/// A message row is drawn again only when what it shows changed.
+@MainActor
+final class MessageRowTests: XCTestCase {
+    private func row(reactions: [Reaction] = []) -> MessageRow {
+        MessageRow(
+            message: message("c:a", "a", 1, "hi"), first: true, last: true, isGroup: false, senderName: "A",
+            reactions: reactions, files: [], preview: nil, reply: {}, retry: {}, download: { _ in },
+            open: { _ in true })
+    }
+
+    func testOnlyWhatItShowsCounts() {
+        // new closures each time the timeline draws: the same row
+        XCTAssertEqual(row(), row())
+        XCTAssertNotEqual(row(), row(reactions: [Reaction(reactor: "b", emoji: "👍")]))
+    }
+}

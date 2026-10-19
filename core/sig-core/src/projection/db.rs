@@ -325,7 +325,7 @@ impl ProjectionDb {
             return Ok(None);
         };
         let texts: Vec<String> = serde_json::from_str(&row.try_get::<String, _>("options")?)
-            .map_err(|e| decode_err(format!("poll options: {e}")))?;
+            .map_err(|e| decode_err(format!("poll options, line {} column {}", e.line(), e.column())))?;
         if texts.is_empty() {
             return Ok(None); // only its end is here
         }
@@ -2611,6 +2611,30 @@ impl ProjectionDb {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(row_to_message).transpose()
+    }
+
+    /// The details of messages, in the order of `keys`: for a page in one call from the app, as a
+    /// call per message and detail was hundreds of hops for a page. A message whose details don't
+    /// read is left out, so the app keeps what it showed for it and the rest of the page comes.
+    pub async fn details(&self, keys: &[MessageKey]) -> Vec<MessageDetails> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.details_of(key).await {
+                Ok(d) => out.push(d),
+                Err(e) => tracing::warn!(sent_at = key.sent_at, error = %e, "a message's details didn't read"),
+            }
+        }
+        out
+    }
+
+    async fn details_of(&self, key: &MessageKey) -> Result<MessageDetails, sqlx::Error> {
+        Ok(MessageDetails {
+            key: key.clone(),
+            reactions: self.reactions(key).await?,
+            attachments: self.attachments(key).await?,
+            preview: self.link_preview(key).await?,
+            poll: self.poll(key).await?,
+        })
     }
 
     /// Reactions on a message, one per reactor, ordered by reactor.
@@ -6208,6 +6232,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn a_pages_details_come_in_one_call_in_the_order_asked() {
+        let db = db().await;
+        for i in 1..=3 {
+            db.insert_message(&msg("alice", i, "x")).await.unwrap();
+        }
+        let preview = NewPreview {
+            url: "https://example.org".into(),
+            title: None,
+            description: None,
+            image: None,
+        };
+        db.apply(&add(
+            k("alice", 1),
+            vec![new_attachment("image/jpeg", 100, false)],
+            Some(preview),
+        ))
+        .await
+        .unwrap();
+        db.apply(&Op::React {
+            target: k("alice", 2),
+            reactor: "bob".into(),
+            emoji: Some("👍".into()),
+        })
+        .await
+        .unwrap();
+        let details = db.details(&[k("alice", 3), k("alice", 1), k("alice", 2)]).await;
+        assert_eq!(details.iter().map(|d| d.key.sent_at).collect::<Vec<_>>(), [3, 1, 2]);
+        assert!(details[0].reactions.is_empty() && details[0].attachments.is_empty());
+        assert!(details[0].preview.is_none() && details[0].poll.is_none());
+        assert_eq!(details[1].attachments.len(), 1);
+        assert_eq!(
+            details[1].preview.as_ref().map(|p| p.url.as_str()),
+            Some("https://example.org")
+        );
+        assert_eq!(details[2].reactions.len(), 1);
+        // a message whose details don't read is left out: the others still come
+        sqlx::query("UPDATE attachments SET state = 99")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let details = db.details(&[k("alice", 1), k("alice", 2)]).await;
+        assert_eq!(details.iter().map(|d| d.key.sent_at).collect::<Vec<_>>(), [2]);
     }
 
     #[tokio::test]

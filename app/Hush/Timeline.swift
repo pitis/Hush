@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 
 /// The rows of a conversation: day separators and messages, with grouping of runs from the same
 /// sender (tight spacing, name and avatar once).
@@ -86,7 +86,7 @@ enum Timeline {
 
     /// What the timeline does when its last message changes: follow it when the reader is at the
     /// bottom or it is their own message, otherwise show the "New messages" pill.
-    enum NewMessageAction: Equatable { case scrollToBottom, showPill, nothing }
+    enum NewMessageAction: Equatable { case scrollToBottom, showPill }
 
     static func onNewLastMessage(atBottom: Bool, isOwn: Bool) -> NewMessageAction {
         atBottom || isOwn ? .scrollToBottom : .showPill
@@ -95,11 +95,11 @@ enum Timeline {
     /// Within this many points of the edge counts as being there.
     static let edgeThreshold: CGFloat = 80
 
-    /// `hiddenBelow`: how much of the visible height something floats over (the composer).
-    static func isAtBottom(
-        offsetY: CGFloat, visibleHeight: CGFloat, contentHeight: CGFloat, hiddenBelow: CGFloat = 0
-    ) -> Bool {
-        offsetY + visibleHeight - hiddenBelow >= contentHeight - edgeThreshold
+    /// The end of the content is in view, above the composer floating over it. The container is the
+    /// height between the toolbar and the composer; the offset is the view's top, behind the top
+    /// inset (the toolbar's, and what pushes a short chat down).
+    static func isAtBottom(_ g: ScrollGeometry) -> Bool {
+        g.contentOffset.y + g.contentInsets.top + g.containerSize.height >= g.contentSize.height - edgeThreshold
     }
 
     static func isNearTop(offsetY: CGFloat) -> Bool { offsetY <= edgeThreshold }
