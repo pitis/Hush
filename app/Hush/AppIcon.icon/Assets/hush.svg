@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- the lips stop at the finger's edges -->
+    <clipPath id="beside-finger">
+      <rect x="0" y="0" width="470" height="1024"/>
+      <rect x="554" y="0" width="470" height="1024"/>
+    </clipPath>
+  </defs>
+  <g fill="none" stroke="#fff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <g clip-path="url(#beside-finger)">
+      <path d="M262,372 C340,320 410,280 466,282 C486,283 502,296 512,306 C522,296 538,283 558,282 C614,280 684,320 762,372"/>
+      <path d="M262,372 Q512,410 762,372"/>
+      <path d="M262,372 C330,440 420,476 512,476 C604,476 694,440 762,372"/>
+    </g>
+    <!-- index finger, its right edge running down to the wrist -->
+    <path d="M470,610 L470,262 A42,42 0 0 1 554,262 L554,610 C600,630 640,670 640,740 C640,820 606,900 604,1000"/>
+    <!-- curled fingers, stacked on the left -->
+    <path d="M470,612 C452,580 400,572 372,600 C344,628 352,668 392,672 L440,672"/>
+    <path d="M392,672 C346,676 340,724 376,736 L448,736"/>
+    <path d="M376,736 C344,746 348,792 384,796 L440,796"/>
+    <!-- palm edge down to the wrist -->
+    <path d="M384,796 C400,840 420,900 424,1000"/>
+    <!-- thumb across the curled fingers -->
+    <path d="M630,698 C596,686 548,690 512,704 C482,716 486,754 514,754 C556,756 600,770 634,792"/>
+  </g>
+</svg>
