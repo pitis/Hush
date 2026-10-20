@@ -27,7 +27,7 @@ struct StickerPicker: View {
                             Button {
                                 packId = p.id
                             } label: {
-                                ThumbnailImage(path: p.stickers[0].path).frame(width: 28, height: 28)
+                                ThumbnailImage(path: p.stickers[0].path, shownAt: 28).frame(width: 28, height: 28)
                                     .padding(4)
                                     .background(
                                         p.id == pack?.id ? Theme.selection : .clear,
@@ -47,7 +47,7 @@ struct StickerPicker: View {
                                     dismiss()
                                     Task { await store.sendSticker(pack: pack.id, sticker: s.id) }
                                 } label: {
-                                    ThumbnailImage(path: s.path).frame(width: 72, height: 72)
+                                    ThumbnailImage(path: s.path, shownAt: 72).frame(width: 72, height: 72)
                                 }
                                 .buttonStyle(.plain)
                                 .help(s.emoji ?? "")
