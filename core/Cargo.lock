@@ -1665,7 +1665,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2910,7 +2910,7 @@ dependencies = [
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/pitis/presage?rev=6a369579bfd753aad2e795fd3a703a15212774e7#6a369579bfd753aad2e795fd3a703a15212774e7"
+source = "git+https://github.com/pitis/presage?rev=1bb5629317eef53eba556b092dc1f791be36376a#1bb5629317eef53eba556b092dc1f791be36376a"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2932,7 +2932,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/pitis/presage?rev=6a369579bfd753aad2e795fd3a703a15212774e7#6a369579bfd753aad2e795fd3a703a15212774e7"
+source = "git+https://github.com/pitis/presage?rev=1bb5629317eef53eba556b092dc1f791be36376a#1bb5629317eef53eba556b092dc1f791be36376a"
 dependencies = [
  "async-trait",
  "bytes",
