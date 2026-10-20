@@ -1,6 +1,6 @@
--- The installed sticker packs as the picker shows them and sending needs them. presage keeps
--- each pack with every image in it as JSON, so its copy is read once, when the pack is first
--- listed: a sticker is here once its image is written to stickers/<pack id>/<sticker id>.
+-- The installed sticker packs as the picker shows them and sending needs them, so that presage's
+-- copy (every image in it as JSON) is read only until the pack is here: a pack is kept once every
+-- image of it is written to stickers/<hex pack id>/<sticker id>.
 CREATE TABLE sticker_packs (
     id BLOB PRIMARY KEY NOT NULL,
     key BLOB NOT NULL,

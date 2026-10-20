@@ -640,7 +640,11 @@ async fn run(
                 Some(m) => {
                     let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join("stickers"));
                     tokio::task::spawn_local(async move {
-                        let _ = done.send(installed_packs(&store, &db, dir).await);
+                        let packs = installed_packs(&store, &db, dir).await;
+                        if let Err(e) = &packs {
+                            tracing::warn!(error = %e, "listing the sticker packs failed");
+                        }
+                        let _ = done.send(packs);
                     });
                 }
                 None => {
@@ -652,10 +656,10 @@ async fn run(
                 sticker_id,
                 done,
             } => match &manager {
-                Some(_) => {
-                    let (db, dir) = (projection.clone(), dir.join("stickers"));
+                Some(m) => {
+                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join("stickers"));
                     tokio::task::spawn_local(async move {
-                        let _ = done.send(chosen_sticker(&db, dir, pack_id, sticker_id).await);
+                        let _ = done.send(chosen_sticker(&store, &db, dir, pack_id, sticker_id).await);
                     });
                 }
                 None => {
@@ -939,8 +943,9 @@ fn start_history(
 }
 
 /// The installed packs with stickers we have images of, by title. presage keeps a pack with every
-/// image in it as JSON, so its copy is read once, when the pack is first listed (or its images
-/// went missing): the projection keeps the rest, the images are files (written off this thread).
+/// image in it as JSON, so its copy is read only while the projection doesn't keep the pack whole
+/// (new, its images gone, or some missing): the projection keeps what the picker and sending
+/// need, the images are files (written off this thread).
 async fn installed_packs(
     store: &SqliteStore,
     db: &ProjectionDb,
@@ -951,9 +956,9 @@ async fn installed_packs(
     for pack in db.sticker_packs().await.map_err(|e| e.to_string())? {
         if installed.contains(&pack.id) {
             kept.push(pack);
-        } else {
-            // removed, here or on the phone
-            db.forget_sticker_pack(&pack.id).await.map_err(|e| e.to_string())?;
+        } else if let Err(e) = db.forget_sticker_pack(&pack.id).await {
+            // removed on the phone, or presage's store was replaced (relinking, a restore)
+            tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a removed sticker pack couldn't be forgotten");
         }
     }
     let images = dir.clone();
@@ -971,17 +976,19 @@ async fn installed_packs(
             Ok(None) => continue,
             Err(e) => {
                 // one unreadable pack doesn't hide the others
-                tracing::warn!(error = %e, "a sticker pack couldn't be read");
+                tracing::warn!(error = %e, pack = %hex::encode(id), "a sticker pack couldn't be read");
                 continue;
             }
         };
         let images = dir.clone();
-        let (pack, complete) = tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images))
+        let (pack, whole) = tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images))
             .await
             .map_err(|e| e.to_string())?;
-        // a pack with images that couldn't be written is read again next time
-        if complete {
-            db.keep_sticker_pack(&pack).await.map_err(|e| e.to_string())?;
+        // one that isn't kept is read again next time, and sending from it reads presage's copy
+        if whole {
+            if let Err(e) = db.keep_sticker_pack(&pack).await {
+                tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a sticker pack couldn't be kept");
+            }
         }
         packs.push(pack);
     }
@@ -994,22 +1001,40 @@ async fn installed_packs(
     Ok(infos)
 }
 
-/// One sticker of a pack the picker listed, from what the projection keeps of it.
+/// One sticker of an installed pack: from what the projection keeps of the pack, else (not kept
+/// whole) from presage's copy, its image written if it isn't yet.
 async fn chosen_sticker(
+    store: &SqliteStore,
     db: &ProjectionDb,
     dir: PathBuf,
     pack_id: Vec<u8>,
     sticker_id: u32,
 ) -> Result<Option<ChosenSticker>, String> {
-    let packs = db.sticker_packs().await.map_err(|e| e.to_string())?;
-    Ok(packs.iter().find(|p| p.id == pack_id).and_then(|pack| {
-        let s = pack.stickers.iter().find(|s| s.id == sticker_id)?;
-        Some(ChosenSticker {
-            info: crate::stickers::sticker_info(pack, s, &dir),
+    if !store.has_sticker_pack(&pack_id).await.map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let kept = db.sticker_packs().await.map_err(|e| e.to_string())?;
+    let pack = match kept.into_iter().find(|p| p.id == pack_id) {
+        Some(pack) => pack,
+        None => {
+            let Some(pack) = store.sticker_pack(&pack_id).await.map_err(|e| e.to_string())? else {
+                return Ok(None);
+            };
+            let images = dir.clone();
+            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images).0)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
+    Ok(pack
+        .stickers
+        .iter()
+        .find(|s| s.id == sticker_id)
+        .map(|s| ChosenSticker {
+            info: crate::stickers::sticker_info(&pack, s, &dir),
             content_type: s.content_type.clone(),
             pack_key: pack.key.clone(),
-        })
-    }))
+        }))
 }
 
 /// Makes a group change, then stores the group in its chat.
@@ -2581,28 +2606,102 @@ mod tests {
         let stickers = dir.join("stickers");
         store.add_sticker_pack(&pack("Foxes")).await.unwrap();
 
+        // an image that can't be written (a file where the pack's folder goes): not kept
+        let folder = stickers.join(hex::encode([1u8; 16]));
+        std::fs::create_dir_all(&stickers).unwrap();
+        std::fs::write(&folder, b"").unwrap();
+        assert!(super::installed_packs(&store, &db, stickers.clone())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db.sticker_packs().await.unwrap().is_empty());
+        std::fs::remove_file(&folder).unwrap();
+
         let listed = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(listed.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), ["Foxes"]);
         assert_eq!(std::fs::read(&listed[0].stickers[0].path).unwrap(), b"fox");
         // listed again from what Hush kept, not from presage's copy
         store.add_sticker_pack(&pack("Renamed")).await.unwrap();
         let again = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
-        assert_eq!(again[0].title, "Foxes");
-        let chosen = super::chosen_sticker(&db, stickers.clone(), vec![1; 16], 0)
+        assert_eq!(again, listed);
+        let chosen = super::chosen_sticker(&store, &db, stickers.clone(), vec![1; 16], 0)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            (chosen.pack_key, chosen.content_type.as_str(), chosen.info.path.as_str()),
-            (vec![2; 32], "image/webp", listed[0].stickers[0].path.as_str())
+            (chosen.pack_key, chosen.content_type.as_str(), chosen.info),
+            (vec![2; 32], "image/webp", listed[0].stickers[0].clone())
         );
+        // its images gone (a restored backup): presage's copy is read again
+        std::fs::remove_file(&listed[0].stickers[0].path).unwrap();
+        let reread = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
+        assert_eq!(reread[0].title, "Renamed");
+        assert_eq!(std::fs::read(&reread[0].stickers[0].path).unwrap(), b"fox");
         // a pack removed on the phone is gone
         store.remove_sticker_pack(&[1; 16]).await.unwrap();
         assert!(super::installed_packs(&store, &db, stickers.clone())
             .await
             .unwrap()
             .is_empty());
-        assert!(super::chosen_sticker(&db, stickers, vec![1; 16], 0)
+        assert!(super::chosen_sticker(&store, &db, stickers, vec![1; 16], 0)
+            .await
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_sticker_pack_presage_has_part_of_is_listed_and_sent_but_not_kept() {
+        use presage::model::identity::OnNewIdentity;
+        use presage::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest};
+        use presage_store_sqlite::SqliteStore;
+        let dir = std::env::temp_dir().join(format!("sig-core-sticker-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = SqliteStore::open_with_options(
+            super::sqlite_options(&dir.join("presage.db"), &"00".repeat(32)).unwrap(),
+            OnNewIdentity::Trust,
+        )
+        .await
+        .unwrap();
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let sticker = |id, bytes: Option<&[u8]>| Sticker {
+            id,
+            emoji: None,
+            content_type: Some("image/webp".into()),
+            bytes: bytes.map(<[u8]>::to_vec),
+        };
+        // a pack presage stored before it kept only whole ones
+        store
+            .add_sticker_pack(&StickerPack {
+                id: vec![1; 16],
+                key: vec![2; 32],
+                manifest: StickerPackManifest {
+                    title: "Foxes".into(),
+                    author: "Ana".into(),
+                    cover: None,
+                    stickers: vec![sticker(0, Some(b"fox")), sticker(1, None)],
+                },
+            })
+            .await
+            .unwrap();
+        let stickers = dir.join("stickers");
+
+        let listed = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
+        assert_eq!(listed[0].stickers.iter().map(|s| s.id).collect::<Vec<_>>(), [0]);
+        assert!(
+            db.sticker_packs().await.unwrap().is_empty(),
+            "not kept: read again next time"
+        );
+        let chosen = super::chosen_sticker(&store, &db, stickers.clone(), vec![1; 16], 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (chosen.pack_key, chosen.info),
+            (vec![2; 32], listed[0].stickers[0].clone())
+        );
+        assert!(super::chosen_sticker(&store, &db, stickers, vec![1; 16], 1)
             .await
             .unwrap()
             .is_none());

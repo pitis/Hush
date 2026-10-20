@@ -1,5 +1,5 @@
-//! Sticker packs: the installed ones (presage keeps them, with their images) shown as files for
-//! the picker, and the links that add one.
+//! Sticker packs: the installed ones (presage keeps them, with their images; the projection keeps
+//! what the picker and sending need) shown as files for the picker, and the links that add one.
 
 use std::path::{Path, PathBuf};
 
@@ -52,24 +52,38 @@ pub(crate) fn parse_link(link: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 /// What to keep of presage's `pack`: each sticker presage has the image of, written once to
-/// `<dir>/<pack id>/<sticker id>` (a sticker without one, or that can't be written, is left out),
-/// and whether every image presage has was written. Blocking file IO: off the core's thread.
+/// `<dir>/<hex pack id>/<sticker id>` (one without an image, one whose image can't be written and
+/// a repeated id are left out), and whether that is the whole pack, every image there. Blocking
+/// file IO: off the core's thread.
 pub(crate) fn keep(pack: &presage::store::StickerPack, dir: &Path) -> (KeptPack, bool) {
-    let mut complete = true;
+    let mut whole = true;
+    let mut seen = std::collections::HashSet::new();
     let stickers = pack
         .manifest
         .stickers
         .iter()
         .filter_map(|s| {
-            let bytes = s.bytes.as_ref()?;
+            // a manifest can repeat an id (presage reads a missing one as 0)
+            if !seen.insert(s.id) {
+                return None;
+            }
+            let Some(bytes) = s.bytes.as_ref() else {
+                whole = false;
+                return None;
+            };
             let path = image_path(dir, &pack.id, s.id);
             if !path.exists() {
                 let written = path
                     .parent()
                     .map_or(Ok(()), std::fs::create_dir_all)
                     .and_then(|_| std::fs::write(&path, bytes));
-                complete &= written.is_ok();
-                written.ok()?;
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, pack = %hex::encode(&pack.id), sticker = s.id, "a sticker's image couldn't be written");
+                    // a partial file would pass for the image next time
+                    let _ = std::fs::remove_file(&path);
+                    whole = false;
+                    return None;
+                }
             }
             Some(KeptSticker {
                 id: s.id,
@@ -85,7 +99,7 @@ pub(crate) fn keep(pack: &presage::store::StickerPack, dir: &Path) -> (KeptPack,
         author: pack.manifest.author.clone(),
         stickers,
     };
-    (kept, complete)
+    (kept, whole)
 }
 
 /// Whether every kept sticker's image is still in `dir`. Blocking file IO.
@@ -167,11 +181,12 @@ mod tests {
                     sticker(0, "🦊", Some(b"fox")),
                     sticker(1, "", None),
                     sticker(2, "", Some(b"den")),
+                    sticker(0, "🐺", Some(b"wolf")),
                 ],
             },
         };
-        let (kept, complete) = keep(&pack, &dir);
-        assert!(complete);
+        let (kept, whole) = keep(&pack, &dir);
+        assert!(!whole, "sticker 1 has no image");
         assert_eq!(kept.stickers[0].content_type, "image/webp");
         let info = pack_info(&kept, &dir);
         assert_eq!(
