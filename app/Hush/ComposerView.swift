@@ -282,7 +282,7 @@ struct PreviewDraftCard: View {
     var body: some View {
         HStack(spacing: 10) {
             if let image = draft.image {
-                ThumbnailImage(path: image.path).frame(width: 44, height: 44)
+                ThumbnailImage(path: image.path, shownAt: 44).frame(width: 44, height: 44)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             VStack(alignment: .leading, spacing: 2) {
@@ -341,7 +341,7 @@ struct FileTray: View {
                 ForEach(store.outgoingFiles, id: \.path) { f in
                     HStack(spacing: 6) {
                         if f.contentType.hasPrefix("image/") {
-                            ThumbnailImage(path: f.path).frame(width: 36, height: 36)
+                            ThumbnailImage(path: f.path, shownAt: 36).frame(width: 36, height: 36)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                         } else {
                             Image(systemName: "doc.fill").font(.system(size: 20)).frame(width: 36, height: 36)
