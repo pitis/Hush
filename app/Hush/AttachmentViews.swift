@@ -269,22 +269,22 @@ struct LinkPreviewCard: View {
 /// A small picture of an image file, decoded off the main thread.
 struct ThumbnailImage: View {
     let path: String
-    /// The longest side it is shown at, in points; nil: an image bubble's.
+    /// The side of the square it fills, in points; nil: decoded at `Thumbnails.maxPixels`.
     var shownAt: CGFloat? = nil
     @Environment(\.displayScale) private var scale
     @State private var image: CGImage?
 
-    private var maxPixels: CGFloat { shownAt.map { ($0 * scale).rounded(.up) } ?? Thumbnails.maxPixels }
+    private var side: CGFloat? { shownAt.map { ($0 * scale).rounded(.up) } }
 
     var body: some View {
         Group {
-            if let image = image ?? Thumbnails.cached(path, maxPixels: maxPixels) {
+            if let image = image ?? Thumbnails.cached(path, filling: side) {
                 Image(decorative: image, scale: 1).resizable().scaledToFill()
             } else {
                 Rectangle().fill(.black.opacity(0.25))
             }
         }
-        .task(id: "\(maxPixels) \(path)") { image = await Thumbnails.load(path, maxPixels: maxPixels) }
+        .task(id: "\(side ?? 0) \(path)") { image = await Thumbnails.load(path, filling: side) }
     }
 }
 
@@ -292,7 +292,7 @@ struct ThumbnailImage: View {
 /// while drawing would stall scrolling.
 @MainActor
 enum Thumbnails {
-    /// Each image costs its bitmap's bytes: past 32 MB, NSCache lets some go.
+    /// Each image costs its bitmap's bytes; past 32 MB NSCache starts evicting (a soft limit).
     private static let cache = {
         let cache = NSCache<NSString, CGImage>()
         cache.totalCostLimit = 32 << 20
@@ -300,36 +300,45 @@ enum Thumbnails {
     }()
     /// Files that didn't decode, not tried again on every draw.
     private static var undecodable: Set<String> = []
-    /// An image bubble's longest side: two bubble widths, for a Retina screen.
+    /// An image bubble's longest side in pixels: `Files.imageBox` at 2× (Retina).
     nonisolated static let maxPixels = 2 * Files.imageBox
 
-    static func cached(_ path: String, maxPixels: CGFloat = Thumbnails.maxPixels) -> CGImage? {
-        cache.object(forKey: key(path, maxPixels))
+    /// `side`: the pixels of a square the picture fills; nil: at most `maxPixels` either way.
+    static func cached(_ path: String, filling side: CGFloat? = nil) -> CGImage? {
+        cache.object(forKey: key(path, side))
     }
 
-    static func load(_ path: String, maxPixels: CGFloat = Thumbnails.maxPixels) async -> CGImage? {
-        if let hit = cached(path, maxPixels: maxPixels) { return hit }
+    static func load(_ path: String, filling side: CGFloat? = nil) async -> CGImage? {
+        if let hit = cached(path, filling: side) { return hit }
         if undecodable.contains(path) { return nil }
-        let image = await Task.detached(priority: .userInitiated) { decode(path, maxPixels) }.value
+        let image = await Task.detached(priority: .userInitiated) { decode(path, side) }.value
         if let image {
-            cache.setObject(image, forKey: key(path, maxPixels), cost: image.bytesPerRow * image.height)
+            cache.setObject(image, forKey: key(path, side), cost: image.bytesPerRow * image.height)
         } else {
             undecodable.insert(path)
         }
         return image
     }
 
-    private static func key(_ path: String, _ maxPixels: CGFloat) -> NSString {
-        "\(Int(maxPixels)) \(path)" as NSString
+    private static func key(_ path: String, _ side: CGFloat?) -> NSString {
+        "\(Int(side ?? 0)) \(path)" as NSString
     }
 
-    nonisolated private static func decode(_ path: String, _ maxPixels: CGFloat) -> CGImage? {
+    nonisolated private static func decode(_ path: String, _ side: CGFloat?) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+        var longest = maxPixels
+        if let side {
+            // its shorter side spans the square and the longer one is cropped (never more than a bubble's)
+            let p = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+            let w = p?[kCGImagePropertyPixelWidth] as? CGFloat ?? 1
+            let h = p?[kCGImagePropertyPixelHeight] as? CGFloat ?? 1
+            longest = min(maxPixels, (side * max(w, h) / max(1, min(w, h))).rounded(.up))
+        }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+            kCGImageSourceThumbnailMaxPixelSize: longest,
         ]
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 }

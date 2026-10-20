@@ -21,16 +21,16 @@ final class ThumbnailsTests: XCTestCase {
         return url.path
     }
 
-    func testAPictureShownSmallIsDecodedSmall() async throws {
+    func testAPictureFillingASmallSquareIsDecodedJustLargeEnough() async throws {
         let path = try picture(width: 2000, height: 1000)
 
-        let small = await Thumbnails.load(path, maxPixels: 80)
+        let small = await Thumbnails.load(path, filling: 80)
         let avatar = try XCTUnwrap(small)
-        XCTAssertEqual([avatar.width, avatar.height], [80, 40])
-        // the bubble's decode of the same file is its own
+        XCTAssertEqual([avatar.width, avatar.height], [160, 80], "its shorter side fills the square")
+        // a bubble's size of the same file is a separate cache entry
         let large = await Thumbnails.load(path)
         let bubble = try XCTUnwrap(large)
-        XCTAssertEqual(bubble.width, Int(Thumbnails.maxPixels))
-        XCTAssertEqual(Thumbnails.cached(path, maxPixels: 80)?.width, 80)
+        XCTAssertEqual([bubble.width, bubble.height], [640, 320])
+        XCTAssertEqual(Thumbnails.cached(path, filling: 80)?.width, 160)
     }
 }
