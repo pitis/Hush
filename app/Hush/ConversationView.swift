@@ -604,7 +604,7 @@ struct MessageRow: View {
                     } else if isViewOnce {
                         viewOnce
                     } else if let sticker = stickerImage {
-                        ThumbnailImage(path: sticker).scaledToFit().frame(maxWidth: 160, maxHeight: 160)
+                        ThumbnailImage(path: sticker, shownAt: 160).scaledToFit().frame(maxWidth: 160, maxHeight: 160)
                             .accessibilityLabel(Placeholder.text(message.kind) ?? "Sticker")
                     } else if case .poll(let question) = message.kind, let poll {
                         PollCard(

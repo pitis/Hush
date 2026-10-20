@@ -76,7 +76,7 @@ struct Avatar: View {
 
     var body: some View {
         if let path = AvatarPictures.shared.paths[id] {
-            ThumbnailImage(path: path).frame(width: size, height: size).clipShape(Circle())
+            ThumbnailImage(path: path, shownAt: size).frame(width: size, height: size).clipShape(Circle())
                 .accessibilityHidden(true)
         } else {
             initials

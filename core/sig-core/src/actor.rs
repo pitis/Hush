@@ -260,13 +260,15 @@ impl Drop for PanicReporter {
 }
 
 /// SQLCipher options with a raw 256-bit key (no key derivation) and statement logging off, so the
-/// key pragma never reaches a log.
+/// key pragma never reaches a log. Each of presage's connections caches 512 KB instead of SQLite's
+/// 2 MB: its hot pages are few, and a miss is a decrypt from the OS's file cache.
 pub(crate) fn sqlite_options(path: &std::path::Path, key: &str) -> Result<SqliteConnectOptions, CoreError> {
     Ok(SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
         .create_if_missing(true)
         .foreign_keys(true)
         .disable_statement_logging()
-        .pragma("key", format!("\"x'{key}'\"")))
+        .pragma("key", format!("\"x'{key}'\""))
+        .pragma("cache_size", "-512"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2705,6 +2707,24 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn presage_connections_keep_a_small_page_cache() {
+        use sqlx::ConnectOptions;
+        let dir = std::env::temp_dir().join(format!("sig-core-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = super::sqlite_options(&dir.join("presage.db"), &"00".repeat(32))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let kib: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(kib, -512);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
