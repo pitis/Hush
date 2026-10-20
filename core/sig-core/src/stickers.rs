@@ -1,9 +1,28 @@
 //! Sticker packs: the installed ones (presage keeps them, with their images) shown as files for
 //! the picker, and the links that add one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::projection::model::{StickerInfo, StickerPackInfo};
+
+/// A pack as the projection keeps it: what the picker shows and what sending needs, its images
+/// written under the stickers folder.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct KeptPack {
+    pub id: Vec<u8>,
+    pub key: Vec<u8>,
+    pub title: String,
+    pub author: String,
+    pub stickers: Vec<KeptSticker>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct KeptSticker {
+    pub id: u32,
+    pub emoji: Option<String>,
+    /// presage's, else empty.
+    pub content_type: String,
+}
 
 /// A pack id is 16 bytes, its key 32.
 const PACK_ID_LEN: usize = 16;
@@ -32,43 +51,69 @@ pub(crate) fn parse_link(link: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     (id.len() == PACK_ID_LEN && key.len() == PACK_KEY_LEN).then_some((id, key))
 }
 
-/// A pack as the picker shows it: each sticker presage has the image of, written once to
-/// `<dir>/<pack id>/<sticker id>` (a sticker without one, or that can't be written, is left out).
-/// Blocking file IO: off the core's thread.
-pub(crate) fn pack_info(pack: &presage::store::StickerPack, dir: &Path) -> StickerPackInfo {
+/// What to keep of presage's `pack`: each sticker presage has the image of, written once to
+/// `<dir>/<pack id>/<sticker id>` (a sticker without one, or that can't be written, is left out),
+/// and whether every image presage has was written. Blocking file IO: off the core's thread.
+pub(crate) fn keep(pack: &presage::store::StickerPack, dir: &Path) -> (KeptPack, bool) {
+    let mut complete = true;
     let stickers = pack
         .manifest
         .stickers
         .iter()
-        .filter_map(|s| sticker_info(pack, s, dir))
+        .filter_map(|s| {
+            let bytes = s.bytes.as_ref()?;
+            let path = image_path(dir, &pack.id, s.id);
+            if !path.exists() {
+                let written = path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|_| std::fs::write(&path, bytes));
+                complete &= written.is_ok();
+                written.ok()?;
+            }
+            Some(KeptSticker {
+                id: s.id,
+                emoji: s.emoji.clone().filter(|e| !e.is_empty()),
+                content_type: s.content_type.clone().unwrap_or_default(),
+            })
+        })
         .collect();
-    StickerPackInfo {
-        id: hex::encode(&pack.id),
+    let kept = KeptPack {
+        id: pack.id.clone(),
+        key: pack.key.clone(),
         title: pack.manifest.title.clone(),
         author: pack.manifest.author.clone(),
         stickers,
+    };
+    (kept, complete)
+}
+
+/// Whether every kept sticker's image is still in `dir`. Blocking file IO.
+pub(crate) fn has_images(pack: &KeptPack, dir: &Path) -> bool {
+    pack.stickers.iter().all(|s| image_path(dir, &pack.id, s.id).exists())
+}
+
+/// A kept pack as the picker shows it.
+pub(crate) fn pack_info(pack: &KeptPack, dir: &Path) -> StickerPackInfo {
+    StickerPackInfo {
+        id: hex::encode(&pack.id),
+        title: pack.title.clone(),
+        author: pack.author.clone(),
+        stickers: pack.stickers.iter().map(|s| sticker_info(pack, s, dir)).collect(),
     }
 }
 
-/// One sticker of `pack` as `pack_info` shows it (its image written if it isn't yet).
-pub(crate) fn sticker_info(
-    pack: &presage::store::StickerPack,
-    s: &presage::store::Sticker,
-    dir: &Path,
-) -> Option<StickerInfo> {
-    let bytes = s.bytes.as_ref()?;
-    let folder = dir.join(hex::encode(&pack.id));
-    let path = folder.join(s.id.to_string());
-    if !path.exists() {
-        std::fs::create_dir_all(&folder)
-            .and_then(|_| std::fs::write(&path, bytes))
-            .ok()?;
-    }
-    Some(StickerInfo {
+/// One sticker of a kept pack as `pack_info` shows it.
+pub(crate) fn sticker_info(pack: &KeptPack, s: &KeptSticker, dir: &Path) -> StickerInfo {
+    StickerInfo {
         id: s.id,
-        emoji: s.emoji.clone().filter(|e| !e.is_empty()),
-        path: path.to_string_lossy().into_owned(),
-    })
+        emoji: s.emoji.clone(),
+        path: image_path(dir, &pack.id, s.id).to_string_lossy().into_owned(),
+    }
+}
+
+fn image_path(dir: &Path, pack_id: &[u8], sticker_id: u32) -> PathBuf {
+    dir.join(hex::encode(pack_id)).join(sticker_id.to_string())
 }
 
 #[cfg(test)]
@@ -125,7 +170,10 @@ mod tests {
                 ],
             },
         };
-        let info = pack_info(&pack, &dir);
+        let (kept, complete) = keep(&pack, &dir);
+        assert!(complete);
+        assert_eq!(kept.stickers[0].content_type, "image/webp");
+        let info = pack_info(&kept, &dir);
         assert_eq!(
             (info.id.as_str(), info.title.as_str(), info.author.as_str()),
             (ID, "Foxes", "Ana")
@@ -133,9 +181,15 @@ mod tests {
         let shown: Vec<_> = info.stickers.iter().map(|s| (s.id, s.emoji.as_deref())).collect();
         assert_eq!(shown, vec![(0, Some("🦊")), (2, None)]);
         assert_eq!(std::fs::read(&info.stickers[0].path).unwrap(), b"fox");
-        // written once: listing again keeps the file
+        // written once: keeping again keeps the file
         std::fs::write(&info.stickers[0].path, b"kept").unwrap();
-        let again = pack_info(&pack, &dir);
-        assert_eq!(std::fs::read(&again.stickers[0].path).unwrap(), b"kept");
+        let (again, _) = keep(&pack, &dir);
+        assert_eq!(
+            std::fs::read(&pack_info(&again, &dir).stickers[0].path).unwrap(),
+            b"kept"
+        );
+        assert!(has_images(&kept, &dir));
+        std::fs::remove_file(&info.stickers[1].path).unwrap();
+        assert!(!has_images(&kept, &dir));
     }
 }

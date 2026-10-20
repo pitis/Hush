@@ -7,6 +7,7 @@ use sqlx::{ConnectOptions, Row};
 
 use super::model::*;
 use super::projector::Op;
+use crate::stickers::{KeptPack, KeptSticker};
 
 /// What applying an `Op` changed, for the UI.
 #[derive(Debug, Clone, PartialEq)]
@@ -2938,6 +2939,80 @@ impl ProjectionDb {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The sticker packs kept for the picker, each with its stickers by id.
+    pub(crate) async fn sticker_packs(&self) -> Result<Vec<KeptPack>, sqlx::Error> {
+        let mut packs = sqlx::query("SELECT id, key, title, author FROM sticker_packs")
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|r| {
+                Ok(KeptPack {
+                    id: r.try_get("id")?,
+                    key: r.try_get("key")?,
+                    title: r.try_get("title")?,
+                    author: r.try_get("author")?,
+                    stickers: vec![],
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let rows = sqlx::query("SELECT pack_id, id, emoji, content_type FROM stickers ORDER BY pack_id, id")
+            .fetch_all(&self.pool)
+            .await?;
+        for r in rows {
+            let pack_id: Vec<u8> = r.try_get("pack_id")?;
+            let id: i64 = r.try_get("id")?;
+            if let Some(pack) = packs.iter_mut().find(|p| p.id == pack_id) {
+                pack.stickers.push(KeptSticker {
+                    id: u32::try_from(id).map_err(|_| decode_err(format!("sticker id {id}")))?,
+                    emoji: r.try_get("emoji")?,
+                    content_type: r.try_get("content_type")?,
+                });
+            }
+        }
+        Ok(packs)
+    }
+
+    /// Keeps a sticker pack for the picker, in place of what was kept of it.
+    pub(crate) async fn keep_sticker_pack(&self, pack: &KeptPack) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM stickers WHERE pack_id = ?1")
+            .bind(&pack.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO sticker_packs(id, key, title, author) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET key = ?2, title = ?3, author = ?4",
+        )
+        .bind(&pack.id)
+        .bind(&pack.key)
+        .bind(&pack.title)
+        .bind(&pack.author)
+        .execute(&mut *tx)
+        .await?;
+        for s in &pack.stickers {
+            sqlx::query("INSERT INTO stickers(pack_id, id, emoji, content_type) VALUES (?1, ?2, ?3, ?4)")
+                .bind(&pack.id)
+                .bind(i64::from(s.id))
+                .bind(&s.emoji)
+                .bind(&s.content_type)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Forgets a sticker pack that is no longer installed.
+    pub(crate) async fn forget_sticker_pack(&self, id: &[u8]) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for q in [
+            "DELETE FROM stickers WHERE pack_id = ?1",
+            "DELETE FROM sticker_packs WHERE id = ?1",
+        ] {
+            sqlx::query(q).bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await
     }
 }
 
