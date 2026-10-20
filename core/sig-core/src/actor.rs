@@ -1366,7 +1366,7 @@ async fn list_new_group(
 
 /// Installs a pack unless presage has it already.
 async fn install_pack(m: &mut Manager<SqliteStore, Registered>, id: &[u8], key: &[u8]) -> Result<(), String> {
-    if matches!(m.store().sticker_pack(id).await, Ok(Some(_))) {
+    if matches!(m.store().has_sticker_pack(id).await, Ok(true)) {
         return Ok(());
     }
     match tokio::time::timeout(STICKER_INSTALL_TIMEOUT, Box::pin(m.install_sticker_pack(id, key))).await {
