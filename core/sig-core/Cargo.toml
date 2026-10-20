@@ -11,10 +11,10 @@ crate-type = ["staticlib", "lib"]
 uniffi = { workspace = true, features = ["tokio"] }
 # whisperfish/presage#448 (group management, on whisperfish/libsignal-service-rs#473), then
 # whisperfish/presage#461 (decryption error kinds), then our fix that skips sticker packs already
-# installed (not proposed upstream yet), in pitis/presage's hush/skip-installed-sticker-packs:
-# back to whisperfish/presage once all three land.
-presage = { git = "https://github.com/pitis/presage", rev = "1bb5629317eef53eba556b092dc1f791be36376a" }
-presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "1bb5629317eef53eba556b092dc1f791be36376a" }
+# installed and a listing of their ids (neither proposed upstream yet), in pitis/presage's
+# hush/sticker-pack-ids: back to whisperfish/presage once all of them land.
+presage = { git = "https://github.com/pitis/presage", rev = "1234d4b2db418231c4ce25c14d008dd0005be742" }
+presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "1234d4b2db418231c4ce25c14d008dd0005be742" }
 # Reads the link-and-sync history archive. Same libsignal tag as libsignal-service's pins, so
 # the checkouts unify. `test-util` makes its `proto` (backup.proto types) and `export` (archive
 # writing, for tests) modules public.
