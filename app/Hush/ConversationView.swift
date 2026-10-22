@@ -494,6 +494,7 @@ struct MessageRow: View {
     let open: (Attachment) -> Bool
     var actions = Actions()
     @Environment(\.chatColor) private var chatColor
+    @Environment(\.colorScheme) private var colorScheme
     @State private var hovering = false
     @State private var picking = false
     @State private var showingReactors = false
@@ -540,10 +541,11 @@ struct MessageRow: View {
                         .wallpaperBacked()
                         .padding(.horizontal, 12)
                 }
-                HStack(alignment: .center, spacing: 6) {
-                    if outgoing { reactButton }
+                // the buttons' padding makes up the rest of the gap
+                HStack(alignment: .center, spacing: 2) {
+                    if outgoing { hoverActions }
                     bubble
-                    if !outgoing { reactButton }
+                    if !outgoing { hoverActions }
                 }
                 if !reactions.isEmpty { reactionPill }
             }
@@ -555,30 +557,7 @@ struct MessageRow: View {
         // right-click beside the bubble gets its menu
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .contextMenu {
-            if !message.deleted {
-                Menu("React") {
-                    ForEach(MessageActions.quickReactions, id: \.self) { emoji in
-                        Button(emoji == mine ? "\(emoji) ✓" : emoji) { actions.react(emoji) }
-                    }
-                }
-                Button("Reply", action: reply)
-            }
-            if actions.canEdit { Button("Edit", action: actions.edit) }
-            if let body = message.body, !message.deleted {
-                Button("Copy") {
-                    NSPasteboard.general.clearContents()
-                    let text = MessageText.plain(
-                        body, ranges: message.ranges, name: mentionName, revealSpoilers: true)
-                    NSPasteboard.general.setString(text, forType: .string)
-                }
-            }
-            if message.status == .failed { Button("Retry", action: retry) }
-            if actions.canDelete {
-                Divider()
-                Button("Delete for Everyone…", role: .destructive) { confirmingDelete = true }
-            }
-        }
+        .contextMenu { menuItems }
         .confirmationDialog("Delete this message for everyone?", isPresented: $confirmingDelete) {
             Button("Delete for Everyone", role: .destructive, action: actions.delete)
         } message: {
@@ -586,23 +565,100 @@ struct MessageRow: View {
         }
     }
 
-    /// Shown on hover, like Desktop's: Signal's reactions and any other emoji.
-    @ViewBuilder private var reactButton: some View {
+    /// Outlined, as the other icons: in dark mode the symbol draws filled, and its .fill outlined.
+    private var smiley: String { colorScheme == .dark ? "face.smiling.fill" : "face.smiling" }
+
+    /// The message's actions: its right-click menu, and the … button's.
+    @ViewBuilder private var menuItems: some View {
         if !message.deleted {
-            Button {
-                picking = true
-            } label: {
-                Image(systemName: "face.smiling").font(.system(size: 15)).foregroundStyle(Theme.secondaryText)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("React")
-            .opacity(hovering || picking ? 1 : 0)
-            .popover(isPresented: $picking) {
-                ReactionPicker(mine: mine) { emoji in
-                    picking = false
-                    actions.react(emoji)
+            Menu("React", systemImage: smiley) {
+                ForEach(MessageActions.quickReactions, id: \.self) { emoji in
+                    Button(emoji == mine ? "\(emoji) ✓" : emoji) { actions.react(emoji) }
                 }
             }
+            Button("Reply", systemImage: "arrowshape.turn.up.left", action: reply)
+        }
+        if actions.canEdit { Button("Edit", systemImage: "pencil", action: actions.edit) }
+        if let body = message.body, !message.deleted {
+            Button("Copy", systemImage: "doc.on.doc") {
+                NSPasteboard.general.clearContents()
+                let text = MessageText.plain(
+                    body, ranges: message.ranges, name: mentionName, revealSpoilers: true)
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+        }
+        if message.status == .failed { Button("Retry", systemImage: "arrow.clockwise", action: retry) }
+        if actions.canDelete {
+            Divider()
+            Button("Delete for Everyone…", systemImage: "trash", role: .destructive) { confirmingDelete = true }
+        }
+    }
+
+    /// Shown on hover, as Desktop's: the menu, Reply, and React nearest the bubble.
+    @ViewBuilder private var hoverActions: some View {
+        if !message.deleted {
+            HStack(spacing: 0) {
+                if outgoing {
+                    moreButton
+                    replyButton
+                    reactButton
+                } else {
+                    reactButton
+                    replyButton
+                    moreButton
+                }
+            }
+            .opacity(hovering || picking ? 1 : 0)
+        }
+    }
+
+    private var moreButton: some View {
+        Menu {
+            menuItems
+        } label: {
+            Image(systemName: "ellipsis").modifier(RowAction())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+        .accessibilityLabel("More")
+    }
+
+    private var replyButton: some View {
+        Button(action: reply) { Image(systemName: "arrowshape.turn.up.left").modifier(RowAction()) }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Reply")
+    }
+
+    /// Signal's reactions and any other emoji.
+    private var reactButton: some View {
+        Button {
+            picking = true
+        } label: {
+            Image(systemName: smiley).modifier(RowAction())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("React")
+        .popover(isPresented: $picking) {
+            ReactionPicker(mine: mine) { emoji in
+                picking = false
+                actions.react(emoji)
+            }
+        }
+    }
+
+    /// A hover button's label, as Desktop's: a circle behind it under the pointer. On the label,
+    /// not the button: a button takes clicks only on its label, so the whole circle is the button.
+    private struct RowAction: ViewModifier {
+        @State private var hovering = false
+
+        func body(content: Content) -> some View {
+            content
+                .font(.system(size: 15))
+                .foregroundStyle(hovering ? Color.primary : Theme.secondaryText)
+                .frame(width: 18, height: 18)
+                .padding(4)
+                .background(Theme.selection.opacity(hovering ? 1 : 0), in: Circle())
+                .contentShape(Circle())
+                .onHover { hovering = $0 }
         }
     }
 
