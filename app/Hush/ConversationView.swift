@@ -541,20 +541,22 @@ struct MessageRow: View {
                         .wallpaperBacked()
                         .padding(.horizontal, 12)
                 }
-                // the buttons' padding makes up the rest of the gap
-                HStack(alignment: .center, spacing: 2) {
-                    if outgoing { hoverActions }
-                    bubble
-                    if !outgoing { hoverActions }
-                }
+                bubble
+                    // beside it, in the room the row's spacer keeps, so they don't narrow the bubble;
+                    // their padding makes up the rest of the gap
+                    .overlay(alignment: outgoing ? .leading : .trailing) {
+                        hoverActions.alignmentGuide(outgoing ? .leading : .trailing) {
+                            outgoing ? $0[.trailing] + 2 : $0[.leading] - 2
+                        }
+                    }
                 if !reactions.isEmpty { reactionPill }
             }
             .frame(maxWidth: 560, alignment: outgoing ? .trailing : .leading)
             if !outgoing { Spacer(minLength: 80) }
         }
         .padding(.top, first ? 8 : 2)
-        // the whole row, gaps included: the hover holds on the way to the react button, and a
-        // right-click beside the bubble gets its menu
+        // the whole row, gaps included: the hover holds on the way to the buttons, and a right-click
+        // beside the bubble gets its menu
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .contextMenu { menuItems }
