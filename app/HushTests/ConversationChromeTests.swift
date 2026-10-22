@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 
 @testable import Hush
@@ -30,5 +32,50 @@ final class MessageRowTests: XCTestCase {
         // new closures each time the timeline draws: the same row
         XCTAssertEqual(row(), row())
         XCTAssertNotEqual(row(), row(reactions: [Reaction(reactor: "b", emoji: "👍")]))
+    }
+
+    private var window: NSWindow!
+
+    /// The row in a window that's never shown.
+    private func host(_ row: MessageRow) -> NSHostingView<AnyView> {
+        let hosting = NSHostingView(rootView: AnyView(row.frame(width: 400)))
+        window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: hosting.fittingSize), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        return hosting
+    }
+
+    private func rightClick(at point: NSPoint) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: .rightMouseDown, location: point, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+    }
+
+    private static func find(in view: NSView) -> NSTextField? {
+        if let v = view as? NSTextField { return v }
+        return view.subviews.lazy.compactMap { find(in: $0) }.first
+    }
+
+    private static func isMessageMenu(_ menu: NSMenu?) -> Bool {
+        menu?.items.contains { $0.title == "Reply" } ?? false
+    }
+
+    func testBesideTheBubbleIsStillTheRow() {
+        // the empty side, past the react button: the hover that shows the button reads the same region
+        let hosting = host(row())
+        XCTAssertTrue(Self.isMessageMenu(hosting.menu(for: rightClick(at: NSPoint(x: 360, y: hosting.bounds.midY)))))
+    }
+
+    func testRightClickOnTextClickedIntoShowsTheMessageMenu() throws {
+        let hosting = host(row())
+        let text = try XCTUnwrap(Self.find(in: hosting))
+        // clicked into: the window's field editor shows the text, with its own menu (Look Up, Translate…)
+        let editor = try XCTUnwrap(window.fieldEditor(true, for: text) as? NSTextView)
+        text.cell!.select(withFrame: text.bounds, in: text, editor: editor, delegate: text, start: 0, length: 0)
+        let event = rightClick(at: text.convert(NSPoint(x: text.bounds.midX, y: text.bounds.midY), to: nil))
+        XCTAssertFalse(Self.isMessageMenu(editor.menu(for: event)))
+        XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(event)?.menu))
     }
 }

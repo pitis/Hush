@@ -287,6 +287,7 @@ struct TimelineList: View {
     @State private var nearTop = false
     @State private var unseenNew = false
     @State private var position = ScrollPosition(edge: .bottom)
+    @State private var rightClicks: Any?
     @Environment(\.controlActiveState) private var activeState
 
     /// What the timeline reads off its scroll geometry; the height, to see the content grow.
@@ -407,6 +408,15 @@ struct TimelineList: View {
             _ in markReadIfSeen()
         }
         .onAppear { markReadIfSeen() }
+        // a right-click on a message's text shows the message's menu
+        .onAppear {
+            rightClicks = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
+                guard let (menu, view) = Self.menuAround(event) else { return event }
+                NSMenu.popUpContextMenu(menu, with: event, for: view)
+                return nil
+            }
+        }
+        .onDisappear { rightClicks.map(NSEvent.removeMonitor) }
         .overlay(alignment: .bottomTrailing) {
             if unseenNew {
                 Button {
@@ -439,6 +449,21 @@ struct TimelineList: View {
     private func loadOlder() {
         guard store.hasOlder else { return }
         Task { await store.loadOlder() }
+    }
+
+    /// Under a right-click on selectable text, the menu of the view around it (a message's), which
+    /// the text's own (Look Up, Translate…) would hide; nil where there is none.
+    static func menuAround(_ event: NSEvent) -> (menu: NSMenu, view: NSView)? {
+        let hit = event.window?.contentView?.hitTest(event.locationInWindow)
+        // text clicked into shows in the window's field editor
+        let editor = (hit as? NSTextView).flatMap { $0.isFieldEditor ? $0.delegate as? NSTextField : nil }
+        guard let text = editor ?? hit as? NSTextField, !text.isEditable else { return nil }
+        var view = text.superview
+        while let v = view {
+            if let menu = v.menu(for: event) { return (menu, v) }
+            view = v.superview
+        }
+        return nil
     }
 }
 
@@ -520,6 +545,8 @@ struct MessageRow: View {
             if !outgoing { Spacer(minLength: 80) }
         }
         .padding(.top, first ? 8 : 2)
+        // the whole row, gaps included: on its way to the react button the pointer is still on it
+        .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .contextMenu {
             if !message.deleted {
