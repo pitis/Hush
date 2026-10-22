@@ -408,9 +408,10 @@ struct TimelineList: View {
             _ in markReadIfSeen()
         }
         .onAppear { markReadIfSeen() }
-        // a right-click on a message's text shows the message's menu
+        // a right-click on a message's text shows the message's menu; the monitor sees every click in
+        // the app, `menuAround` picks these out
         .onAppear {
-            rightClicks = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
+            rightClicks = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .leftMouseDown]) { event in
                 guard let (menu, view) = Self.menuAround(event) else { return event }
                 NSMenu.popUpContextMenu(menu, with: event, for: view)
                 return nil
@@ -451,11 +452,16 @@ struct TimelineList: View {
         Task { await store.loadOlder() }
     }
 
-    /// Under a right-click on selectable text, the menu of the view around it (a message's), which
-    /// the text's own (Look Up, Translate…) would hide; nil where there is none.
+    /// Under a right-click or control-click on read-only text, the menu of the nearest view around it
+    /// (a message's), which the text's own (Look Up, Translate…) would hide; nil for any other click,
+    /// or with no menu around the text.
     static func menuAround(_ event: NSEvent) -> (menu: NSMenu, view: NSView)? {
+        guard event.type == .rightMouseDown || event.modifierFlags.contains(.control),
+            // a monitor sees clicks before AppKit holds them back from a window under a sheet or panel
+            event.window?.attachedSheet == nil, NSApp.modalWindow == nil
+        else { return nil }
         let hit = event.window?.contentView?.hitTest(event.locationInWindow)
-        // text clicked into shows in the window's field editor
+        // text clicked into shows in the window's field editor, whose delegate is the text
         let editor = (hit as? NSTextView).flatMap { $0.isFieldEditor ? $0.delegate as? NSTextField : nil }
         guard let text = editor ?? hit as? NSTextField, !text.isEditable else { return nil }
         var view = text.superview
@@ -545,7 +551,8 @@ struct MessageRow: View {
             if !outgoing { Spacer(minLength: 80) }
         }
         .padding(.top, first ? 8 : 2)
-        // the whole row, gaps included: on its way to the react button the pointer is still on it
+        // the whole row, gaps included: the hover holds on the way to the react button, and a
+        // right-click beside the bubble gets its menu
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .contextMenu {
