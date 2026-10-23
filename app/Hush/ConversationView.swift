@@ -287,6 +287,7 @@ struct TimelineList: View {
     @State private var nearTop = false
     @State private var unseenNew = false
     @State private var position = ScrollPosition(edge: .bottom)
+    @State private var rightClicks: Any?
     @Environment(\.controlActiveState) private var activeState
 
     /// What the timeline reads off its scroll geometry; the height, to see the content grow.
@@ -407,6 +408,16 @@ struct TimelineList: View {
             _ in markReadIfSeen()
         }
         .onAppear { markReadIfSeen() }
+        // a right-click on a message's text shows the message's menu; the monitor sees every click in
+        // the app, `menuAround` picks these out
+        .onAppear {
+            rightClicks = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .leftMouseDown]) { event in
+                guard let (menu, view) = Self.menuAround(event) else { return event }
+                NSMenu.popUpContextMenu(menu, with: event, for: view)
+                return nil
+            }
+        }
+        .onDisappear { rightClicks.map(NSEvent.removeMonitor) }
         .overlay(alignment: .bottomTrailing) {
             if unseenNew {
                 Button {
@@ -440,6 +451,26 @@ struct TimelineList: View {
         guard store.hasOlder else { return }
         Task { await store.loadOlder() }
     }
+
+    /// Under a right-click or control-click on read-only text, the menu of the nearest view around it
+    /// (a message's), which the text's own (Look Up, Translate…) would hide; nil for any other click,
+    /// or with no menu around the text.
+    static func menuAround(_ event: NSEvent) -> (menu: NSMenu, view: NSView)? {
+        guard event.type == .rightMouseDown || event.modifierFlags.contains(.control),
+            // a monitor sees clicks before AppKit holds them back from a window under a sheet or panel
+            event.window?.attachedSheet == nil, NSApp.modalWindow == nil
+        else { return nil }
+        let hit = event.window?.contentView?.hitTest(event.locationInWindow)
+        // text clicked into shows in the window's field editor, whose delegate is the text
+        let editor = (hit as? NSTextView).flatMap { $0.isFieldEditor ? $0.delegate as? NSTextField : nil }
+        guard let text = editor ?? hit as? NSTextField, !text.isEditable else { return nil }
+        var view = text.superview
+        while let v = view {
+            if let menu = v.menu(for: event) { return (menu, v) }
+            view = v.superview
+        }
+        return nil
+    }
 }
 
 struct MessageRow: View {
@@ -463,6 +494,7 @@ struct MessageRow: View {
     let open: (Attachment) -> Bool
     var actions = Actions()
     @Environment(\.chatColor) private var chatColor
+    @Environment(\.colorScheme) private var colorScheme
     @State private var hovering = false
     @State private var picking = false
     @State private var showingReactors = false
@@ -509,42 +541,25 @@ struct MessageRow: View {
                         .wallpaperBacked()
                         .padding(.horizontal, 12)
                 }
-                HStack(alignment: .center, spacing: 6) {
-                    if outgoing { reactButton }
-                    bubble
-                    if !outgoing { reactButton }
-                }
+                bubble
+                    // beside it, in the room the row's spacer keeps, so they don't narrow the bubble;
+                    // their padding makes up the rest of the gap
+                    .overlay(alignment: outgoing ? .leading : .trailing) {
+                        hoverActions.alignmentGuide(outgoing ? .leading : .trailing) {
+                            outgoing ? $0[.trailing] + 2 : $0[.leading] - 2
+                        }
+                    }
                 if !reactions.isEmpty { reactionPill }
             }
             .frame(maxWidth: 560, alignment: outgoing ? .trailing : .leading)
             if !outgoing { Spacer(minLength: 80) }
         }
         .padding(.top, first ? 8 : 2)
+        // the whole row, gaps included: the hover holds on the way to the buttons, and a right-click
+        // beside the bubble gets its menu
+        .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .contextMenu {
-            if !message.deleted {
-                Menu("React") {
-                    ForEach(MessageActions.quickReactions, id: \.self) { emoji in
-                        Button(emoji == mine ? "\(emoji) ✓" : emoji) { actions.react(emoji) }
-                    }
-                }
-                Button("Reply", action: reply)
-            }
-            if actions.canEdit { Button("Edit", action: actions.edit) }
-            if let body = message.body, !message.deleted {
-                Button("Copy") {
-                    NSPasteboard.general.clearContents()
-                    let text = MessageText.plain(
-                        body, ranges: message.ranges, name: mentionName, revealSpoilers: true)
-                    NSPasteboard.general.setString(text, forType: .string)
-                }
-            }
-            if message.status == .failed { Button("Retry", action: retry) }
-            if actions.canDelete {
-                Divider()
-                Button("Delete for Everyone…", role: .destructive) { confirmingDelete = true }
-            }
-        }
+        .contextMenu { menuItems }
         .confirmationDialog("Delete this message for everyone?", isPresented: $confirmingDelete) {
             Button("Delete for Everyone", role: .destructive, action: actions.delete)
         } message: {
@@ -552,23 +567,100 @@ struct MessageRow: View {
         }
     }
 
-    /// Shown on hover, like Desktop's: Signal's reactions and any other emoji.
-    @ViewBuilder private var reactButton: some View {
+    /// Outlined, as the other icons: in dark mode the symbol draws filled, and its .fill outlined.
+    private var smiley: String { colorScheme == .dark ? "face.smiling.fill" : "face.smiling" }
+
+    /// The message's actions: its right-click menu, and the … button's.
+    @ViewBuilder private var menuItems: some View {
         if !message.deleted {
-            Button {
-                picking = true
-            } label: {
-                Image(systemName: "face.smiling").font(.system(size: 15)).foregroundStyle(Theme.secondaryText)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("React")
-            .opacity(hovering || picking ? 1 : 0)
-            .popover(isPresented: $picking) {
-                ReactionPicker(mine: mine) { emoji in
-                    picking = false
-                    actions.react(emoji)
+            Menu("React", systemImage: smiley) {
+                ForEach(MessageActions.quickReactions, id: \.self) { emoji in
+                    Button(emoji == mine ? "\(emoji) ✓" : emoji) { actions.react(emoji) }
                 }
             }
+            Button("Reply", systemImage: "arrowshape.turn.up.left", action: reply)
+        }
+        if actions.canEdit { Button("Edit", systemImage: "pencil", action: actions.edit) }
+        if let body = message.body, !message.deleted {
+            Button("Copy", systemImage: "doc.on.doc") {
+                NSPasteboard.general.clearContents()
+                let text = MessageText.plain(
+                    body, ranges: message.ranges, name: mentionName, revealSpoilers: true)
+                NSPasteboard.general.setString(text, forType: .string)
+            }
+        }
+        if message.status == .failed { Button("Retry", systemImage: "arrow.clockwise", action: retry) }
+        if actions.canDelete {
+            Divider()
+            Button("Delete for Everyone…", systemImage: "trash", role: .destructive) { confirmingDelete = true }
+        }
+    }
+
+    /// Shown on hover, as Desktop's: the menu, Reply, and React nearest the bubble.
+    @ViewBuilder private var hoverActions: some View {
+        if !message.deleted {
+            HStack(spacing: 0) {
+                if outgoing {
+                    moreButton
+                    replyButton
+                    reactButton
+                } else {
+                    reactButton
+                    replyButton
+                    moreButton
+                }
+            }
+            .opacity(hovering || picking ? 1 : 0)
+        }
+    }
+
+    private var moreButton: some View {
+        Menu {
+            menuItems
+        } label: {
+            Image(systemName: "ellipsis").modifier(RowAction())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
+        .accessibilityLabel("More")
+    }
+
+    private var replyButton: some View {
+        Button(action: reply) { Image(systemName: "arrowshape.turn.up.left").modifier(RowAction()) }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Reply")
+    }
+
+    /// Signal's reactions and any other emoji.
+    private var reactButton: some View {
+        Button {
+            picking = true
+        } label: {
+            Image(systemName: smiley).modifier(RowAction())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("React")
+        .popover(isPresented: $picking) {
+            ReactionPicker(mine: mine) { emoji in
+                picking = false
+                actions.react(emoji)
+            }
+        }
+    }
+
+    /// A hover button's label, as Desktop's: a circle behind it under the pointer. On the label,
+    /// not the button: a button takes clicks only on its label, so the whole circle is the button.
+    private struct RowAction: ViewModifier {
+        @State private var hovering = false
+
+        func body(content: Content) -> some View {
+            content
+                .font(.system(size: 15))
+                .foregroundStyle(hovering ? Color.primary : Theme.secondaryText)
+                .frame(width: 18, height: 18)
+                .padding(4)
+                .background(Theme.selection.opacity(hovering ? 1 : 0), in: Circle())
+                .contentShape(Circle())
+                .onHover { hovering = $0 }
         }
     }
 
