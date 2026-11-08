@@ -1,0 +1,4 @@
+# GPUI (the desktop app) follows the latest stable Rust
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

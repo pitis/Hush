@@ -1,5 +1,5 @@
 [workspace]
-members = ["sig-core", "uniffi-bindgen"]
+members = ["sig-core", "uniffi-bindgen", "desktop"]
 resolver = "2"
 
 [workspace.dependencies]

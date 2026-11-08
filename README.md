@@ -11,3 +11,21 @@ make check   # lint + all tests
 ```
 
 Building the app needs the owner's Apple Development certificate (see `app/project.yml`).
+
+## Desktop app (Windows, Linux, macOS)
+
+`core/desktop` is a second, smaller client written in Rust on [GPUI](https://www.gpui.rs) over the
+same core: it links as its own device and keeps its own data. So far it links, lists the chats,
+shows a chat's newest messages and sends text.
+
+```sh
+make desktop-run   # or: cd core && cargo run -p hush-desktop
+```
+
+Linux (x86-64) needs `protobuf-compiler clang cmake pkg-config libxkbcommon-x11-dev libwayland-dev
+libx11-xcb-dev libfontconfig-dev libfreetype-dev libvulkan-dev libasound2-dev` and a Secret Service
+(GNOME Keyring or KWallet) for the database key. arm64 Linux doesn't build yet: the SQLCipher fork's
+Rust crypto assumes a signed C `char`. Windows is untested: expect it to need `protoc`, Git Bash
+(RingRTC's build runs its WebRTC download script with bash), and `OPENSSL_DIR` set to any folder
+with `lib` and `include` in it (the SQLite build script asks for it although SQLCipher doesn't use
+OpenSSL there).
