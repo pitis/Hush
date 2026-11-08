@@ -22,6 +22,13 @@ futures = "0.3"
 hex = "0.4"
 rand = "0.9"
 chrono = "0.4"
+# only for `snapshot`: GPUI's offscreen rendering is test support (gpui-kit's own test-support
+# would also pull in a second GPUI)
+gpui-pre-platform = { version = "=0.3.11", optional = true }
+
+[features]
+# `--snapshot <folder>`: renders made-up screens to PNGs
+snapshot = ["gpui-pre-platform/test-support"]
 
 [dev-dependencies]
 # keyring's own core (already in the tree), for its in-memory mock store

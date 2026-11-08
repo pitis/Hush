@@ -2,6 +2,8 @@
 //! `Placeholder.swift`, `Files.swift`, `AppStore.swift`'s titles) so both clients word things
 //! alike. Times and delivery states are simpler than the Mac app's.
 
+use std::ops::Range;
+
 use sig_core::projection::{
     BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKind, MessageStatus, TextStyle,
 };
@@ -12,6 +14,11 @@ const HIDDEN_SPOILER: &str = "■■■■";
 /// as the phone sends them; one that doesn't fit the text is skipped, except a spoiler, which
 /// hides up to the end of the text.
 pub fn plain(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> String {
+    marked(body, ranges, name).0
+}
+
+/// `plain`, with where its "@name"s are (byte ranges, drawn bold).
+pub fn marked(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
     let units: Vec<u16> = body.encode_utf16().collect();
     let span = |r: &BodyRange| (r.start as usize, r.start as usize + r.length as usize);
     let spoilers: Vec<(usize, usize, Option<&str>)> = ranges
@@ -31,15 +38,27 @@ pub fn plain(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) ->
     let fits = |i: usize| i == units.len() || !(0xDC00..=0xDFFF).contains(&units[i]);
     let mut text = units.clone();
     let mut end = units.len();
+    // the "@name"s so far, in UTF-16 units of `text`: each replacement before them moves them
+    let mut names: Vec<Range<usize>> = vec![];
     for (start, stop, aci) in replaced {
         if stop > end || stop == start || !fits(start) || !fits(stop) {
             continue;
         }
         let with = aci.map_or_else(|| HIDDEN_SPOILER.to_string(), |aci| format!("@{}", name(aci)));
-        text.splice(start..stop, with.encode_utf16());
+        let with: Vec<u16> = with.encode_utf16().collect();
+        let moved = with.len() as isize - (stop - start) as isize;
+        for r in &mut names {
+            *r = r.start.saturating_add_signed(moved)..r.end.saturating_add_signed(moved);
+        }
+        if aci.is_some() {
+            names.push(start..start + with.len());
+        }
+        text.splice(start..stop, with);
         end = start;
     }
-    String::from_utf16_lossy(&text)
+    let bytes = |unit: usize| String::from_utf16_lossy(&text[..unit]).len();
+    let names = names.into_iter().rev().map(|r| bytes(r.start)..bytes(r.end)).collect();
+    (String::from_utf16_lossy(&text), names)
 }
 
 /// A chat's name ("Note to Self" for our own), or until it is known "Group", the contact's
@@ -106,35 +125,89 @@ pub fn preview(c: &Conversation, author: &str, name: impl Fn(&str) -> String) ->
     }
 }
 
-/// A message's text in the timeline.
-pub fn message(m: &Message, name: impl Fn(&str) -> String) -> String {
+/// A message's text in the timeline, with where its "@name"s are.
+pub fn message(m: &Message, name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
     if m.deleted {
-        return "This message was deleted".into();
+        return ("This message was deleted".into(), vec![]);
     }
     if let Some(placeholder) = placeholder(&m.kind) {
-        return placeholder;
+        return (placeholder, vec![]);
     }
     match m.body.as_deref() {
-        Some(body) if !body.trim().is_empty() => plain(body, &m.ranges, name),
+        Some(body) if !body.trim().is_empty() => marked(body, &m.ranges, name),
         // shortcut: files aren't shown, and a captioned one shows only its caption: `Message`
         // carries no file, so show them with `Client::attachments`
-        _ => "📎 Attachment".into(),
+        _ => ("📎 Attachment".into(), vec![]),
     }
 }
 
-/// When something happened (`ms` since the epoch): the time today, else the day.
-pub fn time(ms: i64) -> String {
-    use chrono::{Datelike, Local, TimeZone};
-    let Some(at) = Local.timestamp_millis_opt(ms).single() else {
+type Local = chrono::DateTime<chrono::Local>;
+
+fn local(ms: i64) -> Option<Local> {
+    use chrono::TimeZone as _;
+    chrono::Local.timestamp_millis_opt(ms).single()
+}
+
+/// A chat row's time (`Formatting.listTime`): "Now", "5m", "14:05" today, "Mon" this week,
+/// "Oct 12" this year, else "10/12/25".
+pub fn list_time(ms: i64, now: Local) -> String {
+    use chrono::Datelike as _;
+    let Some(at) = local(ms).filter(|_| ms > 0) else {
         return String::new();
     };
-    let now = Local::now();
-    let format = match () {
-        _ if at.date_naive() == now.date_naive() => "%H:%M",
-        _ if at.year() == now.year() => "%b %-d",
-        _ => "%Y-%m-%d",
-    };
-    at.format(format).to_string()
+    let ago = now.signed_duration_since(at);
+    let days = now.date_naive().signed_duration_since(at.date_naive()).num_days();
+    match () {
+        _ if ago.num_seconds() < 60 => "Now".into(),
+        _ if ago.num_minutes() < 60 => format!("{}m", ago.num_minutes()),
+        _ if days == 0 => at.format("%H:%M").to_string(),
+        _ if days < 7 => at.format("%a").to_string(),
+        _ if at.year() == now.year() => at.format("%b %-d").to_string(),
+        _ => at.format("%-m/%-d/%y").to_string(),
+    }
+}
+
+/// The time inside a bubble.
+pub fn bubble_time(ms: i64) -> String {
+    local(ms).map(|at| at.format("%H:%M").to_string()).unwrap_or_default()
+}
+
+/// A day separator (`Formatting.daySeparator`): "Today", "Yesterday", "Mon, Oct 12", or
+/// "Oct 12, 2024" in another year.
+pub fn day(ms: i64, now: Local) -> String {
+    use chrono::Datelike as _;
+    let Some(at) = local(ms) else { return String::new() };
+    match now.date_naive().signed_duration_since(at.date_naive()).num_days() {
+        0 => "Today".into(),
+        1 => "Yesterday".into(),
+        _ if at.year() == now.year() => at.format("%a, %b %-d").to_string(),
+        _ => at.format("%b %-d, %Y").to_string(),
+    }
+}
+
+/// The same calendar day here.
+pub fn same_day(a: i64, b: i64) -> bool {
+    local(a)
+        .zip(local(b))
+        .is_some_and(|(a, b)| a.date_naive() == b.date_naive())
+}
+
+/// A timer length in its largest whole unit: "30 seconds", "8 hours", "1 week"
+/// (`Placeholder.duration`).
+pub fn duration(seconds: u32) -> String {
+    let units = [
+        (604_800, "week"),
+        (86_400, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    let (size, name) = units
+        .into_iter()
+        .find(|&(size, _)| seconds >= size && seconds.is_multiple_of(size))
+        .unwrap_or((1, "second"));
+    let n = seconds / size;
+    format!("{n} {name}{}", if n == 1 { "" } else { "s" })
 }
 
 /// What our own message's delivery says.
@@ -214,6 +287,15 @@ mod tests {
         let body = "👋 \u{FFFC} and \u{FFFC}";
         let ranges = [mention(3, "a"), mention(9, "b")];
         assert_eq!(plain(body, &ranges, name), "👋 @<a> and @<b>");
+    }
+
+    #[test]
+    fn mentions_say_where_they_are_for_bold() {
+        let body = "👋 \u{FFFC} and \u{FFFC}!";
+        let (text, names) = marked(body, &[mention(3, "a"), mention(9, "b")], name);
+        assert_eq!(text, "👋 @<a> and @<b>!");
+        let found: Vec<&str> = names.iter().map(|r| &text[r.clone()]).collect();
+        assert_eq!(found, ["@<a>", "@<b>"]);
     }
 
     #[test]
@@ -344,6 +426,43 @@ mod tests {
         let mut c = chat(ConversationKind::Direct, "hello");
         c.message_request = true;
         assert_eq!(preview(&c, "Ana", name), "Message request");
+    }
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> Local {
+        use chrono::TimeZone as _;
+        chrono::Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    #[test]
+    fn list_times_shrink_with_age() {
+        let now = at(2026, 11, 9, 15, 0);
+        let ms = |t: Local| t.timestamp_millis();
+        assert_eq!(list_time(ms(at(2026, 11, 9, 14, 59)) + 30_000, now), "Now");
+        assert_eq!(list_time(ms(at(2026, 11, 9, 14, 55)), now), "5m");
+        assert_eq!(list_time(ms(at(2026, 11, 9, 9, 5)), now), "09:05");
+        assert_eq!(list_time(ms(at(2026, 11, 5, 9, 5)), now), "Thu");
+        assert_eq!(list_time(ms(at(2026, 10, 12, 9, 5)), now), "Oct 12");
+        assert_eq!(list_time(ms(at(2025, 10, 12, 9, 5)), now), "10/12/25");
+        assert_eq!(list_time(0, now), "");
+    }
+
+    #[test]
+    fn day_separators_name_the_day() {
+        let now = at(2026, 11, 9, 15, 0);
+        let ms = |t: Local| t.timestamp_millis();
+        assert_eq!(day(ms(at(2026, 11, 9, 0, 1)), now), "Today");
+        assert_eq!(day(ms(at(2026, 11, 8, 23, 59)), now), "Yesterday");
+        assert_eq!(day(ms(at(2026, 10, 12, 9, 0)), now), "Mon, Oct 12");
+        assert_eq!(day(ms(at(2024, 10, 12, 9, 0)), now), "Oct 12, 2024");
+    }
+
+    #[test]
+    fn timers_read_in_their_largest_whole_unit() {
+        assert_eq!(duration(30), "30 seconds");
+        assert_eq!(duration(28_800), "8 hours");
+        assert_eq!(duration(604_800), "1 week");
+        assert_eq!(duration(5_400), "90 minutes");
+        assert_eq!(duration(0), "0 seconds");
     }
 
     #[test]
