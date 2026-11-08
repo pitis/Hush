@@ -1,4 +1,5 @@
-# GPUI (the desktop app) follows the latest stable Rust
+# The whole workspace, the Mac app's core too: GPUI (the desktop app) needs a recent stable Rust.
+# Bump it with gpui-kit.
 [toolchain]
 channel = "1.99.1"
 components = ["clippy", "rustfmt"]

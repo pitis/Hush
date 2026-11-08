@@ -68,7 +68,8 @@ answer, never for mechanics.
 ## Stack rules
 
 - presage is pinned to one git rev in `core/sig-core/Cargo.toml`; bump it only in its own PR.
-  Keep the `[patch.crates-io] libsqlite3-sys` entry in `core/Cargo.toml` in sync with presage's.
+  Keep the `[patch.crates-io] libsqlite3-sys` entry in `core/Cargo.toml` in sync with presage's,
+  and the non-Apple `libsqlite3-sys` version in `core/sig-core/Cargo.toml` with that entry.
 - No `cdsi` feature (BoringSSL/OpenSSL conflict with SQLCipher).
 - Off Apple platforms SQLCipher must use the fork's Rust crypto (`bundled-sqlcipher-custom-crypto`,
   `core/sig-core/Cargo.toml`), never OpenSSL: RingRTC's prebuilt WebRTC carries BoringSSL, whose
@@ -77,11 +78,12 @@ answer, never for mechanics.
 - Never log message content; ids and errors only.
 - Swift bindings and the xcframework are generated (`make core`); never edit `app/Generated/`.
 - The Xcode project is generated from `app/project.yml` (`make project`); never commit it.
-- arm64 only, macOS 26+ (Liquid Glass, no fallback). No "Signal" name or logo in the app.
+- The Mac app: arm64 only, macOS 26+ (Liquid Glass, no fallback). No "Signal" name or logo in
+  either app.
 - The desktop app (`core/desktop`) uses GPUI through `gpui-kit`, which follows the latest stable
   Rust: the toolchain is pinned in `core/rust-toolchain.toml`; bump it with gpui-kit. It keeps its
   own data folder ("Hush Desktop") and keychain entry, never the Mac app's.
-- The app is signed with the owner's Apple Development certificate (team `95KQ82C586`,
+- The Mac app is signed with the owner's Apple Development certificate (team `95KQ82C586`,
   `app/project.yml`): the Keychain trusts rebuilds only under a stable signature. Builds need
   that certificate in the login keychain.
 

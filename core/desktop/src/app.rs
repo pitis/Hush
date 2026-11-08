@@ -1,5 +1,5 @@
-//! The window: linking, the chat list, a chat's messages and the composer. Its rules follow the
-//! Mac app's `AppStore.swift`.
+//! The window: linking, the chat list, a chat's messages and the composer. A subset of the Mac
+//! app's rules (`AppStore.swift`); where this one is simpler, a `shortcut:` comment says so.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -17,20 +17,21 @@ use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::message::MessageAlignment;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Theme};
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Sizable, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use sig_core::projection::{Conversation, ConversationKind, Message, TextStyle};
-use sig_core::{Client, ConnectionState, CoreEvent, EventListener};
+use sig_core::projection::{Conversation, ConversationKind, Message, MessageKey, TextStyle};
+use sig_core::{Client, ConnectionState, CoreEvent, EventListener, HistoryStage};
 
 use crate::{key, qr, text};
 
 /// How the phone lists this computer.
 const DEVICE_NAME: &str = "Hush Desktop";
-/// Inside the OS's app data folder; not the Mac app's "Hush", so the two never share data.
+/// Inside the OS's local app data folder (not Windows' roaming one: this device's keys stay on this
+/// computer); not the Mac app's "Hush", so the two never share data.
 const DATA_FOLDER: &str = "Hush Desktop";
-/// shortcut: only a chat's newest messages are loaded; page older ones with `messages(before:)`
-/// once scrolling back is wanted.
+/// shortcut: only a chat's newest messages are loaded; page older ones with
+/// `Client::messages(id, before, limit)` once scrolling back is wanted.
 const PAGE: u32 = 100;
 
 enum Screen {
@@ -47,7 +48,7 @@ enum Screen {
 /// A message as the timeline shows it.
 struct Row {
     outgoing: bool,
-    /// The sender's name, above the first of their messages in a row (groups only).
+    /// The sender's name, above the first of their messages in a run (groups only).
     author: Option<String>,
     text: String,
     footer: String,
@@ -62,6 +63,9 @@ pub struct Hush {
     screen: Screen,
     connection: ConnectionState,
     error: Option<String>,
+    /// The phone's message history on its way (stage, done, total), or a failed transfer:
+    /// receiving waits for it, so it is shown with its ways out.
+    history: Option<(HistoryStage, u64, u64)>,
     /// The chat list: archived chats are left out.
     chats: Vec<Conversation>,
     chats_loading: bool,
@@ -73,12 +77,19 @@ pub struct Hush {
     generation: u64,
     messages_loading: Option<u64>,
     messages_again: bool,
-    /// Contacts' names by ACI; ACIs asked about once (with or without an answer).
+    /// Contacts' names by ACI.
     names: HashMap<String, String>,
+    /// ACIs whose name was asked for (asked again only after a failed lookup).
     asked: HashSet<String>,
     /// Unsent text of the chats that aren't open.
+    /// shortcut: kept only while the app runs, and not shown in the chat list; the Mac app keeps
+    /// them and shows "Draft: …".
     drafts: HashMap<String, String>,
+    /// The chat whose `mark_read` is running, so a refresh in between doesn't start another.
+    marking_read: Option<String>,
     window_active: bool,
+    /// Not behind other windows, minimized or on a sleeping or locked display.
+    window_visible: bool,
     composer: Entity<TextareaState>,
     timeline: Entity<MessageScrollerState>,
 }
@@ -94,7 +105,7 @@ impl EventListener for Listener {
 
 /// The core over this computer's data folder, and that folder.
 fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), String> {
-    let data_dir = dirs::data_dir()
+    let data_dir = dirs::data_local_dir()
         .ok_or("this system has no folder for app data")?
         .join(DATA_FOLDER);
     let dir = data_dir
@@ -114,7 +125,13 @@ impl Hush {
             .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
-            this.mark_read(cx);
+            this.mark_read(false, cx);
+        })
+        .detach();
+        // the active window stays active under a locked screen: being seen is a separate test
+        cx.observe_window_visibility(window, |this, _, window, cx| {
+            this.window_visible = window.is_visible();
+            this.mark_read(false, cx);
         })
         .detach();
 
@@ -131,6 +148,8 @@ impl Hush {
         })
         .detach();
         let timeline = cx.new(|cx| MessageScrollerState::new(0, cx));
+        // scrolling down to the newest message reads it
+        cx.observe(&timeline, |this, _, cx| this.mark_read(false, cx)).detach();
 
         let (events, mut incoming) = unbounded();
         cx.spawn(async move |this, cx| {
@@ -157,6 +176,7 @@ impl Hush {
             screen: Screen::Opening,
             connection: ConnectionState::Connecting,
             error: None,
+            history: None,
             chats: vec![],
             chats_loading: false,
             chats_again: false,
@@ -168,7 +188,9 @@ impl Hush {
             names: HashMap::new(),
             asked: HashSet::new(),
             drafts: HashMap::new(),
+            marking_read: None,
             window_active: window.is_window_active(),
+            window_visible: window.is_visible(),
             composer,
             timeline,
         }
@@ -187,16 +209,15 @@ impl Hush {
             }
         };
         let linked = client.is_linked();
-        let started = if linked {
+        if linked {
             self.own_aci = client.own_aci();
             self.screen = Screen::Chats;
-            client.start()
+            self.start(client.clone(), cx);
         } else {
             self.screen = Screen::Link { url: None };
-            client.link(DEVICE_NAME.into())
-        };
-        if let Err(e) = started {
-            self.screen = Screen::Failed(e.to_string());
+            if let Err(e) = client.link(DEVICE_NAME.into()) {
+                self.screen = Screen::Failed(e.to_string());
+            }
         }
         self.client = Some(client);
         // an unlinked core has no chats yet: its `Ready` after linking loads them
@@ -206,20 +227,37 @@ impl Hush {
         cx.notify();
     }
 
+    /// Starts receiving once it's known whether a history transfer is still pending: checked
+    /// first, so a fast import can't finish before its progress shows and leave it up.
+    fn start(&mut self, client: Arc<Client>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            // unknown: the core checks again when starting, and reports a failure itself
+            let pending = Compat::new(client.history_pending()).await.unwrap_or(false);
+            let _ = this.update(cx, |app, cx| {
+                if pending && app.history.is_none() {
+                    app.history = Some((HistoryStage::Waiting, 0, 0));
+                }
+                if let Err(e) = client.start() {
+                    app.error = Some(format!("Couldn't start receiving: {e}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         match event {
             CoreEvent::LinkUrl { url } => {
                 self.error = None;
                 self.screen = Screen::Link { url: Some(url) };
             }
+            // an error that came with linking (the history key not kept, say) stays shown
             CoreEvent::Linked => {
-                self.error = None;
                 self.screen = Screen::Chats;
-                if let Some(client) = &self.client {
+                if let Some(client) = self.client.clone() {
                     self.own_aci = client.own_aci();
-                    if let Err(e) = client.start() {
-                        self.error = Some(format!("Couldn't start receiving: {e}"));
-                    }
+                    self.start(client, cx);
                 }
             }
             CoreEvent::Connection { state } => {
@@ -235,7 +273,18 @@ impl Hush {
                 }
                 self.connection = state;
             }
-            CoreEvent::Ready | CoreEvent::ConversationsChanged => self.refresh_chats(cx),
+            // a chat event can be a message that couldn't be decrypted: the list says so
+            CoreEvent::Ready | CoreEvent::ConversationsChanged | CoreEvent::ChatEventAdded { .. } => {
+                self.refresh_chats(cx)
+            }
+            CoreEvent::HistoryProgress { stage, done, total } => match stage {
+                HistoryStage::Done => {
+                    self.history = None;
+                    self.refresh_chats(cx);
+                }
+                HistoryStage::NoHistory => self.history = None,
+                stage => self.history = Some((stage, done, total)),
+            },
             CoreEvent::MessageChanged { conversation_id, .. } | CoreEvent::MessageExpired { conversation_id, .. } => {
                 self.refresh_chats(cx);
                 if self.selected.as_deref() == Some(conversation_id.as_str()) {
@@ -243,8 +292,7 @@ impl Hush {
                 }
             }
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, calls, stories, the history import's progress, files,
-            // notifications
+            // not in this version: typing, reactions, calls, stories, files, notifications
             _ => return,
         }
         cx.notify();
@@ -293,7 +341,7 @@ impl Hush {
         let mut wanted: Vec<String> = authors.map(|c| c.last_message_author.clone()).collect();
         wanted.extend(self.chats.iter().flat_map(|c| mentioned(&c.last_message_ranges)));
         self.load_names(wanted, cx);
-        self.mark_read(cx);
+        self.mark_read(false, cx);
     }
 
     fn select(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -315,7 +363,7 @@ impl Hush {
         self.messages.clear();
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
-        self.mark_read(cx);
+        self.mark_read(true, cx);
         cx.notify();
     }
 
@@ -338,10 +386,7 @@ impl Hush {
                     return false; // another chat was opened meanwhile
                 }
                 match page {
-                    Ok(mut page) => {
-                        page.reverse();
-                        app.set_messages(page, cx);
-                    }
+                    Ok(page) => app.set_messages(page, cx),
                     Err(e) => app.error = Some(format!("Couldn't load the messages: {e}")),
                 }
                 let again = std::mem::take(&mut app.messages_again);
@@ -359,13 +404,19 @@ impl Hush {
     }
 
     fn set_messages(&mut self, page: Vec<Message>, cx: &mut Context<Self>) {
-        let same =
-            page.len() == self.messages.len() && page.iter().zip(&self.messages).all(|(a, b)| a.key() == b.key());
+        let old: Vec<MessageKey> = self.messages.iter().map(Message::key).collect();
+        let new: Vec<MessageKey> = page.iter().map(Message::key).collect();
         self.messages = page;
-        let count = self.messages.len();
-        // the same messages changed (a tick, an edit): their heights may have too
-        self.timeline
-            .update(cx, |t, cx| if same { t.remeasure(cx) } else { t.reset(count, cx) });
+        let (range, count) = changed_rows(&old, &new);
+        // only rows that came or went are replaced, so a reader scrolled up stays put; with the
+        // same messages, some changed (a tick, an edit) and their heights may have too
+        self.timeline.update(cx, |t, cx| {
+            if range.is_empty() && count == 0 {
+                t.remeasure(cx);
+            } else {
+                t.splice(range, count, cx);
+            }
+        });
         let mut wanted: Vec<String> = self
             .messages
             .iter()
@@ -376,7 +427,7 @@ impl Hush {
         self.load_names(wanted, cx);
     }
 
-    /// Looks up each unknown contact's name once.
+    /// Looks up each unknown contact's name; a failed lookup is tried again next time.
     fn load_names(&mut self, acis: Vec<String>, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         let wanted: Vec<String> = acis
@@ -388,40 +439,54 @@ impl Hush {
         }
         cx.spawn(async move |this, cx| {
             for aci in wanted {
-                // no name (or no answer): the short id stays
-                if let Ok(Some(name)) = Compat::new(client.title(format!("c:{aci}"))).await {
-                    let named = this.update(cx, |app, cx| {
+                let found = Compat::new(client.title(format!("c:{aci}"))).await;
+                let answered = this.update(cx, |app, cx| match found {
+                    Ok(Some(name)) => {
                         app.names.insert(aci, name);
                         cx.notify();
-                    });
-                    if named.is_err() {
-                        return;
                     }
+                    // no name yet: the short id stays
+                    Ok(None) => {}
+                    Err(_) => {
+                        app.asked.remove(&aci);
+                    }
+                });
+                if answered.is_err() {
+                    return;
                 }
             }
         })
         .detach();
     }
 
-    /// The open chat counts as read while the window is in front.
-    fn mark_read(&mut self, cx: &mut Context<Self>) {
+    /// The open chat is read once its newest message is on screen in the active, visible window
+    /// (the Mac app's `ChatList.shouldMarkRead`). A chat marked unread by hand counts only when it
+    /// is opened, so marking it unread on the phone isn't undone here at once.
+    fn mark_read(&mut self, opening: bool, cx: &mut Context<Self>) {
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
             return;
         };
-        let unread = self
-            .chats
-            .iter()
-            .any(|c| c.id == id && (c.unread_count > 0 || c.marked_unread));
-        if !self.window_active || !unread {
+        let Some(c) = self.chats.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let unread = c.unread_count > 0 || (opening && c.marked_unread);
+        let at_bottom = !self.timeline.read(cx).is_scrolled_up();
+        let seen = self.window_active && self.window_visible && at_bottom;
+        if !unread || !seen || self.marking_read.as_ref() == Some(&id) {
             return;
         }
+        self.marking_read = Some(id.clone());
         cx.spawn(async move |this, cx| {
-            if let Err(e) = Compat::new(client.mark_read(id)).await {
-                let _ = this.update(cx, |app, cx| {
+            let marked = Compat::new(client.mark_read(id.clone())).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.marking_read.as_ref() == Some(&id) {
+                    app.marking_read = None;
+                }
+                if let Err(e) = marked {
                     app.error = Some(format!("Couldn't mark the chat read: {e}"));
                     cx.notify();
-                });
-            }
+                }
+            });
         })
         .detach();
     }
@@ -430,25 +495,56 @@ impl Hush {
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
             return;
         };
-        let body = self.composer.read(cx).value().to_string();
-        if body.trim().is_empty() {
+        let body = self.composer.read(cx).value().trim().to_string();
+        if body.is_empty() {
             return;
         }
         self.composer.update(cx, |input, cx| input.clean(window, cx));
         cx.spawn_in(window, async move |this, cx| {
-            let Err(e) = Compat::new(client.send_text(id, body.clone(), vec![], None, None)).await else {
-                return;
-            };
+            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], None, None)).await;
+            let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
                 app.error = Some(format!("Couldn't send the message: {e}"));
-                // the text comes back, unless something new was typed meanwhile
-                if app.composer.read(cx).value().is_empty() {
+                // the text goes back to its chat: into the composer if that chat is still open
+                // and nothing new was typed, else into its draft
+                if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
                     app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
+                } else {
+                    app.drafts.entry(id).or_insert(body);
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// After a failed history transfer: picks it up where it stopped.
+    fn retry_history(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else { return };
+        let before = self.history.replace((HistoryStage::Waiting, 0, 0));
+        if let Err(e) = client.retry_history() {
+            self.history = before;
+            self.error = Some(format!("Couldn't retry the transfer: {e}"));
+        }
+        cx.notify();
+    }
+
+    /// "Continue without history": receiving starts; the core says `NoHistory`.
+    fn cancel_history(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else { return };
+        if let Err(e) = client.cancel_history() {
+            self.error = Some(format!("Couldn't stop the transfer: {e}"));
+        }
+        cx.notify();
+    }
+
+    /// Receiving may have stopped (it restarts only on request): starting is idempotent.
+    fn reconnect(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else { return };
+        if let Err(e) = client.start().and_then(|()| client.reconnect()) {
+            self.error = Some(format!("Couldn't reconnect: {e}"));
+        }
+        cx.notify();
     }
 
     fn retry_link(&mut self, cx: &mut Context<Self>) {
@@ -651,12 +747,20 @@ impl Hush {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
         let status = match self.connection {
             ConnectionState::Connecting => Some("Connecting…"),
             ConnectionState::Offline => Some("Offline"),
             ConnectionState::Online | ConnectionState::Unlinked => None,
         };
+        let offline = self.connection == ConnectionState::Offline;
+        let history = self.history.map(|h| self.render_history(h, cx));
+        let reconnect = offline.then(|| {
+            Button::new("reconnect")
+                .xsmall()
+                .label("Reconnect")
+                .on_click(cx.listener(|this, _, _, cx| this.reconnect(cx)))
+        });
+        let theme = cx.theme();
         v_flex()
             .w(px(320.))
             .h_full()
@@ -676,12 +780,19 @@ impl Hush {
                             .aria_level(1)
                             .font_weight(FontWeight::SEMIBOLD),
                     )
-                    .children(status.map(|s| {
-                        label("connection", Role::Status, s)
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                    })),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .children(status.map(|s| {
+                                label("connection", Role::Status, s)
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                            }))
+                            .children(reconnect),
+                    ),
             )
+            .children(history)
             .child(
                 div()
                     .id("chat-list")
@@ -690,6 +801,69 @@ impl Hush {
                     .flex_1()
                     .min_h_0()
                     .child(uniform_list("chats", self.chats.len(), cx.processor(Self::render_chat_rows)).size_full()),
+            )
+    }
+
+    /// The history transfer's progress, with a way out at every stage (the Mac app's
+    /// `HistoryView.swift` words).
+    fn render_history(&self, (stage, done, total): (HistoryStage, u64, u64), cx: &mut Context<Self>) -> Div {
+        let failed = stage == HistoryStage::Failed;
+        let title = match stage {
+            HistoryStage::Waiting => "Preparing to transfer…",
+            HistoryStage::Downloading => "Transferring your messages…",
+            HistoryStage::Importing => "Importing your messages…",
+            HistoryStage::Failed => "The transfer didn't finish",
+            HistoryStage::Done | HistoryStage::NoHistory => "",
+        };
+        let detail = match stage {
+            HistoryStage::Waiting => Some("Keep the app open on your phone.".to_string()),
+            HistoryStage::Downloading if total > 0 => Some(format!(
+                "{:.0} of {:.0} MB",
+                done as f64 / 1_048_576.,
+                total as f64 / 1_048_576.
+            )),
+            HistoryStage::Importing if done > 0 => Some(format!("{done} items")),
+            HistoryStage::Failed => Some("New messages arrive once you continue.".to_string()),
+            _ => None,
+        };
+        let theme = cx.theme();
+        v_flex()
+            .m_3()
+            .p_3()
+            .gap_2()
+            .flex_none()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                label("history-title", Role::Status, title)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM),
+            )
+            .children(detail.map(|d| {
+                label("history-detail", Role::Label, d)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("history-continue")
+                            .small()
+                            .label("Continue without history")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_history(cx))),
+                    )
+                    .when(failed, |this| {
+                        this.child(
+                            Button::new("history-retry")
+                                .small()
+                                .primary()
+                                .label("Try again")
+                                .on_click(cx.listener(|this, _, _, cx| this.retry_history(cx))),
+                        )
+                    }),
             )
     }
 
@@ -730,8 +904,14 @@ impl Hush {
             );
         };
         let rows = Rc::new(self.rows(c.kind == ConversationKind::Group));
-        // as on the phone: a request, an invitation or a blocked chat is answered there first
-        let answer_first = c.message_request || c.group_invitation || c.blocked;
+        // shortcut: requests, invitations, join requests and blocked chats are answered on the
+        // phone; the Mac app offers Accept, Block and the others here
+        let answer_first = c.message_request || c.group_invitation || c.group_join_requested || c.blocked;
+        let answer_where = if c.blocked {
+            "This chat is blocked. Unblock it on your phone to write here."
+        } else {
+            "Answer this chat on your phone to write here."
+        };
         v_flex()
             .flex_1()
             .h_full()
@@ -766,13 +946,9 @@ impl Hush {
                     .border_color(border)
                     .when(answer_first, |this| {
                         this.child(
-                            label(
-                                "answer-first",
-                                Role::Label,
-                                "Answer this chat on your phone to write here.",
-                            )
-                            .text_sm()
-                            .text_color(muted),
+                            label("answer-first", Role::Label, answer_where)
+                                .text_sm()
+                                .text_color(muted),
                         )
                     })
                     .when(!answer_first, |this| {
@@ -828,10 +1004,24 @@ fn render_row(ix: usize, row: &Row, cx: &mut App) -> impl IntoElement {
         .child(div().text_xs().text_color(muted).child(row.footer.clone()))
 }
 
-/// Text that assistive technology reads too: GPUI shows it only what has a role and a label.
+/// Text that assistive technology reads too: GPUI shows it only elements with an id and a role;
+/// the label is what it reads.
 fn label(id: impl Into<ElementId>, role: Role, text: impl Into<SharedString>) -> Stateful<Div> {
     let text = text.into();
     div().id(id).role(role).aria_label(text.clone()).child(text)
+}
+
+/// The rows that changed between two lists of keys: `old[range]` became `count` rows of `new`
+/// (what both share at the start and at the end stays).
+fn changed_rows<K: PartialEq>(old: &[K], new: &[K]) -> (Range<usize>, usize) {
+    let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let end = old[start..]
+        .iter()
+        .rev()
+        .zip(new[start..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (start..old.len() - end, new.len() - start - end)
 }
 
 /// The people a message's text mentions.
@@ -868,5 +1058,26 @@ impl Render for Hush {
             Screen::Failed(e) => self.render_notice("Hush couldn't start", e.clone(), cx),
         };
         div().size_full().bg(background).text_color(foreground).child(screen)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changed_rows;
+
+    #[test]
+    fn only_the_rows_that_came_or_went_change() {
+        // a new message
+        assert_eq!(changed_rows(&[1, 2, 3], &[1, 2, 3, 4]), (3..3, 1));
+        // the window moved on by one: the oldest went, a new one came
+        assert_eq!(changed_rows(&[1, 2, 3], &[2, 3, 4]), (0..3, 3));
+        // one expired in the middle
+        assert_eq!(changed_rows(&[1, 2, 3], &[1, 3]), (1..2, 0));
+        // nothing came or went
+        assert_eq!(changed_rows(&[1, 2], &[1, 2]), (2..2, 0));
+        // the first load
+        assert_eq!(changed_rows(&[], &[1, 2]), (0..0, 2));
+        // a key both at the start and the end is counted once
+        assert_eq!(changed_rows(&[1, 2, 1], &[1]), (1..3, 0));
     }
 }

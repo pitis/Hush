@@ -3,7 +3,8 @@ use gpui_kit::{black, canvas, fill, point, px, size, white, Bounds, IntoElement,
 /// The quiet border a scanner needs around the code, in modules.
 const QUIET: usize = 4;
 
-/// `text` as a QR code `side` pixels wide: whole pixels per module, so edges stay sharp.
+/// `text` as a QR code `side` pixels wide: whole pixels per module, so all modules are the same
+/// size.
 pub fn code(text: &str, side: f32) -> Option<impl IntoElement> {
     let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
     let n = code.width();

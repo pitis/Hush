@@ -47,8 +47,8 @@ perf: ## Measure the installed app against the M1 budget (size, cold launch, idl
 desktop: ## Build the desktop app (GPUI: Windows, Linux, macOS) into core/target/debug/hush
 	cd core && cargo build -p hush-desktop
 
-desktop-run: desktop ## Build and launch the desktop app
-	core/target/debug/hush
+desktop-run: ## Build and launch the desktop app
+	cd core && cargo run -p hush-desktop
 
 ## ── Gate ─────────────────────────────────────────────────────────────
 

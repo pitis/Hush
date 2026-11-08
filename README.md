@@ -15,8 +15,8 @@ Building the app needs the owner's Apple Development certificate (see `app/proje
 ## Desktop app (Windows, Linux, macOS)
 
 `core/desktop` is a second, smaller client written in Rust on [GPUI](https://www.gpui.rs) over the
-same core: it links as its own device and keeps its own data. So far it links, lists the chats,
-shows a chat's newest messages and sends text.
+same core: it links as its own device and keeps its own data. It is meant to link, list the chats,
+show a chat's newest messages and send text; it hasn't been tried with a linked phone yet.
 
 ```sh
 make desktop-run   # or: cd core && cargo run -p hush-desktop

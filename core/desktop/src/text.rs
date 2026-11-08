@@ -1,5 +1,6 @@
 //! What the screen says, ported from the Mac app (`MessageText.swift`, `ChatList.swift`,
-//! `Placeholder.swift`, `Files.swift`) so both clients word things alike.
+//! `Placeholder.swift`, `Files.swift`, `AppStore.swift`'s titles) so both clients word things
+//! alike. Times and delivery states are simpler than the Mac app's.
 
 use sig_core::projection::{
     BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKind, MessageStatus, TextStyle,
@@ -8,7 +9,8 @@ use sig_core::projection::{
 const HIDDEN_SPOILER: &str = "■■■■";
 
 /// `body` as plain text: mentions read "@name", spoilers are hidden. Ranges count UTF-16 units,
-/// as the phone sends them; one that doesn't fit the text is skipped.
+/// as the phone sends them; one that doesn't fit the text is skipped, except a spoiler, which
+/// hides up to the end of the text.
 pub fn plain(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> String {
     let units: Vec<u16> = body.encode_utf16().collect();
     let span = |r: &BodyRange| (r.start as usize, r.start as usize + r.length as usize);
@@ -40,7 +42,8 @@ pub fn plain(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) ->
     String::from_utf16_lossy(&text)
 }
 
-/// A chat's name ("Note to Self" for our own), or a short form of its id until it is known.
+/// A chat's name ("Note to Self" for our own), or until it is known "Group", the contact's
+/// "@username", or a short form of its id.
 pub fn title(c: &Conversation, own_aci: Option<&str>) -> String {
     if own_aci.is_some_and(|me| c.id.strip_prefix("c:") == Some(me)) {
         return "Note to Self".into();
@@ -113,7 +116,8 @@ pub fn message(m: &Message, name: impl Fn(&str) -> String) -> String {
     }
     match m.body.as_deref() {
         Some(body) if !body.trim().is_empty() => plain(body, &m.ranges, name),
-        // shortcut: files aren't shown yet, only that there is one; show them with `Client::attachments`
+        // shortcut: files aren't shown, and a captioned one shows only its caption: `Message`
+        // carries no file, so show them with `Client::attachments`
         _ => "📎 Attachment".into(),
     }
 }
@@ -137,7 +141,7 @@ pub fn time(ms: i64) -> String {
 pub fn status(s: MessageStatus) -> &'static str {
     match s {
         MessageStatus::Failed => "Not sent",
-        MessageStatus::Pending => "Sending…",
+        MessageStatus::Pending => "Sending",
         MessageStatus::Sent => "Sent",
         MessageStatus::Delivered => "Delivered",
         MessageStatus::Read => "Read",
@@ -174,8 +178,18 @@ fn describe(file: &FileSummary, caption: &str) -> String {
     format!("{emoji} {}", if caption.is_empty() { word } else { caption })
 }
 
+/// Lines joined by spaces; every Unicode line break counts, as in Swift's `isNewline`.
 fn one_line(text: &str) -> String {
-    text.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+    let newline = |c: char| {
+        matches!(
+            c,
+            '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+    };
+    text.split(newline)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -211,6 +225,62 @@ mod tests {
         };
         let body = "the \u{FFFC} did it";
         assert_eq!(plain(body, &[spoiler, mention(4, "a")], name), "the ■■■■ it");
+    }
+
+    fn spoiler(start: u32, length: u32) -> BodyRange {
+        BodyRange {
+            start,
+            length,
+            style: TextStyle::Spoiler,
+        }
+    }
+
+    #[test]
+    fn a_spoiler_hides_a_mention_in_its_middle_and_runs_to_the_end_at_most() {
+        assert_eq!(plain("a \u{FFFC} b", &[spoiler(0, 5), mention(2, "bob")], name), "■■■■");
+        assert_eq!(plain("hi there", &[spoiler(3, 50)], name), "hi ■■■■");
+    }
+
+    #[test]
+    fn hostile_ranges_dont_crash() {
+        let huge = [
+            mention(1, "a"),
+            BodyRange {
+                start: 1,
+                length: u32::MAX,
+                style: TextStyle::Mention { aci: "a".into() },
+            },
+            BodyRange {
+                start: u32::MAX,
+                length: u32::MAX,
+                style: TextStyle::Mention { aci: "a".into() },
+            },
+            spoiler(u32::MAX, 1),
+            spoiler(1, u32::MAX),
+        ];
+        for r in huge {
+            plain("a\u{FFFC}", std::slice::from_ref(&r), name);
+        }
+    }
+
+    #[test]
+    fn ranges_splitting_an_emoji_leave_it_whole() {
+        for body in ["👍", "👍👍 hi", "🇷🇴🇩🇪", "👨‍👩‍👧 z", "a👍b"] {
+            for start in 0..6 {
+                for length in 0..4 {
+                    for r in [mention(start, "a"), spoiler(start, length)] {
+                        let r = BodyRange { length, ..r };
+                        let out = plain(body, &[r], name);
+                        assert!(!out.contains('\u{FFFD}'), "{body:?} {start} {length}: {out:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_line_break_joins_the_preview_into_one_line() {
+        assert_eq!(one_line("a\r\nb\u{2028}c\rd"), "a b c d");
     }
 
     #[test]

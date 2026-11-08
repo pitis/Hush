@@ -22,3 +22,7 @@ futures = "0.3"
 hex = "0.4"
 rand = "0.9"
 chrono = "0.4"
+
+[dev-dependencies]
+# keyring's own core (already in the tree), for its in-memory mock store
+keyring-core = "1"

@@ -1,5 +1,6 @@
-//! Warnings and errors from the core and presage go to the unified log on Apple platforms
-//! (Console.app, subsystem `dev.pitis.hush`), to stderr elsewhere. Never log message content.
+//! The core's log (its info and up, presage's warnings and up) goes to the unified log on Apple
+//! platforms (Console.app, subsystem `dev.pitis.hush`), to stderr elsewhere. Never log message
+//! content.
 
 use std::sync::Once;
 
