@@ -4,7 +4,7 @@ import Network
 /// Tells when the network comes back (Wi-Fi on again, a cable plugged in) or the Mac wakes from
 /// sleep, so the core can reconnect at once instead of after its backoff.
 final class NetworkWatch: @unchecked Sendable {  // `was` is only touched on the monitor's serial queue
-    private let monitor = NWPathMonitor()
+    let monitor = NWPathMonitor()  // not private: a test waits for its first report
     private var was: Bool?
     private var wakeObserver: NSObjectProtocol?
 

@@ -1,3 +1,4 @@
+import AppKit
 import Network
 import XCTest
 
@@ -62,6 +63,22 @@ final class TimelineEventTests: XCTestCase {
         XCTAssertTrue(NetworkWatch.shouldReconnectOnWake(.satisfied), "the path may never have dropped")
         XCTAssertFalse(NetworkWatch.shouldReconnectOnWake(.unsatisfied), "the path's return reconnects then")
         XCTAssertFalse(NetworkWatch.shouldReconnectOnWake(.requiresConnection))
+    }
+
+    /// The real wake notification reaches the reconnect (the host app has no watch of its own).
+    @MainActor
+    func testWakingFromSleepWithANetworkAsksToReconnect() async throws {
+        let asked = expectation(description: "asked to reconnect")
+        let watch = NetworkWatch { asked.fulfill() }
+        var tries = 0
+        while watch.monitor.currentPath.status != .satisfied, tries < 100 {
+            try await Task.sleep(for: .milliseconds(20))
+            tries += 1
+        }
+        try XCTSkipUnless(watch.monitor.currentPath.status == .satisfied, "needs a network")
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: NSWorkspace.shared)
+        await fulfillment(of: [asked], timeout: 2)
+        withExtendedLifetime(watch) {}
     }
 }
 
