@@ -9,11 +9,11 @@ crate-type = ["staticlib", "lib"]
 
 [dependencies]
 uniffi = { workspace = true, features = ["tokio"] }
-# whisperfish/presage#448 (group management, on whisperfish/libsignal-service-rs#473), then
-# whisperfish/presage#461 (decryption error kinds), then our fix that skips sticker packs already
-# installed and a listing of their ids (neither proposed upstream yet), then #473 rebased on
-# whisperfish/libsignal-service-rs#501 (uploads send their length), in pitis/presage's
-# hush/upload-length: back to whisperfish/presage once all of them land.
+# pitis/presage's hush/upload-length: whisperfish/presage#448 (group management) and #461
+# (decryption error kinds), plus our fixes that skip installed sticker packs and list their ids
+# (not proposed upstream yet). #448 needs whisperfish/libsignal-service-rs#473: we pin its branch
+# at 04e4e2f, rebased on upstream's #501 (attachment uploads send their length).
+# Back to whisperfish/presage once #448, #461 and our fixes land there.
 presage = { git = "https://github.com/pitis/presage", rev = "7c72e4439cdc02067145b565b888a8b85644d9ef" }
 presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "7c72e4439cdc02067145b565b888a8b85644d9ef" }
 # Reads the link-and-sync history archive. Same libsignal tag as libsignal-service's pins, so
