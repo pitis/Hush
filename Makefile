@@ -4,7 +4,7 @@ XCB := xcodebuild -project app/Hush.xcodeproj -scheme Hush -destination 'platfor
 # the test host app prints harmless linkd/XPC noise on stderr; keep only what matters
 XCB_FILTER := { grep -vE 'com\.apple\.linkd|synchronousRemoteObjectProxy|Process Instance Registry|IDETestOperationsObserverDebug' || true; }
 
-.PHONY: help setup core project app run release perf test check format lint worktree update card
+.PHONY: help setup core project app run release perf desktop desktop-run test check format lint worktree update card
 
 help: ## List available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -43,6 +43,12 @@ release: ## Build the Release app (release core: thin LTO, stripped) and install
 
 perf: ## Measure the installed app against the M1 budget (size, cold launch, idle RAM and CPU)
 	scripts/perf.sh
+
+desktop: ## Build the desktop app (GPUI: Windows, Linux, macOS) into core/target/debug/hush
+	cd core && cargo build -p hush-desktop
+
+desktop-run: ## Build and launch the desktop app
+	cd core && cargo run -p hush-desktop
 
 ## ── Gate ─────────────────────────────────────────────────────────────
 

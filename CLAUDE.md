@@ -1,7 +1,8 @@
 # Hush
 
 Native macOS Signal client: Rust core on [presage](https://github.com/whisperfish/presage) +
-SwiftUI/AppKit app. Unofficial, personal use. AGPL-3.0 (inherited from presage).
+SwiftUI/AppKit app. Unofficial, personal use. AGPL-3.0 (inherited from presage). A second, smaller
+client for Windows, Linux and macOS lives in `core/desktop` (Rust on GPUI, the same core).
 
 - Spec: `docs/superpowers/specs/2026-10-15-m1-daily-driver-design.md`
 - Plans: `docs/superpowers/plans/`
@@ -67,19 +68,28 @@ answer, never for mechanics.
 ## Stack rules
 
 - presage is pinned to one git rev in `core/sig-core/Cargo.toml`; bump it only in its own PR.
-  Keep the `[patch.crates-io] libsqlite3-sys` entry in `core/Cargo.toml` in sync with presage's.
+  Keep the `[patch.crates-io] libsqlite3-sys` entry in `core/Cargo.toml` in sync with presage's,
+  and the non-Apple `libsqlite3-sys` version in `core/sig-core/Cargo.toml` with that entry.
 - No `cdsi` feature (BoringSSL/OpenSSL conflict with SQLCipher).
+- Off Apple platforms SQLCipher must use the fork's Rust crypto (`bundled-sqlcipher-custom-crypto`,
+  `core/sig-core/Cargo.toml`), never OpenSSL: RingRTC's prebuilt WebRTC carries BoringSSL, whose
+  OpenSSL-named functions take SQLCipher's calls (a crash on the first write). Apple keeps CommonCrypto.
 - presage's `Manager`/store are `!Send`: call them only from one dedicated thread (the core's actor, Task 5).
 - Never log message content; ids and errors only.
 - Swift bindings and the xcframework are generated (`make core`); never edit `app/Generated/`.
 - The Xcode project is generated from `app/project.yml` (`make project`); never commit it.
-- arm64 only, macOS 26+ (Liquid Glass, no fallback). No "Signal" name or logo in the app.
-- The app is signed with the owner's Apple Development certificate (team `95KQ82C586`,
+- The Mac app: arm64 only, macOS 26+ (Liquid Glass, no fallback). No "Signal" name or logo in
+  either app.
+- The desktop app (`core/desktop`) uses GPUI through `gpui-kit`, which follows the latest stable
+  Rust: the toolchain is pinned in `core/rust-toolchain.toml`; bump it with gpui-kit. It keeps its
+  own data folder ("Hush Desktop") and keychain entry, never the Mac app's.
+- The Mac app is signed with the owner's Apple Development certificate (team `95KQ82C586`,
   `app/project.yml`): the Keychain trusts rebuilds only under a stable signature. Builds need
   that certificate in the login keychain.
 
 ## Commands
 
-`make setup` · `make core` · `make project` · `make app` · `make run` · `make format` · `make lint` ·
+`make setup` · `make core` · `make project` · `make app` · `make run` · `make desktop` · `make desktop-run` ·
+`make format` · `make lint` ·
 `make test` · `make check` ·
 `make worktree name=… branch=…` · `make update` · `make card issue=… status=…`
