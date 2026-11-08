@@ -12,7 +12,8 @@ uniffi = { workspace = true, features = ["tokio"] }
 # pitis/presage's hush/upload-length: whisperfish/presage#448 (group management) and #461
 # (decryption error kinds), plus our fixes that skip installed sticker packs and list their ids
 # (not proposed upstream yet). #448 needs whisperfish/libsignal-service-rs#473: we pin its branch
-# at 04e4e2f, rebased on upstream's #501 (attachment uploads send their length).
+# at 04e4e2f, rebased on upstream's #501 (attachment uploads send their length); core/Cargo.toml
+# patches it to the branch's head for two group fixes.
 # Back to whisperfish/presage once #448, #461 and our fixes land there.
 presage = { git = "https://github.com/pitis/presage", rev = "7c72e4439cdc02067145b565b888a8b85644d9ef" }
 presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "7c72e4439cdc02067145b565b888a8b85644d9ef" }

@@ -8,6 +8,14 @@ uniffi = "0.32"
 [patch.crates-io]
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
 
+# libsignal-service past presage's pin (barafael's whisperfish/libsignal-service-rs#473 branch
+# at 04e4e2f) to the branch's head, 2c65d88, with two group fixes: groups are created and changed
+# through /v2/groups, and an invite-link join leaves joinFromInviteLink for the server to set.
+# Fetched through upstream (the PR's head), as a patch can't point at the source it patches.
+# Drop once pitis/presage pins 2c65d88 or later.
+[patch."https://github.com/barafael/libsignal-service-rs"]
+libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "2c65d886905985c0ab5f5765bc36e4dc404891c6" }
+
 [profile.release]
 lto = "thin"
 strip = true
