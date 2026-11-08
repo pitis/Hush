@@ -1,3 +1,4 @@
+import Network
 import XCTest
 
 @testable import Hush
@@ -55,6 +56,12 @@ final class TimelineEventTests: XCTestCase {
         XCTAssertFalse(NetworkWatch.shouldReconnect(was: true, now: true))
         XCTAssertFalse(NetworkWatch.shouldReconnect(was: true, now: false))
         XCTAssertFalse(NetworkWatch.shouldReconnect(was: nil, now: true), "the first report isn't a change")
+    }
+
+    func testWakingReconnectsOnlyWithANetwork() {
+        XCTAssertTrue(NetworkWatch.shouldReconnectOnWake(.satisfied), "the path may never have dropped")
+        XCTAssertFalse(NetworkWatch.shouldReconnectOnWake(.unsatisfied), "the path's return reconnects then")
+        XCTAssertFalse(NetworkWatch.shouldReconnectOnWake(.requiresConnection))
     }
 }
 
