@@ -66,6 +66,8 @@ pub enum Demo {
     Link,
     Empty,
     Chat,
+    /// The chat, with the New Group dialog over it.
+    NewGroup,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -78,7 +80,12 @@ fn snapshot(dir: std::path::PathBuf) {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
-            let shots = [("link", Demo::Link), ("empty", Demo::Empty), ("chat", Demo::Chat)];
+            let shots = [
+                ("link", Demo::Link),
+                ("empty", Demo::Empty),
+                ("chat", Demo::Chat),
+                ("new-group", Demo::NewGroup),
+            ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
                     for (name, screen) in shots {
