@@ -369,9 +369,11 @@ impl Hush {
             }
             _ => None,
         };
+        // the chats behind don't take clicks while it's open
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .bg(black().opacity(0.35))
             .flex()
             .items_center()
