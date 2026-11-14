@@ -9,13 +9,13 @@ use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, FocusTrapElement, Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, MessageStatus};
 use sig_core::{ConnectionState, HistoryStage};
 
-use super::{join_step, Dialog, DialogKind, Hush, JoinStep, Screen};
+use super::{join_step, matching, Dialog, DialogKind, Hush, JoinStep, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -172,7 +172,7 @@ impl Hush {
     }
 
     fn render_sidebar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        let shown: Vec<&Conversation> = self.chats.iter().filter(|c| self.matches(c)).collect();
+        let shown: Vec<&Conversation> = self.inbox().filter(|c| self.matches(c)).collect();
         let pinned = self.query.is_empty() && shown.iter().any(|c| c.pinned_order.is_some());
         let mut list = v_flex().pb(px(8.));
         for (ix, c) in shown.iter().enumerate() {
@@ -293,24 +293,33 @@ impl Hush {
             },
         };
         let body = match &d.kind {
-            DialogKind::Group(_) if self.contacts.is_empty() => Some(
-                label("no-one", Role::Label, "No one to add yet; members can be added later.")
-                    .text_size(px(12.))
-                    .text_color(p.secondary)
-                    .into_any_element(),
-            ),
             DialogKind::Group(chosen) => {
-                let people = self.contacts.iter().enumerate().map(|(ix, (aci, name))| {
-                    let aci = aci.clone();
-                    let this = cx.entity().downgrade();
-                    Checkbox::new(("member", ix))
-                        .label(name.clone())
-                        .checked(chosen.contains(&aci))
-                        .on_click(move |_, _, cx| {
-                            let _ = this.update(cx, |app, cx| app.toggle_member(aci.clone(), cx));
-                        })
-                });
-                Some(
+                let filter = d.search.as_ref().map(|s| s.read(cx).value().to_string());
+                // shortcut: names only; the Mac app's picker shows each one's picture too, add
+                // it when the checkbox takes more than a label
+                let people: Vec<_> = matching(&self.contacts, filter.as_deref().unwrap_or_default())
+                    .enumerate()
+                    .map(|(ix, (aci, name))| {
+                        let aci = aci.clone();
+                        let this = cx.entity().downgrade();
+                        Checkbox::new(("member", ix))
+                            .label(name.clone())
+                            .checked(chosen.contains(&aci))
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |app, cx| app.toggle_member(aci.clone(), cx));
+                            })
+                    })
+                    .collect();
+                let list = if people.is_empty() {
+                    let no_one = if self.contacts.is_empty() {
+                        "No one to add yet; members can be added later."
+                    } else {
+                        "No one matches."
+                    };
+                    label("no-one", Role::Label, no_one)
+                        .text_size(px(12.))
+                        .text_color(p.secondary)
+                } else {
                     v_flex()
                         .id("members")
                         .role(Role::List)
@@ -319,6 +328,16 @@ impl Hush {
                         .overflow_y_scroll()
                         .gap(px(6.))
                         .children(people)
+                };
+                Some(
+                    v_flex()
+                        .gap(px(12.))
+                        .children(
+                            d.search
+                                .as_ref()
+                                .map(|s| field(Input::new(s).appearance(false).aria_label("Search").w_full(), p)),
+                        )
+                        .child(list)
                         .into_any_element(),
                 )
             }
@@ -406,18 +425,14 @@ impl Hush {
                             .text_size(px(12.))
                             .text_color(p.secondary)
                     }))
-                    .child(
-                        div()
-                            .h(px(28.))
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.))
-                            .bg(p.field)
-                            .border_1()
-                            .border_color(p.separator)
-                            .child(Input::new(&d.field).appearance(false).aria_label(title).w_full()),
-                    )
+                    .child(field(
+                        Input::new(&d.field)
+                            .appearance(false)
+                            .aria_label(title)
+                            .disabled(d.busy)
+                            .w_full(),
+                        p,
+                    ))
                     .children(body)
                     .children(d.problem.clone().map(|why| {
                         label("dialog-problem", Role::Alert, why)
@@ -442,7 +457,8 @@ impl Hush {
                                     .disabled(d.busy || !asked)
                                     .on_click(cx.listener(|this, _, window, cx| this.submit_dialog(window, cx))),
                             ),
-                    ),
+                    )
+                    .focus_trap("dialog", &d.focus),
             )
     }
 
@@ -643,7 +659,7 @@ impl Hush {
             .as_ref()
             .and_then(|id| self.chats.iter().find(|c| &c.id == id));
         let Some(c) = open else {
-            let (title, detail) = match (self.chats.is_empty(), &self.connection) {
+            let (title, detail) = match (self.inbox().next().is_none(), &self.connection) {
                 (false, _) => ("Select a chat", ""),
                 (true, ConnectionState::Online) => (
                     "Connected — no messages yet",
@@ -674,8 +690,9 @@ impl Hush {
                 _ => String::new(),
             },
         };
-        // shortcut: requests, invitations, join requests and blocked chats are answered on the
-        // phone; the Mac app offers Accept, Block and the others here
+        // shortcut: message requests, invitations and blocked chats are answered on the phone,
+        // and a join request's Delete and Cancel Request don't ask first; the Mac app offers
+        // Accept, Block and the others here, and asks: add them with a confirmation dialog
         let answer_first = c.message_request || c.group_invitation || c.group_join_requested || c.blocked;
         let answer_where = if c.blocked {
             "This chat is blocked. Unblock it on your phone to write here."
@@ -735,11 +752,27 @@ impl Hush {
                             .text_color(p.secondary),
                     )
                     .when(c.group_join_requested && !c.blocked, |this| {
+                        let delete = id.clone();
                         this.child(
-                            Button::new("cancel-request")
-                                .label("Cancel Request")
-                                .disabled(self.cancelling)
-                                .on_click(cx.listener(move |this, _, _, cx| this.cancel_join_request(id.clone(), cx))),
+                            h_flex()
+                                .gap(px(10.))
+                                // here only, should cancelling fail for good (the request stays)
+                                .child(
+                                    Button::new("delete-chat")
+                                        .label("Delete")
+                                        .disabled(self.cancelling)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| this.delete_chat(delete.clone(), cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("cancel-request")
+                                        .label("Cancel Request")
+                                        .disabled(self.cancelling)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| this.cancel_join_request(id.clone(), cx)),
+                                        ),
+                                ),
                         )
                     })
             } else {
@@ -1038,6 +1071,20 @@ fn icon(name: &str, size: f32, color: Hsla) -> Icon {
         .path(SharedString::from(format!("icons/{name}.svg")))
         .size(px(size))
         .text_color(color)
+}
+
+/// A dialog's text field, in its box.
+fn field(input: Input, p: Palette) -> Div {
+    div()
+        .h(px(28.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(6.))
+        .bg(p.field)
+        .border_1()
+        .border_color(p.separator)
+        .child(input)
 }
 
 fn section(title: &'static str, p: Palette) -> Div {
