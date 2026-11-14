@@ -288,6 +288,8 @@ impl Drop for PanicReporter {
 /// key pragma never reaches a log. Each of presage's connections caches 512 KB instead of SQLite's
 /// 2 MB: its hot pages are few, and a miss is a decrypt from the OS's file cache.
 pub(crate) fn sqlite_options(path: &std::path::Path, key: &str) -> Result<SqliteConnectOptions, CoreError> {
+    #[cfg(test)]
+    crate::test_exit::wait_at_exit_for_closing_databases();
     Ok(SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
         .create_if_missing(true)
         .foreign_keys(true)
