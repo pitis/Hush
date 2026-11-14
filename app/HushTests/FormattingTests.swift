@@ -237,13 +237,21 @@ final class ScrollDecisionTests: XCTestCase {
     func testAChatsPageIsNoNewMessage() {
         let page = message("c:alice", "alice", 400_000)
         XCTAssertNil(Timeline.onNewLastMessage(page, after: nil, atBottom: true), "the chat's first page")
+        // the newest one their own: still no new message
+        let mine = message("c:alice", "me-aci", 400_000, outgoing: true)
         XCTAssertNil(
-            Timeline.onNewLastMessage(page, after: message("c:bob", "bob", 30_000), atBottom: true),
+            Timeline.onNewLastMessage(mine, after: message("c:bob", "bob", 30_000), atBottom: false),
             "another chat's page")
         var read = page
         read.status = .read
         XCTAssertNil(Timeline.onNewLastMessage(read, after: page, atBottom: true), "the same message, changed")
         XCTAssertNil(Timeline.onNewLastMessage(nil, after: page, atBottom: true), "the chat closed")
+        XCTAssertNil(
+            Timeline.onNewLastMessage(message("c:alice", "alice", 1000), after: page, atBottom: false),
+            "the last one expired")
+        XCTAssertEqual(
+            Timeline.onNewLastMessage(message("c:alice", "bob", 400_000), after: page, atBottom: false), .showPill,
+            "another member's, sent the same millisecond")
     }
 
     /// As the app's window reports it: a 465pt container between a 52pt toolbar and a 55pt composer.
