@@ -808,7 +808,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -4031,7 +4031,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5014,7 +5014,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/barafael/libsignal-service-rs?rev=04e4e2f370c9a85e7bf80e91a64e5e049a5e63dc#04e4e2f370c9a85e7bf80e91a64e5e049a5e63dc"
+source = "git+https://github.com/barafael/libsignal-service-rs?rev=2c65d886905985c0ab5f5765bc36e4dc404891c6#2c65d886905985c0ab5f5765bc36e4dc404891c6"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -6794,7 +6794,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/pitis/presage?rev=7c72e4439cdc02067145b565b888a8b85644d9ef#7c72e4439cdc02067145b565b888a8b85644d9ef"
+source = "git+https://github.com/pitis/presage?rev=9b217af4ef57e353e60305428ed6ed0b823910a2#9b217af4ef57e353e60305428ed6ed0b823910a2"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6816,7 +6816,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/pitis/presage?rev=7c72e4439cdc02067145b565b888a8b85644d9ef#7c72e4439cdc02067145b565b888a8b85644d9ef"
+source = "git+https://github.com/pitis/presage?rev=9b217af4ef57e353e60305428ed6ed0b823910a2#9b217af4ef57e353e60305428ed6ed0b823910a2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6955,8 +6955,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "petgraph",
@@ -6977,7 +6977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -10718,7 +10718,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
