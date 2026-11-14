@@ -33,10 +33,7 @@ fn main() {
             cx.bind_keys(key_bindings());
             cx.set_menus([
                 Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
-                Menu::new("Chats").items([
-                    MenuItem::action("Search", app::search::Search),
-                    MenuItem::action("Search in Chat", app::search::SearchInChat),
-                ]),
+                Menu::new("Chats").items(chats_menu()),
             ]);
             cx.on_window_closed(|cx, _| app::quit(cx)).detach();
             let (window, hush) = gpui_kit::open_window(window_options(cx), cx, |window, cx| {
@@ -44,6 +41,7 @@ fn main() {
             })
             .expect("the window opens");
             app::search::shortcuts(window, hush.downgrade(), cx);
+            app::navigate::shortcuts(window, hush.downgrade(), cx);
             cx.activate(true);
         });
 }
@@ -53,7 +51,28 @@ fn key_bindings() -> Vec<KeyBinding> {
     let mut all = vec![KeyBinding::new(QUIT_KEY, Quit, None)];
     all.extend(app::search::keys());
     all.extend(app::compose::keys());
+    all.extend(app::navigate::keys());
     all
+}
+
+/// The Mac app's Chats menu (`ChatCommands`).
+fn chats_menu() -> Vec<MenuItem> {
+    use app::navigate::*;
+    let jump = (1..=9).map(|n| MenuItem::action(format!("Chat {n}"), JumpToChat(n)));
+    vec![
+        MenuItem::action("Find Chat…", FindChat),
+        MenuItem::action("Search", app::search::Search),
+        MenuItem::action("Search in Chat", app::search::SearchInChat),
+        MenuItem::separator(),
+        MenuItem::action("Previous Chat", PreviousChat),
+        MenuItem::action("Next Chat", NextChat),
+        MenuItem::action("Previous Unread Chat", PreviousUnreadChat),
+        MenuItem::action("Next Unread Chat", NextUnreadChat),
+        MenuItem::submenu(Menu::new("Jump to Chat").items(jump)),
+        MenuItem::separator(),
+        MenuItem::action("Focus Composer", FocusComposer),
+        MenuItem::action("Close Chat", CloseChat),
+    ]
 }
 
 fn window_options(cx: &App) -> WindowOptions {
@@ -93,6 +112,8 @@ pub enum Demo {
     Search,
     /// The open chat searched, its newest match opened.
     SearchInChat,
+    /// The chat scrolled back: an older page loading, a message come in unseen.
+    History,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -115,6 +136,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("compose", Demo::Compose),
                 ("search", Demo::Search),
                 ("search-in-chat", Demo::SearchInChat),
+                ("history", Demo::History),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

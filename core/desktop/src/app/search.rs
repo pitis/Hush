@@ -12,6 +12,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, MessageKey, SearchHit, HIGHLIGHT_END, HIGHLIGHT_START};
 
+use super::navigate::on;
 use super::view::{avatar, icon, label, section};
 use super::{describe, Hush, Screen, PAGE};
 use crate::style::Palette;
@@ -68,28 +69,22 @@ pub fn keys() -> [KeyBinding; 2] {
 /// What `keys` do, wherever the window's focus is (none at first): the window's views see a
 /// shortcut only on the way from the focused element.
 pub fn shortcuts(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
-    let on = move |hush: WeakEntity<Hush>, f: fn(&mut Hush, &mut Window, &mut Context<Hush>), cx: &mut App| {
-        // once the dispatch is over: it holds the window, which can't be updated inside it
-        cx.defer(move |cx| {
-            let done = window.update(cx, |_, window, cx| hush.update(cx, |app, cx| f(app, window, cx)));
-            if let Err(e) = done.and_then(|r| r) {
-                tracing::warn!(error = %e, "a search shortcut found no window");
-            }
-        });
-    };
-    let weak = hush.clone();
-    cx.on_action(move |_: &Search, cx| on(weak.clone(), Hush::focus_search, cx));
-    cx.on_action(move |_: &SearchInChat, cx| on(hush.clone(), Hush::search_in_chat, cx));
+    on(window, &hush, cx, |app, _: &Search, window, cx| {
+        app.focus_search(window, cx)
+    });
+    on(window, &hush, cx, |app, _: &SearchInChat, window, cx| {
+        app.search_in_chat(window, cx)
+    });
 }
 
 impl Hush {
     /// The sidebar is there, with no dialog over it.
-    fn can_search(&self) -> bool {
+    pub(super) fn can_search(&self) -> bool {
         matches!(self.screen, Screen::Chats) && self.dialog.is_none()
     }
 
     /// The sidebar's search field gets the keys.
-    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_search() {
             self.search.update(cx, |s, cx| s.focus(window, cx));
         }
@@ -216,11 +211,11 @@ impl Hush {
         !self.query.is_empty() && (self.find.scope.is_some() || self.listed().is_empty())
     }
 
-    /// ↑ or ↓ in the search field while browsing results: the next one opens. Else the field has
-    /// the key.
+    /// ↑ or ↓ in the search field while browsing results: the next one opens. Else the chat above
+    /// or below in the list.
     pub(super) fn step_results(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.browsing_results() || self.find.hits.is_empty() {
-            return;
+            return self.step_listed(by < 0, window, cx);
         }
         cx.stop_propagation();
         let next = step(self.find.picked, by, self.find.hits.len());
@@ -295,9 +290,9 @@ impl Hush {
         self.find.jump = None;
     }
 
-    /// Back at the newest message after a found one was shown: only the newest page loads again
-    /// (the rows back to it are off screen by then), so a deep jump isn't reloaded and redrawn
-    /// for as long as the chat stays open.
+    /// Back at the newest message after a found one or older pages were shown: only the newest
+    /// page loads again (the rows back to them are off screen by then), so a deep load isn't
+    /// reloaded and redrawn for as long as the chat stays open.
     pub(super) fn back_to_newest(&mut self, cx: &mut Context<Self>) {
         let at_end = !self.timeline.read(cx).is_scrolled_up();
         if self.depth > PAGE && self.find.jump.is_none() && at_end {

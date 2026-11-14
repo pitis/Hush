@@ -247,6 +247,22 @@ pub fn messages() -> Vec<Message> {
     ]
 }
 
+/// `n` older messages of the "Family" group, oldest first: the days before `messages`.
+pub fn history(n: usize) -> Vec<Message> {
+    const SAID: [&str; 6] = [
+        "Did anyone see the match last night?",
+        "Photos from the weekend are in the album",
+        "Who's bringing the chairs?",
+        "Sounds good 👍",
+        "I can pick up Grandma on the way, if that helps. Tell me by Friday.",
+        "Running late, start without me",
+    ];
+    let authors = [ANA, BOGDAN, ME];
+    (0..n)
+        .map(|i| message(authors[i % 3], 3 * 24 * 60 + (n - i) as i64 * 7, SAID[i % SAID.len()]))
+        .collect()
+}
+
 /// Who sent the messages with files in Bogdan's chat, and how many minutes ago, oldest first.
 const FILES_AGO: [(&str, i64); 7] = [
     (BOGDAN, 90),
