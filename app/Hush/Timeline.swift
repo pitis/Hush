@@ -88,8 +88,13 @@ enum Timeline {
     /// bottom or it is their own message, otherwise show the "New messages" pill.
     enum NewMessageAction: Equatable { case scrollToBottom, showPill }
 
-    static func onNewLastMessage(atBottom: Bool, isOwn: Bool) -> NewMessageAction {
-        atBottom || isOwn ? .scrollToBottom : .showPill
+    /// Nil when no new message came in: the same one changed, or a chat's messages arrived with it (as
+    /// it opens, or a search result's page in another chat).
+    static func onNewLastMessage(_ new: Message?, after old: Message?, atBottom: Bool) -> NewMessageAction? {
+        guard let new, let old, new.conversationId == old.conversationId,
+            (new.author, new.sentAt) != (old.author, old.sentAt)
+        else { return nil }
+        return atBottom || new.isOutgoing ? .scrollToBottom : .showPill
     }
 
     /// Within this many points of the edge counts as being there.
