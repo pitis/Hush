@@ -500,7 +500,11 @@ struct TimelineList: View {
         let hit = event.window?.contentView?.hitTest(event.locationInWindow)
         // text clicked into shows in the window's field editor, whose delegate is the text
         let editor = (hit as? NSTextView).flatMap { $0.isFieldEditor ? $0.delegate as? NSTextField : nil }
-        guard let text = editor ?? hit as? NSTextField, !text.isEditable else { return nil }
+        let text: NSView? =
+            if let field = editor ?? hit as? NSTextField { field.isEditable ? nil : field }
+            // from macOS 27 selectable text is a view of its own, static text to accessibility
+            else if hit?.accessibilityRole() == .staticText { hit } else { nil }
+        guard let text else { return nil }
         var view = text.superview
         while let v = view {
             if let menu = v.menu(for: event) { return (menu, v) }
