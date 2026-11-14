@@ -295,7 +295,8 @@ mod tests {
         let mut reaction = msg(6, "");
         (reaction.body, reaction.story) = (None, story);
         reaction.kind = MessageKind::StoryReaction { emoji: "🔥".into() };
-        assert!(one(&reaction, vec![]).contains("Reacted 🔥 to a story"));
+        let html = one(&reaction, vec![]);
+        assert!(html.contains("Reacted 🔥 to a story") && !html.contains("Replied to a story"));
     }
 
     #[test]

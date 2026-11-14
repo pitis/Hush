@@ -533,7 +533,7 @@ impl Importer {
                 reactions = self.latest_reactions(&m.reactions);
             }
             Some(Item::UpdateMessage(_)) => unreachable!("handled above"),
-            // story replies have no kind yet
+            // a story reply: the backup doesn't name the story it answers
             Some(_) | None => {
                 self.counts.skipped += 1;
                 return;

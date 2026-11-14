@@ -1166,6 +1166,28 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_names_its_story_as_the_story_is_kept() {
+        use presage::proto::{story_message, StoryMessage, TextAttachment};
+        let story = StoryMessage {
+            attachment: Some(story_message::Attachment::TextAttachment(TextAttachment {
+                text: Some("hello".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        // a story's id is its envelope's timestamp; a reply's context carries it
+        let mut c = content(ALICE, 910, ContentBody::StoryMessage(story));
+        c.metadata.client_timestamp = chrono::DateTime::from_timestamp_millis(900).unwrap();
+        let ops = project(&c, ME);
+        let Op::InsertStory(s) = &ops[0] else { panic!("{ops:?}") };
+        let reply = one(project(
+            &content(ME, 950, sent_sync(ALICE, on_story(text(940, "ha"), ALICE, 900))),
+            ME,
+        ));
+        assert_eq!(reply.story, Some(key(&s.author, s.sent_at)));
+    }
+
+    #[test]
     fn view_once_media_arrives_unviewed_and_ours_from_the_phone_counts_as_viewed() {
         let view_once = DataMessage {
             timestamp: Some(461),
@@ -1353,6 +1375,24 @@ mod tests {
                 None,
                 MessageKind::StoryReaction { emoji: "🔥".into() },
                 Some(key(ME, 300))
+            )
+        );
+        // ours, from the phone, to their story
+        let mine = one(project(
+            &content(
+                ME,
+                620,
+                sent_sync(ALICE, on_story(reaction("🔥", false, ALICE, 310), ALICE, 310)),
+            ),
+            ME,
+        ));
+        assert_eq!(
+            (mine.conversation_id, mine.is_outgoing, mine.kind, mine.story),
+            (
+                format!("c:{ALICE}"),
+                true,
+                MessageKind::StoryReaction { emoji: "🔥".into() },
+                Some(key(ALICE, 310))
             )
         );
         // taking it back, or a group story's: nothing in the chat

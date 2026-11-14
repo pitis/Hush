@@ -41,6 +41,11 @@ final class PlaceholderTests: XCTestCase {
             id: 1, message: MessageKey(author: "me", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
             width: nil, height: nil, isVoiceNote: false, path: nil, state: .pending)
         XCTAssertEqual(Placeholder.storyText(story(nil, photo)), "📷 Photo")
+        let link = StoryText(
+            text: "", style: 0, foreground: nil, textBackground: nil, background: [], angle: 0,
+            link: "https://example.com")
+        XCTAssertEqual(Placeholder.storyText(story(link, nil)), "https://example.com", "a link alone")
+        XCTAssertEqual(Placeholder.storyText(story(nil, nil)), "Story")
     }
 
     func testViewOnceMediaOffersOneLookThenSaysViewed() {

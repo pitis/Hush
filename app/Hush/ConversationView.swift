@@ -325,9 +325,7 @@ struct TimelineList: View {
                             reactions: store.reactions[key] ?? [],
                             files: store.attachments[key] ?? [], preview: store.previews[key],
                             poll: store.polls[key],
-                            story: m.story.flatMap { s in
-                                store.stories.first { $0.author == s.author && $0.sentAt == s.sentAt }
-                            },
+                            story: store.story(for: m),
                             highlighted: store.highlighted == key,
                             reply: { store.reply(to: m) },
                             retry: { Task { await store.retry(key) } },

@@ -561,6 +561,12 @@ final class AppStore {
         } catch { append("query failed: \(error)") }
     }
 
+    /// The story `m` replies or reacts to, while it lasts (a day).
+    func story(for m: Message) -> Story? {
+        guard let key = m.story else { return nil }
+        return stories.first { $0.author == key.author && $0.sentAt == key.sentAt }
+    }
+
     /// A story was shown: seen here from now on.
     func storyViewed(_ story: Story) async {
         guard let client else { return }

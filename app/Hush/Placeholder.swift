@@ -36,9 +36,11 @@ enum Placeholder {
         }
     }
 
-    /// What a story a reply answers says: its words, or what its file is ("📷 Photo").
+    /// What a story a reply answers says: its words (else its link), or what its file is
+    /// ("📷 Photo").
     static func storyText(_ s: Story) -> String {
-        s.text?.text ?? s.file.map { Files.describe(Files.summary($0), body: nil) } ?? "Story"
+        if let t = s.text { return t.text.isEmpty ? t.link ?? "Story" : t.text }
+        return s.file.map { Files.describe(Files.summary($0), body: nil) } ?? "Story"
     }
 
     /// The timers offered, as in Desktop (seconds; 0: off).

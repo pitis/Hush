@@ -146,7 +146,7 @@ struct ComposerView: View {
                     icon: "arrowshape.turn.up.left",
                     title: reply.isOutgoing ? "Replying to yourself" : "Replying to \(store.senderName(reply.author))",
                     detail: reply.body.map { MessageText.plain($0, ranges: reply.ranges, name: store.mentionName) }
-                        ?? "Attachment",
+                        ?? Placeholder.text(reply.kind) ?? "Attachment",
                     close: "Cancel reply", cancelsWithEsc: !mentions.isOpen
                 ) { store.replyTo = nil }
             }

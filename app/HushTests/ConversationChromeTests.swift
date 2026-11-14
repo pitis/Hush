@@ -22,10 +22,10 @@ final class ConversationChromeTests: XCTestCase {
 /// anywhere on it.
 @MainActor
 final class MessageRowTests: XCTestCase {
-    private func row(reactions: [Reaction] = []) -> MessageRow {
+    private func row(reactions: [Reaction] = [], story: Story? = nil) -> MessageRow {
         MessageRow(
             message: message("c:a", "a", 1, "hi"), first: true, last: true, isGroup: false, senderName: "A",
-            reactions: reactions, files: [], preview: nil, reply: {}, retry: {}, download: { _ in },
+            reactions: reactions, files: [], preview: nil, story: story, reply: {}, retry: {}, download: { _ in },
             open: { _ in true })
     }
 
@@ -33,6 +33,9 @@ final class MessageRowTests: XCTestCase {
         // new closures each time the timeline draws: the same row
         XCTAssertEqual(row(), row())
         XCTAssertNotEqual(row(), row(reactions: [Reaction(reactor: "b", emoji: "👍")]))
+        // the story it answers, come or gone
+        let story = Story(conversationId: "c:me", author: "me", sentAt: 1, text: nil, file: nil, viewed: true)
+        XCTAssertNotEqual(row(), row(story: story))
     }
 
     private var window: NSWindow!
