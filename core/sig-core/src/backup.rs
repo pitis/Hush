@@ -313,15 +313,15 @@ impl<R: Read> Plain<R> {
     }
 }
 
-/// The plaintext as a stream: it ends only at the last chunk, so a cut-off one is an error.
-impl<R: Read> Read for Plain<R> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+impl<R: Read> Plain<R> {
+    /// The plaintext as a stream (`files`), as `Read::read`: it ends (0) only at the last chunk,
+    /// so a cut-off one is an error.
+    pub(crate) fn read_some(&mut self, out: &mut [u8]) -> Result<usize, BackupError> {
         while self.at == self.chunk.len() {
             if self.ended {
                 return Ok(0);
             }
-            self.next_chunk()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.next_chunk()?;
         }
         let take = out.len().min(self.chunk.len() - self.at);
         out[..take].copy_from_slice(&self.chunk[self.at..self.at + take]);

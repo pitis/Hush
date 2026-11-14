@@ -6,10 +6,10 @@
 //! under the same key. Files from before are plain until encrypted at launch
 //! (`ProjectionDb::encrypt_files`).
 
-use std::io::{BufReader, ErrorKind, Read};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
-use crate::backup::{Plain, Sealer};
+use crate::backup::{BackupError, Plain, Sealer};
 
 pub(crate) type FileKey = [u8; 32];
 
@@ -50,10 +50,14 @@ pub(crate) fn seal(mut input: impl Read, to: &Path, key: &FileKey) -> std::io::R
     Ok(n)
 }
 
-/// Writes the file at `path` out to the disk; with `drive`, out of the drive's own cache too, as
-/// that is slow on Apple platforms (F_FULLFSYNC, milliseconds a file): a batch ends with one.
+/// Writes the file or folder at `path` out to the disk; with `drive`, out of the drive's own cache
+/// too, as that is slow on Apple platforms (F_FULLFSYNC, milliseconds a file): a batch ends with
+/// one. (A folder only where it can be opened: not on Windows.)
 pub(crate) fn sync(path: &Path, drive: bool) -> std::io::Result<()> {
-    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let file = match path.is_dir() {
+        true => std::fs::File::open(path)?,
+        false => std::fs::OpenOptions::new().write(true).open(path)?,
+    };
     #[cfg(target_vendor = "apple")]
     if !drive {
         use std::os::fd::AsRawFd;
@@ -67,10 +71,30 @@ pub(crate) fn sync(path: &Path, drive: bool) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// What a damaged file, or one under another key, reads as.
+const DAMAGED: &str = "this file is damaged or its key doesn't match";
+
+/// A file's read error: the disk's as it is, anything else the file's damage (`DAMAGED`).
+fn read_error(e: BackupError) -> std::io::Error {
+    match e {
+        BackupError::Io(e) => std::io::Error::other(e),
+        _ => std::io::Error::new(ErrorKind::InvalidData, DAMAGED),
+    }
+}
+
+/// A sealed file's plaintext, decrypted as it is read.
+struct Opened<R: Read>(Plain<R>);
+
+impl<R: Read> Read for Opened<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read_some(out).map_err(read_error)
+    }
+}
+
 /// The plaintext of the file at `path`, sealed under `key`, decrypted as it is read. A wrong key,
 /// a changed byte or a cut-off file is an error (`InvalidData`), never other bytes.
 pub(crate) fn open(path: &Path, key: &FileKey) -> std::io::Result<impl Read + Send> {
-    let invalid = || std::io::Error::new(ErrorKind::InvalidData, "not an encrypted file");
+    let invalid = || std::io::Error::new(ErrorKind::InvalidData, DAMAGED);
     let mut input = BufReader::new(std::fs::File::open(path)?);
     let mut header = vec![0; HEADER_LEN];
     input.read_exact(&mut header).map_err(|e| match e.kind() {
@@ -81,7 +105,7 @@ pub(crate) fn open(path: &Path, key: &FileKey) -> std::io::Result<impl Read + Se
         return Err(invalid());
     }
     let key = cipher_key(key, &header[8..]);
-    Plain::new(input, &key, header).map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))
+    Plain::new(input, &key, header).map(Opened).map_err(read_error)
 }
 
 /// Whether two streams hold the same bytes.
@@ -121,28 +145,40 @@ pub(crate) struct Kept {
 }
 
 impl Kept {
-    /// Its plaintext, as it is read. Blocking.
+    /// Its plaintext, as it is read. Blocking. One without a key that is encrypted (its key
+    /// gone) is an error, never its ciphertext.
     pub(crate) fn reader(&self) -> std::io::Result<Box<dyn Read + Send>> {
         Ok(match &self.key {
             Some(key) => Box::new(open(&self.path, key)?),
-            None => Box::new(BufReader::new(std::fs::File::open(&self.path)?)),
+            None => {
+                let mut file = BufReader::new(std::fs::File::open(&self.path)?);
+                if file.fill_buf()?.starts_with(MAGIC) {
+                    return Err(std::io::Error::new(ErrorKind::InvalidData, DAMAGED));
+                }
+                Box::new(file)
+            }
         })
     }
 
     /// Its plaintext, in memory. Blocking.
     pub(crate) fn read(&self) -> std::io::Result<Vec<u8>> {
-        let mut bytes = vec![];
+        // the plaintext is no longer than the file
+        let size = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
         self.reader()?.read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 
-    /// Its plaintext into a new file at `to`; a failed copy leaves none. Blocking.
+    /// Its plaintext into a new file at `to` (one there is an error, and stays as it was); a
+    /// copy that fails partway is removed. Blocking.
     pub(crate) fn copy_to(&self, to: &Path) -> std::io::Result<u64> {
-        let copied = self
-            .reader()
-            .and_then(|mut r| std::io::copy(&mut r, &mut std::fs::File::create_new(to)?));
-        if copied.is_err() && to.is_file() {
-            let _ = std::fs::remove_file(to);
+        let mut reader = self.reader()?;
+        let mut out = std::fs::File::create_new(to)?;
+        let copied = std::io::copy(&mut reader, &mut out);
+        if copied.is_err() {
+            if let Err(e) = std::fs::remove_file(to) {
+                tracing::warn!(error = %e, "a half-written copy of a file couldn't be removed");
+            }
         }
         copied
     }
@@ -260,6 +296,43 @@ mod tests {
         };
         assert!(wrong.copy_to(&dir.join("bad")).is_err());
         assert!(!dir.join("bad").exists());
+        // nor one whose second chunk is damaged, found only partway
+        let mut stored = std::fs::read(&kept.path).unwrap();
+        let at = stored.len() - 10;
+        stored[at] ^= 1;
+        std::fs::write(&kept.path, &stored).unwrap();
+        let e = kept.copy_to(&dir.join("half")).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+        assert!(!dir.join("half").exists());
+        // a file already where it goes stays as it was
+        std::fs::write(dir.join("taken"), b"mine").unwrap();
+        let plain = Kept {
+            path: dir.join("out"),
+            key: None,
+        };
+        assert_eq!(
+            plain.copy_to(&dir.join("taken")).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(dir.join("taken")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn a_damaged_file_says_so_and_an_encrypted_one_without_its_key_isnt_read() {
+        let dir = temp_dir("words");
+        let path = dir.join("f");
+        seal(&b"a photo"[..], &path, &new_key()).unwrap();
+        let e = read(&path, &new_key()).unwrap_err();
+        assert_eq!(e.to_string(), DAMAGED, "not a backup's passphrase");
+        // its key gone (a row without one): an error, not its ciphertext as the picture
+        let keyless = Kept { path, key: None };
+        assert_eq!(keyless.read().unwrap_err().kind(), ErrorKind::InvalidData);
+        // a disk's error stays one
+        let gone = Kept {
+            path: dir.join("missing"),
+            key: Some(new_key()),
+        };
+        assert_eq!(gone.read().unwrap_err().kind(), ErrorKind::NotFound);
     }
 
     #[test]

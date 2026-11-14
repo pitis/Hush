@@ -317,8 +317,13 @@ async fn run(
         // files from before they were encrypted, once (it holds up the open: nothing may read
         // or write them meanwhile)
         match projection.encrypt_files().await {
-            Ok((0, 0)) => {}
-            Ok((encrypted, failed)) => tracing::info!(encrypted, failed, "files from before were encrypted"),
+            Ok(c) if c == Default::default() => {}
+            Ok(c) => tracing::info!(
+                encrypted = c.encrypted,
+                failed = c.failed,
+                missing = c.missing,
+                "files from before were encrypted"
+            ),
             Err(e) => tracing::warn!(error = %e, "encrypting the files from before failed"),
         }
         let store =

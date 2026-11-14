@@ -138,6 +138,38 @@ final class FilesTests: XCTestCase {
         XCTAssertNotNil(quarantineMark(again))
     }
 
+    /// Without the core (opening, starting over), a file it encrypted is never read as if it were
+    /// the file: a view-once look would be spent on its ciphertext.
+    func testAnEncryptedFileIsntReadWithoutTheCore() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-sealed-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        useTemporaryRoots(in: dir)
+        Files.core = nil
+        let stored = dir.appendingPathComponent("42")
+        try Data("HUSHFIL1 sealed bytes".utf8).write(to: stored)
+        do {
+            _ = try await Files.bytes(stored.path)
+            XCTFail("read without the core")
+        } catch Files.OpenError.notReady {}
+        let a = Attachment(
+            id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
+            width: nil, height: nil, isVoiceNote: false, path: stored.path, state: .ready)
+        do {
+            _ = try await Files.openable(a)
+            XCTFail("opened without the core")
+        } catch Files.OpenError.notReady {}
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: Files.openRoot.path), [])
+        XCTAssertEqual(Files.whyNot(Files.OpenError.notReady), "Hush is still opening its files")
+        XCTAssertEqual(
+            Files.whyNot(CoreError.Storage(message: "can't copy the file: x")), "its file is missing or damaged")
+        // a plain file (one to send) still reads as it is
+        let mine = dir.appendingPathComponent("mine.txt")
+        try Data("mine".utf8).write(to: mine)
+        let bytes = try await Files.bytes(mine.path)
+        XCTAssertEqual(bytes, Data("mine".utf8))
+    }
+
     /// Stored files are encrypted: they are read, and copied out to open, through the core.
     func testStoredFilesAreDecryptedByTheCoreInMemoryOrIntoTheCopyThatOpens() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-decrypt-\(UUID())")
@@ -224,6 +256,27 @@ final class AppStoreFilesTests: XCTestCase {
 
     private func file(_ name: String) -> OutgoingFile {
         OutgoingFile(path: "/tmp/\(name)", contentType: "image/png", width: 1, height: 1, isVoiceNote: false)
+    }
+
+    nonisolated override func tearDown() {
+        Files.core = nil
+        super.tearDown()
+    }
+
+    func testFilesAreReadThroughTheOpenCoreAndNotAClosedOne() async {
+        let fake = FakeClient(linked: false)
+        let opens = Counter()
+        let store = AppStore(open: { _ in
+            opens.increment()
+            if opens.value > 1 { throw CoreError.Closed }
+            return fake
+        })
+        await store.boot()
+        XCTAssertTrue(Files.core === fake)
+        // starting over (a restore): the old core goes, and none opened since
+        _ = await store.restoreBackup(from: URL(fileURLWithPath: "/tmp/Hush.hushbackup"), passphrase: "correct horse")
+        XCTAssertEqual(opens.value, 2)
+        XCTAssertNil(Files.core)
     }
 
     func testAMessagesFilesAndPreviewLoadWithIt() async {

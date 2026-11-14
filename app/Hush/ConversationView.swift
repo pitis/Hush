@@ -5,15 +5,23 @@ struct ConversationView: View {
     let store: AppStore
     let conversation: Conversation
     @State private var quickLook: URL?
+    /// On screen: an open that ends after it went drops its copy.
+    @State private var visible = false
     @State private var dropTargeted = false
 
     var body: some View {
         TimelineList(store: store, conversation: conversation) { a in
             do {
-                quickLook = try await Files.openable(a)
+                let url = try await Files.openable(a)
+                guard visible else {
+                    Files.close(url)
+                    return false
+                }
+                quickLook = url
                 return true
             } catch {
-                store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
+                Files.logger.error("opening a file failed: \(error, privacy: .public)")
+                store.showError("Couldn't open \(a.fileName ?? "the file"): \(Files.whyNot(error))")
                 return false
             }
         }
@@ -32,7 +40,11 @@ struct ConversationView: View {
         .quickLookPreview($quickLook)
         // the preview closed: its copy goes
         .onChange(of: quickLook) { old, _ in if let old { Files.close(old) } }
-        .onDisappear { if let quickLook { Files.close(quickLook) } }
+        .onAppear { visible = true }
+        .onDisappear {
+            visible = false
+            if let quickLook { Files.close(quickLook) }
+        }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
             guard !RequestBar.replacesComposer(conversation) else { return false }

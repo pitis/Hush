@@ -77,16 +77,18 @@ pub(crate) fn keep(
             };
             let path = image_path(dir, &pack.id, s.id);
             if !path.exists() {
+                // written aside and moved in whole: a partial file would pass for the image
+                let part = path.with_extension("part");
                 let written = key(&path)
                     .ok_or_else(|| std::io::Error::other("no key for it"))
                     .and_then(|key| {
                         path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
-                        crate::files::seal(bytes.as_slice(), &path, &key)
+                        crate::files::seal(bytes.as_slice(), &part, &key)?;
+                        std::fs::rename(&part, &path)
                     });
                 if let Err(e) = written {
                     tracing::warn!(error = %e, pack = %pack_tag(&pack.id), sticker = s.id, "a sticker's image couldn't be written");
-                    // a partial file would pass for the image next time
-                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(&part);
                     whole = false;
                     return None;
                 }

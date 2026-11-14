@@ -83,7 +83,7 @@ struct ImageAttachmentView: View {
             .task(id: path) {
                 guard let path else { return }
                 image = await Thumbnails.load(path)
-                undecodable = image == nil
+                undecodable = image == nil && Thumbnails.isUndecodable(path)
             }
         }
     }
@@ -122,7 +122,7 @@ struct AudioAttachmentView: View {
     @State private var player: AVPlayer?
     @State private var opened: URL?
     /// Its decrypted copy is being made: another click waits for it.
-    @State private var preparing = false
+    @State private var opening: Task<Void, Never>?
     @State private var playing = false
     @State private var unplayable = false
     @State private var elapsed: Double = 0
@@ -145,31 +145,28 @@ struct AudioAttachmentView: View {
                     DownloadState(state: attachment.state, download: download)
                 }
                 Track(fraction: duration > 0 ? elapsed / duration : 0)
-                Text(Self.clock(playing || elapsed > 0 ? elapsed : duration))
-                    .font(.system(size: 11).monospacedDigit()).opacity(0.8)
+                Text(
+                    Self.clock(
+                        playing || elapsed > 0 ? elapsed : (duration > 0 ? duration : Self.lengths[attachment.id] ?? 0))
+                )
+                .font(.system(size: 11).monospacedDigit()).opacity(0.8)
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(attachment.isVoiceNote ? "Voice message" : (attachment.fileName ?? "Audio"))
         .onDisappear { stop() }
-        .task(id: attachment.state) {
-            // the length shows before playing, as in Desktop (from a decrypted copy, gone at once)
-            guard attachment.state == .ready, let url = try? await Files.openable(attachment) else { return }
-            defer { Files.close(url) }
-            let asset = AVURLAsset(url: url, options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
-            if let length = try? await asset.load(.duration).seconds, length.isFinite { duration = length }
-        }
     }
 
+    /// Recordings' lengths once played, by attachment: shown before they play again (a length
+    /// isn't worth decrypting a recording to disk for when its row only shows).
+    private static var lengths: [Int64: Double] = [:]
+
     private func toggle() {
-        guard !preparing else { return }
-        Task {
-            if player == nil {
-                preparing = true
-                await prepare()
-                preparing = false
-            }
-            guard let player else { return }
+        guard opening == nil else { return }
+        opening = Task {
+            if player == nil { await prepare() }
+            opening = nil
+            guard let player, !Task.isCancelled else { return }
             if playing { player.pause() } else { player.play() }
             playing.toggle()
             guard playing else { return }
@@ -187,6 +184,8 @@ struct AudioAttachmentView: View {
             unplayable = true
             return
         }
+        // gone meanwhile: its copy goes with it
+        if Task.isCancelled { return Files.close(url) }
         opened = url
         let asset = AVURLAsset(url: url, options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
         let item = AVPlayerItem(asset: asset)
@@ -196,7 +195,10 @@ struct AudioAttachmentView: View {
             MainActor.assumeIsolated {
                 elapsed = time.seconds
                 let total = item.duration.seconds
-                if total.isFinite { duration = total }
+                if total.isFinite {
+                    duration = total
+                    Self.lengths[attachment.id] = total
+                }
                 if total.isFinite, time.seconds >= total {
                     // played to the end: back to the start, ready to play again
                     playing = false
@@ -209,6 +211,8 @@ struct AudioAttachmentView: View {
     }
 
     private func stop() {
+        opening?.cancel()
+        opening = nil
         player?.pause()
         if let observer { player?.removeTimeObserver(observer) }
         observer = nil
@@ -319,8 +323,15 @@ enum Thumbnails {
         if let hit = cached(path, filling: side) { return hit }
         if undecodable.contains(path) { return nil }
         // decrypted in memory only
-        let data = try? await Files.bytes(path)
-        let image = await Task.detached(priority: .userInitiated) { data.flatMap { decode($0, side) } }.value
+        let data: Data
+        do {
+            data = try await Files.bytes(path)
+        } catch {
+            // not remembered: one that didn't read now (the core starting over, say) may later
+            AppStore.logger.error("a picture didn't read: \(error, privacy: .public)")
+            return nil
+        }
+        let image = await Task.detached(priority: .userInitiated) { decode(data, side) }.value
         if let image {
             cache.setObject(image, forKey: key(path, side), cost: image.bytesPerRow * image.height)
         } else {
@@ -328,6 +339,9 @@ enum Thumbnails {
         }
         return image
     }
+
+    /// Whether the file at `path` was read but isn't a picture that decodes.
+    static func isUndecodable(_ path: String) -> Bool { undecodable.contains(path) }
 
     private static func key(_ path: String, _ side: CGFloat?) -> NSString {
         "\(Int(side ?? 0)) \(path)" as NSString

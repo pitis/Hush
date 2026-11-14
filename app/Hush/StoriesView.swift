@@ -243,15 +243,27 @@ struct StoryVideo: View {
     let file: Attachment
     @State private var player: AVPlayer?
     @State private var opened: URL?
+    @State private var failed = false
 
     var body: some View {
-        VideoPlayer(player: player)
-            .task(id: file.id) {
-                stop()
-                opened = try? await Files.openable(file)
-                player = opened.map { AVPlayer(url: $0) }
-            }
-            .onDisappear { stop() }
+        if failed {
+            Text("This video can't be played").foregroundStyle(Theme.secondaryText)
+        } else {
+            VideoPlayer(player: player)
+                .task(id: file.id) {
+                    stop()
+                    do {
+                        let url = try await Files.openable(file)
+                        // gone meanwhile: its copy goes with it
+                        if Task.isCancelled { return Files.close(url) }
+                        opened = url
+                        player = AVPlayer(url: url)
+                    } catch {
+                        failed = true
+                    }
+                }
+                .onDisappear { stop() }
+        }
     }
 
     private func stop() {
