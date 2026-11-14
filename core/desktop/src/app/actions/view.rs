@@ -11,7 +11,8 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::MoveUp;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::{Popover, PopoverState};
-use gpui_kit::component::{h_flex, v_flex, Icon, Selectable as SelectableTrigger};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Selectable as SelectableTrigger};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::Message;
@@ -20,6 +21,7 @@ use super::{Item, RowActions, QUICK_REACTIONS};
 use crate::app::view::icon;
 use crate::app::Hush;
 use crate::style::Palette;
+use crate::text::{BOLD, ITALIC, MENTION, MONOSPACE, SPOILER, STRIKETHROUGH};
 
 /// The row the pointer is over: its buttons show.
 const GROUP: &str = "message";
@@ -29,6 +31,8 @@ const GROUP: &str = "message";
 pub(in crate::app) struct ActionCx {
     app: WeakEntity<Hush>,
     focus: FocusHandle,
+    /// The font monospace text is in.
+    pub mono: SharedString,
 }
 
 impl Hush {
@@ -36,6 +40,7 @@ impl Hush {
         ActionCx {
             app: cx.entity().downgrade(),
             focus: self.actions.focus().clone(),
+            mono: cx.theme().mono_font_family.clone(),
         }
     }
 
@@ -274,13 +279,10 @@ fn picker(row: &Rc<RowActions>, act: &ActionCx, popover: Entity<PopoverState>, p
         }))
 }
 
-/// What a reply answers, above the bubble's text, under a small header.
-pub(in crate::app) fn quote(row: &RowActions) -> Option<Div> {
-    let (header, text, mentions) = row.quote.clone()?;
-    let bold = HighlightStyle {
-        font_weight: Some(FontWeight::BOLD),
-        ..Default::default()
-    };
+/// What a reply answers, above the bubble's text, under a small header; its spoilers stay hidden.
+/// `behind`: the bubble's colour.
+pub(in crate::app) fn quote(row: &RowActions, act: &ActionCx, p: Palette, behind: Hsla) -> Option<Div> {
+    let (header, text, runs) = row.quote.clone()?;
     Some(
         v_flex()
             .w_full()
@@ -293,9 +295,112 @@ pub(in crate::app) fn quote(row: &RowActions) -> Option<Div> {
                 div()
                     .text_size(px(12.))
                     .line_clamp(2)
-                    .child(StyledText::new(text).with_highlights(mentions.into_iter().map(|r| (r, bold)))),
+                    .child(covered(text, &runs, act, p, behind)),
             ),
     )
+}
+
+/// A message's text in its styles (`behind`: the bubble's colour): selectable, or while it hides
+/// a spoiler, a click shows it (as Desktop; there is nothing to select until then, so the hidden
+/// words can't be copied).
+pub(in crate::app) fn message_text(
+    row: &Rc<RowActions>,
+    text: String,
+    runs: &[(Range<usize>, u8)],
+    act: &ActionCx,
+    p: Palette,
+    behind: Hsla,
+) -> AnyElement {
+    if runs.iter().any(|(_, s)| s & SPOILER != 0) {
+        return div()
+            .id("text")
+            .cursor_pointer()
+            .tooltip(|window, cx| Tooltip::new("Click to reveal").build(window, cx))
+            .on_click(on(act, row, |app, m, _, cx| app.reveal(m, cx)))
+            .child(covered(text, runs, act, p, behind))
+            .into_any_element();
+    }
+    Selectable::new("text", text.clone(), act)
+        .with_highlights(highlights(runs, HighlightStyle::default(), p.accent))
+        .with_font_family_overrides(fonts(runs, &act.mono))
+        .into_any_element()
+}
+
+/// `text` in its styles, its hidden spoilers under blocks of the text's colour, half over the
+/// bubble's (`behind`), as the Mac app's: opaque, as emoji don't take a text colour.
+fn covered(text: String, runs: &[(Range<usize>, u8)], act: &ActionCx, p: Palette, behind: Hsla) -> Div {
+    let text = styled(text, runs, HighlightStyle::default(), p.accent, &act.mono);
+    let layout = text.layout().clone();
+    let hidden: Vec<Range<usize>> = runs
+        .iter()
+        .filter(|(_, s)| s & SPOILER != 0)
+        .map(|(r, _)| r.clone())
+        .collect();
+    let cover = behind.blend(p.text.opacity(0.45));
+    let blocks = canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            // a clamped quote's hidden lines stay inside it
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for r in &hidden {
+                    let (Some(start), Some(end)) =
+                        (layout.position_for_index(r.start), layout.position_for_index(r.end))
+                    else {
+                        continue;
+                    };
+                    for quad in selection_quads(start, end, layout.bounds(), layout.line_height()) {
+                        window.paint_quad(fill(quad, cover));
+                    }
+                }
+            });
+        },
+    );
+    div().relative().child(text).child(blocks.absolute().inset_0())
+}
+
+/// `text` drawn in its styles (`text::styled`'s runs): a spoiler as `spoiler`, a mention in the
+/// composer in `mention`'s colour, monospace in `mono`.
+pub(in crate::app) fn styled(
+    text: impl Into<SharedString>,
+    runs: &[(Range<usize>, u8)],
+    spoiler: HighlightStyle,
+    mention: Hsla,
+    mono: &SharedString,
+) -> StyledText {
+    StyledText::new(text)
+        .with_highlights(highlights(runs, spoiler, mention))
+        .with_font_family_overrides(fonts(runs, mono))
+}
+
+fn highlights(
+    runs: &[(Range<usize>, u8)],
+    spoiler: HighlightStyle,
+    mention: Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let runs = runs.iter().map(|(range, s)| {
+        let mut style = HighlightStyle {
+            font_weight: (s & BOLD != 0).then_some(FontWeight::BOLD),
+            font_style: (s & ITALIC != 0).then_some(FontStyle::Italic),
+            strikethrough: (s & STRIKETHROUGH != 0).then_some(StrikethroughStyle {
+                thickness: px(1.),
+                color: None,
+            }),
+            color: (s & MENTION != 0).then_some(mention),
+            ..Default::default()
+        };
+        if s & SPOILER != 0 {
+            // a cover hides even a mention's colour
+            style.color = spoiler.color.or(style.color);
+            style.background_color = spoiler.background_color;
+        }
+        (range.clone(), style)
+    });
+    runs.collect()
+}
+
+fn fonts(runs: &[(Range<usize>, u8)], mono: &SharedString) -> Vec<(Range<usize>, SharedString)> {
+    let mono_runs = runs.iter().filter(|(_, s)| s & MONOSPACE != 0);
+    mono_runs.map(|(range, _)| (range.clone(), mono.clone())).collect()
 }
 
 /// A failed send's tick: Retry.
@@ -432,6 +537,11 @@ impl Selectable {
         highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
     ) -> Self {
         self.styled = self.styled.with_highlights(highlights);
+        self
+    }
+
+    fn with_font_family_overrides(mut self, overrides: Vec<(Range<usize>, SharedString)>) -> Self {
+        self.styled = self.styled.with_font_family_overrides(overrides);
         self
     }
 }

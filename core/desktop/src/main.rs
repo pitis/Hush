@@ -29,6 +29,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
+            app::compose::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
             cx.bind_keys(app::search::keys());
@@ -80,6 +81,8 @@ pub enum Demo {
     Reply,
     /// A chat's pictures, recordings and files.
     Files,
+    /// The chat, writing a styled message with a mention, the mention picker open.
+    Compose,
     /// Every chat searched.
     Search,
     /// The open chat searched, its newest match opened.
@@ -103,6 +106,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("new-group", Demo::NewGroup),
                 ("reply", Demo::Reply),
                 ("files", Demo::Files),
+                ("compose", Demo::Compose),
                 ("search", Demo::Search),
                 ("search-in-chat", Demo::SearchInChat),
             ];
