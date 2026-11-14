@@ -36,6 +36,8 @@ fn main() {
                 Menu::new("Chats").items([
                     MenuItem::action("Search", app::search::Search),
                     MenuItem::action("Search in Chat", app::search::SearchInChat),
+                    MenuItem::separator(),
+                    MenuItem::action("Attach Files…", app::attach::AttachFiles),
                 ]),
             ]);
             cx.on_window_closed(|cx, _| app::quit(cx)).detach();
@@ -44,6 +46,7 @@ fn main() {
             })
             .expect("the window opens");
             app::search::shortcuts(window, hush.downgrade(), cx);
+            app::attach::shortcut(window, hush.downgrade(), cx);
             cx.activate(true);
         });
 }
@@ -53,6 +56,7 @@ fn key_bindings() -> Vec<KeyBinding> {
     let mut all = vec![KeyBinding::new(QUIT_KEY, Quit, None)];
     all.extend(app::search::keys());
     all.extend(app::compose::keys());
+    all.extend(app::attach::keys());
     all
 }
 
@@ -85,7 +89,7 @@ pub enum Demo {
     NewGroup,
     /// The chat, replying to a message whose buttons and reaction picker show.
     Reply,
-    /// A chat's pictures, recordings and files.
+    /// A chat's pictures, recordings and files, and files waiting to be sent.
     Files,
     /// The chat, writing a styled message with a mention, the mention picker open.
     Compose,

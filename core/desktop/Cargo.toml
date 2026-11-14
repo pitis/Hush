@@ -27,6 +27,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # voice and audio messages, played in the bubble from memory: GPUI has no audio (CoreAudio, WASAPI,
 # ALSA through cpal; AAC/M4A, MP3, Ogg Vorbis, FLAC and WAV through Symphonia)
 rodio = { version = "0.23", default-features = false, features = ["playback", "mp4", "mp3", "vorbis", "flac", "wav", "tracing"] }
+# a file's type by its extension, for the files sent (already in the tree through reqwest)
+mime_guess = { version = "2", default-features = false }
 # warnings (ids and errors only) into the core's log
 tracing = "0.1"
 # only for `snapshot`: GPUI's offscreen rendering is test support (gpui-kit's own test-support
