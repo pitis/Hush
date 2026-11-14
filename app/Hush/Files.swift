@@ -61,6 +61,11 @@ enum Files {
         "Hush-open", isDirectory: true)
     nonisolated(unsafe) static var openRoot = defaultOpenRoot
 
+    /// Where pasted pictures wait to be sent; swapped only by tests.
+    static let defaultPasteRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "Hush-paste", isDirectory: true)
+    nonisolated(unsafe) static var pasteRoot = defaultPasteRoot
+
     enum OpenError: LocalizedError {
         case notDownloaded
 
@@ -88,7 +93,22 @@ enum Files {
         } catch {
             try fm.copyItem(at: URL(fileURLWithPath: path), to: url)  // e.g. another volume
         }
+        // a link marks the stored file too: harmless, Hush only reads it
+        try quarantine(url)
         return url
+    }
+
+    /// Marks a file from a chat as come from someone else, as a browser marks its downloads:
+    /// Gatekeeper checks it before it runs (a `.command` a contact sent, opened from Quick Look's
+    /// Open With or from Finder).
+    static func quarantine(_ file: URL) throws {
+        var file = file
+        var values = URLResourceValues()
+        values.quarantineProperties = [
+            kLSQuarantineAgentNameKey as String: "Hush",
+            kLSQuarantineTypeKey as String: kLSQuarantineTypeInstantMessageAttachment as String,
+        ]
+        try file.setResourceValues(values)
     }
 
     /// Done with an opened file: its link goes.
@@ -96,9 +116,17 @@ enum Files {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
     }
 
-    /// At launch: what a previous run left open goes.
-    static func clearOpened() {
-        try? FileManager.default.removeItem(at: openRoot)
+    /// Files out of the tray, sent (the core keeps its own copy) or dropped: the pictures pasted
+    /// into it go. Files chosen or dropped from the user's folders are theirs and stay.
+    static func discard(_ paths: [String]) {
+        for path in paths where path.hasPrefix(pasteRoot.path + "/") {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+    }
+
+    /// At launch: what a previous run left open or pasted goes.
+    static func clearLeftovers() {
+        for root in [openRoot, pasteRoot] { try? FileManager.default.removeItem(at: root) }
     }
 
     /// Of dropped or pasted items, the ones that can be sent: files (not folders) that exist.

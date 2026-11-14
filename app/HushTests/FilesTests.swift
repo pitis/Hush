@@ -98,8 +98,25 @@ final class FilesTests: XCTestCase {
         gone.path = dir.appendingPathComponent("missing").path
         XCTAssertThrowsError(try Files.openable(gone))
         // what a previous run left behind goes at launch
-        Files.clearOpened()
+        Files.clearLeftovers()
         XCTAssertFalse(FileManager.default.fileExists(atPath: Files.openRoot.path))
+    }
+
+    /// A file a contact sent (a `.command`, say) gets Gatekeeper's check before it runs from Quick
+    /// Look's Open With, as a browser's downloads do.
+    func testOpenedFilesAreQuarantined() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-quarantine-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        Files.openRoot = dir.appendingPathComponent("open")
+        defer { Files.openRoot = Files.defaultOpenRoot }
+        let stored = dir.appendingPathComponent("42")
+        try Data("echo hi".utf8).write(to: stored)
+        let a = Attachment(
+            id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "application/octet-stream",
+            fileName: "run.command", size: 7, width: nil, height: nil, isVoiceNote: false, path: stored.path,
+            state: .ready)
+        XCTAssertEqual(try quarantineAgent(Files.openable(a)), "Hush")
     }
 
     func testOnlyRegularFilesCanBeAttached() throws {
@@ -110,6 +127,13 @@ final class FilesTests: XCTestCase {
         try Data("x".utf8).write(to: file)
         XCTAssertEqual(Files.attachable([dir, file, dir.appendingPathComponent("missing")]), [file])
     }
+}
+
+/// Who marked the file as come from elsewhere (its `com.apple.quarantine`), or nil if unmarked.
+func quarantineAgent(_ url: URL) throws -> String? {
+    guard getxattr(url.path, "com.apple.quarantine", nil, 0, 0, 0) > 0 else { return nil }
+    return try url.resourceValues(forKeys: [.quarantinePropertiesKey])
+        .quarantineProperties?[kLSQuarantineAgentNameKey as String] as? String
 }
 
 func attachment(_ id: Int64, _ key: MessageKey, _ type: String = "image/jpeg", state: AttachmentState = .ready)
@@ -193,6 +217,49 @@ final class AppStoreFilesTests: XCTestCase {
         XCTAssertNotNil(store.lastError)
     }
 
+    /// A pasted picture is Hush's own copy: it goes once sent (the core keeps its copy) or dropped
+    /// from the tray; files chosen or dropped from the user's folders stay.
+    func testPastedPicturesGoOnceSentOrDropped() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("hush-paste-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        Files.pasteRoot = root.appendingPathComponent("paste")
+        defer { Files.pasteRoot = Files.defaultPasteRoot }
+        try FileManager.default.createDirectory(at: Files.pasteRoot, withIntermediateDirectories: true)
+        func made(_ name: String, _ dir: URL) -> OutgoingFile {
+            let url = dir.appendingPathComponent(name)
+            try? Data("png".utf8).write(to: url)
+            return Files.outgoing(url)
+        }
+        func exists(_ f: OutgoingFile) -> Bool { FileManager.default.fileExists(atPath: f.path) }
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        let (sent, own) = (made("sent.png", Files.pasteRoot), made("own.png", root))
+        store.addFiles([sent, own])
+        fake.sendError = TestError(description: "offline")
+        _ = await store.send("")
+        XCTAssertTrue(exists(sent), "a failed send keeps it, back in the tray")
+        fake.sendError = nil
+        _ = await store.send("")
+        XCTAssertFalse(exists(sent))
+        XCTAssertTrue(exists(own), "the user's own file isn't Hush's to remove")
+        let removed = made("removed.png", Files.pasteRoot)
+        store.addFiles([removed, own])
+        store.removeFile(removed.path)
+        XCTAssertFalse(exists(removed))
+        store.removeFile(own.path)
+        XCTAssertTrue(exists(own))
+        let left = made("left.png", Files.pasteRoot)
+        store.addFiles([left])
+        store.select("c:b")
+        XCTAssertFalse(exists(left), "switching chats empties the tray")
+        // what a previous run left pasted goes at launch
+        _ = made("leftover.png", Files.pasteRoot)
+        Files.clearLeftovers()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Files.pasteRoot.path))
+    }
+
     func testAFailedSendKeepsTheFilesAndSwitchingChatsClearsThem() async {
         let fake = FakeClient(linked: true)
         fake.sendError = TestError(description: "too big")
@@ -239,5 +306,8 @@ final class PasteTests: XCTestCase {
         XCTAssertEqual(pasted.count, 1)
         XCTAssertEqual(pasted.first?.pathExtension, "png")
         XCTAssertNotNil(NSImage(contentsOf: try XCTUnwrap(pasted.first)))
+        XCTAssertEqual(
+            pasted.first?.deletingLastPathComponent().standardizedFileURL, Files.pasteRoot.standardizedFileURL)
+        try? FileManager.default.removeItem(at: try XCTUnwrap(pasted.first))
     }
 }
