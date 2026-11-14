@@ -13,7 +13,6 @@ use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
 use gpui_kit::component::input::{InputEditsEvent, InputEvent, InputState, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
-use gpui_kit::component::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, Message, TextStyle};
@@ -34,6 +33,7 @@ mod options;
 mod paging;
 mod previews;
 pub mod search;
+pub mod settings;
 mod view;
 
 /// How the phone lists this computer.
@@ -171,7 +171,24 @@ pub struct Hush {
     /// The open chat's events among its messages.
     events: events::Events,
     options: options::Options,
+    settings: settings::Settings,
+    /// The open core's events, handled; dropped with this state when it starts over, so an old
+    /// core's last ones never reach the new one.
+    listening: Task<()>,
 }
+
+/// This computer's data folder and keychain entry. Only the real window has them: made-up screens
+/// and window tests never touch the owner's data.
+#[derive(Clone)]
+struct Home {
+    folder: PathBuf,
+    /// The database key, made on first use.
+    key: fn() -> Result<String, String>,
+    /// Removes it, with the data it opened (unlinking).
+    forget_key: fn() -> Result<(), String>,
+}
+
+impl Global for Home {}
 
 /// The open core and the draft writes on their way, for `quit`.
 struct Core(Arc<Client>, drafts::Writer);
@@ -210,15 +227,13 @@ impl EventListener for Listener {
 }
 
 /// The core over this computer's data folder, and that folder.
-fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), String> {
-    let data_dir = dirs::data_local_dir()
-        .ok_or("this system has no folder for app data")?
-        .join(DATA_FOLDER);
+fn open(home: &Home, events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), String> {
+    let data_dir = home.folder.clone();
     let dir = data_dir
         .to_str()
         .ok_or("the data folder's path isn't valid text")?
         .to_owned();
-    let key = key::db_key()?;
+    let key = (home.key)()?;
     let client =
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
     // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
@@ -229,33 +244,15 @@ fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), St
 
 impl Hush {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Theme::sync_system_appearance(Some(window), cx);
-        cx.observe_window_appearance(window, |_, window, cx| Theme::sync_system_appearance(Some(window), cx))
-            .detach();
-        let app = Self::window(window, cx);
-
-        let (events, mut incoming) = unbounded();
-        cx.spawn(async move |this, cx| {
-            while let Some(event) = incoming.next().await {
-                if this.update(cx, |app, cx| app.handle(event, cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
-        // off the main thread: the keychain may ask, and the store opens on disk
-        let opening = cx.background_spawn(async move { open(events) });
-        cx.spawn(async move |this, cx| {
-            let client = opening.await;
-            this.update(cx, |app, cx| app.opened(client, cx))
-        })
-        .detach();
-        app
-    }
-
-    /// The window's state and controls, before any core.
-    fn window(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        if let Some(dir) = dirs::data_local_dir() {
+            cx.set_global(Home {
+                folder: dir.join(DATA_FOLDER),
+                key: key::db_key,
+                forget_key: key::forget,
+            });
+        }
+        settings::follow_appearance(window, cx);
+        // here, not with the state: starting over builds that again
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             this.mark_read(false, cx);
@@ -267,7 +264,45 @@ impl Hush {
             this.mark_read(false, cx);
         })
         .detach();
+        let mut app = Self::window(window, cx);
+        app.boot(false, cx);
+        app
+    }
 
+    /// Opens this computer's core, its old key removed first if `forget_key` (its data is gone).
+    fn boot(&mut self, forget_key: bool, cx: &mut Context<Self>) {
+        let Some(home) = cx.try_global::<Home>().cloned() else {
+            self.screen = Screen::Failed("this system has no folder for app data".into());
+            return;
+        };
+        let (events, mut incoming) = unbounded();
+        self.listening = cx.spawn(async move |this, cx| {
+            while let Some(event) = incoming.next().await {
+                if this.update(cx, |app, cx| app.handle(event, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // off the main thread: the keychain may ask, and the store opens on disk
+        let opening = cx.background_spawn(async move {
+            if forget_key {
+                // the old key opens nothing now: one left is used again, harmlessly
+                if let Err(e) = (home.forget_key)() {
+                    tracing::warn!(error = %e, "the old database key couldn't be removed");
+                }
+            }
+            open(&home, events)
+        });
+        cx.spawn(async move |this, cx| {
+            let client = opening.await;
+            this.update(cx, |app, cx| app.opened(client, cx))
+        })
+        .detach();
+    }
+
+    /// The window's state and controls, before any core.
+    fn window(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -365,6 +400,8 @@ impl Hush {
             previews: Default::default(),
             events: Default::default(),
             options: Default::default(),
+            settings: Default::default(),
+            listening: Task::ready(()),
         }
     }
 
@@ -436,6 +473,13 @@ impl Hush {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.demo_chats(screen, cx);
+            }
+            crate::Demo::Settings | crate::Demo::Unlinked => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.set_messages(crate::demo::messages(), cx);
+                app.demo_settings(matches!(screen, crate::Demo::Unlinked), window, cx);
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;

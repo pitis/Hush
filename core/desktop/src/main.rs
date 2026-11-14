@@ -32,7 +32,11 @@ fn main() {
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys(key_bindings());
             cx.set_menus([
-                Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
+                Menu::new("Hush").items([
+                    MenuItem::action("Settings…", app::settings::OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Hush", Quit),
+                ]),
                 Menu::new("Chats").items(chats_menu()),
             ]);
             cx.on_window_closed(|cx, _| app::quit(cx)).detach();
@@ -43,6 +47,7 @@ fn main() {
             app::search::shortcuts(window, hush.downgrade(), cx);
             app::attach::shortcut(window, hush.downgrade(), cx);
             app::navigate::shortcuts(window, hush.downgrade(), cx);
+            app::settings::shortcut(window, hush.downgrade(), cx);
             cx.activate(true);
         });
 }
@@ -54,6 +59,7 @@ fn key_bindings() -> Vec<KeyBinding> {
     all.extend(app::compose::keys());
     all.extend(app::attach::keys());
     all.extend(app::navigate::keys());
+    all.extend(app::settings::keys());
     all
 }
 
@@ -136,6 +142,10 @@ pub enum Demo {
     EditGroup,
     /// Members being added to it.
     AddMembers,
+    /// Settings over the chat, with our made-up profile.
+    Settings,
+    /// Removed on the phone: Link Again.
+    Unlinked,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -168,6 +178,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("group-info", Demo::GroupInfo),
                 ("edit-group", Demo::EditGroup),
                 ("add-members", Demo::AddMembers),
+                ("settings", Demo::Settings),
+                ("unlinked", Demo::Unlinked),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

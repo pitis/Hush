@@ -298,7 +298,8 @@ impl Hush {
                                     .flex_1(),
                             ),
                     )
-                    .children((!archive).then(|| self.render_new_chat(p, cx))),
+                    .children((!archive).then(|| self.render_new_chat(p, cx)))
+                    .child(self.render_settings_button(p, cx)),
             )
             .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
             .child(list)
@@ -1210,7 +1211,7 @@ pub(super) fn section(title: &'static str, p: Palette) -> Div {
         .child(title)
 }
 
-fn empty_state(symbol: &str, title: &'static str, detail: impl Into<SharedString>, p: Palette) -> Div {
+pub(super) fn empty_state(symbol: &str, title: &'static str, detail: impl Into<SharedString>, p: Palette) -> Div {
     let detail = detail.into();
     v_flex()
         .flex_1()
@@ -1260,18 +1261,12 @@ impl Render for Hush {
                 .items_stretch()
                 .child(self.render_sidebar(p, cx))
                 .child(self.render_chat(p, cx)),
-            Screen::Unlinked => v_flex().size_full().child(empty_state(
-                "smartphone",
-                "This computer is no longer linked",
-                format!(
-                    "It was removed from your phone's linked devices. Linking it again isn't in this version yet: quit Hush, delete the folder {}, and open Hush again.",
-                    self.data_dir.display()
-                ),
-                p,
-            )),
-            Screen::Failed(e) => v_flex()
-                .size_full()
-                .child(empty_state("octagon-alert", "Hush couldn't start", e.clone(), p)),
+            Screen::Unlinked => self.render_unlinked(p, cx),
+            Screen::Failed(e) => {
+                v_flex()
+                    .size_full()
+                    .child(empty_state("octagon-alert", "Hush couldn't start", e.clone(), p))
+            }
         };
         let history = match self.screen {
             Screen::Chats => self.history.map(|h| self.render_history(h, p, cx)),
@@ -1295,5 +1290,6 @@ impl Render for Hush {
             .children(history)
             .children(dialog)
             .children(group)
+            .children(self.render_settings(p, cx))
     }
 }
