@@ -34,6 +34,7 @@ mod options;
 mod paging;
 mod previews;
 pub mod search;
+mod typing;
 mod view;
 
 /// How the phone lists this computer.
@@ -171,6 +172,8 @@ pub struct Hush {
     /// The open chat's events among its messages.
     events: events::Events,
     options: options::Options,
+    /// Who is typing where, and where we are.
+    typing: typing::Typing,
 }
 
 /// The open core and the draft writes on their way, for `quit`.
@@ -283,6 +286,7 @@ impl Hush {
                     this.composer_empty = composer.read(cx).value().trim().is_empty();
                     this.composer_changed(cx);
                     this.keep_draft(cx);
+                    this.composer_typed();
                     cx.notify();
                 }
                 _ => {}
@@ -365,6 +369,7 @@ impl Hush {
             previews: Default::default(),
             events: Default::default(),
             options: Default::default(),
+            typing: Default::default(),
         }
     }
 
@@ -392,7 +397,8 @@ impl Hush {
             | crate::Demo::LinkPreview
             | crate::Demo::GroupInfo
             | crate::Demo::EditGroup
-            | crate::Demo::AddMembers => {
+            | crate::Demo::AddMembers
+            | crate::Demo::Typing => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -416,6 +422,9 @@ impl Hush {
                 }
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
+                }
+                if let crate::Demo::Typing = screen {
+                    app.demo_typing(cx);
                 }
                 match screen {
                     crate::Demo::GroupInfo => app.demo_group(None, window, cx),
@@ -567,7 +576,12 @@ impl Hush {
                 ..
             } => self.attachment_changed(&conversation_id, &message, cx),
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, calls, stories, notifications (a reaction shows with its
+            CoreEvent::Typing {
+                conversation_id,
+                who,
+                started,
+            } => self.typing_event(conversation_id, who, started, cx),
+            // not in this version: calls, stories, notifications (a reaction shows with its
             // message's `MessageChanged`)
             _ => return,
         }

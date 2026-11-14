@@ -136,6 +136,8 @@ pub enum Demo {
     EditGroup,
     /// Members being added to it.
     AddMembers,
+    /// The chat with someone typing in it, and in another chat.
+    Typing,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -168,6 +170,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("group-info", Demo::GroupInfo),
                 ("edit-group", Demo::EditGroup),
                 ("add-members", Demo::AddMembers),
+                ("typing", Demo::Typing),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

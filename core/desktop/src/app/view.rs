@@ -18,7 +18,7 @@ use sig_core::{ConnectionState, HistoryStage};
 
 use super::actions::{self, view::ActionCx};
 use super::options::{self, backed};
-use super::{events, files, join_step, matching, previews, Dialog, DialogKind, Hush, JoinStep, Screen};
+use super::{events, files, join_step, matching, previews, typing, Dialog, DialogKind, Hush, JoinStep, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -59,6 +59,8 @@ struct Row {
     events: Vec<events::Line>,
     /// The last row's only: what happened after it.
     after: Vec<events::Line>,
+    /// The last row's only: someone typing, after everything.
+    typing: Option<typing::Bubble>,
     /// Gone once its timer runs out: an hourglass by its time.
     disappears: bool,
     /// The chat has a wallpaper: what isn't in a bubble gets a backing.
@@ -138,6 +140,7 @@ impl Hush {
                 None => self.event_lines(c, i + 1, now),
                 Some(_) => vec![],
             },
+            typing: next.is_none().then(|| self.typing_bubble(c)).flatten(),
             disappears,
             backed: c.wallpaper.is_some(),
         })
@@ -516,7 +519,12 @@ impl Hush {
         let title = text::title(c, self.own_aci.as_deref());
         let selected = self.selected.as_deref() == Some(c.id.as_str());
         let draft = self.listed_draft(&c.id);
-        let line = text::preview(c, draft, &self.name(&c.last_message_author), |aci| self.name(aci));
+        // someone typing comes first (`ChatList.line`)
+        let typing = self.is_typing(&c.id);
+        let line = match typing {
+            true => typing::WORDS.to_string(),
+            false => text::preview(c, draft, &self.name(&c.last_message_author), |aci| self.name(aci)),
+        };
         // unless the line says what the chat is
         let drafted = draft.is_some() && line.starts_with(text::DRAFT);
         // the system's sidebar: the accent while the window is active, else grey
@@ -529,8 +537,8 @@ impl Hush {
         let unread = c.unread_count > 0 || c.marked_unread;
         let muted = c.mute_until > chrono::Utc::now().timestamp_millis();
         // the last message's, not shown under a draft
-        let tick =
-            (!drafted && c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted).then(|| {
+        let tick = (!drafted && !typing && c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted)
+            .then(|| {
                 let behind = if focused {
                     p.accent
                 } else if selected {
@@ -639,6 +647,7 @@ impl Hush {
                                             .min_w_0()
                                             .truncate()
                                             .text_color(if unread { fg } else { secondary })
+                                            .when(typing, Styled::italic)
                                             .child(shown),
                                     )
                                     .children(badge),
@@ -740,6 +749,8 @@ impl Hush {
         let out_fill = style::bubble_fill(c.chat_color.as_ref(), p.bubble_out);
         let title = text::title(c, self.own_aci.as_deref());
         let subtitle = match &self.connection {
+            // the most pressing first (`ConversationChrome.subtitle`)
+            _ if self.is_typing(&c.id) => typing::WORDS.to_string(),
             ConnectionState::Offline => "Offline".to_string(),
             ConnectionState::Connecting => "Connecting…".to_string(),
             _ if c.expire_timer > 0 => format!("Disappearing messages: {}", text::duration(c.expire_timer)),
@@ -1077,6 +1088,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
                 .map(|line| actions::view::with_menu(line, &row.actions, act)),
         )
         .children(events::render(&row.after, row.backed, this, p))
+        .children(row.typing.clone())
 }
 
 /// A day separator in the timeline ("Today").
