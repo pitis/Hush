@@ -36,6 +36,7 @@ mod paging;
 mod polls;
 mod previews;
 pub mod search;
+mod stories;
 mod typing;
 mod view;
 mod view_once;
@@ -179,6 +180,8 @@ pub struct Hush {
     polls: polls::Polls,
     /// View-once media's one look.
     view_once: view_once::ViewOnce,
+    /// The last day's stories, and their window.
+    stories: stories::Stories,
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
@@ -379,6 +382,7 @@ impl Hush {
             options: Default::default(),
             polls: Default::default(),
             view_once: Default::default(),
+            stories: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
         }
@@ -466,6 +470,13 @@ impl Hush {
                     app.demo_view_once(window, cx);
                 }
             }
+            crate::Demo::Stories(steps) => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.set_messages(crate::demo::messages(), cx);
+                app.demo_stories(steps, window, cx);
+            }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
@@ -509,6 +520,7 @@ impl Hush {
         // an unlinked core has no chats yet: its `Ready` after linking loads them
         if linked {
             self.refresh_chats(cx);
+            self.refresh_stories(cx);
         }
         cx.notify();
     }
@@ -558,6 +570,9 @@ impl Hush {
                 cx,
             ),
             CoreEvent::ChatEventAdded { conversation_id, kind } => self.event_added(conversation_id, *kind, cx),
+            // a chat blocked or accepted changes whose stories show too
+            CoreEvent::Ready | CoreEvent::ConversationsChanged | CoreEvent::StoriesChanged => self.refresh_stories(cx),
+            CoreEvent::AttachmentChanged { message, .. } => self.story_file_changed(message, cx),
             CoreEvent::Error { .. } => self.resets_failed(),
             _ => {}
         }
@@ -621,7 +636,7 @@ impl Hush {
             } => self.typing_event(conversation_id, who, started, cx),
             // their message is in: they stopped (not every app says so); it notified above
             CoreEvent::NewMessage { conversation_id, key } => self.typing_event(conversation_id, key.author, false, cx),
-            // not in this version: calls, stories (a reaction shows with its message's
+            // not in this version: calls (a reaction shows with its message's
             // `MessageChanged`; `NewReaction` notifies in the match above)
             _ => return,
         }
@@ -630,6 +645,7 @@ impl Hush {
             self.dialog = None;
             self.group = None;
             self.end_view_once(cx);
+            self.stories.close();
         }
         cx.notify();
     }

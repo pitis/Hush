@@ -299,7 +299,7 @@ impl Files {
         self.thumbs.contains_key(path)
     }
 
-    fn look(&self, a: &Attachment) -> Look {
+    pub(super) fn look(&self, a: &Attachment) -> Look {
         if is_image(a) {
             let path = ready_path(a);
             let thumb = path.as_ref().and_then(|path| self.thumbs.get(path));
@@ -475,11 +475,13 @@ impl Hush {
     /// Only the `loaded` messages' files stay, with what is shown of them: rows that went let
     /// their pictures' memory go (one still decoding isn't).
     pub(super) fn keep_files(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
+        // and the story shown over the chat
+        let story = self.current_story().and_then(|s| s.file.as_ref()).and_then(ready_path);
         let f = &mut self.files;
         f.by_message.retain(|k, _| loaded.contains(k));
         let files = f.by_message.values().flatten();
         let ids: HashSet<i64> = files.clone().map(|a| a.id).collect();
-        let paths: HashSet<String> = files.filter_map(ready_path).collect();
+        let paths: HashSet<String> = files.filter_map(ready_path).chain(story).collect();
         let gone = f.thumbs.extract_if(|path, _| !paths.contains(path));
         drop_thumbs(gone.map(|(_, thumb)| thumb).collect(), cx);
         f.drawn.get_mut().retain(|path, _| paths.contains(path));
@@ -604,10 +606,17 @@ impl Hush {
     /// decrypted copy under its own name in a folder of its own, made once. A program or a
     /// script is only saved.
     pub(super) fn open_file(&mut self, a: &Attachment, cx: &mut Context<Self>) {
+        if let Some(chat) = self.selected.clone() {
+            self.open_file_of(chat, a, cx);
+        }
+    }
+
+    /// `open_file`, for a file of chat `chat` (whose deletion takes its copy).
+    pub(super) fn open_file_of(&mut self, chat: String, a: &Attachment, cx: &mut Context<Self>) {
         if !openable(a) {
             return self.save_file(a, cx);
         }
-        let (Some(client), Some(path), Some(chat)) = (self.client.clone(), ready_path(a), self.selected.clone()) else {
+        let (Some(client), Some(path)) = (self.client.clone(), ready_path(a)) else {
             return;
         };
         let name = file_name(a);
@@ -693,6 +702,11 @@ impl Hush {
     /// A chat was deleted: its opened copies go.
     pub(super) fn drop_chat_copies(&mut self, chat: &str) {
         remove_copies(self.files.take_copies(|c| c.chat == chat));
+    }
+
+    /// Stories that left the list: their opened copies go.
+    pub(super) fn drop_story_copies(&mut self, gone: &HashSet<Key>) {
+        remove_copies(self.files.take_copies(|c| gone.contains(&c.message)));
     }
 
     /// Saves a decrypted copy of a downloaded file where the user picks.

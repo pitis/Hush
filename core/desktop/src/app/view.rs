@@ -314,7 +314,8 @@ impl Hush {
                                     .flex_1(),
                             ),
                     )
-                    .children((!archive).then(|| self.render_new_chat(p, cx))),
+                    .children((!archive).then(|| self.render_new_chat(p, cx)))
+                    .children(self.render_stories_button(p, cx).filter(|_| !archive)),
             )
             .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
             .child(list)
@@ -1327,6 +1328,7 @@ impl Render for Hush {
             .children(history)
             .children(dialog)
             .children(group)
+            .children(self.render_stories(p, cx))
             .children(self.render_view_once(p, cx))
     }
 }
