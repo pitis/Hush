@@ -20,6 +20,8 @@ use crate::send::{self, Job, SendJob};
 
 /// Signal's limit for attachments in one message.
 const MAX_ATTACHMENTS: usize = 32;
+/// Quitting never waits on the core longer (its own drain ends within about 3.5 s).
+const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The app's handle on the core. Cheap to call from any thread; Signal work happens on the core
 /// thread and reports back through the `EventListener`.
@@ -1096,15 +1098,21 @@ impl Client {
         self.drop_presage()
     }
 
-    /// Stops the core as the app quits, within a few seconds: what the open connection has read
+    /// Stops the core as the app quits, within `STOP_WITHIN`: what the open connection has read
     /// is handled first (the server counts it as delivered, so it never comes again). Nothing
     /// works after.
     pub async fn stop(&self) {
-        let (done, stopped) = tokio::sync::oneshot::channel();
-        if self.send(Command::Stop { done }).is_ok() {
-            let _ = stopped.await;
+        let stopping = async {
+            let (done, stopped) = tokio::sync::oneshot::channel();
+            if self.send(Command::Stop { done }).is_ok() {
+                let _ = stopped.await;
+            }
+            self.join_core("stopping").await;
+        };
+        // the core may be busy with a long command first (an unlink waits up to 15 s)
+        if tokio::time::timeout(STOP_WITHIN, stopping).await.is_err() {
+            tracing::error!("the core didn't stop in time: quitting anyway");
         }
-        self.join_core("stopping").await;
     }
 
     /// Writes a backup of every chat and file here to `path` (replaced), encrypted with
@@ -2253,6 +2261,12 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(client.stop());
+        let again = std::time::Instant::now();
+        rt.block_on(client.stop());
+        assert!(
+            again.elapsed() < Duration::from_secs(1),
+            "a second stop returns at once"
+        );
         assert!(matches!(client.start(), Err(CoreError::Closed)));
         assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
     }

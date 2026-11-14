@@ -813,9 +813,12 @@ async fn run(
                 let until = tokio::time::Instant::now() + STOPPING;
                 wake.stop(until);
                 if let Some(receiver) = receiver.take() {
-                    // a message still being handled at `until` gets a moment to finish
-                    if tokio::time::timeout_at(until + DRAIN / 2, receiver).await.is_err() {
-                        tracing::warn!("receiving didn't stop in time");
+                    // the message in hand when reading stops gets a moment to finish
+                    if tokio::time::timeout_at(until + FINISHING + DRAIN / 2, receiver)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("receiving didn't stop in time: a message being handled may have been cut off");
                     }
                 }
                 tracing::info!("the core stopped");
@@ -1952,11 +1955,13 @@ async fn receive_loop(
     let mut progress = Progress::default();
     // a pass fetching chats' pictures is under way
     let fetching_avatars = std::rc::Rc::new(std::cell::Cell::new(false));
+    // messages handled since quitting began
+    let mut handled_quitting = 0;
     loop {
-        if wake.stop.get().is_some() {
+        if !wake.connect() {
+            tracing::info!(handled = handled_quitting, "receiving stopped");
             return;
         }
-        wake.forget();
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Connecting,
         });
@@ -1990,7 +1995,7 @@ async fn receive_loop(
                     };
                     let Some(received) = received else { break };
                     let pictures = matches!(received, Received::QueueEmpty | Received::Contacts);
-                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
+                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues, &wake).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && progress.titles_synced;
                         *ready |= progress.titles_synced;
@@ -2010,8 +2015,9 @@ async fn receive_loop(
                     // The server already counts what this connection read as delivered: handle
                     // all of it before dropping the connection (it ends once nothing comes for
                     // a moment; a dead one has nothing more).
-                    while let Some(received) = drained(&mut stream, wake.stop.get()).await {
-                        handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
+                    while let Some(received) = drained(&mut stream, wake.until()).await {
+                        handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues, &wake).await;
+                        handled_quitting += usize::from(wake.until().is_some());
                     }
                     backoff = Duration::from_secs(1);
                     continue;
@@ -2053,6 +2059,10 @@ const DRAIN: Duration = Duration::from_secs(1);
 /// Quitting: the open connection is read (`DRAIN`) for at most this long, so quitting never hangs.
 const STOPPING: Duration = Duration::from_secs(2);
 
+/// Quitting: a message still being handled when reading stops gets this long for a group fetch
+/// (`sync_group`), and then half a `DRAIN` for the rest.
+const FINISHING: Duration = Duration::from_secs(1);
+
 /// While a connection is drained: its next message, or None once it is quiet for `DRAIN` or
 /// `until` (quitting) has passed.
 async fn drained<S: futures::Stream + Unpin>(stream: &mut S, until: Option<tokio::time::Instant>) -> Option<S::Item> {
@@ -2070,8 +2080,8 @@ async fn drained<S: futures::Stream + Unpin>(stream: &mut S, until: Option<tokio
 #[derive(Default)]
 struct Wake {
     notify: tokio::sync::Notify,
-    /// Quitting: receiving ends by then.
-    stop: Cell<Option<tokio::time::Instant>>,
+    /// Quitting: reading ends by then.
+    stop: watch::Sender<Option<tokio::time::Instant>>,
 }
 
 impl Wake {
@@ -2081,13 +2091,36 @@ impl Wake {
     }
 
     fn stop(&self, until: tokio::time::Instant) {
-        self.stop.set(Some(until));
+        self.stop.send_replace(Some(until));
         self.notify.notify_one();
     }
 
-    /// Drops a request made before a connect: that connect answers it, so it mustn't cut it short.
-    fn forget(&self) {
+    /// When reading ends, once quitting.
+    fn until(&self) -> Option<tokio::time::Instant> {
+        *self.stop.borrow()
+    }
+
+    /// Once quitting: when reading ends.
+    async fn stopping(&self) -> tokio::time::Instant {
+        // the sender lives in `self`, so the wait ends only once quitting
+        let until = self
+            .stop
+            .subscribe()
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|u| *u);
+        until.unwrap_or_else(tokio::time::Instant::now)
+    }
+
+    /// At each connect: false once quitting; otherwise a request made before is dropped (this
+    /// connect answers it, so it mustn't cut it short).
+    fn connect(&self) -> bool {
+        if self.until().is_some() {
+            return false;
+        }
         let _ = futures::FutureExt::now_or_never(self.notify.notified());
+        true
     }
 }
 
@@ -2138,6 +2171,7 @@ impl Progress {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     received: Received,
     m: &Manager<SqliteStore, Registered>,
@@ -2146,6 +2180,7 @@ async fn handle(
     progress: &mut Progress,
     l: &dyn EventListener,
     queues: &Queues,
+    wake: &Wake,
 ) {
     // Kinds, counts and ids only: never message content.
     match &received {
@@ -2172,12 +2207,9 @@ async fn handle(
         // their device asks us to resend or restart the session; Hush doesn't, so a reset is offered
         Received::RetryReceipt { sender, .. } => decryption_failed(db, l, sender, None).await,
         Received::Content(content) => {
-            sync_group(m, db, l, &mut progress.refetches, &content).await;
-            match drop_blocked(db, &content, me).await {
-                Ok(true) => {
-                    tracing::info!(kind = content_kind(&content.body), "dropped: blocked or not a member");
-                    return;
-                }
+            let unconfirmed = sync_group(m, db, l, &mut progress.refetches, wake, &content).await;
+            match drop_blocked(db, &content, me, unconfirmed).await {
+                Ok(true) => return,
                 Ok(false) => {}
                 // shown rather than dropped: losing a message is worse than showing a blocked one
                 Err(e) => l.on_event(CoreEvent::Error {
@@ -2219,8 +2251,9 @@ async fn handle(
 /// Whether content comes from a blocked person, or belongs to a blocked group or to a group
 /// the sender isn't a member of (messages, edits, typing, stories), so nothing should see it.
 /// A dropped message's copy in presage's store (saved before we see it) is queued for the
-/// sweep to delete. Our own devices are never blocked.
-async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<bool, sqlx::Error> {
+/// sweep to delete. Our own devices are never blocked, and a sender whose membership a failed
+/// fetch left `unconfirmed` (`sync_group`) isn't judged a non-member.
+async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str, unconfirmed: bool) -> Result<bool, sqlx::Error> {
     use presage::libsignal_service::content::ContentBody;
     let sender = &content.metadata.sender;
     if sender.raw_uuid().to_string() == me {
@@ -2236,11 +2269,23 @@ async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<
         ContentBody::StoryMessage(sm) => group_chat(sm.group.as_ref()),
         _ => None,
     };
+    let kind = content_kind(&content.body);
     let blocked = db.is_blocked(&direct_id(sender)).await?
         || match &group {
-            Some(g) => db.is_blocked(g).await? || outsider(db, g, sender).await?,
+            Some(g) => db.is_blocked(g).await?,
             None => false,
         };
+    // shown rather than dropped: losing a message is worse than showing a non-member's
+    let outsider = match &group {
+        Some(g) if !blocked && !unconfirmed => outsider(db, g, sender).await?,
+        _ => false,
+    };
+    if blocked {
+        tracing::info!(kind, "dropped: blocked");
+    } else if outsider {
+        tracing::warn!(kind, "dropped: its sender isn't a member of the group");
+    }
+    let blocked = blocked || outsider;
     if blocked && matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
         // still dropped if this fails: the copy only stays in presage's store
         let queued = match Thread::try_from(content) {
@@ -2489,42 +2534,51 @@ async fn list_invitation(
 /// Brings a group message's chat up to presage's group, so its sender is checked against
 /// current members. presage refreshes the group before handing us a message sent at a newer
 /// revision; if that refresh failed, or the sender isn't among its members, a group presage
-/// knows is fetched once more, though not for a blocked sender or group and at most every five
-/// minutes per group or sender (`Refetches`): the revision is whatever the sender wrote.
+/// knows is fetched once more (`refetched`), though not for a blocked sender or group: the
+/// revision is whatever the sender wrote. True if the sender isn't among the members and a
+/// failed fetch left that unconfirmed: their message is shown then (`drop_blocked`).
 async fn sync_group(
     m: &Manager<SqliteStore, Registered>,
     db: &ProjectionDb,
     l: &dyn EventListener,
     refetches: &mut Refetches,
+    wake: &Wake,
     content: &Content,
-) {
+) -> bool {
     let Ok(Thread::Group(key)) = Thread::try_from(content) else {
-        return;
+        return false;
     };
     let sent_at = sent_revision(&content.body);
     let sender = &content.metadata.sender;
     let own = &m.registration_data().service_ids;
+    let mut unconfirmed = false;
     let group = match m.store().group(key).await {
         Ok(Some(g)) => {
-            let fetch = match refetch_key(&g, key, sent_at, sender, own) {
-                Some(why) => {
-                    !(db.is_blocked(&direct_id(sender)).await.unwrap_or(true)
-                        || db.is_blocked(&group_id(&key)).await.unwrap_or(true))
-                        && refetches.allow(why, std::time::Instant::now())
-                }
-                None => false,
+            let why = match refetch_key(&g, key, sent_at, sender, own) {
+                Some(why) if !blocked_group_message(db, sender, &key).await => Some(why),
+                _ => None,
             };
-            if !fetch {
-                Ok(g)
-            } else {
-                match tokio::time::timeout(Duration::from_secs(10), m.clone().fetch_group(&key)).await {
-                    Ok(fetched) => fetched.map_err(|e| e.to_string()),
-                    Err(_) => Err("fetching it timed out".into()),
+            let fetch = async {
+                let mut m = m.clone();
+                tokio::select! {
+                    fetched = tokio::time::timeout(Duration::from_secs(10), m.fetch_group(&key)) => {
+                        match fetched {
+                            Ok(fetched) => fetched.map_err(|e| e.to_string()),
+                            Err(_) => Err("fetching it timed out".into()),
+                        }
+                    }
+                    // quitting: the rest of this message needs a moment too before the core ends
+                    _ = async { tokio::time::sleep_until(wake.stopping().await + FINISHING).await } => {
+                        Err("quitting cut fetching it short".into())
+                    }
                 }
-            }
+            };
+            let (group, unsure) = refetched(g, why, refetches, std::time::Instant::now(), fetch).await;
+            unconfirmed = unsure;
+            group
         }
         // presage couldn't fetch it as the message came: not ours to try again
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(e) => Err(e.to_string()),
     };
     let stored = match group {
@@ -2541,6 +2595,46 @@ async fn sync_group(
         Err(e) => l.on_event(CoreEvent::Error {
             message: format!("syncing a group failed: {e}"),
         }),
+    }
+    unconfirmed
+}
+
+/// Whether a group message's sender or its group is blocked; a failed check counts as blocked.
+async fn blocked_group_message(db: &ProjectionDb, sender: &ServiceId, key: &[u8; 32]) -> bool {
+    for id in [direct_id(sender), group_id(key)] {
+        match db.is_blocked(&id).await {
+            Ok(false) => {}
+            Ok(true) => return true,
+            Err(e) => {
+                tracing::warn!(error = %e, "checking whether a group message is blocked failed");
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// presage's group `g` for a message, fetched again (`fetch`) if `refetch_key` asks for it
+/// (`why`) and `Refetches` allows. Also whether the sender, missing from the group, may be a
+/// member all the same: a failed fetch couldn't confirm it.
+async fn refetched(
+    g: presage::model::groups::Group,
+    why: Option<RefetchKey>,
+    refetches: &mut Refetches,
+    now: std::time::Instant,
+    fetch: impl std::future::Future<Output = Result<presage::model::groups::Group, String>>,
+) -> (Result<presage::model::groups::Group, String>, bool) {
+    let Some(why) = why else { return (Ok(g), false) };
+    let stranger = why.1.is_some();
+    if !refetches.allow(why, now) {
+        return (Ok(g), stranger && refetches.failed_last(&why));
+    }
+    match fetch.await {
+        Ok(fresh) => (Ok(fresh), false),
+        Err(e) => {
+            refetches.failed(why, now);
+            (Err(e), stranger)
+        }
     }
 }
 
@@ -2565,24 +2659,33 @@ fn refetch_key(
 /// A group, or a sender in it.
 type RefetchKey = ([u8; 32], Option<presage::libsignal_service::prelude::Uuid>);
 
-/// When each group (or a sender in it) was last fetched again by `sync_group`.
+/// When each group (or a sender in it) may next be fetched again by `sync_group`, and whether
+/// its last fetch failed.
 #[derive(Default)]
-struct Refetches(std::collections::HashMap<RefetchKey, std::time::Instant>);
+struct Refetches(std::collections::HashMap<RefetchKey, (std::time::Instant, bool)>);
 
 impl Refetches {
     const EVERY: Duration = Duration::from_secs(5 * 60);
+    /// After a failed fetch.
+    const RETRY: Duration = Duration::from_secs(30);
 
     /// Whether the group may be fetched again at `now` for `key`; if so, counts it as fetched.
     fn allow(&mut self, key: RefetchKey, now: std::time::Instant) -> bool {
-        if self
-            .0
-            .get(&key)
-            .is_some_and(|last| now.duration_since(*last) < Self::EVERY)
-        {
+        if self.0.get(&key).is_some_and(|(next, _)| now < *next) {
             return false;
         }
-        self.0.insert(key, now);
+        self.0.insert(key, (now + Self::EVERY, false));
         true
+    }
+
+    /// The fetch `allow` let through failed: it may be tried again after `RETRY`.
+    fn failed(&mut self, key: RefetchKey, now: std::time::Instant) {
+        self.0.insert(key, (now + Self::RETRY, true));
+    }
+
+    /// Whether the last fetch for `key` failed.
+    fn failed_last(&self, key: &RefetchKey) -> bool {
+        self.0.get(key).is_some_and(|(_, failed)| *failed)
     }
 }
 
@@ -2875,12 +2978,46 @@ mod tests {
         assert!(super::pause(std::time::Duration::from_secs(5), &wake).await, "kept");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         wake.reconnect();
-        wake.forget();
+        assert!(wake.connect());
         assert!(
             !super::pause(std::time::Duration::from_secs(5), &wake).await,
             "dropped at a connect"
         );
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+    }
+
+    /// Quitting ends a wait at once, and no connect follows, however often the loop asks.
+    #[tokio::test(start_paused = true)]
+    async fn quitting_ends_the_wait_and_no_connect_follows() {
+        let wake = super::Wake::default();
+        let started = tokio::time::Instant::now();
+        wake.stop(started + super::STOPPING);
+        assert!(super::pause(std::time::Duration::from_secs(30), &wake).await);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!wake.connect());
+        assert!(!wake.connect(), "still quitting");
+        assert_eq!(wake.stopping().await, started + super::STOPPING);
+    }
+
+    /// Stop is answered (not just dropped with the thread), and the core thread ends, while the
+    /// commands channel is still open.
+    #[test]
+    fn stop_is_answered_and_ends_the_core_thread() {
+        let dir = std::env::temp_dir().join(format!("sig-core-stop-{}", std::process::id()));
+        let h = super::spawn(
+            dir.clone(),
+            "ab".repeat(32),
+            std::sync::Arc::new(Sink(std::sync::Mutex::new(vec![]))),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let (done, stopped) = oneshot::channel();
+        h.commands.send(Command::Stop { done }).unwrap();
+        assert!(stopped.blocking_recv().is_ok(), "answered");
+        h.thread.join().unwrap();
+        assert!(h.commands.send(Command::Start).is_err(), "nothing listens any more");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Quitting reads what the connection has already got (the server counts it as delivered)
@@ -2889,7 +3026,7 @@ mod tests {
     async fn quitting_drains_the_connection_by_a_deadline() {
         use futures::StreamExt;
         use std::time::Duration;
-        use tokio::time::{sleep, timeout, Instant};
+        use tokio::time::Instant;
         let started = Instant::now();
         let mut read = futures::stream::iter([1, 2, 3]).chain(futures::stream::pending());
         let mut handled = vec![];
@@ -2899,16 +3036,15 @@ mod tests {
         assert_eq!(handled, [1, 2, 3]);
         assert_eq!(started.elapsed(), super::DRAIN, "ended once quiet");
 
-        let started = Instant::now();
-        let mut endless = Box::pin(futures::stream::repeat(()).then(|()| sleep(Duration::from_millis(100))));
-        let drain = async {
-            while super::drained(&mut endless, Some(started + super::STOPPING))
-                .await
-                .is_some()
-            {}
-        };
-        assert!(timeout(Duration::from_secs(10), drain).await.is_ok(), "stopped");
-        assert!(started.elapsed() <= super::STOPPING);
+        // a message always ready: only the deadline ends the drain
+        let until = Instant::now() + super::STOPPING;
+        let mut ready = futures::stream::repeat(());
+        let mut handled = 0;
+        while handled < 1000 && super::drained(&mut ready, Some(until)).await.is_some() {
+            handled += 1;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        assert_eq!(handled, 20, "read for two seconds");
     }
 
     /// Each connection starts by catching up; it is live only once the server queue is drained.
@@ -3195,7 +3331,7 @@ mod tests {
         }
         let dropped = |c| {
             let db = &db;
-            async move { super::drop_blocked(db, &c, ME).await.unwrap() }
+            async move { super::drop_blocked(db, &c, ME, false).await.unwrap() }
         };
         assert!(dropped(content_from(ALICE, 100, text(100, None))).await);
         assert!(dropped(content_from(ALICE, 2, typing(None))).await);
@@ -3285,7 +3421,7 @@ mod tests {
         };
         let dropped = |c| {
             let db = &db;
-            async move { super::drop_blocked(db, &c, ME).await.unwrap() }
+            async move { super::drop_blocked(db, &c, ME, false).await.unwrap() }
         };
         assert!(dropped(content_from(MALLORY, 100, text(100, known))).await);
         let edit = ContentBody::EditMessage(presage::proto::EditMessage {
@@ -3327,6 +3463,11 @@ mod tests {
             dropped(content_from(MALLORY, 500, newer)).await,
             "a revision the sender claims doesn't turn the check off"
         );
+        let unconfirmed = content_from(MALLORY, 600, text(600, known));
+        assert!(
+            !super::drop_blocked(&db, &unconfirmed, ME, true).await.unwrap(),
+            "a failed fetch couldn't confirm it: shown"
+        );
         assert_eq!(
             db.presage_forget_queue().await.unwrap(),
             vec![(group.clone(), 100), (group.clone(), 101), (group, 500)],
@@ -3347,6 +3488,36 @@ mod tests {
             "another group"
         );
         assert!(refetches.allow(([1; 32], None), t + Duration::from_secs(301)));
+    }
+
+    /// A fetch that fails (offline, a server error, cut short by quitting) doesn't confirm that a
+    /// sender missing from a group isn't a member: their message is shown, and the group is
+    /// tried again after half a minute, not five; a fetch that works settles it.
+    #[tokio::test]
+    async fn a_failed_fetch_leaves_a_missing_sender_unconfirmed() {
+        use presage::libsignal_service::prelude::Uuid;
+        use std::time::{Duration, Instant};
+        let key = [7; 32];
+        let bob = (key, Some(Uuid::from_u128(0xb0b)));
+        let mut refetches = super::Refetches::default();
+        let t = Instant::now();
+        let failing = || async { Err("offline".to_string()) };
+        let working = || async { Ok(hikers(4)) };
+        let at = |secs| t + Duration::from_secs(secs);
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, t, failing()).await;
+        assert!(g.is_err() && unsure, "failed: unconfirmed");
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, at(10), working()).await;
+        assert_eq!(g.unwrap().revision, 3, "not fetched again at once");
+        assert!(unsure, "still unconfirmed");
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, at(31), working()).await;
+        assert_eq!(g.unwrap().revision, 4, "tried again");
+        assert!(!unsure);
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, at(60), failing()).await;
+        assert_eq!(g.unwrap().revision, 3, "not fetched again for five minutes");
+        assert!(!unsure, "confirmed by the last fetch");
+        let newer = (key, None);
+        let (g, unsure) = super::refetched(hikers(3), Some(newer), &mut refetches, t, failing()).await;
+        assert!(g.is_err() && !unsure, "a member's newer revision: nothing to confirm");
     }
 
     /// A sender the group doesn't list (added since presage last fetched it?) has it fetched
