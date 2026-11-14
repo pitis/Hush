@@ -127,7 +127,8 @@ impl Hush {
         open.is_some_and(|c| !answer_first(c)) && !self.actions.editing()
     }
 
-    /// The picker can open, and the composer have the keys after it: nothing is over the chat.
+    /// A picker (files or stickers) can open, and the composer have the keys after it: nothing is
+    /// over the chat.
     pub(super) fn can_attach(&self) -> bool {
         matches!(self.screen, Screen::Chats) && self.dialog.is_none() && self.group.is_none() && self.writable()
     }

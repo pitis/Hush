@@ -92,7 +92,7 @@ impl Hush {
         picker.filter(|p| p.generation == self.generation)
     }
 
-    /// The pictures the open picker shows: each pack's first (its tab) and its pack's.
+    /// The pictures the open picker shows: each pack's first (its tab) and the shown pack's.
     pub(super) fn picker_paths(&self) -> Vec<String> {
         let Some(picker) = self.open_picker() else {
             return vec![];
@@ -105,15 +105,20 @@ impl Hush {
         tabs.chain(pack).map(|s| s.path.clone()).collect()
     }
 
+    /// Reads the packs for the picker just opened; why they didn't come is said in it (the Mac app
+    /// only logs it), not in one opened since.
     fn load_sticker_packs(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
+        let (Some(client), Some(picker)) = (self.client.clone(), &self.stickers.picker) else {
+            return;
+        };
+        let field = picker.link.clone();
         cx.spawn(async move |this, cx| {
             let packs = Compat::new(client.sticker_packs()).await;
             let _ = this.update(cx, |app, cx| {
                 match packs {
                     Ok(packs) => app.stickers.packs = packs,
                     Err(e) => {
-                        if let Some(p) = &mut app.stickers.picker {
+                        if let Some(p) = app.stickers.picker.as_mut().filter(|p| p.link == field) {
                             p.problem = Some(format!("Couldn't load the sticker packs: {}", describe(&e)));
                         }
                     }
@@ -132,7 +137,7 @@ impl Hush {
     }
 
     /// Adds the pack the link names, then shows it (`StickerPicker.add`); why it couldn't is said
-    /// under the link.
+    /// under the link, or in the window if that picker is gone by then (an add can take minutes).
     fn add_sticker_pack(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         let Some(picker) = &mut self.stickers.picker else {
@@ -157,8 +162,14 @@ impl Hush {
                 if let Some(Ok(packs)) = &packs {
                     app.stickers.packs = packs.clone();
                 }
-                // closed meanwhile (and maybe opened again): only the packs change
-                let Some(picker) = app.stickers.picker.as_mut().filter(|p| p.link == field) else {
+                // closed meanwhile (or opened again, or another chat open): only the packs change,
+                // and a failure is said in the window
+                let shown = app.open_picker().is_some_and(|p| p.link == field);
+                let Some(picker) = app.stickers.picker.as_mut().filter(|_| shown) else {
+                    if let Err(e) = &added_pack {
+                        app.error = Some(format!("Couldn't add the sticker pack: {}", describe(e)));
+                        cx.notify();
+                    }
                     return;
                 };
                 picker.adding = false;
@@ -180,7 +191,7 @@ impl Hush {
 
     /// Sends a sticker to the open chat, as a reply if one is set (`AppStore.sendSticker`), once
     /// the picker closes. The core shows it at once as a pending message; a failure is said, and
-    /// the reply goes back into the composer.
+    /// the reply goes back into the composer if its chat is still open.
     fn send_sticker(&mut self, pack: String, sticker: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.close_stickers(window, cx);
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
@@ -290,6 +301,7 @@ mod window_tests {
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Context, Entity, TestAppContext, Window, WindowOptions};
 
     use super::super::attach::window_tests::with_core;
+    use super::super::files::Sticker;
     use super::super::Hush;
     use crate::Demo;
 
@@ -333,6 +345,7 @@ mod window_tests {
             app.reply(&theirs.expect("one of theirs"), window, cx);
             let pack = app.stickers.packs[0].id.clone();
             app.send_sticker(pack, 3, window, cx);
+            assert!(app.composer_bar().is_none(), "the reply goes with the sticker");
         });
         let (error, picker, bar) = hush.read_with(cx, |app, _| {
             let bar = app.composer_bar().map(|b| b.0);
@@ -341,7 +354,36 @@ mod window_tests {
         assert_eq!(error.as_deref(), Some("not linked to a phone"));
         assert!(!picker, "it closed to send");
         assert_eq!(bar, Some("reply"), "the reply is back");
+
+        // another chat open by the time it fails: the reply doesn't come back into that one
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.error = None;
+            let pack = app.stickers.packs[0].id.clone();
+            app.send_sticker(pack, 3, window, cx);
+            app.selected = Some("g:03".into());
+        });
+        let (error, bar) = hush.read_with(cx, |app, _| (app.error.clone(), app.composer_bar().is_some()));
+        assert_eq!(error.as_deref(), Some("not linked to a phone"));
+        assert!(!bar);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[gpui::test]
+    fn a_sticker_shows_its_picture_in_place_of_its_words_which_are_still_read_out(cx: &mut TestAppContext) {
+        let (_, hush, _) = open(Demo::Stickers, "rows", cx);
+        hush.read_with(cx, |app, _| {
+            let family = app.chats.iter().find(|c| c.id == "g:01").unwrap();
+            let now = chrono::Local::now();
+            let row = |i| app.row(family, i, now).expect("a row");
+            let anas = row(1);
+            assert!(anas.text.is_empty());
+            assert!(matches!(anas.sticker, Some(Sticker::Picture(Some(_)))));
+            assert!(anas.label.contains("🥳 Sticker message"), "{}", anas.label);
+            // not downloaded: its words, with the download
+            let bogdans = row(2);
+            assert_eq!(bogdans.text, "😎 Sticker message");
+            assert!(matches!(bogdans.sticker, Some(Sticker::Fetch(_))));
+        });
     }
 
     #[gpui::test]
@@ -370,6 +412,21 @@ mod window_tests {
         });
         assert!(!adding);
         assert_eq!(typed, link, "kept, to be fixed");
+
+        // closed and opened again before the answer: the new picker has its own say, and the
+        // failure is said in the window
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.add_sticker_pack(window, cx);
+            assert!(app.stickers.picker.as_ref().unwrap().adding, "one add at a time");
+            app.close_stickers(window, cx);
+            app.open_stickers(window, cx);
+        });
+        assert_eq!(problem(&hush, cx).as_deref(), Some(unlinked));
+        let error = hush.read_with(cx, |app, _| app.error.clone());
+        assert_eq!(
+            error.as_deref(),
+            Some("Couldn't add the sticker pack: not a sticker pack link")
+        );
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -387,17 +444,47 @@ mod window_tests {
     #[gpui::test]
     fn the_open_pickers_pictures_stay_as_messages_load_and_go_once_it_closes(cx: &mut TestAppContext) {
         let (window, hush, _) = open(Demo::StickerPicker, "pictures", cx);
-        let path = hush.read_with(cx, |app, _| app.stickers.packs[1].stickers[0].path.clone());
+        let paths = hush.read_with(cx, |app, _| {
+            let path = |pack: usize, i: usize| app.stickers.packs[pack].stickers[i].path.clone();
+            [path(0, 0), path(0, 4), path(1, 0), path(1, 4)]
+        });
+        // a message came, say: the messages load again
         let reload = |cx: &mut TestAppContext| {
             hush.update(cx, |app, cx| {
                 let messages = app.messages.clone();
                 app.set_messages(messages, cx);
             });
-            hush.read_with(cx, |app, _| app.files.has_picture(&path))
+            hush.read_with(cx, |app, _| paths.clone().map(|p| app.files.has_picture(&p)))
         };
-        // a message came, say: the messages load again
-        assert!(reload(cx), "a tab's picture stays");
+        // the shown pack's and each tab's stay; another pack's go
+        assert_eq!(reload(cx), [true, true, true, false]);
+        // another pack chosen: its stickers are the ones kept
+        let second = hush.read_with(cx, |app, _| app.stickers.packs[1].id.clone());
+        hush.update(cx, |app, cx| app.choose_pack(second, cx));
+        let kept = hush.read_with(cx, |app, _| app.picker_paths());
+        assert!(kept.contains(&paths[3]) && kept.contains(&paths[0]) && !kept.contains(&paths[1]));
         in_window(window, &hush, cx, |app, window, cx| app.close_stickers(window, cx));
-        assert!(!reload(cx));
+        assert_eq!(reload(cx), [false; 4]);
+        // open again, then another chat: it isn't over that one
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.open_stickers(window, cx);
+            app.select("g:03".into(), window, cx)
+        });
+        assert!(hush.read_with(cx, |app, _| app.picker_paths().is_empty()));
+    }
+
+    #[gpui::test]
+    fn the_open_picker_asks_for_the_pictures_it_hasnt(cx: &mut TestAppContext) {
+        let (window, hush, _) = open(Demo::StickerPicker, "asks", cx);
+        // closed, its pictures let go as the messages load again
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.close_stickers(window, cx);
+            let messages = app.messages.clone();
+            app.set_messages(messages, cx);
+        });
+        assert!(!hush.read_with(cx, |app, _| app.files.wants_pictures()));
+        in_window(window, &hush, cx, |app, window, cx| app.open_stickers(window, cx));
+        // drawn, with no core to read them: they wait to be decoded
+        assert!(hush.read_with(cx, |app, _| app.files.wants_pictures()));
     }
 }

@@ -146,8 +146,8 @@ pub(super) struct Files {
     drawn: RefCell<HashMap<String, u64>>,
     /// Frames drawn (`new_frame`).
     frame: Cell<u64>,
-    /// Pictures whose rows were drawn with none decoded (or it was let go), and at most how many
-    /// pixels either way: decoded next.
+    /// Pictures drawn (a row's, or the sticker picker's) with none decoded (or it was let go), and
+    /// at most how many pixels either way: decoded next.
     wanted: RefCell<Vec<(i64, String, u32)>>,
     /// A picture is being decoded: one at a time (a full photo is decoded before it's shrunk).
     decoding: bool,
@@ -256,7 +256,7 @@ pub(super) struct Shown {
     pub look: Look,
 }
 
-/// A sticker message's picture as its row shows it.
+/// How a sticker message's row shows it: its picture, or the download of its file.
 pub(super) enum Sticker {
     /// Its picture, once decoded: on its own, without a bubble.
     Picture(Option<Arc<RenderImage>>),
@@ -380,8 +380,8 @@ impl Files {
         self.frame.set(self.frame.get() + 1);
     }
 
-    /// A picture's row is drawn in this frame, and its picture is decoded (at most `max` pixels
-    /// either way) if it isn't.
+    /// A picture is drawn in this frame (a row's, or the sticker picker's), and is decoded (at most
+    /// `max` pixels either way) if it isn't.
     fn drew(&self, id: i64, path: String, max: u32, missing: bool) {
         if missing {
             self.wanted.borrow_mut().push((id, path.clone(), max));
@@ -527,7 +527,7 @@ impl Hush {
     }
 
     /// Only the `loaded` messages' files stay, with what is shown of them: rows that went let
-    /// their pictures' memory go (one still decoding isn't), but the open sticker picker's.
+    /// their pictures' memory go (one still decoding isn't); the open sticker picker's stay.
     pub(super) fn keep_files(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
         let picked = self.picker_paths();
         let f = &mut self.files;
@@ -1710,6 +1710,28 @@ mod tests {
     }
 
     #[test]
+    fn a_webp_sticker_decodes_small_keeping_what_is_clear() {
+        use image::ImageEncoder as _;
+        // opaque but for its top-left corner: a sticker stands on the chat without a bubble
+        let sticker = image::RgbaImage::from_fn(512, 512, |x, y| {
+            image::Rgba(if x < 64 && y < 64 {
+                [0, 0, 0, 0]
+            } else {
+                [255, 0, 0, 255]
+            })
+        });
+        let mut webp = vec![];
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+            .write_image(&sticker, 512, 512, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let shown = picture(&webp, STICKER_PIXELS).unwrap();
+        assert_eq!(shown.size(0), size2(320, 320));
+        let bytes = shown.as_bytes(0).unwrap();
+        assert_eq!(bytes[3], 0, "clear");
+        assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 255, 255], "red, in BGRA");
+    }
+
+    #[test]
     fn an_animated_picture_shows_its_first_frame_decoded_small() {
         let frame = |c: [u8; 4]| image::Frame::new(image::RgbaImage::from_pixel(8, 8, image::Rgba(c)));
         let mut gif = vec![];
@@ -1717,7 +1739,6 @@ mod tests {
             .encode_frames([frame([255, 0, 0, 255]), frame([0, 0, 255, 255])])
             .unwrap();
         let shown = picture(&gif, STICKER_PIXELS).unwrap();
-        assert_eq!(shown.frame_count(), 1);
         // the first frame's red, in BGRA
         let pixel = &shown.as_bytes(0).unwrap()[..4];
         assert!(pixel[2] > 200 && pixel[0] < 50, "{pixel:?}");

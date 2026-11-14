@@ -620,7 +620,7 @@ pub fn sticker_packs() -> Vec<StickerPackInfo> {
     ]
 }
 
-/// The colour of sticker `i` of a pack.
+/// Made-up sticker colour `i`, of eight, round again past the last.
 pub fn sticker_colour(i: usize) -> [u8; 3] {
     const COLOURS: [[u8; 3]; 8] = [
         [255, 196, 0],
@@ -654,8 +654,8 @@ pub fn sticker(colour: [u8; 3]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// Stickers sent in the Family group, the newest: Ana's, Bogdan's (not downloaded yet) and ours;
-/// and their files.
+/// The Family group's newest: Ana's "Table booked!", then stickers: hers, Bogdan's (not
+/// downloaded yet) and ours; and their files.
 pub fn sticker_messages() -> (Vec<Message>, Vec<Attachment>) {
     let sticker = |author: &str, ago: i64, emoji: &str| {
         let mut m = message(author, ago, "");

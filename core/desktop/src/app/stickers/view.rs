@@ -1,4 +1,5 @@
-//! The sticker picker, over "+" (`StickerPicker`'s 340×360).
+//! The sticker picker, over "+": `StickerPicker`'s 340×360, its 316×336 inside the popover's
+//! 12-point padding.
 
 use std::sync::Arc;
 
@@ -56,10 +57,21 @@ impl Hush {
                     .text_color(p.secondary),
             ),
             Some(pack) => {
-                let tabs = packs.iter().enumerate().map(|(i, each)| {
+                // the last asked for decodes first: the tabs, then the stickers from the top
+                let mut pictures: Vec<_> = (pack.stickers.iter().rev())
+                    .map(|s| self.files.picture_at(&s.path, PICKER_PIXELS))
+                    .collect();
+                let mut firsts: Vec<_> = (packs.iter().rev())
+                    .map(|p| {
+                        p.stickers
+                            .first()
+                            .and_then(|s| self.files.picture_at(&s.path, PICKER_PIXELS))
+                    })
+                    .collect();
+                pictures.reverse();
+                firsts.reverse();
+                let tabs = packs.iter().zip(firsts).enumerate().map(|(i, (each, picture))| {
                     let chosen = each.id == pack.id;
-                    let first = each.stickers.first();
-                    let picture = first.and_then(|s| self.files.picture_at(&s.path, PICKER_PIXELS));
                     let id = each.id.clone();
                     div()
                         .id(("sticker-pack", i))
@@ -74,8 +86,7 @@ impl Hush {
                         .child(sticker(picture, 28.))
                         .on_click(cx.listener(move |this, _, _, cx| this.choose_pack(id.clone(), cx)))
                 });
-                let cells = pack.stickers.iter().map(|s| {
-                    let picture = self.files.picture_at(&s.path, PICKER_PIXELS);
+                let cells = pack.stickers.iter().zip(pictures).map(|(s, picture)| {
                     let name = s.emoji.as_ref().map_or("Sticker".into(), |e| format!("Sticker {e}"));
                     let (pack, id) = (pack.id.clone(), s.id);
                     div()

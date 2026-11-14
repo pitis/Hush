@@ -40,15 +40,16 @@ pub(super) struct Row {
     /// Above the first of a run in a group: the sender's name, in their colour.
     sender: Option<(String, Hsla)>,
     gutter: Gutter,
-    text: String,
+    pub(super) text: String,
     /// Its styles (`text::styled`).
     runs: text::Runs,
     /// Deleted: said in italics.
     note: bool,
     /// Above the text, which is empty without a caption.
     files: Vec<files::Shown>,
-    /// A sticker's picture, in place of its words and its bubble.
-    sticker: Option<files::Sticker>,
+    /// A sticker message's picture, in place of its words and its bubble; or, not downloaded,
+    /// its download beside its words.
+    pub(super) sticker: Option<files::Sticker>,
     /// Under the files.
     preview: Option<previews::Card>,
     // a poll's card or view-once media's button, in place of its words
@@ -58,7 +59,7 @@ pub(super) struct Row {
     time: String,
     status: Option<MessageStatus>,
     /// What assistive technology reads: who, what, when.
-    label: String,
+    pub(super) label: String,
     actions: Rc<actions::RowActions>,
     /// Just opened from the search: outlined for a moment.
     found: bool,
@@ -1004,7 +1005,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         .child(row.time.clone())
         .children(row.status.map(|s| match s {
             MessageStatus::Failed => actions::view::retry(&row.actions, act, p),
-            s => tick(s, 10., meta_color, p.bubble_out, p),
+            s => tick(s, 10., meta_color, behind, p),
         }));
     let line = h_flex()
         .max_w_full()
