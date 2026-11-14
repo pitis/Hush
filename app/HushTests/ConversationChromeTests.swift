@@ -59,18 +59,25 @@ final class MessageRowTests: XCTestCase {
             context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
     }
 
-    private static func find(in view: NSView) -> NSTextField? {
-        if let v = view as? NSTextField { return v }
+    /// A text field, or from macOS 27 selectable text's own view (static text to accessibility).
+    private static func find(in view: NSView) -> NSView? {
+        if view is NSTextField || view.accessibilityRole() == .staticText { return view }
         return view.subviews.lazy.compactMap { find(in: $0) }.first
     }
 
-    /// The first text field in the view, clicked into as a click does: shown in the window's field
-    /// editor, the field its delegate. Its middle, in the window.
-    private func clickInto(_ hosting: NSView) throws -> (editor: NSTextView, point: NSPoint) {
+    /// The first text in the view, clicked into as a click does: a text field shows in the window's
+    /// field editor, the field its delegate; other text takes the click itself. The view showing it,
+    /// and its middle, in the window.
+    private func clickInto(_ hosting: NSView) throws -> (view: NSView, point: NSPoint) {
         let text = try XCTUnwrap(Self.find(in: hosting))
-        let editor = try XCTUnwrap(window.fieldEditor(true, for: text) as? NSTextView)
-        text.cell!.select(withFrame: text.bounds, in: text, editor: editor, delegate: text, start: 0, length: 0)
-        return (editor, text.convert(NSPoint(x: text.bounds.midX, y: text.bounds.midY), to: nil))
+        let point = text.convert(NSPoint(x: text.bounds.midX, y: text.bounds.midY), to: nil)
+        guard let field = text as? NSTextField else {
+            window.makeFirstResponder(text)
+            return (text, point)
+        }
+        let editor = try XCTUnwrap(window.fieldEditor(true, for: field) as? NSTextView)
+        field.cell!.select(withFrame: field.bounds, in: field, editor: editor, delegate: field, start: 0, length: 0)
+        return (editor, point)
     }
 
     private static func isMessageMenu(_ menu: NSMenu?) -> Bool {
@@ -86,13 +93,28 @@ final class MessageRowTests: XCTestCase {
     }
 
     func testRightClickOnTextClickedIntoShowsTheMessageMenu() throws {
-        let (editor, point) = try clickInto(host(row()))
-        // the field editor's own menu: Look Up, Translate…
-        XCTAssertFalse(Self.isMessageMenu(editor.menu(for: click(at: point))))
+        let (text, point) = try clickInto(host(row()))
+        // the text's own menu: Look Up, Translate… (from macOS 27 Cut, Copy, Paste…)
+        XCTAssertFalse(Self.isMessageMenu(text.menu(for: click(at: point))))
         XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(click(at: point))?.menu))
         XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(click(.leftMouseDown, at: point, .control))?.menu))
         // a plain click selects as before
         XCTAssertNil(TimelineList.menuAround(click(.leftMouseDown, at: point)))
+    }
+
+    func testRightClickOnALabelClickedIntoShowsTheMenuAround() throws {
+        // selectable text on macOS 26 is one; from 27 any AppKit label still is
+        let (_, point) = try clickInto(host(Label().contextMenu { Button("Reply") {} }))
+        XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(click(at: point))?.menu))
+    }
+
+    private struct Label: NSViewRepresentable {
+        func makeNSView(context: Context) -> NSTextField {
+            let label = NSTextField(labelWithString: "hi")
+            label.isSelectable = true
+            return label
+        }
+        func updateNSView(_ label: NSTextField, context: Context) {}
     }
 
     func testEditableTextKeepsItsOwnMenu() throws {
