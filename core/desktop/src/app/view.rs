@@ -1,11 +1,12 @@
 //! What the window draws: the Mac app's components (`DESIGN.md`, its views' sizes), in GPUI.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Escape, Input, MoveDown, MoveUp};
+use gpui_kit::component::input::{Escape, Input, InputState, MoveDown, MoveUp};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
@@ -344,54 +345,11 @@ impl Hush {
             },
         };
         let body = match &d.kind {
-            DialogKind::Group(chosen) => {
-                let filter = d.search.as_ref().map(|s| s.read(cx).value().to_string());
-                // shortcut: names only; the Mac app's picker shows each one's picture too, add
-                // it when the checkbox takes more than a label
-                let people: Vec<_> = matching(&self.contacts, filter.as_deref().unwrap_or_default())
-                    .enumerate()
-                    .map(|(ix, (aci, name))| {
-                        let aci = aci.clone();
-                        let this = cx.entity().downgrade();
-                        Checkbox::new(("member", ix))
-                            .label(name.clone())
-                            .checked(chosen.contains(&aci))
-                            .on_click(move |_, _, cx| {
-                                let _ = this.update(cx, |app, cx| app.toggle_member(aci.clone(), cx));
-                            })
-                    })
-                    .collect();
-                let list = if people.is_empty() {
-                    let no_one = if self.contacts.is_empty() {
-                        "No one to add yet; members can be added later."
-                    } else {
-                        "No one matches."
-                    };
-                    label("no-one", Role::Label, no_one)
-                        .text_size(px(12.))
-                        .text_color(p.secondary)
-                } else {
-                    v_flex()
-                        .id("members")
-                        .role(Role::List)
-                        .aria_label("Members")
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .gap(px(6.))
-                        .children(people)
-                };
-                Some(
-                    v_flex()
-                        .gap(px(12.))
-                        .children(
-                            d.search
-                                .as_ref()
-                                .map(|s| field(Input::new(s).appearance(false).aria_label("Search").w_full(), p)),
-                        )
-                        .child(list)
-                        .into_any_element(),
-                )
-            }
+            DialogKind::Group(chosen) => d.search.as_ref().map(|search| {
+                let no_one = "No one to add yet; members can be added later.";
+                self.people(&self.contacts, chosen, search, no_one, Hush::toggle_member, cx)
+                    .into_any_element()
+            }),
             DialogKind::Join(Some(g)) => {
                 let members = match g.member_count {
                     1 => "1 member".to_string(),
@@ -439,78 +397,119 @@ impl Hush {
             }
             _ => None,
         };
-        // the chats behind don't take clicks while it's open
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(black().opacity(0.35))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                v_flex()
-                    .id("dialog")
-                    .role(Role::Dialog)
-                    .aria_label(title)
-                    .w(px(380.))
-                    .p(px(20.))
-                    .gap(px(12.))
-                    .rounded(px(12.))
-                    .bg(p.window)
-                    .border_1()
-                    .border_color(p.separator)
-                    .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                        if e.keystroke.key == "escape" {
-                            this.close_dialog(cx);
-                        }
-                    }))
-                    .child(
-                        label("dialog-title", Role::Heading, title)
-                            .aria_level(1)
-                            .text_size(px(17.))
-                            .font_weight(FontWeight::SEMIBOLD),
-                    )
-                    .children(detail.map(|d| {
-                        label("dialog-detail", Role::Label, d)
-                            .text_size(px(12.))
-                            .text_color(p.secondary)
-                    }))
-                    .child(field(
-                        Input::new(&d.field)
-                            .appearance(false)
-                            .aria_label(title)
-                            .disabled(d.busy)
-                            .w_full(),
-                        p,
-                    ))
-                    .children(body)
-                    .children(d.problem.clone().map(|why| {
-                        label("dialog-problem", Role::Alert, why)
-                            .text_size(px(12.))
-                            .text_color(p.danger)
-                    }))
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .when(d.busy, |this| this.child(Spinner::new().xsmall()))
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("dialog-cancel")
-                                    .label("Cancel")
-                                    .disabled(d.busy)
-                                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
-                            )
-                            .child(
-                                Button::new("dialog-primary")
-                                    .primary()
-                                    .label(primary)
-                                    .disabled(d.busy || !asked)
-                                    .on_click(cx.listener(|this, _, window, cx| this.submit_dialog(window, cx))),
-                            ),
-                    )
-                    .focus_trap("dialog", &d.focus),
-            )
+        modal(
+            card(p)
+                .id("dialog")
+                .role(Role::Dialog)
+                .aria_label(title)
+                .w(px(380.))
+                .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                    if e.keystroke.key == "escape" {
+                        this.close_dialog(cx);
+                    }
+                }))
+                .child(
+                    label("dialog-title", Role::Heading, title)
+                        .aria_level(1)
+                        .text_size(px(17.))
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .children(detail.map(|d| {
+                    label("dialog-detail", Role::Label, d)
+                        .text_size(px(12.))
+                        .text_color(p.secondary)
+                }))
+                .child(field(
+                    Input::new(&d.field)
+                        .appearance(false)
+                        .aria_label(title)
+                        .disabled(d.busy)
+                        .w_full(),
+                    p,
+                ))
+                .children(body)
+                .children(d.problem.clone().map(|why| {
+                    label("dialog-problem", Role::Alert, why)
+                        .text_size(px(12.))
+                        .text_color(p.danger)
+                }))
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .when(d.busy, |this| this.child(Spinner::new().xsmall()))
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("dialog-cancel")
+                                .label("Cancel")
+                                .disabled(d.busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+                        )
+                        .child(
+                            Button::new("dialog-primary")
+                                .primary()
+                                .label(primary)
+                                .disabled(d.busy || !asked)
+                                .on_click(cx.listener(|this, _, window, cx| this.submit_dialog(window, cx))),
+                        ),
+                )
+                .focus_trap("dialog", &d.focus),
+        )
+    }
+
+    /// People to tick, with a search over their names (`PeoplePicker`); `no_one` says there's no
+    /// one to pick at all.
+    pub(super) fn people(
+        &self,
+        candidates: &[(String, String)],
+        chosen: &HashSet<String>,
+        search: &Entity<InputState>,
+        no_one: &'static str,
+        toggle: fn(&mut Hush, String, &mut Context<Hush>),
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let p = style::palette(cx);
+        let filter = search.read(cx).value().to_string();
+        // shortcut: names only; the Mac app's picker shows each one's picture too, add it when the
+        // checkbox takes more than a label
+        let people: Vec<_> = matching(candidates, &filter)
+            .enumerate()
+            .map(|(ix, (aci, name))| {
+                let aci = aci.clone();
+                let this = cx.entity().downgrade();
+                Checkbox::new(("member", ix))
+                    .label(name.clone())
+                    .checked(chosen.contains(&aci))
+                    .on_click(move |_, _, cx| {
+                        let _ = this.update(cx, |app, cx| toggle(app, aci.clone(), cx));
+                    })
+            })
+            .collect();
+        let list = if people.is_empty() {
+            let no_one = if candidates.is_empty() {
+                no_one
+            } else {
+                "No one matches."
+            };
+            label("no-one", Role::Label, no_one)
+                .text_size(px(12.))
+                .text_color(p.secondary)
+        } else {
+            v_flex()
+                .id("members")
+                .role(Role::List)
+                .aria_label("Members")
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .gap(px(6.))
+                .children(people)
+        };
+        v_flex()
+            .gap(px(12.))
+            .child(field(
+                Input::new(search).appearance(false).aria_label("Search").w_full(),
+                p,
+            ))
+            .child(list)
     }
 
     fn render_chat_row(&self, ix: usize, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -769,28 +768,33 @@ impl Hush {
             // the chat leave the composer's focus alone
             .child(div().track_focus(self.actions.focus()))
             .child(
-                v_flex()
+                h_flex()
                     .h(px(TOOLBAR))
                     .flex_none()
-                    .justify_center()
-                    .px(px(16.))
-                    .relative()
-                    .pr(px(52.))
-                    .window_control_area(WindowControlArea::Drag)
+                    .pr(px(10.))
                     .child(
-                        label("chat-title", Role::Heading, title)
-                            .aria_level(2)
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::BOLD)
-                            .truncate(),
+                        v_flex()
+                            .h_full()
+                            .flex_1()
+                            .min_w_0()
+                            .justify_center()
+                            .px(px(16.))
+                            .window_control_area(WindowControlArea::Drag)
+                            .child(
+                                label("chat-title", Role::Heading, title)
+                                    .aria_level(2)
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .truncate(),
+                            )
+                            .when(!subtitle.is_empty(), |this| {
+                                this.child(
+                                    label("chat-subtitle", Role::Label, subtitle)
+                                        .text_size(px(11.))
+                                        .text_color(p.secondary),
+                                )
+                            }),
                     )
-                    .when(!subtitle.is_empty(), |this| {
-                        this.child(
-                            label("chat-subtitle", Role::Label, subtitle)
-                                .text_size(px(11.))
-                                .text_color(p.secondary),
-                        )
-                    })
                     .child(self.render_options(c, p, cx)),
             )
             .child(
@@ -1157,8 +1161,32 @@ pub(super) fn icon(name: &str, size: f32, color: Hsla) -> Icon {
         .text_color(color)
 }
 
+/// A dialog over the window: the chats behind don't take clicks while it's open.
+pub(super) fn modal(dialog: impl IntoElement) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(black().opacity(0.35))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(dialog)
+}
+
+/// A dialog's card, as the Mac app's sheets.
+pub(super) fn card(p: Palette) -> Div {
+    v_flex()
+        .p(px(20.))
+        .gap(px(12.))
+        .rounded(px(12.))
+        .bg(p.window)
+        .border_1()
+        .border_color(p.separator)
+}
+
 /// A dialog's text field, in its box.
-fn field(input: Input, p: Palette) -> Div {
+pub(super) fn field(input: Input, p: Palette) -> Div {
     div()
         .h(px(28.))
         .px(px(8.))
@@ -1253,6 +1281,10 @@ impl Render for Hush {
             Screen::Chats => self.dialog.as_ref().map(|d| self.render_dialog(d, p, cx)),
             _ => None,
         };
+        let group = match self.screen {
+            Screen::Chats => self.render_group_info(p, cx),
+            _ => vec![],
+        };
         div()
             .relative()
             .size_full()
@@ -1262,5 +1294,6 @@ impl Render for Hush {
             .child(screen)
             .children(history)
             .children(dialog)
+            .children(group)
     }
 }

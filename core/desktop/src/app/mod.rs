@@ -28,6 +28,7 @@ pub mod compose;
 mod drafts;
 mod events;
 mod files;
+mod group;
 pub mod navigate;
 mod options;
 mod paging;
@@ -153,6 +154,8 @@ pub struct Hush {
     /// Who a new group can have, by name: (ACI, name).
     contacts: Vec<(String, String)>,
     dialog: Option<Dialog>,
+    /// The Group Info panel, over the window.
+    group: Option<group::Panel>,
     /// A join request is being withdrawn, or an invitation answered.
     answering: bool,
     /// The archive, and the chat changes on their way.
@@ -352,6 +355,7 @@ impl Hush {
             timeline,
             contacts: vec![],
             dialog: None,
+            group: None,
             answering: false,
             chat_actions: Default::default(),
             actions: actions::Actions::new(window, cx),
@@ -385,7 +389,10 @@ impl Hush {
             | crate::Demo::Search
             | crate::Demo::SearchInChat
             | crate::Demo::History
-            | crate::Demo::LinkPreview => {
+            | crate::Demo::LinkPreview
+            | crate::Demo::GroupInfo
+            | crate::Demo::EditGroup
+            | crate::Demo::AddMembers => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -409,6 +416,12 @@ impl Hush {
                 }
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
+                }
+                match screen {
+                    crate::Demo::GroupInfo => app.demo_group(None, window, cx),
+                    crate::Demo::EditGroup => app.demo_group(Some(true), window, cx),
+                    crate::Demo::AddMembers => app.demo_group(Some(false), window, cx),
+                    _ => {}
                 }
             }
             crate::Demo::Events | crate::Demo::ChatStyle => {
@@ -561,6 +574,7 @@ impl Hush {
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
         if !matches!(self.screen, Screen::Chats) {
             self.dialog = None;
+            self.group = None;
         }
         cx.notify();
     }
@@ -613,6 +627,8 @@ impl Hush {
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
+        // any change stored reloads the chats: the open group may have changed, read it again
+        self.read_group(cx);
     }
 
     /// The chat list's pictures not asked for yet (a new picture is a new file).

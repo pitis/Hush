@@ -1,6 +1,6 @@
-//! The open chat's options (the Mac app's Chat Options menu, `ConversationChrome`): its
-//! disappearing-message timer, and its colour and wallpaper (`ChatStylePicker`), which are this
-//! computer's only.
+//! The open chat's options (the Mac app's Chat Options menu, `ConversationChrome`): a direct
+//! chat's disappearing-message timer (a group's is in Group Info), its colour and wallpaper
+//! (`ChatStylePicker`), which are this computer's only, and a group's info.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -9,6 +9,7 @@ use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{ChatColor, Conversation, ConversationKind};
+use sig_core::GroupChange;
 
 use super::actions::view::Trigger;
 use super::view::icon;
@@ -29,16 +30,17 @@ pub(super) struct Options {
 type SetStyle = fn(&mut Hush, String, Option<ChatColor>, &mut Context<Hush>);
 
 impl Hush {
-    /// The Chat Options menu, at the toolbar's right, and the colour and wallpaper picker, which
-    /// shows under it.
+    /// The Chat Options menu (ⓘ), at the toolbar's right, and the colour and wallpaper picker,
+    /// which shows under it.
     pub(super) fn render_options(&self, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Div {
         let this = cx.entity().downgrade();
         let (id, current, timer) = (c.id.clone(), c.expire_timer, can_set_timer(c));
+        let group = c.kind == ConversationKind::Group;
         let menu = {
             let this = this.clone();
             Button::new("chat-options")
                 .ghost()
-                .icon(icon("info", 15., p.secondary))
+                .icon(icon("info", 16., p.secondary))
                 .accessibility_label("Chat Options")
                 .tooltip("Chat options")
                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
@@ -50,12 +52,8 @@ impl Hush {
                                     let (this, id) = (this.clone(), id.clone());
                                     let item = PopupMenuItem::new(timer_choice(seconds))
                                         .checked(seconds == current)
-                                        // the one set again would be sent again, and shown to both
-                                        .when(seconds != current, |item| {
-                                            item.on_click(move |_, _, cx| {
-                                                let _ =
-                                                    this.update(cx, |app, cx| app.set_timer(id.clone(), seconds, cx));
-                                            })
+                                        .on_click(move |_, _, cx| {
+                                            let _ = this.update(cx, |app, cx| app.set_timer(id.clone(), seconds, cx));
                                         });
                                     menu = menu.item(item);
                                 }
@@ -64,15 +62,22 @@ impl Hush {
                         }
                         false => menu,
                     };
-                    let this = this.clone();
-                    menu.item(
+                    let style = this.clone();
+                    let menu = menu.item(
                         PopupMenuItem::new("Chat Colour and Wallpaper…").on_click(move |_, _, cx| {
-                            let _ = this.update(cx, |app, cx| {
+                            let _ = style.update(cx, |app, cx| {
                                 app.options.styling = Some(app.generation);
                                 cx.notify();
                             });
                         }),
-                    )
+                    );
+                    if !group {
+                        return menu;
+                    }
+                    let (this, id) = (this.clone(), id.clone());
+                    menu.item(PopupMenuItem::new("Group Info…").on_click(move |_, window, cx| {
+                        let _ = this.update(cx, |app, cx| app.open_group_info(id.clone(), window, cx));
+                    }))
                 })
         };
         let (id, color, wallpaper) = (c.id.clone(), c.chat_color.clone(), c.wallpaper.clone());
@@ -118,21 +123,22 @@ impl Hush {
                             .child("For this chat, on this computer."),
                     )
             });
-        // over the toolbar's drag area, which would take its clicks
-        div()
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .right(px(10.))
-            .flex()
-            .items_center()
-            .occlude()
-            .child(menu)
-            .child(picker)
+        h_flex().child(menu).child(picker)
     }
 
-    /// Sets a direct chat's disappearing-message timer, for both sides.
-    fn set_timer(&mut self, id: String, seconds: u32, cx: &mut Context<Self>) {
+    /// Sets a chat's disappearing-message timer, for everyone in it: a group's as a change to the
+    /// group (its panel waits for it), a direct chat's for both sides. The one set is left as it
+    /// is: sent again, it would show again in both timelines.
+    pub(super) fn set_timer(&mut self, id: String, seconds: u32, cx: &mut Context<Self>) {
+        let Some(c) = self.chats.iter().find(|c| c.id == id) else {
+            return;
+        };
+        if c.expire_timer == seconds {
+            return;
+        }
+        if c.kind == ConversationKind::Group {
+            return self.change_group_in(id, vec![GroupChange::Timer { seconds }], cx);
+        }
         self.change("set the disappearing timer", cx, move |client| async move {
             client.set_disappearing_timer(id, seconds).await
         });
@@ -235,7 +241,7 @@ pub(super) fn backed(content: Div, wallpaper: bool, p: Palette) -> Div {
 }
 
 /// The choices, with `current` among them when the phone set another (2 days, say).
-fn timer_choices(current: u32) -> Vec<u32> {
+pub(super) fn timer_choices(current: u32) -> Vec<u32> {
     let mut all = TIMERS.to_vec();
     if !all.contains(&current) {
         all.push(current);
@@ -244,7 +250,7 @@ fn timer_choices(current: u32) -> Vec<u32> {
     all
 }
 
-fn timer_choice(seconds: u32) -> String {
+pub(super) fn timer_choice(seconds: u32) -> String {
     match seconds {
         0 => "Off".into(),
         s => text::duration(s),
@@ -320,12 +326,15 @@ mod window_tests {
         let _ = std::fs::remove_dir_all(&data);
         // not linked: it sends nothing
         with_core(&hush, &data, cx);
-        hush.update(cx, |app, cx| {
-            let chat = app.selected.clone().unwrap();
-            app.set_timer(chat, 30, cx);
-        });
+        let chat = hush.read_with(cx, |app, _| app.selected.clone().unwrap());
+        let error = |cx: &mut TestAppContext| hush.read_with(cx, |app, _| app.error.clone());
+        // the one set already (a week): nothing is sent, so nothing fails
+        hush.update(cx, |app, cx| app.set_timer(chat.clone(), 604_800, cx));
         cx.run_until_parked();
-        let error = hush.read_with(cx, |app, _| app.error.clone().unwrap_or_default());
+        assert_eq!(error(cx), None);
+        hush.update(cx, |app, cx| app.set_timer(chat, 30, cx));
+        cx.run_until_parked();
+        let error = error(cx).unwrap_or_default();
         assert!(error.starts_with("Couldn't set the disappearing timer: "), "{error}");
     }
 }

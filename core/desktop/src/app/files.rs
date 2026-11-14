@@ -1121,6 +1121,15 @@ fn extension(content_type: &str) -> Option<&str> {
 /// A picture decoded at most `MAX_PIXELS` either way, turned as its photo says, in GPUI's BGRA;
 /// or why not.
 pub(super) fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
+    let mut pixels = upright(bytes, MAX_PIXELS)?.into_rgba8();
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Ok(RenderImage::new([image::Frame::new(pixels)]))
+}
+
+/// A picture decoded at most `max` pixels either way, turned as its photo says; or why not.
+pub(super) fn upright(bytes: &[u8], max: u32) -> Result<image::DynamicImage, String> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
@@ -1137,16 +1146,12 @@ pub(super) fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut picture = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
-    if picture.width() > MAX_PIXELS || picture.height() > MAX_PIXELS {
-        picture = picture.thumbnail(MAX_PIXELS, MAX_PIXELS);
+    if picture.width() > max || picture.height() > max {
+        picture = picture.thumbnail(max, max);
     }
     // turned once small: turning the whole photo would cost as much again
     picture.apply_orientation(orientation);
-    let mut pixels = picture.into_rgba8();
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-    }
-    Ok(RenderImage::new([image::Frame::new(pixels)]))
+    Ok(picture)
 }
 
 fn decoder(
