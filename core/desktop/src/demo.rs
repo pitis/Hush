@@ -1,7 +1,8 @@
 //! Made-up chats for `--snapshot`: the screens render without a core or anyone's real messages.
 
 use sig_core::projection::{
-    BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKind, MessageStatus, TextStyle,
+    BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKind, MessageStatus, SearchHit, TextStyle,
+    HIGHLIGHT_END, HIGHLIGHT_START,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
@@ -106,7 +107,10 @@ pub fn chats() -> Vec<Conversation> {
     );
     stranger.message_request = true;
     stranger.username = Some("radu.42".into());
-    vec![family, ana, bogdan, note, club, stranger]
+    // only a search shows it
+    let mut swap = chat("g:03", ConversationKind::Group, "Book swap", 900, "Who has Dune?");
+    swap.archived = true;
+    vec![family, ana, bogdan, note, club, stranger, swap]
 }
 
 fn message(author: &str, ago_minutes: i64, body: &str) -> Message {
@@ -128,6 +132,50 @@ fn message(author: &str, ago_minutes: i64, body: &str) -> Message {
         expires_at: None,
         story: None,
     }
+}
+
+/// Messages found for "book" in every chat, newest first.
+pub fn hits() -> Vec<SearchHit> {
+    let hit = |chat: &str, author: &str, ago_minutes: i64, snippet: &str| {
+        let mut message = message(author, ago_minutes, "");
+        message.conversation_id = chat.into();
+        SearchHit {
+            message,
+            snippet: snippet
+                .replace('[', &HIGHLIGHT_START.to_string())
+                .replace(']', &HIGHLIGHT_END.to_string()),
+        }
+    };
+    vec![
+        hit(
+            "g:01",
+            ANA,
+            44,
+            "…says the table is [book]ed for 8, the usual place near the park…",
+        ),
+        hit(&format!("c:{ANA}"), ME, 3 * 60, "I'll bring back your [book] tomorrow"),
+        hit("g:02", BOGDAN, 80 * 60, "Next [book]: The Left Hand of Darkness"),
+        hit(
+            "g:03",
+            ANA,
+            900 * 60,
+            "Anyone want my old [book]s? Dune, Solaris and a few more",
+        ),
+    ]
+}
+
+/// The messages with `word` in them, newest first, as the core finds them.
+pub fn found(messages: &[Message], word: &str) -> Vec<SearchHit> {
+    let marked = format!("{HIGHLIGHT_START}{word}{HIGHLIGHT_END}");
+    let with = messages
+        .iter()
+        .rev()
+        .filter(|m| m.body.as_deref().is_some_and(|b| b.contains(word)));
+    with.map(|m| SearchHit {
+        message: m.clone(),
+        snippet: m.body.clone().unwrap_or_default().replace(word, &marked),
+    })
+    .collect()
 }
 
 /// The "Family" group's newest messages, oldest first.
