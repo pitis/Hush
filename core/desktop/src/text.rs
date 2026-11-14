@@ -169,8 +169,12 @@ pub fn short_id(aci: &str) -> String {
     aci.chars().take(8).collect()
 }
 
-/// A chat row's second line. `author` is the last message's author's name.
-pub fn preview(c: &Conversation, author: &str, name: impl Fn(&str) -> String) -> String {
+/// What a row's second line says before a chat's draft (`ChatList.line`, `SidebarView`).
+pub const DRAFT: &str = "Draft:";
+
+/// A chat row's second line. `draft` is the chat's unsent text (not blank) if it isn't open;
+/// `author` is the last message's author's name.
+pub fn preview(c: &Conversation, draft: Option<&str>, author: &str, name: impl Fn(&str) -> String) -> String {
     // what the chat is, not what was said in it
     if c.blocked {
         return "Blocked".into();
@@ -183,6 +187,9 @@ pub fn preview(c: &Conversation, author: &str, name: impl Fn(&str) -> String) ->
     }
     if c.message_request {
         return "Message request".into();
+    }
+    if let Some(draft) = draft {
+        return format!("{DRAFT} {}", one_line(draft));
     }
     if c.last_message_at <= 0 {
         return String::new();
@@ -587,7 +594,7 @@ mod tests {
     #[test]
     fn group_previews_say_who_wrote_and_files_say_what_they_are() {
         let mut c = chat(ConversationKind::Group, "line one\nline two");
-        assert_eq!(preview(&c, "Ana", name), "Ana: line one line two");
+        assert_eq!(preview(&c, None, "Ana", name), "Ana: line one line two");
         c.last_message_outgoing = true;
         c.last_message_file = Some(FileSummary {
             content_type: "image/jpeg".into(),
@@ -595,7 +602,7 @@ mod tests {
             is_voice_note: false,
         });
         c.last_message_preview = String::new();
-        assert_eq!(preview(&c, "Ana", name), "You: 📷 Photo");
+        assert_eq!(preview(&c, None, "Ana", name), "You: 📷 Photo");
     }
 
     #[test]
@@ -631,7 +638,21 @@ mod tests {
     fn what_a_chat_is_comes_before_what_was_said() {
         let mut c = chat(ConversationKind::Direct, "hello");
         c.message_request = true;
-        assert_eq!(preview(&c, "Ana", name), "Message request");
+        assert_eq!(preview(&c, None, "Ana", name), "Message request");
+    }
+
+    #[test]
+    fn a_draft_shows_after_what_the_chat_is_and_before_what_was_said() {
+        let mut c = chat(ConversationKind::Group, "hello");
+        assert_eq!(preview(&c, Some("see you\nat 8"), "Ana", name), "Draft: see you at 8");
+        c.last_message_at = 0;
+        assert_eq!(
+            preview(&c, Some("first"), "Ana", name),
+            "Draft: first",
+            "no message yet"
+        );
+        c.blocked = true;
+        assert_eq!(preview(&c, Some("see you"), "Ana", name), "Blocked");
     }
 
     fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> Local {

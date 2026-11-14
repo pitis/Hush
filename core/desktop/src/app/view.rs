@@ -485,8 +485,11 @@ impl Hush {
 
     fn render_chat_row(&self, ix: usize, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Stateful<Div> {
         let title = text::title(c, self.own_aci.as_deref());
-        let line = text::preview(c, &self.name(&c.last_message_author), |aci| self.name(aci));
         let selected = self.selected.as_deref() == Some(c.id.as_str());
+        let draft = self.listed_draft(&c.id);
+        let line = text::preview(c, draft, &self.name(&c.last_message_author), |aci| self.name(aci));
+        // unless the line says what the chat is
+        let drafted = draft.is_some() && line.starts_with(text::DRAFT);
         // the system's sidebar: the accent while the window is active, else grey
         let focused = selected && self.window_active;
         let (fg, secondary) = if focused {
@@ -496,22 +499,24 @@ impl Hush {
         };
         let unread = c.unread_count > 0 || c.marked_unread;
         let muted = c.mute_until > chrono::Utc::now().timestamp_millis();
-        let tick = (c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted).then(|| {
-            let behind = if focused {
-                p.accent
-            } else if selected {
-                p.selection
-            } else {
-                p.sidebar
-            };
-            tick(
-                c.last_message_status,
-                12.,
-                if unread { fg } else { secondary },
-                behind,
-                p,
-            )
-        });
+        // the last message's, not shown under a draft
+        let tick =
+            (!drafted && c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted).then(|| {
+                let behind = if focused {
+                    p.accent
+                } else if selected {
+                    p.selection
+                } else {
+                    p.sidebar
+                };
+                tick(
+                    c.last_message_status,
+                    12.,
+                    if unread { fg } else { secondary },
+                    behind,
+                    p,
+                )
+            });
         let badge = unread.then(|| {
             let (bg, color) = if focused {
                 (p.on_accent, p.accent)
@@ -537,6 +542,16 @@ impl Hush {
             (_, true) => format!("{title}, unread. {line}"),
             _ => format!("{title}. {line}"),
         };
+        // "Draft:" bold and italic, as `SidebarView` draws it
+        let mut shown = StyledText::new(line.clone());
+        if drafted {
+            let marked = HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            };
+            shown = shown.with_highlights([(0..text::DRAFT.len(), marked)]);
+        }
         // a blocked chat's or a request's picture isn't shown (a stranger chose it)
         let picture = c
             .avatar
@@ -595,7 +610,7 @@ impl Hush {
                                             .min_w_0()
                                             .truncate()
                                             .text_color(if unread { fg } else { secondary })
-                                            .child(line),
+                                            .child(shown),
                                     )
                                     .children(badge),
                             ),

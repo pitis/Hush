@@ -221,6 +221,11 @@ impl Actions {
     pub(super) fn editing(&self) -> bool {
         self.editing.is_some()
     }
+
+    /// A failed send's text while an edit is in the composer: it comes back when the edit ends.
+    pub(super) fn set_aside(&mut self, typed: Typed) {
+        self.draft_before_edit = Some(typed);
+    }
 }
 
 /// What a row shows of a message's actions and reactions.

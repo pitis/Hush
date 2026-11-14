@@ -78,8 +78,9 @@ pub(super) fn plan(body: &str, editing: bool, adding: bool, files: bool) -> Plan
     }
 }
 
-/// What a failed send says when its words went to its chat's draft instead of the composer: the
-/// quote, and the files if another chat is open, are gone.
+/// What a failed send says when its words didn't go back into the composer: `words` if they went
+/// to its chat's draft instead (else they're lost: it had one). The quote, and the files if another
+/// chat is open, are gone.
 pub(super) fn unsent(e: &str, words: bool, quote: bool, files: bool) -> String {
     let quote = if quote { ", without the quote" } else { "" };
     let files_lost = if files { ", and its files weren't sent" } else { "" };
