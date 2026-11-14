@@ -276,7 +276,11 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
             draftStore[conversationId] = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
         }
     }
-    func drafts() async throws -> [String: String] { lock.withLock { draftStore } }
+    var draftsError: Error?
+    func drafts() async throws -> [String: String] {
+        if let draftsError { throw draftsError }
+        return lock.withLock { draftStore }
+    }
     /// What the core answers to "is this chat muted now?".
     var muted: Set<String> = []
     func isMuted(conversationId: String) async throws -> Bool { lock.withLock { muted.contains(conversationId) } }

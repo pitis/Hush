@@ -269,6 +269,23 @@ final class AppStoreNotificationTests: XCTestCase {
         XCTAssertEqual(notifier.removed, [])
     }
 
+    func testANotificationWhoseChatIsGoneOpensNothingAndSendsNothing() async {
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a", unread: 1)])]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        await eventually { store.conversations.count == 1 }
+        let gone = fake.opaqueId(id: "c:gone")
+        await store.openFromNotification(chat: gone)
+        XCTAssertNil(store.selectedId)
+        await store.markReadFromNotification(chat: gone)
+        XCTAssertEqual(fake.markedRead, [])
+        await store.replyFromNotification(chat: gone, text: "hi")
+        XCTAssertTrue(fake.sent.isEmpty)
+        XCTAssertEqual(notifier.posted.map(\.title), ["Reply not sent"])
+        XCTAssertEqual(notifier.posted.first?.body, "Its chat is no longer in Hush.", "not: open it")
+    }
+
     func testOpeningANotificationOpensItsChat() async {
         let fake = FakeClient(linked: true)
         fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
@@ -299,6 +316,11 @@ final class AppStoreNotificationTests: XCTestCase {
         }
         await store.openFromNotification(chat: notifier.posted[0].chat)
         XCTAssertEqual(store.selectedId, "g:00")
+        // a deleted chat's notifications go with it (opening it took them once already)
+        let removed = notifier.removed.count
+        store.deleteChat("g:00")
+        XCTAssertEqual(notifier.removed.count, removed + 1)
+        XCTAssertEqual(notifier.removed.last, fake.opaqueId(id: "g:00"))
         // the old versions' notifications, named by chat id and ACI, go when the app starts
         XCTAssertTrue(Set(["c:", "g:", "call-missed|c:", "reply-failed-"]).isSubset(of: notifier.removedPrefixes))
     }

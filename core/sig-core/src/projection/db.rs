@@ -718,15 +718,17 @@ impl ProjectionDb {
 
     /// Moves pictures named by chat id (as before opaque ids) or stored under another folder
     /// (the data folder was moved, e.g. by the app's rename; the files came along) to their name
-    /// in this one. Safe to interrupt: a file renamed before its row is found by its new name.
-    /// A picture whose file is gone is looked for again. The count of pictures changed.
-    pub async fn rename_avatars(&self) -> Result<u64, sqlx::Error> {
-        let Some(dir) = self.files.clone() else { return Ok(0) };
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, avatar FROM conversations WHERE avatar IS NOT NULL")
-                .fetch_all(&self.pool)
-                .await?;
-        let mut changed = 0;
+    /// in this one. Safe to interrupt: a file renamed before its row is found by its new name. A
+    /// picture whose file is gone is looked for again; one that can't be renamed waits for the
+    /// next start. Files named by chat id that no chat points to go (they can be fetched again).
+    /// The counts of pictures moved and of those found missing.
+    pub async fn rename_avatars(&self) -> Result<(u64, u64), sqlx::Error> {
+        let Some(dir) = self.files.clone() else {
+            return Ok((0, 0));
+        };
+        let avatars = || sqlx::query_as("SELECT id, avatar FROM conversations WHERE avatar IS NOT NULL");
+        let rows: Vec<(String, String)> = avatars().fetch_all(&self.pool).await?;
+        let (mut moved, mut missing) = (0, 0);
         for (id, avatar) in rows {
             let Some(name) = std::path::Path::new(&avatar).file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -738,20 +740,44 @@ impl ProjectionDb {
             }
             let found = dir.join(name);
             if found.is_file() {
-                std::fs::rename(&found, &target)?;
+                if let Err(e) = std::fs::rename(&found, &target) {
+                    tracing::warn!(chat = %self.opaque_id(&id), error = %e, "a chat picture couldn't be renamed");
+                    continue;
+                }
             }
             let path = target.is_file().then(|| target.to_string_lossy().into_owned());
-            changed += sqlx::query(
+            match path {
+                Some(_) => moved += 1,
+                None => missing += 1,
+            }
+            sqlx::query(
                 "UPDATE conversations SET avatar = ?2,
                    avatar_checked_at = CASE WHEN ?2 IS NULL THEN 0 ELSE avatar_checked_at END WHERE id = ?1",
             )
             .bind(&id)
             .bind(path)
             .execute(&self.pool)
-            .await?
-            .rows_affected();
+            .await?;
         }
-        Ok(changed)
+        let kept: std::collections::HashSet<String> = avatars()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .filter_map(|(_, avatar): (String, String)| {
+                std::path::Path::new(&avatar)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .collect();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if (name.starts_with("avatar-c-") || name.starts_with("avatar-g-")) && !kept.contains(&name) {
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    tracing::warn!(error = %e, "a chat picture named by its chat couldn't be removed");
+                }
+            }
+        }
+        Ok((moved, missing))
     }
 
     /// A chat's picture was looked for (and not found or not reachable) at `now_ms`.
@@ -5795,7 +5821,7 @@ mod tests {
         std::fs::create_dir_all(&files.0).unwrap();
         let db = db().await.with_files(files.0.clone());
         let group = format!("g:{}", "ab".repeat(32));
-        let chats = ["c:alice", "c:bob", "c:carol", "c:dave", group.as_str()];
+        let chats = ["c:alice", "c:bob", "c:carol", "c:dave", "c:erin", group.as_str()];
         for (i, c) in (1..).zip(chats) {
             db.insert_message(&in_conv(c, msg("x", i, "hi"))).await.unwrap();
         }
@@ -5826,8 +5852,16 @@ mod tests {
         point("c:carol", here("avatar-c-carol-4")).await;
         // the file is gone: looked for again
         point("c:dave", here("avatar-c-dave-5")).await;
+        // can't be renamed (something is in the way): left as it is, the others go on
+        std::fs::write(here("avatar-c-erin-6"), b"e").unwrap();
+        point("c:erin", here("avatar-c-erin-6")).await;
+        let blocker = here(&format!("avatar-{}-6", db.opaque_id("c:erin")));
+        std::fs::create_dir(&blocker).unwrap();
+        // no chat points to it any more, but its name names one
+        std::fs::write(here("avatar-c-frank-7"), b"f").unwrap();
+        std::fs::write(here("12"), b"an attachment").unwrap();
 
-        assert_eq!(db.rename_avatars().await.unwrap(), 4);
+        assert_eq!(db.rename_avatars().await.unwrap(), (3, 1));
         assert_eq!(conv(&db, "c:alice").await.avatar.unwrap(), kept);
         for (id, at, bytes) in [(group.as_str(), 2, b"g"), ("c:bob", 3, b"b"), ("c:carol", 4, b"c")] {
             let path = conv(&db, id).await.avatar.unwrap();
@@ -5840,11 +5874,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(checked, 0);
+        assert_eq!(conv(&db, "c:erin").await.avatar.unwrap(), here("avatar-c-erin-6"));
+        assert_eq!(
+            std::fs::read(here("avatar-c-erin-6")).unwrap(),
+            b"e",
+            "kept: its chat points to it"
+        );
+        assert!(!std::path::Path::new(&here("avatar-c-frank-7")).exists());
+        assert!(std::path::Path::new(&here("12")).exists(), "attachments stay");
+
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(db.rename_avatars().await.unwrap(), (1, 0), "the next start finishes it");
         for name in std::fs::read_dir(&files.0).unwrap() {
             let name = name.unwrap().file_name().into_string().unwrap();
-            assert!(!name.contains("abab") && !name.contains("-c-"), "{name}");
+            assert!(
+                !name.contains(&"ab".repeat(32)) && !name.starts_with("avatar-c-"),
+                "{name}"
+            );
         }
-        assert_eq!(db.rename_avatars().await.unwrap(), 0, "once");
+        assert_eq!(db.rename_avatars().await.unwrap(), (0, 0), "once");
     }
 
     #[tokio::test]

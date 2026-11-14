@@ -93,7 +93,7 @@ timestamp) and removed by the existing sweep. Logged as a count with the kind on
 | `accept_request(id)` | `whitelisted=1, blocked=0` | 1:1: MRR `ACCEPT`; if it was blocked: `Blocked` list | 1:1: our profile key (`DataMessage{flags: PROFILE_KEY_UPDATE}`); the held read receipts |
 | `block(id)` | `blocked=1, whitelisted=0` | 1:1: MRR `BLOCK`; `Blocked` list | — |
 | `unblock(id)` | as `accept_request` | as `accept_request` | as `accept_request` |
-| `delete_chat(id)` | `whitelisted=0`, `has_sent=0`, unpinned; messages, files, events, search rows gone; presage thread cleared | 1:1: MRR `DELETE` | — |
+| `delete_chat(id)` | `whitelisted=0`, `has_sent=0`, unpinned; messages, files, events, search rows and its draft gone; presage thread cleared | 1:1: MRR `DELETE` | — |
 
 Every change marks the chat `storage_dirty` and triggers a storage sync, so the record follows
 (when the chat has one; when it doesn't, the `Blocked` list and the MRR tell the phone, which

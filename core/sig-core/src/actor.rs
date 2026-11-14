@@ -303,8 +303,10 @@ async fn run(
             .await?
             .with_files(dir.join("attachments"));
         match projection.rename_avatars().await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(n, "chat pictures renamed or moved into the data folder"),
+            Ok((0, 0)) => {}
+            Ok((moved, missing)) => {
+                tracing::info!(moved, missing, "chat pictures renamed or moved into the data folder")
+            }
             Err(e) => tracing::warn!(error = %e, "renaming chat pictures failed"),
         }
         let store =
@@ -581,7 +583,10 @@ async fn run(
                         let at = chrono::Utc::now().timestamp_millis();
                         if let Err(e) = Box::pin(m.send_session_reset(&to, at as u64)).await {
                             return l.on_event(CoreEvent::Error {
-                                message: format!("resetting the session with {conversation_id} failed: {e}"),
+                                message: format!(
+                                    "resetting the session in chat {} failed: {e}",
+                                    db.opaque_id(&conversation_id)
+                                ),
                             });
                         }
                         let author = to.raw_uuid().to_string();
@@ -597,7 +602,10 @@ async fn run(
                     });
                 }
                 _ => listener.on_event(CoreEvent::Error {
-                    message: format!("a session can't be reset with {conversation_id}"),
+                    message: format!(
+                        "a session can't be reset in chat {}",
+                        projection.opaque_id(&conversation_id)
+                    ),
                 }),
             },
             Command::Unlink { tell_server, done } => {
@@ -993,7 +1001,7 @@ async fn installed_packs(
             kept.push(pack);
         } else if let Err(e) = db.forget_sticker_pack(&pack.id).await {
             // removed on the phone, or presage's store was replaced (relinking, a restore)
-            tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a removed sticker pack couldn't be forgotten");
+            tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(&pack.id), "a removed sticker pack couldn't be forgotten");
         }
     }
     let images = dir.clone();
@@ -1011,7 +1019,7 @@ async fn installed_packs(
             Ok(None) => continue,
             Err(e) => {
                 // one unreadable pack doesn't hide the others
-                tracing::warn!(error = %e, pack = %hex::encode(id), "a sticker pack couldn't be read");
+                tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(id), "a sticker pack couldn't be read");
                 continue;
             }
         };
@@ -1022,7 +1030,7 @@ async fn installed_packs(
         // one that isn't kept is read again next time, and sending from it reads presage's copy
         if whole {
             if let Err(e) = db.keep_sticker_pack(&pack).await {
-                tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a sticker pack couldn't be kept");
+                tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(&pack.id), "a sticker pack couldn't be kept");
             }
         }
         packs.push(pack);
@@ -2206,11 +2214,11 @@ async fn handle(
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
-        Received::DecryptionError { error, .. } => {
-            tracing::warn!(%error, "a message couldn't be decrypted")
+        Received::DecryptionError { sender, error } => {
+            tracing::warn!(chat = %db.opaque_id(&direct_id(sender)), %error, "a message couldn't be decrypted")
         }
-        Received::RetryReceipt { .. } => {
-            tracing::info!("a message of ours couldn't be decrypted there")
+        Received::RetryReceipt { sender, .. } => {
+            tracing::info!(chat = %db.opaque_id(&direct_id(sender)), "a message of ours couldn't be decrypted there")
         }
         Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
     }
@@ -2378,7 +2386,7 @@ async fn hold_back_unaccepted_call(
         if !db.is_unaccepted(&id).await? {
             return Ok(false);
         }
-        tracing::info!("a call from a chat not accepted didn't ring");
+        tracing::info!(chat = %db.opaque_id(&id), "a call from a chat not accepted didn't ring");
         let offer = calls
             .iter()
             .any(|c| matches!(c.message, ringrtc::core::signaling::Message::Offer(_)));
@@ -2429,7 +2437,10 @@ async fn apply_received(
                 }
             }
             Err(e) => l.on_event(CoreEvent::Error {
-                message: format!("storing a message from {sender} failed: {e}"),
+                message: format!(
+                    "storing a message in chat {} failed: {e}",
+                    db.opaque_id(&format!("c:{sender}"))
+                ),
             }),
         }
     }
@@ -2447,11 +2458,11 @@ async fn decryption_failed(
     sender: ServiceId,
     error: Option<&SignalProtocolError>,
 ) {
+    let conversation_id = direct_id(&sender);
     if matches!(error, Some(SignalProtocolError::DuplicatedMessage(..))) {
-        tracing::info!("dropped a message delivered again");
+        tracing::info!(chat = %db.opaque_id(&conversation_id), "dropped a message delivered again");
         return;
     }
-    let conversation_id = direct_id(&sender);
     // shown rather than dropped if the lookup fails, as messages are
     if matches!(db.is_blocked(&conversation_id).await, Ok(true)) {
         return;

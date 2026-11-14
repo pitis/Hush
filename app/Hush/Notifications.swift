@@ -49,6 +49,8 @@ enum Notifications {
     static let callCategory = "call"
     static let acceptCallAction = "accept-call"
     static let declineCallAction = "decline-call"
+    /// The `userInfo` key of the chat a notification is about (its opaque id).
+    static let chatKey = "chat"
 
     /// Removed when the app starts: a ring from a previous run can't be answered, and the
     /// notifications of older versions were named by chat id and ACI.
@@ -140,7 +142,7 @@ protocol Notifier: AnyObject {
 final class SystemNotifier: Notifier {
     private var center: UNUserNotificationCenter { .current() }
     /// Ids and errors only, never what a notification says.
-    private static let logger = Logger(subsystem: "dev.pitis.hush", category: "notifications")
+    static let logger = Logger(subsystem: "dev.pitis.hush", category: "notifications")
 
     func authorize() {
         let reply = UNTextInputNotificationAction(
@@ -172,7 +174,7 @@ final class SystemNotifier: Notifier {
         content.body = request.body
         content.sound = .default
         content.threadIdentifier = request.chat
-        content.userInfo = ["chat": request.chat]
+        content.userInfo = [Notifications.chatKey: request.chat]
         if let category = request.category {
             content.categoryIdentifier = category
         } else if request.hasActions {
@@ -210,7 +212,10 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     init(store: AppStore) { self.store = store }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let chat = response.notification.request.content.userInfo["chat"] as? String else { return }
+        guard let chat = response.notification.request.content.userInfo[Notifications.chatKey] as? String else {
+            // an older version's, removed at the next launch
+            return SystemNotifier.logger.error("a notification that names no chat was used")
+        }
         let text = (response as? UNTextInputNotificationResponse)?.userText
         switch response.actionIdentifier {
         case Notifications.replyAction:

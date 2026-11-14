@@ -210,7 +210,7 @@ impl Client {
         check_conversation(id)?;
         if !self.db.has_conversation(id).await? {
             return Err(CoreError::InvalidInput {
-                message: format!("no such chat: {id}"),
+                message: format!("no such chat: {}", self.db.opaque_id(id)),
             });
         }
         Ok(())
@@ -672,7 +672,10 @@ impl Client {
         let aci = |id: &str| id.strip_prefix("c:").is_some_and(|rest| !rest.starts_with("PNI:"));
         if !matches!(send::recipient(&conversation_id), Some(send::Recipient::Direct(_))) || !aci(&conversation_id) {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+                message: format!(
+                    "not a 1:1 chat with a known contact: {}",
+                    self.db.opaque_id(&conversation_id)
+                ),
             });
         }
         self.send(Command::ResetSession { conversation_id })
@@ -689,7 +692,10 @@ impl Client {
             .filter(|rest| !rest.starts_with("PNI:") && !rest.is_empty());
         let Some(peer_aci) = aci else {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+                message: format!(
+                    "not a 1:1 chat with a known contact: {}",
+                    self.db.opaque_id(&conversation_id)
+                ),
             });
         };
         self.send(Command::Call(crate::calls::actor::CallCommand::Start {
@@ -1325,7 +1331,7 @@ impl Client {
             Some(crate::send::Recipient::Direct(_))
         ) {
             return Err(CoreError::InvalidInput {
-                message: format!("the timer can be set here in direct chats only, not {conversation_id}"),
+                message: "the timer can be set here in direct chats only".into(),
             });
         }
         let at = self.next_sent_at() as u64;
