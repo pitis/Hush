@@ -95,7 +95,7 @@ fn window_options(cx: &App) -> WindowOptions {
             traffic_light_position: Some(point(px(22.), px(22.))),
         }),
         window_min_size: Some(size(px(820.), px(520.))),
-        // Linux: its launcher, the one with the unread count
+        // Linux: ties the window to the launcher entry named `APP_ID` (the one with the unread count)
         app_id: Some(app::notifications::APP_ID.into()),
         ..Default::default()
     }

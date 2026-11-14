@@ -508,14 +508,14 @@ impl Hush {
 
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         match &event {
-            CoreEvent::MessageExpired { key, .. } => {
+            CoreEvent::MessageExpired { conversation_id, key } => {
                 self.message_expired(key, cx);
                 self.forget_hit(key);
-                self.message_gone(key, cx);
+                self.message_gone(conversation_id, key, cx);
             }
-            CoreEvent::MessageChanged { key, .. } => {
+            CoreEvent::MessageChanged { conversation_id, key } => {
                 self.recheck_hit(key, cx);
-                self.recheck_notified(key, cx);
+                self.recheck_notified(conversation_id, key, cx);
             }
             CoreEvent::NewMessage { conversation_id, key } => {
                 self.notify(conversation_id.clone(), key.clone(), None, cx)
@@ -589,7 +589,7 @@ impl Hush {
             } => self.attachment_changed(&conversation_id, &message, cx),
             CoreEvent::Error { message } => self.error = Some(message),
             // not in this version: typing, calls, stories (a reaction shows with its message's
-            // `MessageChanged`; notifications are shown above)
+            // `MessageChanged`; `NewMessage` and `NewReaction` notify in the match above)
             _ => return,
         }
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
