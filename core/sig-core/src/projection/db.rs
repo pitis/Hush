@@ -3005,6 +3005,10 @@ impl ProjectionDb {
         let state: i64 = r.try_get("state")?;
         let size: i64 = r.try_get("size")?;
         let file: Option<String> = r.try_get("file")?;
+        let pointer: Option<Vec<u8>> = r.try_get("pointer")?;
+        let state = AttachmentState::from_i64(state).ok_or_else(|| decode_err(format!("attachment state {state}")))?;
+        // what `start_download` takes
+        let fetchable = pointer.is_some() && (1..=MAX_ATTACHMENT as i64).contains(&size);
         Ok(Attachment {
             id: r.try_get("id")?,
             message: MessageKey {
@@ -3020,7 +3024,8 @@ impl ProjectionDb {
             path: file
                 .zip(self.files.as_ref())
                 .map(|(f, dir)| dir.join(f).to_string_lossy().into_owned()),
-            state: AttachmentState::from_i64(state).ok_or_else(|| decode_err(format!("attachment state {state}")))?,
+            state,
+            available: state == AttachmentState::Ready || fetchable,
         })
     }
 
@@ -4764,12 +4769,44 @@ mod tests {
                     is_voice_note: false,
                     pointer: None,
                 },
+                // the core never fetches one of unknown size, or one too big to hold in memory
+                ImportAttachment {
+                    position: 2,
+                    content_type: "application/pdf".into(),
+                    file_name: None,
+                    size: 0,
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                    pointer: Some(vec![1, 2, 3]),
+                },
+                ImportAttachment {
+                    position: 3,
+                    content_type: "video/mp4".into(),
+                    file_name: None,
+                    size: MAX_ATTACHMENT + 1,
+                    width: None,
+                    height: None,
+                    is_voice_note: false,
+                    pointer: Some(vec![1, 2, 3]),
+                },
             ];
             db.import_history(&batch_with(vec![m])).await.unwrap();
             let files = db.attachments(&key("alice", 5)).await.unwrap();
-            assert_eq!(files.len(), 2);
+            assert_eq!(files.len(), 4);
             assert_eq!(files[0].state, AttachmentState::Pending, "downloadable");
             assert_eq!(files[1].state, AttachmentState::Failed, "no longer available");
+            assert_eq!(
+                files.iter().map(|f| f.available).collect::<Vec<_>>(),
+                [true, false, false, false]
+            );
+            for f in &files[1..] {
+                assert_eq!(
+                    db.start_download(f.id).await.unwrap(),
+                    None,
+                    "what isn't available isn't fetched"
+                );
+            }
         }
 
         /// 100k messages across 50 chats; run with

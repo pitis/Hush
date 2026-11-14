@@ -27,6 +27,8 @@ enum Files {
 
     static func isImage(_ a: Attachment) -> Bool { a.contentType.hasPrefix("image/") && !a.isVoiceNote }
     static func isAudio(_ a: Attachment) -> Bool { a.isVoiceNote || a.contentType.hasPrefix("audio/") }
+    /// Not here yet, not on its way, and can still be fetched (not gone from the server, say).
+    static func offersDownload(_ a: Attachment) -> Bool { a.available && [.pending, .failed].contains(a.state) }
 
     static let imageBox: CGFloat = 320
 

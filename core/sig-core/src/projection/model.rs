@@ -528,6 +528,10 @@ pub struct Attachment {
     /// The file on disk, once `Ready`.
     pub path: Option<String>,
     pub state: AttachmentState,
+    /// Here, or can still be downloaded. False for one no longer on the server (from history),
+    /// of unknown size, or larger than the core fetches: nothing to offer but "Not available".
+    #[uniffi(default = true)]
+    pub available: bool,
 }
 
 /// A received link preview (title, url, image), shown with its message.

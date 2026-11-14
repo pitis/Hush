@@ -23,15 +23,18 @@ struct AttachmentList: View {
     }
 }
 
-/// What a file that isn't there yet offers: download, a spinner, or try again.
+/// What a file that isn't there yet offers: download, a spinner, try again, or that it can't be
+/// had (no longer on the server, say).
 struct DownloadState: View {
-    let state: AttachmentState
+    let file: Attachment
     let download: () -> Void
 
     var body: some View {
-        switch state {
+        switch file.state {
         case .downloading:
             ProgressView().controlSize(.small)
+        case .pending where !file.available, .failed where !file.available:
+            Text("Not available").font(.system(size: 12)).foregroundStyle(.secondary)
         case .failed:
             Button(action: download) {
                 Label("Retry", systemImage: "exclamationmark.arrow.circlepath")
@@ -74,7 +77,7 @@ struct ImageAttachmentView: View {
                     .accessibilityLabel(attachment.fileName ?? "Photo")
                 } else {
                     Rectangle().fill(.black.opacity(0.25))
-                        .overlay { DownloadState(state: attachment.state, download: download) }
+                        .overlay { DownloadState(file: attachment, download: download) }
                         .accessibilityLabel("Photo, \(Files.size(attachment.size))")
                 }
             }
@@ -96,7 +99,11 @@ struct FileAttachmentView: View {
 
     var body: some View {
         Button {
-            attachment.state == .ready ? open() : download()
+            if attachment.state == .ready {
+                open()
+            } else if Files.offersDownload(attachment) {
+                download()
+            }
         } label: {
             HStack(spacing: 10) {
                 Image(nsImage: NSWorkspace.shared.icon(for: UTType(mimeType: attachment.contentType) ?? .data))
@@ -106,7 +113,7 @@ struct FileAttachmentView: View {
                     Text(Files.size(attachment.size)).font(.system(size: 11)).opacity(0.7)
                 }
                 Spacer(minLength: 8)
-                DownloadState(state: attachment.state, download: download)
+                DownloadState(file: attachment, download: download)
             }
             .frame(width: 260)
             .contentShape(Rectangle())
@@ -142,7 +149,7 @@ struct AudioAttachmentView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel(playing ? "Pause" : "Play")
                 } else {
-                    DownloadState(state: attachment.state, download: download)
+                    DownloadState(file: attachment, download: download)
                 }
                 Track(fraction: duration > 0 ? elapsed / duration : 0)
                 Text(Self.clock(playing || elapsed > 0 ? elapsed : duration))

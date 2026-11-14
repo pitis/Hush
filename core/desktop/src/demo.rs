@@ -291,6 +291,7 @@ pub fn link_messages() -> (Vec<Message>, LinkPreview) {
             is_voice_note: false,
             path: Some("demo-preview".into()),
             state: AttachmentState::Ready,
+            available: true,
         }),
     };
     (vec![place, group], preview)
@@ -352,6 +353,7 @@ pub fn files(messages: &[Message]) -> Vec<Attachment> {
         is_voice_note: false,
         path: (state == AttachmentState::Ready).then(|| format!("demo-{i}")),
         state,
+        available: true,
     };
     let mut voice = file(0, "audio/aac", None, 160_000, AttachmentState::Ready);
     voice.is_voice_note = true;

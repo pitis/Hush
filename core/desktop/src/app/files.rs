@@ -1120,7 +1120,7 @@ mod tests {
     // not `super::*`: GPUI's `test` attribute would come with it
     use super::{
         byte_count, clear_open_copies, clock, display_size, file_name, is_audio, is_image, length, openable, thumbnail,
-        with_details, Attachment, Clock, Copy, Duration, Files, Look, Thumb, Tick, PLAY_LIMIT,
+        view, with_details, Attachment, Clock, Copy, Duration, Files, Look, Thumb, Tick, PLAY_LIMIT,
     };
     use gpui_kit::{DevicePixels, Size};
     use sig_core::projection::{AttachmentState, Message, MessageDetails, MessageKey, MessageKind, MessageStatus};
@@ -1142,6 +1142,7 @@ mod tests {
             is_voice_note: false,
             path: None,
             state: AttachmentState::Ready,
+            available: true,
         }
     }
 
@@ -1153,6 +1154,22 @@ mod tests {
         let mut voice = file("application/octet-stream", None);
         voice.is_voice_note = true;
         assert!(is_audio(&voice) && !is_image(&voice));
+    }
+
+    #[test]
+    fn a_file_that_cant_be_had_offers_no_download() {
+        let mut a = file("image/jpeg", None);
+        for (state, available, wants) in [
+            (AttachmentState::Pending, true, true),
+            (AttachmentState::Failed, true, true),
+            (AttachmentState::Pending, false, false),
+            (AttachmentState::Failed, false, false),
+            (AttachmentState::Downloading, true, false),
+            (AttachmentState::Ready, true, false),
+        ] {
+            (a.state, a.available) = (state, available);
+            assert_eq!(view::wants_download(&a), wants, "{state:?}, available: {available}");
+        }
     }
 
     #[test]

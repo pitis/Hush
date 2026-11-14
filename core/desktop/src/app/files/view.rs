@@ -190,16 +190,22 @@ fn file_row(a: &Attachment, this: &WeakEntity<Hush>, color: Hsla, behind: Hsla) 
     }
 }
 
-/// Not here yet, and not on its way.
-fn wants_download(a: &Attachment) -> bool {
-    matches!(a.state, AttachmentState::Pending | AttachmentState::Failed)
+/// Not here yet, not on its way, and can still be fetched.
+pub(super) fn wants_download(a: &Attachment) -> bool {
+    a.available && matches!(a.state, AttachmentState::Pending | AttachmentState::Failed)
 }
 
-/// What a file that isn't here yet shows: a download button, a spinner, or try again.
+/// What a file that isn't here yet shows: a download button, a spinner, try again, or that it
+/// can't be had (no longer on the server, say).
 fn download_state(a: &Attachment, color: Hsla, behind: Hsla) -> Option<AnyElement> {
     Some(match a.state {
         AttachmentState::Ready => return None,
         AttachmentState::Downloading => Spinner::new().small().color(color).into_any_element(),
+        _ if !a.available => div()
+            .text_size(px(13.))
+            .text_color(color.opacity(0.7))
+            .child("Not available")
+            .into_any_element(),
         AttachmentState::Failed => h_flex()
             .id(("retry", a.id as u64))
             .role(Role::Button)

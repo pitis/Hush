@@ -626,6 +626,7 @@ mod tests {
             is_voice_note: false,
             path: path.map(Into::into),
             state,
+            available: true,
         };
         let mut a = details(&key("x", 1), Some("https://a.example"));
         a.preview.as_mut().unwrap().image = Some(image(Some("files/1"), AttachmentState::Ready));
