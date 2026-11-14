@@ -93,6 +93,9 @@ pub enum Demo {
     Search,
     /// The open chat searched, its newest match opened.
     SearchInChat,
+    /// The chat with a received link preview and a group's invite link, writing a link with its
+    /// preview above the composer.
+    LinkPreview,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -115,6 +118,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("compose", Demo::Compose),
                 ("search", Demo::Search),
                 ("search-in-chat", Demo::SearchInChat),
+                ("link-preview", Demo::LinkPreview),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

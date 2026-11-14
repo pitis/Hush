@@ -362,6 +362,7 @@ impl Hush {
                     return false; // another chat: its own load runs
                 }
                 app.files_loaded(&keys, &details, cx);
+                app.previews_loaded(&keys, &details, cx);
                 app.reactions_loaded(details, cx);
                 app.actions.loading = std::mem::take(&mut app.actions.again);
                 app.actions.loading

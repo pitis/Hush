@@ -23,6 +23,7 @@ use crate::{key, text};
 mod actions;
 pub mod compose;
 mod files;
+mod previews;
 pub mod search;
 mod view;
 
@@ -142,6 +143,7 @@ pub struct Hush {
     files: files::Files,
     /// The composer's styles and mentions.
     compose: compose::Compose,
+    previews: previews::Previews,
 }
 
 /// The open core, for `quit`.
@@ -247,6 +249,7 @@ impl Hush {
                 InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
                 InputEvent::Change => {
                     this.composer_empty = composer.read(cx).value().trim().is_empty();
+                    this.composer_changed(cx);
                     cx.notify();
                 }
                 _ => {}
@@ -318,6 +321,7 @@ impl Hush {
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
             compose: Default::default(),
+            previews: Default::default(),
         }
     }
 
@@ -340,7 +344,8 @@ impl Hush {
             | crate::Demo::Reply
             | crate::Demo::Compose
             | crate::Demo::Search
-            | crate::Demo::SearchInChat => {
+            | crate::Demo::SearchInChat
+            | crate::Demo::LinkPreview => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -356,6 +361,9 @@ impl Hush {
                 }
                 if let crate::Demo::Search | crate::Demo::SearchInChat = screen {
                     app.demo_search(matches!(screen, crate::Demo::SearchInChat), window, cx);
+                }
+                if let crate::Demo::LinkPreview = screen {
+                    app.demo_previews(window, cx);
                 }
             }
             crate::Demo::Files => {
@@ -607,6 +615,7 @@ impl Hush {
         self.depth = PAGE;
         self.messages.clear();
         self.clear_files(cx);
+        self.clear_previews(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
         self.mark_read(true, cx);
@@ -764,9 +773,10 @@ impl Hush {
         }
         let reply = self.take_reply();
         let quote = reply.as_ref().map(actions::quote);
+        let preview = self.previews.take(&body);
         self.set_typed(compose::Typed::default(), window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            let sent = Compat::new(client.send_text(id.clone(), body, ranges, quote, None)).await;
+            let sent = Compat::new(client.send_text(id.clone(), body, ranges, quote, preview.clone())).await;
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
                 app.error = Some(format!("Couldn't send the message: {e}"));
@@ -775,6 +785,7 @@ impl Hush {
                 if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
                     app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
+                    app.previews.put_back(preview);
                 } else {
                     if reply.is_some() {
                         app.error = Some(format!(
@@ -975,6 +986,7 @@ impl Hush {
             self.generation += 1;
             self.messages.clear();
             self.clear_files(cx);
+            self.clear_previews(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
         self.drop_chat_copies(&id);

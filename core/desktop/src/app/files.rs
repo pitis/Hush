@@ -708,8 +708,15 @@ fn start(
     Ok((device, player, length))
 }
 
-/// Opens a copy in the system's app for its kind, off the main thread; a failure is said.
-fn launch(file: PathBuf, what: String, cx: &mut Context<Hush>) {
+/// Opens an https link in the system's browser, off the main thread; a failure is said. Not
+/// GPUI's `open_url`: that logs the link when it fails.
+pub(super) fn open_link(url: String, cx: &mut Context<Hush>) {
+    launch(url, "the link".into(), cx);
+}
+
+/// Opens a copy (or a link) in the system's app for its kind, off the main thread; a failure is
+/// said.
+fn launch(file: impl AsRef<std::ffi::OsStr> + Send + 'static, what: String, cx: &mut Context<Hush>) {
     cx.spawn(async move |this, cx| {
         let opened = cx.background_spawn(async move { open_with_system(&file) }).await;
         if let Err(e) = opened {
@@ -722,9 +729,10 @@ fn launch(file: PathBuf, what: String, cx: &mut Context<Hush>) {
     .detach();
 }
 
-/// Opens `file` in the system's app for its kind. Not GPUI's: that says nothing when no app opens
-/// it, and on Windows logs the file's path (a name the sender chose).
-fn open_with_system(file: &Path) -> Result<(), String> {
+/// Opens `file` (or an https link: `open` takes one after `--` too) in the system's app for its
+/// kind. Not GPUI's: that says nothing when no app opens it, and on Windows logs the file's path (a
+/// name the sender chose).
+fn open_with_system(file: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
     use std::process::{Command, Stdio};
     #[cfg(target_os = "macos")]
     let mut opener = {
@@ -982,7 +990,7 @@ fn extension(content_type: &str) -> Option<&str> {
 
 /// A picture decoded at most `MAX_PIXELS` either way, turned as its photo says, in GPUI's BGRA;
 /// or why not.
-fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
+pub(super) fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
