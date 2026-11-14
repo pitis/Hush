@@ -149,6 +149,19 @@ final class AppStoreNotificationTests: XCTestCase {
         XCTAssertEqual(notifier.posted.first?.body, "📷 Photo")
     }
 
+    func testAReactionToOurStoryIsAnnouncedInWords() async {
+        let fake = FakeClient(linked: true)
+        var reaction = message("c:alice", "alice", 1)
+        (reaction.body, reaction.kind) = (nil, .storyReaction(emoji: "🔥"))
+        reaction.story = MessageKey(author: "me-aci", sentAt: 0)
+        fake.messageAnswers["c:alice"] = [reaction]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        store.handle(newMessage("c:alice", "alice", 1))
+        await eventually { notifier.posted.count == 1 }
+        XCTAssertEqual(notifier.posted.first?.body, "Reacted 🔥 to a story")
+    }
+
     func testDeletedMessagesDontNotifyButReactionsToMineDo() async {
         let fake = FakeClient(linked: true)
         fake.titles["c:alice"] = "Alice"

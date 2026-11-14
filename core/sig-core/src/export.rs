@@ -95,6 +95,7 @@ fn kind_text(kind: &MessageKind) -> Option<String> {
         MessageKind::Poll { question } => format!("Poll: {}", question.as_deref().unwrap_or("")),
         MessageKind::GiftBadge => "Gift badge".into(),
         MessageKind::ViewOnce { .. } => "View-once media".into(),
+        MessageKind::StoryReaction { emoji } => format!("Reacted {emoji} to a story"),
     })
 }
 
@@ -159,6 +160,8 @@ where
         }
         if let Some(kind) = kind_text(&m.kind) {
             out.push_str(&format!("<div class=\"note\">{}</div>", escape(&kind)));
+        } else if m.story.is_some() {
+            out.push_str("<div class=\"note\">Replied to a story</div>");
         }
         for f in &e.files {
             match &f.path {
@@ -212,6 +215,7 @@ mod tests {
             kind: MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         }
     }
 
@@ -276,6 +280,23 @@ mod tests {
         let html = one(&m, vec![]);
         assert!(html.contains("hi @name-of-a and @name-of-b"), "{html}");
         assert!(html.contains("name-of-q</span><br>quoted"));
+    }
+
+    #[test]
+    fn replies_and_reactions_to_stories_say_so() {
+        let story = Some(crate::projection::MessageKey {
+            author: "a".into(),
+            sent_at: 1,
+        });
+        let mut reply = msg(5, "nice");
+        reply.story = story.clone();
+        let html = one(&reply, vec![]);
+        assert!(html.contains("Replied to a story") && html.contains("nice"), "{html}");
+        let mut reaction = msg(6, "");
+        (reaction.body, reaction.story) = (None, story);
+        reaction.kind = MessageKind::StoryReaction { emoji: "🔥".into() };
+        let html = one(&reaction, vec![]);
+        assert!(html.contains("Reacted 🔥 to a story") && !html.contains("Replied to a story"));
     }
 
     #[test]

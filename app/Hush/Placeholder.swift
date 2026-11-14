@@ -19,7 +19,28 @@ enum Placeholder {
         case .poll(let question): "📊 Poll: \(question ?? "")"
         case .giftBadge: "✨ Gift badge"
         case .viewOnce: "View-once media"
+        case .storyReaction(let emoji): "Reacted \(emoji) to a story"
         }
+    }
+
+    /// The header of a reply or reaction to a story, as Signal's apps word it (nil for any other
+    /// message). In a 1:1 chat theirs answer our story, and ours theirs.
+    static func storyHeader(_ m: Message) -> String? {
+        guard m.story != nil else { return nil }
+        let emoji: String? = if case .storyReaction(let e) = m.kind { e } else { nil }
+        return switch (m.isOutgoing, emoji) {
+        case (false, nil): "Replied to your story"
+        case (false, let e?): "Reacted \(e) to your story"
+        case (true, nil): "You replied to their story"
+        case (true, let e?): "You reacted \(e) to their story"
+        }
+    }
+
+    /// What a story a reply answers says: its words (else its link), or what its file is
+    /// ("📷 Photo").
+    static func storyText(_ s: Story) -> String {
+        if let t = s.text { return t.text.isEmpty ? t.link ?? "Story" : t.text }
+        return s.file.map { Files.describe(Files.summary($0), body: nil) } ?? "Story"
     }
 
     /// The timers offered, as in Desktop (seconds; 0: off).

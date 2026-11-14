@@ -234,6 +234,7 @@ fn placeholder(kind: &MessageKind) -> Option<String> {
         MessageKind::Poll { question } => format!("📊 Poll: {}", question.as_deref().unwrap_or_default()),
         MessageKind::GiftBadge => "✨ Gift badge".into(),
         MessageKind::ViewOnce { .. } => "View-once media".into(),
+        MessageKind::StoryReaction { emoji } => format!("Reacted {emoji} to a story"),
     })
 }
 

@@ -126,6 +126,7 @@ fn message(author: &str, ago_minutes: i64, body: &str) -> Message {
         kind: MessageKind::Normal,
         expires_in: 0,
         expires_at: None,
+        story: None,
     }
 }
 
