@@ -11,6 +11,7 @@ use gpui_kit::*;
 use sig_core::projection::{Conversation, FileSummary, Message, MessageKey};
 use sig_core::{Client, CoreError};
 
+use super::settings::{self, NotificationContent};
 use super::{files, mentioned, Hush};
 use crate::text;
 
@@ -180,7 +181,8 @@ impl Hush {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client.clone() else { return };
-        if self.in_front() {
+        // off: nothing is read for one (`words` says none too, for a change made meanwhile)
+        if self.in_front() || settings::chosen::<NotificationContent>(cx) == NotificationContent::Off {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -208,29 +210,34 @@ impl Hush {
         let text = message_text(&about.message, about.file.as_ref(), name);
         let sender = name(reaction.as_ref().map_or(&key.author, |(reactor, _)| reactor));
         let emoji = reaction.as_ref().map(|(_, emoji)| emoji.as_str());
-        let (title, body) = words(&sender, about.group.as_deref(), text.as_deref(), emoji);
+        let setting = settings::chosen::<NotificationContent>(cx);
+        let Some((title, body)) = words(setting, &sender, about.group.as_deref(), text.as_deref(), emoji) else {
+            return;
+        };
         let shown = Shown {
             tag: about.tag,
             chat,
             key,
             reaction: reaction.is_some(),
         };
-        self.post(shown, title, body, cx);
+        self.post(shown, title, body, setting == NotificationContent::NameAndMessage, cx);
     }
 
-    /// Shows a notification, unless the window came to the front meanwhile.
-    fn post(&mut self, shown: Shown, title: String, body: String, cx: &mut Context<Self>) {
+    /// Shows a notification, with Mark as Read if `actions` (only with its content shown), unless
+    /// the window came to the front meanwhile.
+    fn post(&mut self, shown: Shown, title: String, body: String, actions: bool, cx: &mut Context<Self>) {
         if self.in_front() {
             return;
         }
+        let mark_read = SystemNotificationAction {
+            id: MARK_READ.into(),
+            label: "Mark as Read".into(),
+        };
         cx.show_system_notification(SystemNotification {
             tag: shown.tag.clone().into(),
             title: title.into(),
             body: body.into(),
-            actions: vec![SystemNotificationAction {
-                id: MARK_READ.into(),
-                label: "Mark as Read".into(),
-            }],
+            actions: if actions { vec![mark_read] } else { vec![] },
         });
         self.notifications.add(shown);
     }
@@ -282,6 +289,20 @@ impl Hush {
 
     /// The chat list changed: the chats read take their notifications with them, and the unread
     /// count is set again, and again when a timed mute ends.
+    /// Starting over (`AppStore.restart`): the count goes, and what this run showed goes with the
+    /// data if that's gone (the message previews in them); what the new state keeps tracking.
+    /// shortcut: those from earlier runs have no tag known here, and Linux takes nothing back.
+    pub(super) fn start_over(&mut self, data_gone: bool, cx: &mut Context<Self>) -> Notifications {
+        if data_gone {
+            Self::take_back(self.notifications.take(|_| true), cx);
+        }
+        show_badge(0);
+        Notifications {
+            shown: std::mem::take(&mut self.notifications.shown),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn chats_counted(&mut self, cx: &mut Context<Self>) {
         Self::take_back(self.notifications.of_read(&self.chats), cx);
         let now = chrono::Utc::now().timestamp_millis();
@@ -458,24 +479,33 @@ fn message_text(m: &Message, file: Option<&FileSummary>, name: impl Fn(&str) -> 
     }
 }
 
-/// A notification's title and body as Signal Desktop words them, with name and content shown
-/// (`Notifications.request`); `emoji`: a reaction by `sender` to our message.
-fn words(sender: &str, group: Option<&str>, text: Option<&str>, emoji: Option<&str>) -> (String, String) {
+/// A notification's title and body as Signal Desktop words them, with what `setting` lets it
+/// show, or none when notifications are off (`Notifications.request`); `emoji`: a reaction by
+/// `sender` to our message.
+fn words(
+    setting: NotificationContent,
+    sender: &str,
+    group: Option<&str>,
+    text: Option<&str>,
+    emoji: Option<&str>,
+) -> Option<(String, String)> {
     let title = match group {
         Some(group) => format!("{sender} in {group}"),
         None => sender.to_owned(),
     };
     let text = text.unwrap_or("Attachment");
-    let body = match emoji {
-        Some(emoji) => format!("{sender} reacted {emoji} to: {text}"),
-        None => text.to_owned(),
-    };
-    (title, body)
+    Some(match (setting, emoji) {
+        (NotificationContent::Off, _) => return None,
+        (NotificationContent::NoNameOrMessage, _) => ("Hush".into(), "New Message".into()),
+        (NotificationContent::NameOnly, _) => (title, "New Message".into()),
+        (NotificationContent::NameAndMessage, Some(emoji)) => (title, format!("{sender} reacted {emoji} to: {text}")),
+        (NotificationContent::NameAndMessage, None) => (title, text.to_owned()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{badge, message_text, next_mute_end, tag, words, Notifications, Shown};
+    use super::{badge, message_text, next_mute_end, tag, words, NotificationContent, Notifications, Shown};
     use sig_core::projection::{
         BodyRange, Conversation, FileSummary, Message, MessageKey, MessageKind, MessageStatus, TextStyle,
     };
@@ -692,15 +722,32 @@ mod tests {
 
     #[test]
     fn a_notification_names_the_sender_and_the_group_and_quotes_what_was_reacted_to() {
-        assert_eq!(words("Ana", None, Some("hi"), None), ("Ana".into(), "hi".into()));
+        let all = NotificationContent::NameAndMessage;
+        let said = |title: &str, body: &str| Some((title.to_string(), body.to_string()));
+        assert_eq!(words(all, "Ana", None, Some("hi"), None), said("Ana", "hi"));
         assert_eq!(
-            words("Ana", Some("Family"), None, None),
-            ("Ana in Family".into(), "Attachment".into())
+            words(all, "Ana", Some("Family"), None, None),
+            said("Ana in Family", "Attachment")
         );
         assert_eq!(
-            words("Ana", Some("Family"), Some("Dinner at 8?"), Some("👍")),
-            ("Ana in Family".into(), "Ana reacted 👍 to: Dinner at 8?".into())
+            words(all, "Ana", Some("Family"), Some("Dinner at 8?"), Some("👍")),
+            said("Ana in Family", "Ana reacted 👍 to: Dinner at 8?")
         );
+    }
+
+    #[test]
+    fn a_notification_shows_only_what_settings_let_it() {
+        let reaction = |setting| words(setting, "Ana", Some("Family"), Some("Dinner at 8?"), Some("👍"));
+        let said = |title: &str, body: &str| Some((title.to_string(), body.to_string()));
+        assert_eq!(
+            reaction(NotificationContent::NameOnly),
+            said("Ana in Family", "New Message")
+        );
+        assert_eq!(
+            reaction(NotificationContent::NoNameOrMessage),
+            said("Hush", "New Message")
+        );
+        assert_eq!(reaction(NotificationContent::Off), None);
     }
 }
 
@@ -774,7 +821,9 @@ mod window_tests {
             key,
             reaction,
         };
-        hush.update(cx, |app, cx| app.post(shown, "Ana Popescu".into(), "hi".into(), cx));
+        hush.update(cx, |app, cx| {
+            app.post(shown, "Ana Popescu".into(), "hi".into(), true, cx)
+        });
     }
 
     fn on_show(cx: &TestAppContext) -> Vec<String> {
@@ -882,6 +931,55 @@ mod window_tests {
         chats[0].unread_count = 0;
         act(window, &hush, cx, |app, _, cx| app.set_chats(chats, cx));
         assert_eq!(on_show(cx), ["r"], "a reaction isn't unread: reading leaves it");
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn starting_over_takes_back_what_was_shown_only_with_the_data(cx: &mut TestAppContext) {
+        let (_, hush, data) = open("start-over", cx);
+        let ana = format!("c:{ANA}");
+        post(&hush, "m1", &ana, key(ANA, 1), false, cx);
+        let kept = hush.update(cx, |app, cx| app.start_over(false, cx));
+        assert_eq!(on_show(cx), ["m1"], "relinking keeps them");
+        assert_eq!(kept.chat_of("m1"), Some(ana), "and still knows their chat");
+        hush.update(cx, |app, cx| {
+            app.notifications = kept;
+            app.start_over(true, cx)
+        });
+        assert!(on_show(cx).is_empty(), "unlinking takes them back with the data");
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_notification_shows_what_the_setting_lets_it(cx: &mut TestAppContext) {
+        use super::NotificationContent;
+        let (_, hush, data) = open("setting", cx);
+        let about = |tag: &str| About {
+            tag: tag.into(),
+            message: super::tests::message(Some("Dinner at 8?"), MessageKind::Normal),
+            file: None,
+            group: Some("Family".into()),
+            names: vec![],
+        };
+        let show = |hush: &Entity<Hush>, setting, tag: &str, cx: &mut TestAppContext| {
+            cx.update(|cx| cx.set_global(setting));
+            let about = about(tag);
+            hush.update(cx, |app, cx| app.show("g:01".into(), key(ANA, 1), None, about, cx));
+        };
+        show(&hush, NotificationContent::NameOnly, "name", cx);
+        show(&hush, NotificationContent::NoNameOrMessage, "count", cx);
+        show(&hush, NotificationContent::Off, "off", cx);
+        let shown = cx.shown_system_notifications();
+        let said: Vec<_> = shown
+            .iter()
+            .map(|n| (n.title.as_ref(), n.body.as_ref(), n.actions.len()))
+            .collect();
+        assert_eq!(
+            said,
+            [("Ana Popescu in Family", "New Message", 0), ("Hush", "New Message", 0)],
+            "no content, no Mark as Read; none at all when off"
+        );
+        assert_eq!(on_show(cx), ["name", "count"]);
         std::fs::remove_dir_all(&data).unwrap();
     }
 

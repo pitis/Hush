@@ -197,7 +197,7 @@ impl Hush {
 
     /// The Stories button: the window over the chats, on the first chat's first story.
     pub(super) fn open_stories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dialog.is_some() || self.group.is_some() || self.stories.list.is_empty() {
+        if self.dialog.is_some() || self.group.is_some() || self.settings_open() || self.stories.list.is_empty() {
             return;
         }
         let order: Vec<String> = groups(&self.stories.list, self.own_aci.as_deref())
@@ -439,7 +439,7 @@ mod window_tests {
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Entity, Focusable as _, TestAppContext, WindowOptions};
 
     use super::super::attach::window_tests::with_core;
-    use super::super::{files, navigate, Hush};
+    use super::super::{files, navigate, settings, Hush};
     use super::{key, Key};
     use crate::demo::ANA;
     use crate::Demo;
@@ -453,6 +453,7 @@ mod window_tests {
             })
             .expect("the window opens");
             navigate::shortcuts(window, hush.downgrade(), cx);
+            settings::shortcut(window, hush.downgrade(), cx);
             (window, hush)
         });
         cx.run_until_parked();
@@ -498,12 +499,13 @@ mod window_tests {
         cx.simulate_keystrokes(window, "left");
         assert_eq!(shown(&hush, cx).map(|(k, _)| k.0).as_deref(), Some(crate::demo::ME));
 
-        // the chats behind wait
-        cx.simulate_keystrokes(window, "alt-down");
+        // the chats behind wait, and Settings
+        cx.simulate_keystrokes(window, "alt-down secondary-,");
         assert_eq!(
             hush.read_with(cx, |app, _| app.selected.clone()).as_deref(),
             Some("g:01")
         );
+        assert!(!hush.read_with(cx, |app, _| app.settings_open()));
         cx.simulate_keystrokes(window, "escape");
         assert!(hush.read_with(cx, |app, _| app.stories.viewer.is_none()));
         let composer = window
