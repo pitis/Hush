@@ -4024,12 +4024,16 @@ dependencies = [
  "keyring-core",
  "libc",
  "mime_guess",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "qrcode",
  "rand 0.9.5",
  "rodio",
  "sig-core",
  "tracing",
  "url",
+ "zbus 5.19.0",
 ]
 
 [[package]]
