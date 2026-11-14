@@ -29,10 +29,20 @@ targets:
       properties:
         CFBundleDisplayName: Hush
         LSMinimumSystemVersion: "26.0"
+        NSMicrophoneUsageDescription: Hush uses the microphone for voice calls.
+    # Only what the hardened runtime would otherwise deny: the microphone, for calls. No camera:
+    # calls are voice only. RingRTC needs no JIT, unsigned memory or outside libraries.
+    entitlements:
+      path: Hush/Hush.entitlements
+      properties:
+        com.apple.security.device.audio-input: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.hush
-        ENABLE_HARDENED_RUNTIME: NO
+        # The app then loads only code signed by its own team and, outside Debug, ignores DYLD_*
+        # variables: no other app can run code in the app the Keychain gives the database key to.
+        # Xcode leaves it off in ad-hoc Debug builds, whose debug dylib would fail that check.
+        ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: YES
         # RingRTC's WebRTC and cubeb are C++
         OTHER_LDFLAGS: ["-lc++"]
