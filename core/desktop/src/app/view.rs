@@ -199,6 +199,7 @@ impl Hush {
                 .text_size(px(12.))
                 .text_color(p.secondary),
             )
+            .children(self.render_restore_note())
             .child(
                 div()
                     .id("link-code")
@@ -226,6 +227,7 @@ impl Hush {
                         .on_click(cx.listener(|this, _, _, cx| this.retry_link(cx))),
                 )
             })
+            .child(self.render_restore_button(p, cx))
     }
 
     fn render_sidebar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
@@ -1328,5 +1330,6 @@ impl Render for Hush {
             .children(dialog)
             .children(group)
             .children(self.render_view_once(p, cx))
+            .children(self.render_backup(p, cx))
     }
 }

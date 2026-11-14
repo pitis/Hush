@@ -23,6 +23,7 @@ use crate::{key, text};
 
 mod actions;
 pub mod attach;
+pub mod backup;
 mod chats;
 pub mod compose;
 mod drafts;
@@ -182,7 +183,22 @@ pub struct Hush {
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
+    backup: backup::Backup,
+    /// The open core's events, handled; dropped with this state when it starts over, so an old
+    /// core's last ones never reach the new one.
+    listening: Task<()>,
 }
+
+/// This computer's data folder and database key. Only the real window has them: made-up screens
+/// and window tests never touch the owner's data.
+#[derive(Clone)]
+struct Home {
+    folder: PathBuf,
+    /// The database key, made on first use.
+    key: fn() -> Result<String, String>,
+}
+
+impl Global for Home {}
 
 /// The open core and the draft writes on their way, for `quit`.
 struct Core(Arc<Client>, drafts::Writer);
@@ -221,15 +237,13 @@ impl EventListener for Listener {
 }
 
 /// The core over this computer's data folder, and that folder.
-fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), String> {
-    let data_dir = dirs::data_local_dir()
-        .ok_or("this system has no folder for app data")?
-        .join(DATA_FOLDER);
+fn open(home: &Home, events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), String> {
+    let data_dir = home.folder.clone();
     let dir = data_dir
         .to_str()
         .ok_or("the data folder's path isn't valid text")?
         .to_owned();
-    let key = key::db_key()?;
+    let key = (home.key)()?;
     let client =
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
     // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
@@ -243,30 +257,21 @@ impl Hush {
         Theme::sync_system_appearance(Some(window), cx);
         cx.observe_window_appearance(window, |_, window, cx| Theme::sync_system_appearance(Some(window), cx))
             .detach();
-        let app = Self::window(window, cx);
-
-        let (events, mut incoming) = unbounded();
-        cx.spawn(async move |this, cx| {
-            while let Some(event) = incoming.next().await {
-                if this.update(cx, |app, cx| app.handle(event, cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
-        // off the main thread: the keychain may ask, and the store opens on disk
-        let opening = cx.background_spawn(async move { open(events) });
-        cx.spawn(async move |this, cx| {
-            let client = opening.await;
-            this.update(cx, |app, cx| app.opened(client, cx))
-        })
-        .detach();
+        if let Some(dir) = dirs::data_local_dir() {
+            cx.set_global(Home {
+                folder: dir.join(DATA_FOLDER),
+                key: key::db_key,
+            });
+        }
+        Self::observe(window, cx);
+        let mut app = Self::window(window, cx);
+        app.boot(cx);
         app
     }
 
-    /// The window's state and controls, before any core.
-    fn window(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Whether the window is active and seen; once, not with the state: starting over builds that
+    /// again.
+    fn observe(window: &mut Window, cx: &mut Context<Self>) {
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             this.mark_read(false, cx);
@@ -278,7 +283,34 @@ impl Hush {
             this.mark_read(false, cx);
         })
         .detach();
+    }
 
+    /// Opens this computer's core.
+    fn boot(&mut self, cx: &mut Context<Self>) {
+        let Some(home) = cx.try_global::<Home>().cloned() else {
+            self.screen = Screen::Failed("this system has no folder for app data".into());
+            return;
+        };
+        let (events, mut incoming) = unbounded();
+        self.listening = cx.spawn(async move |this, cx| {
+            while let Some(event) = incoming.next().await {
+                if this.update(cx, |app, cx| app.handle(event, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // off the main thread: the keychain may ask, and the store opens on disk
+        let opening = cx.background_spawn(async move { open(&home, events) });
+        cx.spawn(async move |this, cx| {
+            let client = opening.await;
+            this.update(cx, |app, cx| app.opened(client, cx))
+        })
+        .detach();
+    }
+
+    /// The window's state and controls, before any core.
+    fn window(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -381,20 +413,26 @@ impl Hush {
             view_once: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
+            backup: Default::default(),
+            listening: Task::ready(()),
         }
     }
 
     /// A screen of made-up chats for `--snapshot`: no core, nobody's real messages.
     #[cfg(feature = "snapshot")]
     pub fn demo(screen: crate::Demo, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::observe(window, cx);
         let mut app = Self::window(window, cx);
         app.own_aci = Some(crate::demo::ME.into());
         app.names.extend(crate::demo::names());
         app.connection = ConnectionState::Online;
         match screen {
-            crate::Demo::Link => {
+            crate::Demo::Link | crate::Demo::Restored => {
                 app.screen = Screen::Link {
                     url: Some("sgnl://linkdevice?uuid=demo&pub_key=demo".into()),
+                };
+                if let crate::Demo::Restored = screen {
+                    app.demo_backup(true, window, cx);
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
@@ -409,7 +447,8 @@ impl Hush {
             | crate::Demo::GroupInfo
             | crate::Demo::EditGroup
             | crate::Demo::AddMembers
-            | crate::Demo::Typing => {
+            | crate::Demo::Typing
+            | crate::Demo::BackUp => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -436,6 +475,9 @@ impl Hush {
                 }
                 if let crate::Demo::Typing = screen {
                     app.demo_typing(cx);
+                }
+                if let crate::Demo::BackUp = screen {
+                    app.demo_backup(false, window, cx);
                 }
                 match screen {
                     crate::Demo::GroupInfo => app.demo_group(None, window, cx),

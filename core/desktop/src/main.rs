@@ -34,7 +34,11 @@ fn main() {
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys(key_bindings());
             cx.set_menus([
-                Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
+                Menu::new("Hush").items([
+                    MenuItem::action("Back Up…", app::backup::BackUp),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Hush", Quit),
+                ]),
                 Menu::new("Chats").items(chats_menu()),
             ]);
             cx.on_window_closed(|cx, _| app::quit(cx)).detach();
@@ -45,6 +49,7 @@ fn main() {
             app::search::shortcuts(window, hush.downgrade(), cx);
             app::attach::shortcut(window, hush.downgrade(), cx);
             app::navigate::shortcuts(window, hush.downgrade(), cx);
+            app::backup::shortcut(window, hush.downgrade(), cx);
             app::notifications::responses(window, hush.downgrade(), cx);
             cx.activate(true);
         });
@@ -147,6 +152,10 @@ pub enum Demo {
     ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
+    /// Back Up's dialog over the chat, its passphrase typed once.
+    BackUp,
+    /// The link screen after a restore.
+    Restored,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -182,6 +191,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("polls", Demo::Polls),
                 ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),
+                ("back-up", Demo::BackUp),
+                ("restored", Demo::Restored),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
