@@ -19,6 +19,7 @@ use sig_core::{Client, ConnectionState, CoreEvent, EventListener, HistoryStage};
 
 use crate::{key, text};
 
+mod files;
 mod view;
 
 /// How the phone lists this computer.
@@ -85,6 +86,7 @@ pub struct Hush {
     search: Entity<InputState>,
     query: String,
     timeline: Entity<MessageScrollerState>,
+    files: files::Files,
 }
 
 /// The open core, for `quit`.
@@ -101,6 +103,10 @@ pub fn quit(cx: &mut App) {
     let client = client.clone();
     cx.spawn(async move |cx| {
         Compat::new(client.stop()).await;
+        // opened files' decrypted copies go with the app
+        if let Some(dir) = dirs::data_local_dir() {
+            files::clear_open_copies(&dir.join(DATA_FOLDER));
+        }
         cx.update(|cx| cx.quit());
     })
     .detach();
@@ -127,6 +133,8 @@ fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), St
     let key = key::db_key()?;
     let client =
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
+    // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
+    files::clear_open_copies(&data_dir);
     Ok((client, data_dir))
 }
 
@@ -230,6 +238,7 @@ impl Hush {
             search,
             query: String::new(),
             timeline,
+            files: Default::default(),
         }
     }
 
@@ -252,6 +261,14 @@ impl Hush {
                 app.chats = crate::demo::chats();
                 app.selected = Some("g:01".into());
                 app.set_messages(crate::demo::messages(), cx);
+            }
+            crate::Demo::Files => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some(format!("c:{}", crate::demo::BOGDAN));
+                let messages = crate::demo::file_messages();
+                app.files = files::Files::demo(crate::demo::files(&messages));
+                app.set_messages(messages, cx);
             }
         }
         app
@@ -353,8 +370,9 @@ impl Hush {
                     self.reload_messages(cx);
                 }
             }
+            CoreEvent::AttachmentChanged { conversation_id, .. } => self.attachment_changed(&conversation_id, cx),
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, reactions, calls, stories, files, notifications
+            // not in this version: typing, reactions, calls, stories, notifications
             _ => return,
         }
         cx.notify();
@@ -470,6 +488,7 @@ impl Hush {
         });
         self.generation += 1;
         self.messages.clear();
+        self.clear_files(window, cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
         self.mark_read(true, cx);
@@ -534,6 +553,7 @@ impl Hush {
             .collect();
         wanted.extend(self.messages.iter().flat_map(|m| mentioned(&m.ranges)));
         self.load_names(wanted, cx);
+        self.load_files(cx);
     }
 
     /// Looks up each unknown contact's name; a failed lookup is tried again next time.

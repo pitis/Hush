@@ -13,7 +13,7 @@ use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, MessageStatus};
 use sig_core::{ConnectionState, HistoryStage};
 
-use super::{Hush, Screen};
+use super::{files, Hush, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -38,6 +38,8 @@ struct Row {
     mentions: Vec<std::ops::Range<usize>>,
     /// Deleted: said in italics.
     note: bool,
+    /// Above the text, which is empty without a caption.
+    files: Vec<files::Shown>,
     edited: bool,
     time: String,
     status: Option<MessageStatus>,
@@ -71,7 +73,12 @@ impl Hush {
             let last = !next.is_some_and(|n| joins(m, n));
             let name = self.name(&m.author);
             let person = format!("c:{}", m.author);
-            let (body, mentions) = text::message(m, |aci| self.name(aci));
+            let files = self.files_of(m);
+            let (body, mentions) = text::message(m, !files.is_empty(), |aci| self.name(aci));
+            let spoken = match files.first() {
+                Some(f) if body.is_empty() => text::describe(&files::summary(&f.file), ""),
+                _ => body.clone(),
+            };
             let time = text::bubble_time(m.sent_at);
             let status = m.is_outgoing.then_some(m.status);
             let said = status.map(|s| format!(", {}", text::status(s))).unwrap_or_default();
@@ -88,8 +95,9 @@ impl Hush {
                     },
                     _ => Gutter::Blank,
                 },
-                label: format!("{name}: {body}. {time}{said}"),
+                label: format!("{name}: {spoken}. {time}{said}"),
                 text: body,
+                files,
                 mentions,
                 note: m.deleted,
                 edited: m.edited && !m.deleted,
@@ -479,6 +487,7 @@ impl Hush {
         } else {
             "Answer this chat on your phone to write here."
         };
+        let this = cx.entity().downgrade();
         let mut row_style = StyleRefinement::default();
         row_style.padding.bottom = Some(px(0.).into());
         v_flex()
@@ -510,7 +519,7 @@ impl Hush {
             )
             .child(
                 MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
-                    render_row(ix, &rows[ix], &out_fill, style::palette(cx))
+                    render_row(ix, &rows[ix], &out_fill, &this, style::palette(cx))
                 })
                 .with_row_style(row_style)
                 .flex_1()
@@ -661,11 +670,11 @@ impl Hush {
     }
 }
 
-fn render_row(ix: usize, row: &Row, out_fill: &Background, p: Palette) -> Stateful<Div> {
-    let (fill, color) = if row.outgoing {
-        (*out_fill, p.on_accent)
+fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hush>, p: Palette) -> Stateful<Div> {
+    let (fill, color, behind) = if row.outgoing {
+        (*out_fill, p.on_accent, p.bubble_out)
     } else {
-        (p.bubble_in.into(), p.text_in)
+        (p.bubble_in.into(), p.text_in, p.bubble_in)
     };
     let meta_color = color.opacity(0.6);
     let meta = h_flex()
@@ -677,31 +686,40 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, p: Palette) -> Statef
         .when(row.edited, |this| this.child("edited"))
         .child(row.time.clone())
         .children(row.status.map(|s| tick(s, 10., meta_color, p.bubble_out, p)));
-    let bubble = h_flex()
+    let line = h_flex()
         .max_w_full()
         .items_end()
         .gap(px(8.))
+        .when(!row.text.is_empty(), |this| {
+            this.child(
+                div()
+                    .min_w_0()
+                    .text_size(px(14.))
+                    .when(row.note, |this| this.italic().text_color(color.opacity(0.6)))
+                    .child(
+                        StyledText::new(row.text.clone()).with_highlights(row.mentions.iter().map(|r| {
+                            let bold = HighlightStyle {
+                                font_weight: Some(FontWeight::BOLD),
+                                ..Default::default()
+                            };
+                            (r.clone(), bold)
+                        })),
+                    ),
+            )
+        })
+        .child(meta);
+    let bubble = v_flex()
+        .max_w_full()
+        .gap(px(4.))
         .px(px(12.))
         .py(px(8.))
         .rounded(px(18.))
         .bg(fill)
         .text_color(color)
-        .child(
-            div()
-                .min_w_0()
-                .text_size(px(14.))
-                .when(row.note, |this| this.italic().text_color(color.opacity(0.6)))
-                .child(
-                    StyledText::new(row.text.clone()).with_highlights(row.mentions.iter().map(|r| {
-                        let bold = HighlightStyle {
-                            font_weight: Some(FontWeight::BOLD),
-                            ..Default::default()
-                        };
-                        (r.clone(), bold)
-                    })),
-                ),
-        )
-        .child(meta);
+        // files without a caption: the time sits under them on the right
+        .when(row.text.is_empty(), |this| this.items_end())
+        .children(files::render(&row.files, this, color, behind))
+        .child(line);
     let gutter = match &row.gutter {
         Gutter::None => None,
         Gutter::Blank => Some(div().size(px(28.)).flex_none()),
@@ -813,7 +831,7 @@ fn tick(status: MessageStatus, size: f32, color: Hsla, behind: Hsla, p: Palette)
     }
 }
 
-fn icon(name: &str, size: f32, color: Hsla) -> Icon {
+pub(super) fn icon(name: &str, size: f32, color: Hsla) -> Icon {
     Icon::empty()
         .path(SharedString::from(format!("icons/{name}.svg")))
         .size(px(size))
