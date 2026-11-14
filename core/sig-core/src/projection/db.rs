@@ -584,6 +584,19 @@ impl ProjectionDb {
         Ok(was.unwrap_or(false))
     }
 
+    /// Whether the chat is a message request, or would be one once a stranger's first message
+    /// or call makes it (a chat we don't have yet, once the phone's state is known).
+    pub async fn is_message_request(&self, id: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(concat!(
+            "SELECT COALESCE((SELECT ",
+            is_request!(),
+            " FROM conversations c WHERE c.id = ?1), EXISTS (SELECT 1 FROM storage_sync WHERE version > 0))"
+        ))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Whether the chat is blocked (false for a chat we don't have).
     pub async fn is_blocked(&self, id: &str) -> Result<bool, sqlx::Error> {
         let b: Option<bool> = sqlx::query_scalar("SELECT blocked FROM conversations WHERE id = ?1")
@@ -2464,15 +2477,19 @@ impl ProjectionDb {
         }))
     }
 
-    /// Not yet downloaded images and voice notes up to `AUTO_DOWNLOAD_MAX`, oldest first.
+    /// Not yet downloaded images and voice notes up to `AUTO_DOWNLOAD_MAX`, oldest first, but
+    /// not those of message requests and blocked chats: they wait until it is accepted.
     pub async fn auto_downloads(&self) -> Result<Vec<i64>, sqlx::Error> {
-        sqlx::query_scalar(
+        sqlx::query_scalar(concat!(
             "SELECT id FROM attachments a WHERE state = ?1 AND pointer IS NOT NULL AND size <= ?2
                AND (content_type LIKE 'image/%' OR is_voice_note = 1)
                -- a story's file is fetched when the story is opened, not before
                AND NOT EXISTS (SELECT 1 FROM stories s WHERE s.author = a.message_author AND s.sent_at = a.message_sent_at)
-             ORDER BY id",
-        )
+               AND NOT EXISTS (SELECT 1 FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                 WHERE m.author = a.message_author AND m.sent_at = a.message_sent_at AND (c.blocked OR ",
+            is_request!(),
+            ")) ORDER BY id"
+        ))
         .bind(AttachmentState::Pending.to_i64())
         .bind(AUTO_DOWNLOAD_MAX as i64)
         .fetch_all(&self.pool)
@@ -7311,6 +7328,60 @@ mod tests {
         db.accept("c:alice").await.unwrap();
         db.accept("c:bob").await.unwrap();
         assert_eq!(db.unsent_receipts().await.unwrap(), vec![k("alice", 1), k("bob", 2)]);
+    }
+
+    /// A stranger's pictures and voice notes aren't fetched (nor decoded) until the chat is
+    /// accepted, nor a blocked chat's; opened by hand, one still downloads.
+    #[tokio::test]
+    async fn media_waits_while_a_chat_is_a_request_or_blocked() {
+        let db = db().await;
+        phone_state_known(&db).await;
+        db.insert_message(&msg("alice", 1, "a")).await.unwrap();
+        db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        let image = || {
+            vec![
+                new_attachment("image/jpeg", 3, false),
+                new_attachment("image/jpeg", 3, false),
+            ]
+        };
+        db.apply(&add(k("alice", 1), image(), None)).await.unwrap();
+        db.apply(&add(k("bob", 2), image(), None)).await.unwrap();
+        db.accept("c:bob").await.unwrap();
+        db.block("c:bob").await.unwrap();
+        assert!(db.auto_downloads().await.unwrap().is_empty());
+        let [a, a2] = <[Attachment; 2]>::try_from(db.attachments(&k("alice", 1)).await.unwrap()).unwrap();
+        assert!(db.start_download(a2.id).await.unwrap().is_some(), "by hand");
+        db.accept("c:alice").await.unwrap();
+        db.accept("c:bob").await.unwrap();
+        let bob: Vec<i64> = db
+            .attachments(&k("bob", 2))
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(db.auto_downloads().await.unwrap(), [vec![a.id], bob].concat());
+    }
+
+    /// A call rings only from a chat we accepted: not from a message request, nor from a
+    /// stranger we have no chat with yet (once the phone's state is known, as for requests).
+    #[tokio::test]
+    async fn a_call_is_from_a_request_as_its_chat_would_be() {
+        let db = db().await;
+        assert!(
+            !db.is_message_request("c:stranger").await.unwrap(),
+            "state unknown: accepted"
+        );
+        phone_state_known(&db).await;
+        assert!(db.is_message_request("c:stranger").await.unwrap());
+        db.insert_message(&msg("alice", 1, "hello?")).await.unwrap();
+        assert!(db.is_message_request("c:alice").await.unwrap());
+        db.accept("c:alice").await.unwrap();
+        db.set_phone_contact("c:bob", true).await.unwrap();
+        db.insert_message(&mine("c:carol", 2)).await.unwrap();
+        for c in ["c:alice", "c:bob", "c:carol"] {
+            assert!(!db.is_message_request(c).await.unwrap(), "{c}");
+        }
     }
 
     #[tokio::test]

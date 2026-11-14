@@ -109,6 +109,16 @@ already synced, and not for chats that are requests or blocked: those wait, and 
 it's accepted (Desktop sends them on accept).
 Typing needs nothing: the composer isn't there.
 
+### Calls and media (owner, 2026-11-14; #161)
+- A call from a request, or from a stranger we have no chat with yet (once the state is known),
+  doesn't ring, as in Signal's apps: the call router drops all its messages (offer, ICE, hangup)
+  before the call engine, so no connection is set up and the caller can't learn our IP. An offer
+  is recorded as a missed call in that chat. Nothing is sent back, as with receipts (Signal-Android,
+  as remembered and not checked against its source, answers with a `NEED_PERMISSION` hangup).
+- Pictures and voice notes of requests and blocked chats don't download by themselves
+  (`auto_downloads`); accepting here, or on the phone (`MessageRequestResponse`, `Blocked`),
+  queues a pass that fetches them. Opening one by hand still downloads it.
+
 ### From the phone (projector + db)
 - `Blocked`: the list replaces ours. Each listed ACI or group (matched by identifier against
   our group chats' master keys) not blocked here → `blocked=1, whitelisted=0`; each chat blocked

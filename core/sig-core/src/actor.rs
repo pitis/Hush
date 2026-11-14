@@ -60,8 +60,8 @@ pub enum Command {
     },
     Start,
     Send(Job),
-    /// Download one attachment (the user asked for it).
-    Download(i64),
+    /// Download one attachment (the user asked for it), or what downloads by itself.
+    Download(Download),
     /// The user is typing in a conversation (`started`), or stopped.
     Typing {
         conversation_id: String,
@@ -823,8 +823,8 @@ async fn run(
                 // the thread ends; the Client deletes presage's store and the app relinks
                 return;
             }
-            Command::Download(id) => {
-                let _ = download_tx.send(Download::One(id));
+            Command::Download(what) => {
+                let _ = download_tx.send(what);
             }
             Command::Typing {
                 conversation_id,
@@ -1500,6 +1500,7 @@ fn spawn_call_router(
 ) -> Rc<dyn Fn() -> Option<std::sync::mpsc::Sender<crate::calls::actor::CallCommand>>> {
     use crate::calls::actor::{CallCommand, CallOutput};
     let engine: Rc<RefCell<Option<std::sync::mpsc::Sender<CallCommand>>>> = Rc::new(RefCell::new(None));
+    let held_back_tx = call_out_tx.clone();
     let ensure_engine = {
         let engine = engine.clone();
         let registration = registration.clone();
@@ -1520,6 +1521,7 @@ fn spawn_call_router(
     {
         let ensure_engine = ensure_engine.clone();
         let (store, listener, registration) = (store.clone(), listener.clone(), registration.clone());
+        let db = db.clone();
         tokio::task::spawn_local(async move {
             use presage::libsignal_service::protocol::{IdentityKeyStore, ProtocolAddress};
             while let Some(envelope) = incoming_rx.recv().await {
@@ -1531,6 +1533,20 @@ fn spawn_call_router(
                 let calls = crate::calls::wire::from_proto(&envelope.message, our_device_id);
                 if calls.is_empty() {
                     continue; // not for this device, or nothing we handle: no audio stack for it
+                }
+                match hold_back_unaccepted_call(&db, &sender_aci, &calls, &held_back_tx).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        tracing::info!(sender = %sender_aci, "a call from a message request didn't ring");
+                        continue;
+                    }
+                    // held back too: a call that rings by mistake gives our IP away
+                    Err(e) => {
+                        listener.on_event(CoreEvent::Error {
+                            message: format!("a call couldn't be checked against message requests: {e}"),
+                        });
+                        continue;
+                    }
                 }
                 let Some(engine) = ensure_engine() else {
                     tracing::warn!("a call message arrived while unlinked");
@@ -2141,7 +2157,7 @@ async fn handle(
                 // now that the new setting is stored, so they can't go out under the old one
                 let _ = queues.sends.send(Job::Receipts);
             }
-            if outcome.attachments_added {
+            if outcome.attachments_added || outcome.requests_answered {
                 let _ = queues.downloads.send(Download::Auto);
             }
         }
@@ -2225,6 +2241,34 @@ struct Queues {
 struct Outcome {
     settings_changed: bool,
     attachments_added: bool,
+    requests_answered: bool,
+}
+
+/// As on Signal, a call from a chat we haven't accepted (a message request, or a stranger with
+/// no chat yet) doesn't ring: none of its messages reach the call engine, so no connection is set
+/// up and the caller can't learn our IP. Its offer goes to `out` as a missed call, which makes
+/// the request. Nothing is answered: the caller hears no answer, as receipts to requests wait
+/// too. True if it was held back.
+async fn hold_back_unaccepted_call(
+    db: &ProjectionDb,
+    sender_aci: &str,
+    calls: &[crate::calls::wire::IncomingCall],
+    out: &mpsc::UnboundedSender<crate::calls::actor::CallOutput>,
+) -> Result<bool, sqlx::Error> {
+    if !db.is_message_request(&format!("c:{sender_aci}")).await? {
+        return Ok(false);
+    }
+    if calls
+        .iter()
+        .any(|c| matches!(c.message, ringrtc::core::signaling::Message::Offer(_)))
+    {
+        let _ = out.send(crate::calls::actor::CallOutput::ChatEvent {
+            peer_aci: sender_aci.to_owned(),
+            kind: ChatEventKind::MissedCall,
+            value: None,
+        });
+    }
+    Ok(true)
 }
 
 /// Applies the ops of one received content and, when `live` (not catching up), announces what
@@ -2243,6 +2287,8 @@ async fn apply_received(
             Ok(applied) => {
                 outcome.settings_changed |= matches!(op, Op::Settings { .. });
                 outcome.attachments_added |= matches!(op, Op::AddAttachments { .. }) && !applied.is_empty();
+                // a block list or request answer changed chats: an accepted one's media may come
+                outcome.requests_answered |= applied.contains(&crate::projection::db::Applied::ConversationsChanged);
                 let new = if live { alert(op, &applied, me) } else { None };
                 applied.into_iter().for_each(|a| l.on_event(from_applied(a)));
                 if let Some(e) = new {
@@ -2865,6 +2911,76 @@ mod tests {
         db.block(&chat).await.unwrap();
         super::decryption_failed(&db, &sink, alice, Some(&broken)).await;
         assert_eq!(db.chat_events(&chat, 0).await.unwrap().len(), 2);
+    }
+
+    /// A call from a message request doesn't ring: nothing of it reaches the call engine (so no
+    /// connection gives our IP away), and its offer shows as a missed call in the request.
+    #[tokio::test]
+    async fn a_call_from_a_message_request_is_held_back_as_missed() {
+        use crate::calls::actor::CallOutput;
+        use crate::calls::wire::IncomingCall;
+        use crate::projection::ChatEventKind;
+        use ringrtc::common::{CallId, CallMediaType};
+        use ringrtc::core::signaling::{Ice, Message, Offer};
+        const STRANGER: &str = "22222222-2222-2222-2222-222222222222";
+        const BOB: &str = "33333333-3333-3333-3333-333333333333";
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        db.set_storage_state(&crate::projection::StorageState {
+            version: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.set_phone_contact(&format!("c:{BOB}"), true).await.unwrap();
+        let (out, mut outputs) = mpsc::unbounded_channel();
+        let offer = || IncomingCall {
+            call_id: CallId::new(7),
+            message: Message::Offer(Offer::new(CallMediaType::Audio, vec![]).unwrap()),
+        };
+        let ice = || IncomingCall {
+            call_id: CallId::new(7),
+            message: Message::Ice(Ice { candidates: vec![] }),
+        };
+        let held = |sender: &'static str, calls: Vec<IncomingCall>| {
+            let (db, out) = (&db, &out);
+            async move { super::hold_back_unaccepted_call(db, sender, &calls, out).await.unwrap() }
+        };
+        assert!(held(STRANGER, vec![offer(), ice()]).await);
+        match outputs.try_recv() {
+            Ok(CallOutput::ChatEvent { peer_aci, kind, value }) => {
+                assert_eq!(
+                    (peer_aci.as_str(), kind, value),
+                    (STRANGER, ChatEventKind::MissedCall, None)
+                );
+            }
+            _ => panic!("expected a missed call"),
+        }
+        assert!(held(STRANGER, vec![ice()]).await, "its ICE and hangup stay out too");
+        assert!(outputs.try_recv().is_err(), "one missed call per offer");
+        assert!(!held(BOB, vec![offer()]).await, "an accepted chat's call rings");
+        assert!(outputs.try_recv().is_err());
+    }
+
+    /// The phone accepting a request (or unblocking a chat) lets its held-back media download.
+    #[tokio::test]
+    async fn a_request_accepted_on_the_phone_lets_its_media_download() {
+        use crate::projection::{RequestResponse, RequestThread};
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let accept = Op::RequestResponse {
+            thread: RequestThread::Aci("alice".into()),
+            response: RequestResponse::Accept,
+        };
+        assert!(
+            super::apply_received(&db, &Quiet, std::slice::from_ref(&accept), "me", "me", true)
+                .await
+                .requests_answered
+        );
+        assert!(
+            !super::apply_received(&db, &Quiet, &[accept], "me", "me", true)
+                .await
+                .requests_answered,
+            "already accepted: nothing new to fetch"
+        );
     }
 
     /// The receipts flush is queued after this returns, so the new setting must already be stored.

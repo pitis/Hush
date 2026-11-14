@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::actor::{self, Command};
 use crate::backup;
+use crate::download::Download;
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
 use crate::groups::{GroupChange, GroupInfo, GroupJoined, GroupPreview};
@@ -262,6 +263,13 @@ impl Client {
         if let Err(e) = self.send(Command::Send(job)) {
             tracing::warn!(error = %e, "a send job was dropped");
         }
+    }
+
+    /// Queues a download (if the core is closing it is lost: the next start's pass picks it up).
+    fn download(&self, what: Download) -> Result<(), CoreError> {
+        #[cfg(test)]
+        self.sent_jobs.lock().unwrap().push(format!("{what:?}"));
+        self.send(Command::Download(what))
     }
 
     /// A chat that can be blocked or deleted: known, and not Note to Self.
@@ -722,7 +730,7 @@ impl Client {
         if !self.is_linked() {
             return Err(CoreError::NotLinked);
         }
-        self.send(Command::Download(id))
+        self.download(Download::One(id))
     }
 
     /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
@@ -1506,6 +1514,8 @@ impl Client {
             self.queue(Job::ProfileKey { conversation_id });
         }
         self.queue(Job::Receipts);
+        // its pictures and voice notes waited while it was a request
+        let _ = self.download(Download::Auto);
         Ok(())
     }
 
@@ -2689,13 +2699,19 @@ mod tests {
             assert!(!c.blocked && c.whitelisted);
             assert_eq!(
                 jobs(&client),
-                ["RequestResponse(Accept)", "BlockedList", "ProfileKey", "Receipts"],
-                "unblocking is accepting; the block list changed too"
+                [
+                    "RequestResponse(Accept)",
+                    "BlockedList",
+                    "ProfileKey",
+                    "Receipts",
+                    "Auto"
+                ],
+                "unblocking is accepting; the block list changed too; held-back media comes now"
             );
             client.accept_request(conv.clone()).await.unwrap();
             assert_eq!(
                 jobs(&client),
-                ["RequestResponse(Accept)", "ProfileKey", "Receipts"],
+                ["RequestResponse(Accept)", "ProfileKey", "Receipts", "Auto"],
                 "the block list didn't change"
             );
             client.delete_chat(conv.clone()).await.unwrap();
@@ -2733,7 +2749,7 @@ mod tests {
                 .await
                 .unwrap();
             client.accept_request(group.clone()).await.unwrap();
-            assert_eq!(jobs(&client), ["RequestResponse(Accept)", "Receipts"]);
+            assert_eq!(jobs(&client), ["RequestResponse(Accept)", "Receipts", "Auto"]);
             client.block(group.clone()).await.unwrap();
             assert_eq!(jobs(&client), ["RequestResponse(Block)", "BlockedList"]);
         });
