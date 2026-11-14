@@ -41,6 +41,7 @@ fn main() {
             })
             .expect("the window opens");
             app::search::shortcuts(window, hush.downgrade(), cx);
+            app::attach::shortcut(window, hush.downgrade(), cx);
             app::navigate::shortcuts(window, hush.downgrade(), cx);
             cx.activate(true);
         });
@@ -51,6 +52,7 @@ fn key_bindings() -> Vec<KeyBinding> {
     let mut all = vec![KeyBinding::new(QUIT_KEY, Quit, None)];
     all.extend(app::search::keys());
     all.extend(app::compose::keys());
+    all.extend(app::attach::keys());
     all.extend(app::navigate::keys());
     all
 }
@@ -71,6 +73,7 @@ fn chats_menu() -> Vec<MenuItem> {
         MenuItem::submenu(Menu::new("Jump to Chat").items(jump)),
         MenuItem::separator(),
         MenuItem::action("Focus Composer", FocusComposer),
+        MenuItem::action("Attach Files…", app::attach::AttachFiles),
         MenuItem::action("Close Chat", CloseChat),
     ]
 }
@@ -104,7 +107,7 @@ pub enum Demo {
     NewGroup,
     /// The chat, replying to a message whose buttons and reaction picker show.
     Reply,
-    /// A chat's pictures, recordings and files.
+    /// A chat's pictures, recordings and files, and files waiting to be sent.
     Files,
     /// The chat, writing a styled message with a mention, the mention picker open.
     Compose,

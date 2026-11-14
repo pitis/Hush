@@ -22,6 +22,7 @@ use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, Gro
 use crate::{key, text};
 
 mod actions;
+pub mod attach;
 pub mod compose;
 mod files;
 pub mod navigate;
@@ -132,6 +133,12 @@ pub struct Hush {
     composer: Entity<TextareaState>,
     /// Nothing to send: the send button hides.
     composer_empty: bool,
+    /// Files to send with the next message.
+    tray: Vec<attach::Outgoing>,
+    /// Files being added to the tray (read, a pasted picture written).
+    adding: usize,
+    /// ↩ was pressed while files were being added: the message goes once they're in.
+    send_waiting: bool,
     /// The sidebar's search field and its words (chats whose name has them; messages in `find`).
     search: Entity<InputState>,
     query: String,
@@ -166,9 +173,10 @@ pub fn quit(cx: &mut App) {
     let client = client.clone();
     cx.spawn(async move |cx| {
         Compat::new(client.stop()).await;
-        // opened files' decrypted copies go with the app
+        // opened files' decrypted copies go with the app, and pasted pictures
         if let Some(dir) = dirs::data_local_dir() {
             files::clear_open_copies(&dir.join(DATA_FOLDER));
+            attach::clear_pasted(&dir.join(DATA_FOLDER));
         }
         cx.update(|cx| cx.quit());
     })
@@ -198,6 +206,7 @@ fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), St
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
     // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
     files::clear_open_copies(&data_dir);
+    attach::clear_pasted(&data_dir);
     Ok((client, data_dir))
 }
 
@@ -318,6 +327,9 @@ impl Hush {
             window_visible: window.is_visible(),
             composer,
             composer_empty: true,
+            tray: vec![],
+            adding: 0,
+            send_waiting: false,
             search,
             query: String::new(),
             find: Default::default(),
@@ -380,6 +392,7 @@ impl Hush {
                 let messages = crate::demo::file_messages();
                 app.files = files::Files::demo(crate::demo::files(&messages));
                 app.set_messages(messages, cx);
+                app.demo_tray();
             }
         }
         app
@@ -631,6 +644,7 @@ impl Hush {
         self.depth = PAGE;
         self.messages.clear();
         self.clear_files(cx);
+        self.clear_tray(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
         self.mark_read(true, cx);
@@ -782,33 +796,50 @@ impl Hush {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
-            return;
-        };
+        let Some(id) = self.selected.clone() else { return };
         let typed = self.typed(cx);
         let (body, ranges) = compose::message(&typed);
-        if body.is_empty() || self.save_edit(body.clone(), ranges.clone(), window, cx) {
-            return;
+        let plan = attach::plan(&body, self.actions.editing(), self.adding > 0, !self.tray.is_empty());
+        match plan {
+            attach::Plan::Nothing => return,
+            attach::Plan::Edit => {
+                self.save_edit(body, ranges, window, cx);
+                return;
+            }
+            attach::Plan::Wait => return self.send_when_added(),
+            attach::Plan::Text | attach::Plan::Files { .. } => {}
         }
+        let Some(client) = self.client.clone() else { return };
         let reply = self.take_reply();
         let quote = reply.as_ref().map(actions::quote);
         self.set_typed(compose::Typed::default(), window, cx);
+        let files = self.take_tray();
+        let worded = !body.is_empty();
         cx.spawn_in(window, async move |this, cx| {
-            let sent = Compat::new(client.send_text(id.clone(), body, ranges, quote, None)).await;
+            let sent = match plan {
+                attach::Plan::Files { caption } => {
+                    let outgoing = files.iter().map(attach::Outgoing::file).collect();
+                    Compat::new(client.send_attachments(id.clone(), outgoing, caption, ranges, quote)).await
+                }
+                _ => Compat::new(client.send_text(id.clone(), body, ranges, quote, None)).await,
+            };
+            let had_files = !files.is_empty();
+            let _ = this.update(cx, |app, cx| app.tray_back(&id, files, sent.is_ok(), cx));
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
-                app.error = Some(format!("Couldn't send the message: {e}"));
+                // the Mac app's words: the core's
+                let e = describe(&e);
                 // the text goes back to its chat: into the composer if that chat is still open
                 // and nothing new was typed, else into its draft
-                if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
+                let open = app.selected.as_deref() == Some(id.as_str());
+                if open && app.composer.read(cx).value().is_empty() {
+                    app.error = Some(e);
                     app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
                 } else {
-                    if reply.is_some() {
-                        app.error = Some(format!(
-                            "Couldn't send the reply: {e}. Its text is back in its chat, without the quote."
-                        ));
-                    }
+                    // the files went back to the tray only if their chat is still open
+                    let lost_files = had_files && !open;
+                    app.error = Some(attach::unsent(&e, worded, reply.is_some(), lost_files));
                     app.drafts.entry(id).or_insert(typed.words());
                 }
                 cx.notify();
@@ -1003,6 +1034,7 @@ impl Hush {
             self.generation += 1;
             self.messages.clear();
             self.clear_files(cx);
+            self.clear_tray(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
         self.drop_chat_copies(&id);
