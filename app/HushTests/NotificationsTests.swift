@@ -7,7 +7,7 @@ final class NotificationsTests: XCTestCase {
         _ setting: NotificationContent, group: String? = nil, text: String? = "hi", reaction: String? = nil
     ) -> NotificationRequest? {
         Notifications.request(
-            setting: setting, conversationId: "c:a", id: "c:a|a|1", sender: "Alice", groupTitle: group, text: text,
+            setting: setting, chat: "opaque-a", id: "opaque-alice|1|", sender: "Alice", groupTitle: group, text: text,
             reaction: reaction)
     }
 
@@ -16,7 +16,7 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(r?.title, "Alice")
         XCTAssertEqual(r?.body, "hi")
         XCTAssertEqual(r?.hasActions, true)
-        XCTAssertEqual(r?.conversationId, "c:a")
+        XCTAssertEqual(r?.chat, "opaque-a")
         XCTAssertEqual(request(.nameAndMessage, group: "Climbing crew")?.title, "Alice in Climbing crew")
         XCTAssertEqual(request(.nameAndMessage, text: nil)?.body, "Attachment")
     }
@@ -52,7 +52,7 @@ final class FakeNotifier: Notifier, @unchecked Sendable {
     private(set) var removedIds: [String] = []
     func authorize() { authorized += 1 }
     func post(_ request: NotificationRequest) { posted.append(request) }
-    func remove(conversationId: String) { removed.append(conversationId) }
+    func remove(chat: String) { removed.append(chat) }
     func remove(ids: [String]) { removedIds += ids }
     private(set) var removedPrefixes: [String] = []
     func remove(idPrefix: String) { removedPrefixes.append(idPrefix) }
@@ -115,7 +115,7 @@ final class AppStoreNotificationTests: XCTestCase {
         store.handle(newMessage("c:alice", "alice", 1))
         await eventually { notifier.posted.count == 1 }
         try? await Task.sleep(for: .milliseconds(50))
-        XCTAssertEqual(notifier.posted.map(\.conversationId), ["c:alice"])
+        XCTAssertEqual(notifier.posted.map(\.chat), [fake.opaqueId(id: "c:alice")])
     }
 
     func testGroupMessagesNameSenderAndGroupAndOffMeansNone() async {
@@ -208,9 +208,9 @@ final class AppStoreNotificationTests: XCTestCase {
         // read on the phone: the list refresh shows it
         fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
         store.handle(.conversationsChanged)
-        await eventually { notifier.removed == ["c:a"] }
+        await eventually { notifier.removed == [fake.opaqueId(id: "c:a")] }
         store.select("c:b")
-        XCTAssertEqual(notifier.removed, ["c:a", "c:b"])
+        XCTAssertEqual(notifier.removed, ["c:a", "c:b"].map { fake.opaqueId(id: $0) })
     }
 
     func testReplyFromANotificationSendsAndMarksTheChatRead() async {
@@ -219,12 +219,12 @@ final class AppStoreNotificationTests: XCTestCase {
         let notifier = FakeNotifier()
         let store = await store(fake, notifier)
         await eventually { store.conversations.count == 1 }
-        await store.replyFromNotification(conversationId: "c:a", text: " on my way ")
+        await store.replyFromNotification(chat: fake.opaqueId(id: "c:a"), text: " on my way ")
         XCTAssertEqual(fake.sent.map(\.body), ["on my way"])
         XCTAssertEqual(fake.sent.first?.conversationId, "c:a")
         await eventually { fake.markedRead == ["c:a"] }
-        await store.markReadFromNotification(conversationId: "c:a")
-        XCTAssertTrue(notifier.removed.contains("c:a"))
+        await store.markReadFromNotification(chat: fake.opaqueId(id: "c:a"))
+        XCTAssertTrue(notifier.removed.contains(fake.opaqueId(id: "c:a")))
     }
 
     func testMarkAsReadWorksWhenTheClickLaunchedTheApp() async {
@@ -232,7 +232,7 @@ final class AppStoreNotificationTests: XCTestCase {
         fake.conversationAnswers = [.success([conversation("c:a", unread: 1)])]
         fake.holdCall = 1  // the chat list is still loading when the action arrives
         let store = await store(fake, FakeNotifier())
-        let action = Task { await store.markReadFromNotification(conversationId: "c:a") }
+        let action = Task { await store.markReadFromNotification(chat: fake.opaqueId(id: "c:a")) }
         await eventually { fake.isHolding }
         fake.release()
         await action.value
@@ -245,7 +245,7 @@ final class AppStoreNotificationTests: XCTestCase {
         fake.sendError = TestError(description: "closed")
         let notifier = FakeNotifier()
         let store = await store(fake, notifier)
-        await store.replyFromNotification(conversationId: "c:a", text: "hi")
+        await store.replyFromNotification(chat: fake.opaqueId(id: "c:a"), text: "hi")
         XCTAssertNotNil(store.lastError)
         XCTAssertEqual(notifier.posted.map(\.title), ["Reply not sent"])
         XCTAssertEqual(fake.markedRead, [])
@@ -271,9 +271,35 @@ final class AppStoreNotificationTests: XCTestCase {
 
     func testOpeningANotificationOpensItsChat() async {
         let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b")])]
         let store = await store(fake, FakeNotifier())
-        await store.openFromNotification(conversationId: "c:a")
+        await store.openFromNotification(chat: fake.opaqueId(id: "c:a"))
         XCTAssertEqual(store.selectedId, "c:a")
         XCTAssertTrue(store.composerWantsFocus)
+    }
+
+    func testANotificationNamesNoChatOrPersonButOpensItsChat() async {
+        let fake = FakeClient(linked: true)
+        fake.titles["c:alice"] = "Alice"
+        fake.titles["g:00"] = "Climbing crew"
+        fake.conversationAnswers = [.success([conversation("c:alice"), conversation("g:00")])]
+        fake.messageAnswers["g:00"] = [message("g:00", "alice", 1, "who's in?"), message("g:00", "me-aci", 2)]
+        let notifier = FakeNotifier()
+        let store = await store(fake, notifier)
+        await eventually { store.conversations.count == 2 }
+        store.handle(newMessage("g:00", "alice", 1))
+        store.handle(
+            .newReaction(
+                conversationId: "g:00", target: MessageKey(author: "me-aci", sentAt: 2), reactor: "alice",
+                emoji: "👍"))
+        await eventually { notifier.posted.count == 2 }
+        for posted in notifier.posted {
+            XCTAssertEqual(posted.chat, fake.opaqueId(id: "g:00"))
+            for id in ["g:00", "alice", "me-aci"] { XCTAssertFalse(posted.id.contains(id), posted.id) }
+        }
+        await store.openFromNotification(chat: notifier.posted[0].chat)
+        XCTAssertEqual(store.selectedId, "g:00")
+        // the old versions' notifications, named by chat id and ACI, go when the app starts
+        XCTAssertTrue(Set(["c:", "g:", "call-missed|c:", "reply-failed-"]).isSubset(of: notifier.removedPrefixes))
     }
 }

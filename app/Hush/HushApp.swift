@@ -54,7 +54,8 @@ struct HushApp: App {
     init() {
         let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         if !isTestHost { Legacy.adoptSettings() }  // before any setting is read
-        let core = AppStore(notifier: isTestHost ? nil : SystemNotifier())
+        let core = AppStore(
+            notifier: isTestHost ? nil : SystemNotifier(), legacyDrafts: isTestHost ? nil : .standard)
         if !isTestHost { Files.clearOpened() }
         self.isTestHost = isTestHost
         _core = State(initialValue: core)

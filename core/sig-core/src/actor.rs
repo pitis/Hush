@@ -292,10 +292,10 @@ async fn run(
         let projection = ProjectionDb::open(&format!("sqlite://{}", dir.join("projection.db").display()), Some(&key))
             .await?
             .with_files(dir.join("attachments"));
-        match projection.reroot_avatars().await {
+        match projection.rename_avatars().await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(n, "chat pictures now point into the moved data folder"),
-            Err(e) => tracing::warn!(error = %e, "re-pointing chat pictures after a folder move failed"),
+            Ok(n) => tracing::info!(n, "chat pictures renamed or moved into the data folder"),
+            Err(e) => tracing::warn!(error = %e, "renaming chat pictures failed"),
         }
         let store =
             SqliteStore::open_with_options(sqlite_options(&dir.join("presage.db"), &key)?, OnNewIdentity::Trust)
@@ -1591,7 +1591,7 @@ fn spawn_call_router(
                     Ok(Some(identity)) => identity.public_key().public_key_bytes().to_vec(),
                     Ok(None) => {
                         // no session with this device: a call can't be verified, so it can't ring
-                        tracing::warn!(sender = %sender_aci, "a call from an unknown device was ignored");
+                        tracing::warn!("a call from an unknown device was ignored");
                         continue;
                     }
                     Err(e) => {
@@ -2196,11 +2196,11 @@ async fn handle(
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
-        Received::DecryptionError { sender, error } => {
-            tracing::warn!(sender = %sender.service_id_string(), %error, "a message couldn't be decrypted")
+        Received::DecryptionError { error, .. } => {
+            tracing::warn!(%error, "a message couldn't be decrypted")
         }
-        Received::RetryReceipt { sender, .. } => {
-            tracing::info!(sender = %sender.service_id_string(), "a message of ours couldn't be decrypted there")
+        Received::RetryReceipt { .. } => {
+            tracing::info!("a message of ours couldn't be decrypted there")
         }
         Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
     }
@@ -2368,7 +2368,7 @@ async fn hold_back_unaccepted_call(
         if !db.is_unaccepted(&id).await? {
             return Ok(false);
         }
-        tracing::info!(sender = %sender_aci, "a call from a chat not accepted didn't ring");
+        tracing::info!("a call from a chat not accepted didn't ring");
         let offer = calls
             .iter()
             .any(|c| matches!(c.message, ringrtc::core::signaling::Message::Offer(_)));
@@ -2438,7 +2438,7 @@ async fn decryption_failed(
     error: Option<&SignalProtocolError>,
 ) {
     if matches!(error, Some(SignalProtocolError::DuplicatedMessage(..))) {
-        tracing::info!(sender = %sender.service_id_string(), "dropped a message delivered again");
+        tracing::info!("dropped a message delivered again");
         return;
     }
     let conversation_id = direct_id(&sender);
@@ -2524,14 +2524,14 @@ async fn fetch_avatars(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, 
         let stored = match fetched {
             Ok(bytes) => db.store_avatar(&id, bytes.as_deref(), now).await,
             Err(e) => {
-                // ids only; tried again in a day
-                tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be fetched");
+                // opaque ids only; tried again in a day
+                tracing::warn!(chat = %db.opaque_id(&id), error = %e, "a chat's picture couldn't be fetched");
                 db.set_avatar_checked(&id, now).await.map(|_| false)
             }
         };
         match stored {
             Ok(c) => changed |= c,
-            Err(e) => tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be kept"),
+            Err(e) => tracing::warn!(chat = %db.opaque_id(&id), error = %e, "a chat's picture couldn't be kept"),
         }
     }
     if changed {

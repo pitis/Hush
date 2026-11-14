@@ -106,16 +106,46 @@ final class ComposerTests: XCTestCase {
         XCTAssertTrue(Composer.canSend(" hi "))
     }
 
-    func testDraftsAreKeptPerConversation() {
+    @MainActor func testDraftsAreKeptPerConversationByTheCore() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        store.saveDraft("for a", for: "c:a")
+        store.saveDraft("for b", for: "c:b")
+        XCTAssertEqual(store.draft("c:a"), "for a")
+        XCTAssertEqual(store.draft("c:b"), "for b")
+        store.saveDraft("for a, more", for: "c:a")
+        store.saveDraft("  ", for: "c:b")
+        XCTAssertEqual(store.draft("c:b"), "")
+        await eventually { fake.draftStore == ["c:a": "for a, more"] }
+        store.deleteChat("c:a")
+        XCTAssertEqual(store.draft("c:a"), "", "it goes with the chat")
+    }
+
+    @MainActor func testDraftsKeptInThePreferencesMoveIntoTheCoreAndLeaveThem() async {
         let defaults = UserDefaults(suiteName: "hush.tests.\(UUID())")!
-        Composer.defaults = defaults
-        defer { Composer.defaults = .standard }
-        Composer.saveDraft("for a", for: "c:a")
-        Composer.saveDraft("for b", for: "c:b")
-        XCTAssertEqual(Composer.draft(for: "c:a"), "for a")
-        XCTAssertEqual(Composer.draft(for: "c:b"), "for b")
-        Composer.saveDraft("  ", for: "c:a")
-        XCTAssertEqual(Composer.draft(for: "c:a"), "")
+        defaults.set("unsent", forKey: "draft.c:a")
+        defaults.set("in the group", forKey: "draft.g:00")
+        defaults.set("dark", forKey: "appearance")
+        let fake = FakeClient(linked: true)
+        fake.draftStore = ["c:b": "already moved"]
+        let store = AppStore(open: { _ in fake }, legacyDrafts: defaults)
+        await store.boot()
+        XCTAssertEqual(fake.draftStore, ["c:a": "unsent", "g:00": "in the group", "c:b": "already moved"])
+        XCTAssertEqual(store.draft("c:a"), "unsent")
+        XCTAssertEqual(store.draft("c:b"), "already moved")
+        XCTAssertNil(defaults.object(forKey: "draft.c:a"))
+        XCTAssertNil(defaults.object(forKey: "draft.g:00"))
+        XCTAssertEqual(defaults.string(forKey: "appearance"), "dark", "other settings stay")
+    }
+
+    @MainActor func testADraftTheCoreCouldntTakeStaysInThePreferences() async {
+        let defaults = UserDefaults(suiteName: "hush.tests.\(UUID())")!
+        defaults.set("unsent", forKey: "draft.c:a")
+        let fake = FakeClient(linked: true)
+        fake.draftError = TestError(description: "closed")
+        await AppStore(open: { _ in fake }, legacyDrafts: defaults).boot()
+        XCTAssertEqual(defaults.string(forKey: "draft.c:a"), "unsent", "moved on a later launch")
     }
 
     func testDisplayTitleFallsBackToAShortId() {

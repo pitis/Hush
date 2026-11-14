@@ -108,6 +108,11 @@ final class AppStore {
     /// Chats with notifications showing; true if any is for a message (reactions don't count as
     /// unread, so those go away when the chat is opened).
     private var notified: [String: Bool] = [:]
+    /// Drafts by chat id, as the core keeps them. Not observed: the composer and the chat list
+    /// read them as they draw, so a keystroke doesn't redraw the list.
+    @ObservationIgnored private var drafts: [String: String] = [:]
+    /// Draft writes run one after the other, so the text kept is the last one typed.
+    @ObservationIgnored private var lastDraftWrite: Task<Void, Never>?
     /// The notification showing for each message, so a deletion can take it away.
     private var notifiedMessages: [MessageKey: String] = [:]
     /// The chat list has loaded once (actions from notifications need its unread counts).
@@ -191,15 +196,20 @@ final class AppStore {
     private var refreshing = false
     private var refreshAgain = false
 
+    /// Where older versions kept drafts (`draft.<chat id>`), moved into the core at boot. Nil in
+    /// tests: the test host's standard defaults are the real app's.
+    private let legacyDrafts: UserDefaults?
+
     init(
         open: @escaping Opener = AppStore.openReal, notifier: Notifier? = nil,
         isAppActive: @escaping @MainActor () -> Bool = { AppStore.appIsActive() },
-        forgetKey: @escaping () -> Void = { Keychain().delete() }
+        forgetKey: @escaping () -> Void = { Keychain().delete() }, legacyDrafts: UserDefaults? = nil
     ) {
         self.open = open
         self.notifier = notifier
         self.isAppActive = isAppActive
         self.forgetKey = forgetKey
+        self.legacyDrafts = legacyDrafts
     }
 
     /// In front with the window on screen: then the chat list shows what's new, and notifications
@@ -240,6 +250,7 @@ final class AppStore {
         do {
             let client = try opened.get()
             self.client = client
+            await loadDrafts(client)
             if client.isLinked() {
                 ownAci = client.ownAci()
                 notifier?.authorize()
@@ -256,7 +267,7 @@ final class AppStore {
                     // resuming an interrupted transfer: show it before its first event arrives
                     history = HistoryProgress(stage: .waiting, done: 0, total: 0)
                 }
-                notifier?.remove(idPrefix: "call|")  // a ring from a previous run can't be answered
+                for stale in Notifications.stalePrefixes { notifier?.remove(idPrefix: stale) }
             } else {
                 screen = .link
                 try client.link(deviceName: Self.deviceName)
@@ -326,7 +337,7 @@ final class AppStore {
             }
             searchResults.removeAll { $0.message.author == key.author && $0.message.sentAt == key.sentAt }
             notifiedMessages[key] = nil
-            notifier?.remove(idPrefix: Notifications.idPrefix(conversationId, key))
+            notifier?.remove(idPrefix: Notifications.idPrefix(author: opaque(key.author), sentAt: key.sentAt))
         case .newMessage(let conversationId, let key):
             Task { await notify(conversationId, about: key, reaction: nil) }
         case .attachmentChanged(let conversationId, let message, _):
@@ -758,6 +769,7 @@ final class AppStore {
     /// Deletes the chat's messages here and, for a person, on the phone too. It closes.
     func deleteChat(_ conversationId: String) {
         if selectedId == conversationId { select(nil) }
+        drafts[conversationId] = nil  // the core's goes with the chat
         change(conversationId, "delete the chat") { try await $0.deleteChat(conversationId: conversationId) }
     }
 
@@ -846,6 +858,39 @@ final class AppStore {
         focusComposer()
     }
 
+    // MARK: Drafts
+
+    /// What was typed in a chat and not sent.
+    func draft(_ conversationId: String) -> String { drafts[conversationId] ?? "" }
+
+    /// Keeps what is typed in a chat (the core stores it); blank text clears it.
+    func saveDraft(_ text: String, for conversationId: String) {
+        let kept = Composer.canSend(text) ? text : nil
+        guard let client, drafts[conversationId] != kept else { return }
+        drafts[conversationId] = kept
+        let previous = lastDraftWrite
+        lastDraftWrite = Task {
+            await previous?.value
+            do { try await client.setDraft(conversationId: conversationId, text: kept ?? "") } catch {
+                append("a draft wasn't saved: \(error)")
+            }
+        }
+    }
+
+    /// Moves the drafts older versions kept in the preferences (plain text, outliving the chat)
+    /// into the core, each removed once stored, then reads them all.
+    private func loadDrafts(_ client: any ClientProtocol) async {
+        let prefix = "draft."
+        for (key, value) in legacyDrafts?.dictionaryRepresentation() ?? [:] where key.hasPrefix(prefix) {
+            guard let text = value as? String else { continue }
+            do {
+                try await client.setDraft(conversationId: String(key.dropFirst(prefix.count)), text: text)
+                legacyDrafts?.removeObject(forKey: key)
+            } catch { append("a draft couldn't be moved: \(error)") }
+        }
+        do { drafts = try await client.drafts() } catch { append("couldn't read the drafts: \(error)") }
+    }
+
     // MARK: Notifications
 
     /// Shows a notification for a new message, or for `reaction` to our message `key`, unless the
@@ -875,8 +920,10 @@ final class AppStore {
                 conversationId.hasPrefix("g:") ? try await client.title(conversationId: conversationId) ?? "Group" : nil
             guard
                 let request = Notifications.request(
-                    setting: setting, conversationId: conversationId,
-                    id: Notifications.id(conversationId, key, reactor: reaction?.reactor, emoji: reaction?.emoji),
+                    setting: setting, chat: opaque(conversationId),
+                    id: Notifications.id(
+                        author: opaque(key.author), sentAt: key.sentAt, reactor: reaction.map { opaque($0.reactor) },
+                        emoji: reaction?.emoji),
                     sender: senderName(author), groupTitle: groupTitle, text: text, reaction: reaction?.emoji)
             else { return }
             notifier.post(request)
@@ -900,13 +947,24 @@ final class AppStore {
 
     private func removeNotifications(_ conversationId: String) {
         notified[conversationId] = nil
-        notifier?.remove(conversationId: conversationId)
+        notifier?.remove(chat: opaque(conversationId))
+    }
+
+    /// A chat's (or a person's) id as notifications name it: the core's opaque id.
+    private func opaque(_ id: String) -> String { client?.opaqueId(id: id) ?? "" }
+
+    /// The chat a notification names by its opaque id.
+    private func conversationId(opaque chat: String) -> String? {
+        conversations.first { opaque($0.id) == chat }?.id
     }
 
     /// A click on a notification: brings up its chat, ready to type.
-    func openFromNotification(conversationId: String) async {
+    func openFromNotification(chat: String) async {
         guard await ready() else {
             return Self.logger.error("opening a chat from a notification failed: Hush wasn't ready")
+        }
+        guard let conversationId = conversationId(opaque: chat) else {
+            return Self.logger.error("opening a chat from a notification failed: the chat is gone")
         }
         select(conversationId)
         focusComposer()
@@ -914,35 +972,39 @@ final class AppStore {
     }
 
     /// Reply typed into a notification: sends it and marks the chat read (the reply shows it was).
-    func replyFromNotification(conversationId: String, text: String) async {
+    func replyFromNotification(chat: String, text: String) async {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
         guard await ready(), let client else {
-            return replyFailed(conversationId, because: "Hush wasn't ready")
+            return replyFailed(chat, because: "Hush wasn't ready")
+        }
+        guard let conversationId = conversationId(opaque: chat) else {
+            return replyFailed(chat, because: "the chat is gone")
         }
         do {
             _ = try await client.sendText(
                 conversationId: conversationId, body: body, ranges: [], quote: nil, preview: nil)
             markRead(conversationId)
         } catch {
-            replyFailed(conversationId, because: Self.describe(error))
+            replyFailed(chat, because: Self.describe(error))
         }
     }
 
     /// The app is in the background when a reply comes from a notification: say so the same way.
-    private func replyFailed(_ conversationId: String, because reason: String) {
+    private func replyFailed(_ chat: String, because reason: String) {
         Self.logger.error("reply from a notification failed: \(reason, privacy: .private)")
         lastError = "Your reply couldn't be sent: \(reason)"
         notifier?.post(
             NotificationRequest(
-                id: "reply-failed-\(conversationId)", conversationId: conversationId, title: "Reply not sent",
+                id: "reply-failed|\(chat)", chat: chat, title: "Reply not sent",
                 body: "Open the chat to send it again.", hasActions: false))
     }
 
-    func markReadFromNotification(conversationId: String) async {
+    func markReadFromNotification(chat: String) async {
         guard await ready() else {
             return Self.logger.error("mark read from a notification dropped: Hush wasn't ready")
         }
+        guard let conversationId = conversationId(opaque: chat) else { return }
         markRead(conversationId)
         removeNotifications(conversationId)
     }
@@ -1008,7 +1070,7 @@ final class AppStore {
             ?? "Call"
         switch phase {
         case .ended:
-            notifier?.remove(ids: [Notifications.callId(conversationId)])
+            notifier?.remove(ids: [Notifications.callId(opaque(conversationId))])
             // an end belongs to the call that is up, not to a stale one
             guard var ended = call, ended.conversationId == conversationId, ended.phase != .ended else { return }
             // a call we never took that the caller gave up on; not one we declined, nor one
@@ -1016,7 +1078,7 @@ final class AppStore {
             let missed = ended.incoming && ended.connectedAt == nil && reason.map(Self.isMissed) == true
             if missed,
                 let notification = Notifications.missedCall(
-                    setting: NotificationContent.current(), conversationId: conversationId, title: title, at: now)
+                    setting: NotificationContent.current(), chat: opaque(conversationId), title: title, at: now)
             {
                 notifier?.post(notification)
             }
@@ -1038,7 +1100,7 @@ final class AppStore {
             WindowOpener.open?(id: "call")
             if phase == .incoming, !isAppActive(),
                 let ring = Notifications.incomingCall(
-                    setting: NotificationContent.current(), conversationId: conversationId, title: title)
+                    setting: NotificationContent.current(), chat: opaque(conversationId), title: title)
             {
                 notifier?.post(ring)
             }
@@ -1046,7 +1108,7 @@ final class AppStore {
             guard call?.conversationId == conversationId, call?.phase != .ended else { return }
             call?.phase = phase
             if phase == .connected {
-                notifier?.remove(ids: [Notifications.callId(conversationId)])
+                notifier?.remove(ids: [Notifications.callId(opaque(conversationId))])
                 if call?.connectedAt == nil { call?.connectedAt = now }
             }
         }
@@ -1084,7 +1146,7 @@ final class AppStore {
     /// `hangupGrace`, the window is ended anyway: a stuck engine must not hold the user.
     func hangupCall() {
         guard let current = call, current.phase != .ended else { return }
-        notifier?.remove(ids: [Notifications.callId(current.conversationId)])
+        notifier?.remove(ids: [Notifications.callId(opaque(current.conversationId))])
         guard let client else { return endCallLocally(current.conversationId) }
         do { try client.hangupCall() } catch {
             showError("Couldn't hang up: \(Self.describe(error))")
@@ -1275,6 +1337,7 @@ final class AppStore {
         unnamedAuthors = []
         notified = [:]
         notifiedMessages = [:]
+        drafts = [:]
         conversationsLoaded = false
         ownAci = nil
         linkURL = nil

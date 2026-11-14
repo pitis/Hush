@@ -75,6 +75,8 @@ pub struct ProjectionDb {
     /// Counts pin changes (`set_account_dirty(true)`), so the sync clears the account's mark
     /// only if nothing changed while it wrote; the lock makes the count and the mark move together.
     account_changes: Arc<tokio::sync::Mutex<u64>>,
+    /// This install's key for opaque ids (`opaque_id`).
+    id_key: [u8; 32],
 }
 
 /// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
@@ -171,11 +173,50 @@ impl ProjectionDb {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        sqlx::query("INSERT OR IGNORE INTO install_key (id, key) VALUES (1, ?1)")
+            .bind(rand::random::<[u8; 32]>().to_vec())
+            .execute(&pool)
+            .await?;
+        let id_key: Vec<u8> = sqlx::query_scalar("SELECT key FROM install_key")
+            .fetch_one(&pool)
+            .await?;
         Ok(Self {
             pool,
             files: None,
             account_changes: Default::default(),
+            id_key: id_key.try_into().map_err(|_| decode_err("install key".into()))?,
         })
+    }
+
+    /// A chat's (or anyone's) id as logs, file names and notifications may show it: its keyed
+    /// hash, which can't be reversed or checked against a known id without this database.
+    pub fn opaque_id(&self, id: &str) -> String {
+        use hmac::{Hmac, KeyInit, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.id_key).expect("HMAC takes any key length");
+        mac.update(id.as_bytes());
+        hex::encode(&mac.finalize().into_bytes()[..8])
+    }
+
+    /// What was typed in a chat and not sent; blank text clears it.
+    pub async fn set_draft(&self, conversation_id: &str, text: &str) -> Result<(), sqlx::Error> {
+        let query = match text.trim().is_empty() {
+            true => sqlx::query("DELETE FROM drafts WHERE conversation_id = ?1"),
+            false => sqlx::query(
+                "INSERT INTO drafts (conversation_id, text) VALUES (?1, ?2)
+                 ON CONFLICT(conversation_id) DO UPDATE SET text = ?2",
+            ),
+        };
+        query.bind(conversation_id).bind(text).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Every chat's draft, by chat id.
+    pub async fn drafts(&self) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+        Ok(sqlx::query_as("SELECT conversation_id, text FROM drafts")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     /// For tests that set up rows no public call makes.
@@ -656,7 +697,7 @@ impl ProjectionDb {
         let path = match bytes {
             Some(bytes) => {
                 std::fs::create_dir_all(&dir)?;
-                let path = dir.join(format!("avatar-{}-{now_ms}", id.replace(':', "-")));
+                let path = dir.join(self.avatar_name(id, now_ms));
                 std::fs::write(&path, bytes)?;
                 Some(path.to_string_lossy().into_owned())
             }
@@ -669,30 +710,48 @@ impl ProjectionDb {
         Ok(true)
     }
 
-    /// Points pictures stored under another folder (the data folder was moved, e.g. by the app's
-    /// rename) at the same file name in this one. The count of pictures moved.
-    pub async fn reroot_avatars(&self) -> Result<u64, sqlx::Error> {
+    /// A chat's picture file: by its opaque id (a group's chat id is its key), and when it was
+    /// fetched (a new picture is a new file).
+    fn avatar_name(&self, id: &str, at: impl std::fmt::Display) -> String {
+        format!("avatar-{}-{at}", self.opaque_id(id))
+    }
+
+    /// Moves pictures named by chat id (as before opaque ids) or stored under another folder
+    /// (the data folder was moved, e.g. by the app's rename; the files came along) to their name
+    /// in this one. Safe to interrupt: a file renamed before its row is found by its new name.
+    /// A picture whose file is gone is looked for again. The count of pictures changed.
+    pub async fn rename_avatars(&self) -> Result<u64, sqlx::Error> {
         let Some(dir) = self.files.clone() else { return Ok(0) };
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT id, avatar FROM conversations WHERE avatar IS NOT NULL")
                 .fetch_all(&self.pool)
                 .await?;
-        let mut moved = 0;
+        let mut changed = 0;
         for (id, avatar) in rows {
-            let old = std::path::Path::new(&avatar);
-            let Some(name) = old.file_name() else { continue };
-            if old.parent() == Some(dir.as_path()) {
+            let Some(name) = std::path::Path::new(&avatar).file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let at = name.rsplit_once('-').map_or(name, |(_, at)| at);
+            let target = dir.join(self.avatar_name(&id, at));
+            if std::path::Path::new(&avatar) == target {
                 continue;
             }
-            let path = dir.join(name);
-            moved += sqlx::query("UPDATE conversations SET avatar = ?2 WHERE id = ?1")
-                .bind(&id)
-                .bind(path.to_string_lossy())
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
+            let found = dir.join(name);
+            if found.is_file() {
+                std::fs::rename(&found, &target)?;
+            }
+            let path = target.is_file().then(|| target.to_string_lossy().into_owned());
+            changed += sqlx::query(
+                "UPDATE conversations SET avatar = ?2,
+                   avatar_checked_at = CASE WHEN ?2 IS NULL THEN 0 ELSE avatar_checked_at END WHERE id = ?1",
+            )
+            .bind(&id)
+            .bind(path)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
         }
-        Ok(moved)
+        Ok(changed)
     }
 
     /// A chat's picture was looked for (and not found or not reachable) at `now_ms`.
@@ -868,10 +927,12 @@ impl ProjectionDb {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM chat_events WHERE conversation_id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        for sql in [
+            "DELETE FROM chat_events WHERE conversation_id = ?1",
+            "DELETE FROM drafts WHERE conversation_id = ?1",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+        }
         let stories: Vec<(String, i64)> =
             sqlx::query_as("DELETE FROM stories WHERE conversation_id = ?1 RETURNING author, sent_at")
                 .bind(id)
@@ -5696,30 +5757,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pictures_stored_under_a_moved_folder_point_into_the_current_one() {
-        let files = TempFiles::new("reroot");
+    async fn a_chats_opaque_id_is_stable_in_its_install_and_differs_in_another() {
+        let files = TempFiles::new("opaque");
+        std::fs::create_dir_all(&files.0).unwrap();
+        let url = format!("sqlite://{}", files.0.join("projection.db").display());
+        let group = format!("g:{}", "ab".repeat(32));
+        let install = ProjectionDb::open(&url, None).await.unwrap();
+        let id = install.opaque_id(&group);
+        assert_eq!(id.len(), 16);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(id, install.opaque_id("c:alice"), "chats differ");
+        install.close().await;
+        let reopened = ProjectionDb::open(&url, None).await.unwrap();
+        assert_eq!(reopened.opaque_id(&group), id, "the same after reopening");
+        assert_ne!(db().await.opaque_id(&group), id, "another install's key");
+    }
+
+    #[tokio::test]
+    async fn a_chats_picture_file_is_named_by_its_opaque_id() {
+        let files = TempFiles::new("avatar-names");
         let db = db().await.with_files(files.0.clone());
-        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
-        db.insert_message(&Message {
-            conversation_id: "c:bob".into(),
-            ..msg("bob", 1, "hi")
-        })
-        .await
-        .unwrap();
-        assert!(db.store_avatar("c:alice", Some(b"jpeg"), 1).await.unwrap());
+        let group = format!("g:{}", "ab".repeat(32));
+        db.insert_message(&in_conv(&group, msg("bob", 1, "hi"))).await.unwrap();
+        assert!(db.store_avatar(&group, Some(b"jpeg"), 7).await.unwrap());
+        assert_eq!(
+            conv(&db, &group).await.avatar.unwrap(),
+            files
+                .0
+                .join(format!("avatar-{}-7", db.opaque_id(&group)))
+                .to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    async fn pictures_named_by_chat_id_or_under_a_moved_folder_are_renamed_into_the_current_one() {
+        let files = TempFiles::new("rename");
+        std::fs::create_dir_all(&files.0).unwrap();
+        let db = db().await.with_files(files.0.clone());
+        let group = format!("g:{}", "ab".repeat(32));
+        let chats = ["c:alice", "c:bob", "c:carol", "c:dave", group.as_str()];
+        for (i, c) in (1..).zip(chats) {
+            db.insert_message(&in_conv(c, msg("x", i, "hi"))).await.unwrap();
+        }
+        assert!(db.store_avatar("c:alice", Some(b"a"), 1).await.unwrap());
         let kept = conv(&db, "c:alice").await.avatar.unwrap();
-        sqlx::query("UPDATE conversations SET avatar = '/old/Semaphore/attachments/avatar-c-bob-1' WHERE id = 'c:bob'")
-            .execute(&db.pool)
+        let point = |id: &str, path: String| {
+            let pool = db.pool.clone();
+            let id = id.to_string();
+            async move {
+                sqlx::query("UPDATE conversations SET avatar = ?2, avatar_checked_at = 9 WHERE id = ?1")
+                    .bind(id)
+                    .bind(path)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        let here = |name: &str| files.0.join(name).to_string_lossy().into_owned();
+        // named by the group's key
+        let keyed = format!("avatar-g-{}-2", "ab".repeat(32));
+        std::fs::write(here(&keyed), b"g").unwrap();
+        point(&group, here(&keyed)).await;
+        // stored under the folder's old place (the file moved with the folder)
+        std::fs::write(here("avatar-c-bob-3"), b"b").unwrap();
+        point("c:bob", "/old/Semaphore/attachments/avatar-c-bob-3".into()).await;
+        // renamed, then interrupted before its row changed
+        std::fs::write(here(&format!("avatar-{}-4", db.opaque_id("c:carol"))), b"c").unwrap();
+        point("c:carol", here("avatar-c-carol-4")).await;
+        // the file is gone: looked for again
+        point("c:dave", here("avatar-c-dave-5")).await;
+
+        assert_eq!(db.rename_avatars().await.unwrap(), 4);
+        assert_eq!(conv(&db, "c:alice").await.avatar.unwrap(), kept);
+        for (id, at, bytes) in [(group.as_str(), 2, b"g"), ("c:bob", 3, b"b"), ("c:carol", 4, b"c")] {
+            let path = conv(&db, id).await.avatar.unwrap();
+            assert_eq!(path, here(&format!("avatar-{}-{at}", db.opaque_id(id))));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        assert_eq!(conv(&db, "c:dave").await.avatar, None);
+        let checked: i64 = sqlx::query_scalar("SELECT avatar_checked_at FROM conversations WHERE id = 'c:dave'")
+            .fetch_one(&db.pool)
             .await
             .unwrap();
+        assert_eq!(checked, 0);
+        for name in std::fs::read_dir(&files.0).unwrap() {
+            let name = name.unwrap().file_name().into_string().unwrap();
+            assert!(!name.contains("abab") && !name.contains("-c-"), "{name}");
+        }
+        assert_eq!(db.rename_avatars().await.unwrap(), 0, "once");
+    }
 
-        assert_eq!(db.reroot_avatars().await.unwrap(), 1);
-        assert_eq!(conv(&db, "c:alice").await.avatar.unwrap(), kept);
+    #[tokio::test]
+    async fn drafts_are_kept_cleared_when_blank_and_go_with_their_chat() {
+        let db = db().await;
+        db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
+        db.set_draft("c:alice", "unsent").await.unwrap();
+        db.set_draft("c:bob", "for bob").await.unwrap();
+        db.set_draft("c:bob", "for bob, later").await.unwrap();
         assert_eq!(
-            conv(&db, "c:bob").await.avatar.unwrap(),
-            files.0.join("avatar-c-bob-1").to_string_lossy()
+            db.drafts().await.unwrap(),
+            std::collections::HashMap::from([
+                ("c:alice".to_string(), "unsent".to_string()),
+                ("c:bob".to_string(), "for bob, later".to_string()),
+            ])
         );
-        assert_eq!(db.reroot_avatars().await.unwrap(), 0);
+        db.set_draft("c:bob", " \n").await.unwrap();
+        db.delete_chat("c:alice").await.unwrap();
+        assert!(db.drafts().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7454,6 +7598,7 @@ mod tests {
             pool,
             files: None,
             account_changes: Default::default(),
+            id_key: [0; 32],
         };
         phone_state_known(&db).await;
         assert!(!db.is_unaccepted("c:alice").await.unwrap());

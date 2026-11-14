@@ -8438,6 +8438,7 @@ dependencies = [
  "presage-store-sqlite",
  "protobuf 3.7.2",
  "rand 0.9.5",
+ "regex",
  "reqwest",
  "reqwest-websocket",
  "ringrtc",

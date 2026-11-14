@@ -588,8 +588,8 @@ pub async fn sender(
             } => {
                 let sent = send_to(&mut m, &conversation_id, *body, at).await;
                 if let Err(e) = &sent {
-                    // ids only; the call engine ends the call, this says why
-                    tracing::warn!(conversation = %conversation_id, error = %e, "a call message wasn't sent");
+                    // opaque ids only; the call engine ends the call, this says why
+                    tracing::warn!(chat = %db.opaque_id(&conversation_id), error = %e, "a call message wasn't sent");
                     l.on_event(CoreEvent::Error {
                         message: format!("a call message to {conversation_id} wasn't sent: {e}"),
                     });
@@ -611,12 +611,7 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
-                    // a group's id is its key: not for the log
-                    let what = match conversation_id.starts_with("g:") {
-                        true => "telling the phone about a group's request".to_string(),
-                        false => format!("telling the phone about the request from {conversation_id}"),
-                    };
-                    report(l.as_ref(), &what, &e);
+                    report(l.as_ref(), "telling the phone about a message request", &e);
                 }
             }
             Job::ViewOnceOpen { key } => {
@@ -637,8 +632,7 @@ pub async fn sender(
                 let at = now_ms();
                 // not retried: every message we send carries the key too
                 if let Err(e) = send_to(&mut m, &conversation_id, profile_key_update(at).into(), at).await {
-                    let what = format!("sharing your profile with {conversation_id} (it goes with your next message)");
-                    report(l.as_ref(), &what, &e);
+                    report(l.as_ref(), "sharing your profile (it goes with your next message)", &e);
                 }
             }
             Job::Typing {
@@ -659,7 +653,7 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = send_to(&mut m, &conversation_id, tm.into(), at).await {
-                    tracing::warn!(conversation = %conversation_id, error = %e, "typing not sent");
+                    tracing::warn!(chat = %db.opaque_id(&conversation_id), error = %e, "typing not sent");
                 }
             }
         }
@@ -895,7 +889,7 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
         match sent {
             Ok(()) => done.extend(targets.iter().filter(|t| t.author == author).cloned()),
             Err(e) => {
-                tracing::warn!(to = %author, error = %e, "read receipt not sent");
+                tracing::warn!(error = %e, "read receipt not sent");
                 failed += 1;
             }
         }
