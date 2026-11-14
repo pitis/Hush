@@ -31,9 +31,11 @@ struct DownloadState: View {
 
     var body: some View {
         switch file.state {
+        case .ready:
+            EmptyView()
         case .downloading:
             ProgressView().controlSize(.small)
-        case .pending where !file.available, .failed where !file.available:
+        case _ where !Files.offersDownload(file):
             Text("Not available").font(.system(size: 12)).foregroundStyle(.secondary)
         case .failed:
             Button(action: download) {
@@ -47,8 +49,6 @@ struct DownloadState: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Download")
-        case .ready:
-            EmptyView()
         }
     }
 }

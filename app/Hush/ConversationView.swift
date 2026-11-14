@@ -836,7 +836,7 @@ struct MessageRow: View {
             } label: {
                 label
             }.buttonStyle(.bordered)
-        case .sent, .viewed, .downloading:
+        case .sent, .viewed, .downloading, .unavailable:
             label.italic()
         }
     }

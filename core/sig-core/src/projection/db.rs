@@ -4745,7 +4745,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn unavailable_files_are_failed_rows() {
+        async fn files_that_cant_be_fetched_are_unavailable() {
             let db = db().await;
             let mut m = imported("c:alice", "alice", 5, "files", MessageStatus::Read);
             m.attachments = vec![
@@ -4807,6 +4807,7 @@ mod tests {
                     "what isn't available isn't fetched"
                 );
             }
+            assert!(db.start_download(files[0].id).await.unwrap().is_some(), "what is, is");
         }
 
         /// 100k messages across 50 chats; run with
@@ -7305,9 +7306,11 @@ mod tests {
         // a corrupt download fails; it can be tried again
         db.start_download(b.id).await.unwrap().unwrap();
         db.finish_download(b.id, Err("bad digest".into())).await.unwrap();
+        let failed = db.attachment(b.id).await.unwrap().unwrap();
         assert_eq!(
-            db.attachment(b.id).await.unwrap().unwrap().state,
-            AttachmentState::Failed
+            (failed.state, failed.available),
+            (AttachmentState::Failed, true),
+            "Retry, not Not available"
         );
         assert!(
             db.auto_downloads().await.unwrap().is_empty(),
@@ -7613,6 +7616,10 @@ mod tests {
         };
         assert!(db.insert_outgoing(&mine, &[file], None, None).await.unwrap());
         let ours = db.attachments(&k("me", 4)).await.unwrap()[0].id;
+        assert!(
+            db.attachment(ours).await.unwrap().unwrap().available,
+            "ours is here, with no pointer"
+        );
         assert_eq!(db.attachment_bytes(ours).await.unwrap().1, b"ours");
         assert!(db.attachment_bytes(9999).await.is_err(), "gone");
     }
@@ -7722,13 +7729,13 @@ mod tests {
         ))
         .await
         .unwrap();
-        let ids: Vec<i64> = db
-            .attachments(&k("alice", 1))
-            .await
-            .unwrap()
-            .iter()
-            .map(|a| a.id)
-            .collect();
+        let files = db.attachments(&k("alice", 1)).await.unwrap();
+        // what the apps are told agrees with what is fetched
+        assert_eq!(
+            files.iter().map(|a| a.available).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        let ids: Vec<i64> = files.iter().map(|a| a.id).collect();
         assert!(db.start_download(ids[0]).await.unwrap().is_none());
         assert!(db.start_download(ids[1]).await.unwrap().is_none());
         assert!(db.start_download(ids[2]).await.unwrap().is_some());

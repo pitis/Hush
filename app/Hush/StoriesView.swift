@@ -200,7 +200,7 @@ struct StoryCard: View {
                 }
             case .downloading:
                 ProgressView()
-            case .pending where !file.available, .failed where !file.available:
+            case _ where !Files.offersDownload(file):
                 Text("This story can't be shown").foregroundStyle(Theme.secondaryText)
             case .pending:
                 // fetched when opened (never before: not every story is looked at)
