@@ -20,6 +20,8 @@ mod safety;
 mod send;
 mod stickers;
 mod storage;
+#[cfg(test)]
+mod test_exit;
 mod typing;
 
 pub use calls::{AudioDevice, AudioDevices, CallPhase};
