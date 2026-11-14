@@ -12,7 +12,7 @@ libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rus
 lto = "thin"
 strip = true
 
-# Build scripts and proc macros run on this Mac, never ship: stripped, their dylibs failed to load
-# ("mis-aligned LINKEDIT string pool") with rustc 1.97 and Xcode 27.2.
+# Build scripts and proc macros run on the build machine, never ship: stripped, their dylibs failed to
+# load ("mis-aligned LINKEDIT string pool") with rustc 1.97 and Xcode 27.2. Gone by rustc 1.99.1; a guard.
 [profile.release.build-override]
 strip = false
