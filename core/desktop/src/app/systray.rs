@@ -1,5 +1,5 @@
 //! The tray icon, in the menu bar on macOS (the Mac app's `MenuBarItem`): the unread count, and a
-//! menu to open the window, jump to a chat with unread messages, open Hush at login, or quit. On
+//! menu to open the window, jump to a chat with unread messages, or quit; Settings hides it. On
 //! macOS a click opens the menu; elsewhere a left click opens the window and a right click the
 //! menu. The count is the Dock's (`notifications`); the window still quits Hush when closed.
 
@@ -9,17 +9,17 @@ use gpui_kit::assets::AllAssets;
 use gpui_kit::*;
 use sig_core::projection::Conversation;
 use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use super::{login, Hush};
+use super::settings::{chosen, Choice};
+use super::Hush;
 use crate::text;
 
 /// How many unread chats the menu lists (`MenuBar.unreadChatsShown`).
 const CHATS_SHOWN: usize = 5;
 /// The menu's items: these, and a chat's, `CHAT` then its id.
 const OPEN: &str = "open";
-const LOGIN: &str = "login";
 const QUIT: &str = "quit";
 const CHAT: &str = "chat:";
 
@@ -29,16 +29,29 @@ struct Shown {
     unread: u32,
     /// The unread chats listed: id, and its entry.
     chats: Vec<(String, String)>,
-    login: bool,
 }
 
 #[derive(Default)]
 pub(super) struct Systray {
     icon: Option<TrayIcon>,
-    /// None until first drawn, and to draw it again.
+    /// None until first drawn.
     shown: Option<Shown>,
-    /// Opens at login, as last asked of the system.
-    login: bool,
+}
+
+/// Settings' Show in menu bar (Show in system tray off macOS).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum ShowInTray {
+    #[default]
+    Shown,
+    Hidden,
+}
+
+impl Global for ShowInTray {}
+
+impl Choice for ShowInTray {
+    const FILE: &'static str = "tray";
+    const ALL: &'static [(Self, &'static str, &'static str)] =
+        &[(Self::Shown, "shown", "Shown"), (Self::Hidden, "hidden", "Hidden")];
 }
 
 /// The chats with unread messages, in list order (newest first), as the menu lists them: the ones
@@ -91,10 +104,11 @@ pub fn start(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
         Ok(icon) => icon,
         Err(e) => return tracing::warn!(error = %e, "no tray icon"),
     };
-    let _ = hush.update(cx, |app, _| {
+    let _ = hush.update(cx, |app, cx| {
         app.systray.icon = Some(icon);
-        app.systray.login = login::enabled();
         app.systray_changed(chrono::Utc::now().timestamp_millis());
+        app.systray_shown(cx);
+        cx.observe_global::<ShowInTray>(Hush::systray_shown).detach();
     });
     cx.spawn(async move |cx| {
         while let Some(id) = picked.next().await {
@@ -116,7 +130,6 @@ impl Hush {
         let shown = Shown {
             unread: self.notifications.badge,
             chats: unread_chats(&self.chats, now_ms, self.own_aci.as_deref()),
-            login: self.systray.login,
         };
         let before = self.systray.shown.as_ref();
         if before == Some(&shown) {
@@ -149,20 +162,18 @@ impl Hush {
         self.systray.shown = Some(shown);
     }
 
+    /// Shown or hidden, as Settings has it.
+    fn systray_shown(&mut self, cx: &mut Context<Self>) {
+        let Some(icon) = &self.systray.icon else { return };
+        if let Err(e) = icon.set_visible(chosen::<ShowInTray>(cx) == ShowInTray::Shown) {
+            tracing::warn!(error = %e, "the tray icon didn't show or hide");
+        }
+    }
+
     /// An item of the tray's menu, or a click on the tray (`OPEN`).
     fn tray_picked(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         match id {
             QUIT => super::quit(cx),
-            LOGIN => {
-                if let Err(e) = login::set(!self.systray.login) {
-                    self.error = Some(format!("Couldn't change the login item: {e}"));
-                    cx.notify();
-                }
-                self.systray.login = login::enabled();
-                // its tick is set again, after a failure too (the menu ticked it on the click)
-                self.systray.shown = None;
-                self.systray_changed(chrono::Utc::now().timestamp_millis());
-            }
             _ => {
                 cx.activate(true);
                 window.activate_window();
@@ -187,8 +198,6 @@ fn menu(shown: &Shown) -> tray_icon::menu::Result<Menu> {
         }
     }
     menu.append(&PredefinedMenuItem::separator())?;
-    // shortcut: here as the desktop has no Settings yet; move it there (the Mac app's place) with them
-    menu.append(&CheckMenuItem::with_id(LOGIN, "Open at Login", true, shown.login, None))?;
     let quit_key = cfg!(target_os = "macos").then(|| Accelerator::new(Modifiers::META, Code::KeyQ));
     menu.append(&MenuItem::with_id(QUIT, "Quit Hush", true, quit_key))?;
     Ok(menu)
@@ -228,7 +237,7 @@ fn drawn(unread: bool) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::unread_chats;
+    use super::{unread_chats, Choice, ShowInTray};
     use sig_core::projection::Conversation;
 
     const NOW: i64 = 1_000_000;
@@ -282,6 +291,19 @@ mod tests {
         let chats: Vec<Conversation> = (1..=7).map(|n| chat(&format!("c:{n}"), &format!("C{n}"), n)).collect();
         let listed: Vec<String> = unread_chats(&chats, NOW, None).into_iter().map(|(id, _)| id).collect();
         assert_eq!(listed, ["c:1", "c:2", "c:3", "c:4", "c:5"]);
+    }
+
+    #[test]
+    fn the_tray_shows_unless_hidden_in_settings() {
+        let folder = std::env::temp_dir().join(format!("hush-desktop-tray-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        assert_eq!(ShowInTray::read(&folder), ShowInTray::Shown, "none kept yet");
+        ShowInTray::Hidden.save(&folder).unwrap();
+        assert_eq!(ShowInTray::read(&folder), ShowInTray::Hidden);
+        assert_eq!(std::fs::read_to_string(folder.join("tray")).unwrap(), "hidden");
+        ShowInTray::Shown.save(&folder).unwrap();
+        assert_eq!(ShowInTray::read(&folder), ShowInTray::Shown);
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     #[test]
