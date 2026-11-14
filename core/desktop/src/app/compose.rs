@@ -344,6 +344,7 @@ impl Hush {
         self.composer_empty = text.trim().is_empty();
         self.compose.text = text;
         self.compose.pending = None;
+        self.keep_draft(cx);
         cx.notify();
     }
 

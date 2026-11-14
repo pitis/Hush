@@ -485,8 +485,10 @@ impl Hush {
 
     fn render_chat_row(&self, ix: usize, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Stateful<Div> {
         let title = text::title(c, self.own_aci.as_deref());
-        let line = text::preview(c, &self.name(&c.last_message_author), |aci| self.name(aci));
         let selected = self.selected.as_deref() == Some(c.id.as_str());
+        // the open chat's is in its composer
+        let draft = self.drafts.get(&c.id).filter(|_| !selected).map(String::as_str);
+        let line = text::preview(c, draft, &self.name(&c.last_message_author), |aci| self.name(aci));
         // the system's sidebar: the accent while the window is active, else grey
         let focused = selected && self.window_active;
         let (fg, secondary) = if focused {
@@ -537,6 +539,16 @@ impl Hush {
             (_, true) => format!("{title}, unread. {line}"),
             _ => format!("{title}. {line}"),
         };
+        // "Draft:" bold and italic, as on the Mac (unless the line says what the chat is)
+        let mut shown = StyledText::new(line.clone());
+        if draft.is_some() && line.starts_with(text::DRAFT) {
+            let marked = HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            };
+            shown = shown.with_highlights([(0..text::DRAFT.len(), marked)]);
+        }
         // a blocked chat's or a request's picture isn't shown (a stranger chose it)
         let picture = c
             .avatar
@@ -595,7 +607,7 @@ impl Hush {
                                             .min_w_0()
                                             .truncate()
                                             .text_color(if unread { fg } else { secondary })
-                                            .child(line),
+                                            .child(shown),
                                     )
                                     .children(badge),
                             ),
