@@ -66,6 +66,8 @@ pub enum Demo {
     Link,
     Empty,
     Chat,
+    /// The chat, with the New Group dialog over it.
+    NewGroup,
     /// A chat's pictures, recordings and files.
     Files,
 }
@@ -84,6 +86,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("link", Demo::Link),
                 ("empty", Demo::Empty),
                 ("chat", Demo::Chat),
+                ("new-group", Demo::NewGroup),
                 ("files", Demo::Files),
             ];
             cx.spawn(async move |cx| {

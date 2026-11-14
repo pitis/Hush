@@ -91,6 +91,22 @@ pub(super) struct Audio {
 }
 
 impl Files {
+    /// A message's files as shown; none for a deleted message, a view-once one or a sticker
+    /// (those show otherwise).
+    pub(super) fn of(&self, m: &Message) -> Vec<Shown> {
+        if m.deleted || matches!(m.kind, MessageKind::ViewOnce { .. } | MessageKind::Sticker { .. }) {
+            return vec![];
+        }
+        let Some(files) = self.by_message.get(&(m.author.clone(), m.sent_at)) else {
+            return vec![];
+        };
+        let shown = files.iter().map(|a| Shown {
+            look: self.look(a),
+            file: a.clone(),
+        });
+        shown.collect()
+    }
+
     fn look(&self, a: &Attachment) -> Look {
         if is_image(a) {
             return match ready_path(a).and_then(|path| self.thumbs.get(&path)) {
@@ -137,22 +153,6 @@ impl Files {
 }
 
 impl Hush {
-    /// A message's files as shown; none for a deleted message, a view-once one or a sticker
-    /// (those show otherwise).
-    pub(super) fn files_of(&self, m: &Message) -> Vec<Shown> {
-        if m.deleted || matches!(m.kind, MessageKind::ViewOnce { .. } | MessageKind::Sticker { .. }) {
-            return vec![];
-        }
-        let Some(files) = self.files.by_message.get(&(m.author.clone(), m.sent_at)) else {
-            return vec![];
-        };
-        let shown = files.iter().map(|a| Shown {
-            look: self.files.look(a),
-            file: a.clone(),
-        });
-        shown.collect()
-    }
-
     /// Reads the open chat's messages' files; calls while a read runs are folded into one more.
     pub(super) fn load_files(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
@@ -269,13 +269,17 @@ impl Hush {
     }
 
     /// Leaving a chat: its pictures' memory goes and its recording stops.
-    pub(super) fn clear_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn clear_files(&mut self, cx: &mut Context<Self>) {
         self.files.by_message.clear();
-        for (_, thumb) in self.files.thumbs.drain() {
-            if let Thumb::Shown(thumb) = thumb {
-                cx.drop_image(thumb, Some(window));
+        let shown: Vec<_> = self.files.thumbs.drain().collect();
+        // once no window is being drawn, so each lets their copy go
+        cx.defer(move |cx| {
+            for (_, thumb) in shown {
+                if let Thumb::Shown(thumb) = thumb {
+                    cx.drop_image(thumb, None);
+                }
             }
-        }
+        });
         self.files.playing = None;
         self.files.opening = None;
     }
@@ -670,10 +674,12 @@ fn mark_from_elsewhere(_: &Path) -> std::io::Result<()> {
 mod tests {
     // not `super::*`: GPUI's `test` attribute would come with it
     use super::{
-        byte_count, clock, display_size, file_name, is_audio, is_image, length, thumbnail, Attachment, Duration,
+        byte_count, clear_open_copies, clock, display_size, file_name, is_audio, is_image, length, thumbnail,
+        Attachment, Duration, Files, Look, Thumb,
     };
     use gpui_kit::{DevicePixels, Size};
-    use sig_core::projection::{AttachmentState, MessageKey};
+    use sig_core::projection::{AttachmentState, Message, MessageKey, MessageKind, MessageStatus};
+    use std::sync::Arc;
 
     fn file(content_type: &str, name: Option<&str>) -> Attachment {
         Attachment {
@@ -826,5 +832,100 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(n > 0, "marked");
         assert!(value[..n as usize].starts_with(b"0081;"), "as downloaded");
+    }
+
+    fn message(kind: MessageKind) -> Message {
+        Message {
+            conversation_id: "c:a".into(),
+            author: "a".into(),
+            sent_at: 1,
+            received_at: 1,
+            body: None,
+            ranges: vec![],
+            is_outgoing: false,
+            status: MessageStatus::Read,
+            edited: false,
+            deleted: false,
+            quote: None,
+            kind,
+            expires_in: 0,
+            expires_at: None,
+            story: None,
+        }
+    }
+
+    /// The files of `message`: each kind, in each state.
+    fn shown() -> Files {
+        let mut files = Files::default();
+        let ready = |id: i64, content_type: &str| Attachment {
+            id,
+            path: Some(format!("f{id}")),
+            ..file(content_type, None)
+        };
+        let decoded = ready(1, "image/jpeg");
+        let broken = ready(2, "image/heic");
+        let coming = Attachment {
+            id: 3,
+            state: AttachmentState::Pending,
+            ..file("image/jpeg", None)
+        };
+        let voice = Attachment {
+            is_voice_note: true,
+            ..ready(4, "audio/aac")
+        };
+        let video = ready(5, "video/mp4");
+        let picture = thumbnail(&png(4, 4)).unwrap();
+        files.thumbs.insert("f1".into(), Thumb::Shown(Arc::new(picture)));
+        files.thumbs.insert("f2".into(), Thumb::Undecodable);
+        files.lengths.insert(4, Some(Duration::from_secs(42)));
+        files
+            .by_message
+            .insert(("a".into(), 1), vec![decoded, broken, coming, voice, video]);
+        files
+    }
+
+    #[test]
+    fn each_file_shows_as_its_kind_and_state_say() {
+        let looks: Vec<String> = shown()
+            .of(&message(MessageKind::Normal))
+            .iter()
+            .map(|f| match &f.look {
+                Look::Picture(Some(_)) => "picture".into(),
+                Look::Picture(None) => "placeholder".into(),
+                Look::Audio(a) => format!("audio {} {}", a.length, a.playing),
+                Look::File => "file".into(),
+            })
+            .collect();
+        // a picture that didn't decode is a file to open; a video opens in the system's player
+        let expected = ["picture", "file", "placeholder", "audio 42 false", "file"];
+        assert_eq!(looks, expected);
+    }
+
+    #[test]
+    fn deleted_view_once_and_sticker_messages_show_no_files() {
+        let files = shown();
+        let mut deleted = message(MessageKind::Normal);
+        deleted.deleted = true;
+        assert!(files.of(&deleted).is_empty());
+        assert!(files.of(&message(MessageKind::ViewOnce { viewed: false })).is_empty());
+        assert!(files.of(&message(MessageKind::Sticker { emoji: None })).is_empty());
+        let mut other = message(MessageKind::Normal);
+        other.sent_at = 2;
+        assert!(files.of(&other).is_empty(), "another message's");
+    }
+
+    #[test]
+    fn opened_copies_go_and_the_rest_of_the_data_folder_stays() {
+        let data = std::env::temp_dir().join(format!("hush-desktop-open-{}", std::process::id()));
+        let copy = data.join("open").join("0123").join("Menu.pdf");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, "menu").unwrap();
+        std::fs::write(data.join("projection.db"), "kept").unwrap();
+        clear_open_copies(&data);
+        let gone = !data.join("open").exists();
+        let kept = data.join("projection.db").exists();
+        std::fs::remove_dir_all(&data).unwrap();
+        assert!(gone && kept);
+        clear_open_copies(&data); // nothing left: no error
     }
 }

@@ -78,12 +78,28 @@ fn recording(a: &Attachment, audio: &Audio, this: &WeakEntity<Hush>, color: Hsla
         .role(Role::Group)
         .aria_label(name)
         .gap(px(10.));
-    if audio.unplayable {
-        return row
-            .child(icon("triangle-alert", 14., orange()))
+    // one this can't play still opens in the system's player, from its menu
+    let row = if audio.unplayable {
+        row.child(icon("triangle-alert", 14., orange()))
             .child(div().text_size(px(12.)).child("This recording can't be played"))
-            .into_any_element();
+    } else {
+        playable(row, a, audio, this, color, behind)
+    };
+    match a.state {
+        AttachmentState::Ready => row.context_menu(menu(this, a)).into_any_element(),
+        _ => row.into_any_element(),
     }
+}
+
+/// Play/pause (or the download), the track and the time.
+fn playable(
+    row: Stateful<Div>,
+    a: &Attachment,
+    audio: &Audio,
+    this: &WeakEntity<Hush>,
+    color: Hsla,
+    behind: Hsla,
+) -> Stateful<Div> {
     let control = match a.state {
         AttachmentState::Ready => div()
             .id(("play", a.id as u64))
@@ -108,8 +124,7 @@ fn recording(a: &Attachment, audio: &Audio, this: &WeakEntity<Hush>, color: Hsla
     } else {
         audio.length
     };
-    let row = row
-        .child(control)
+    row.child(control)
         // how far it has played
         .child(
             div()
@@ -126,11 +141,7 @@ fn recording(a: &Attachment, audio: &Audio, this: &WeakEntity<Hush>, color: Hsla
                 .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
                 .text_color(color.opacity(0.8))
                 .child(clock(time)),
-        );
-    match a.state {
-        AttachmentState::Ready => row.context_menu(menu(this, a)).into_any_element(),
-        _ => row.into_any_element(),
-    }
+        )
 }
 
 /// Any other file: its icon, name and size; a click opens it, or downloads it.
