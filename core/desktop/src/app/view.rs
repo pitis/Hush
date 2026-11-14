@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
@@ -37,8 +37,8 @@ struct Row {
     sender: Option<(String, Hsla)>,
     gutter: Gutter,
     text: String,
-    /// The "@name"s in `text`, drawn bold.
-    mentions: Vec<std::ops::Range<usize>>,
+    /// Its styles (`text::styled`).
+    runs: text::Runs,
     /// Deleted: said in italics.
     note: bool,
     /// Above the text, which is empty without a caption.
@@ -79,9 +79,12 @@ impl Hush {
             let name = self.name(&m.author);
             let person = format!("c:{}", m.author);
             let files = self.files.of(m);
-            let (body, mentions) = text::message(m, !files.is_empty(), |aci| self.name(aci));
+            let (body, runs) = text::message(m, !files.is_empty(), self.revealed(m), |aci| self.name(aci));
+            let hidden = runs.iter().any(|(_, s)| s & text::SPOILER != 0);
             let spoken = match files.first() {
                 Some(f) if body.is_empty() => text::describe(&files::summary(&f.file), ""),
+                // what a spoiler covers isn't read out either
+                _ if hidden => text::plain(m.body.as_deref().unwrap_or_default(), &m.ranges, |aci| self.name(aci)),
                 _ => body.clone(),
             };
             let time = text::bubble_time(m.sent_at);
@@ -103,7 +106,7 @@ impl Hush {
                 label: format!("{name}: {spoken}. {time}{said}"),
                 text: body,
                 files,
-                mentions,
+                runs,
                 note: m.deleted,
                 edited: m.edited && !m.deleted,
                 time,
@@ -799,7 +802,7 @@ impl Hush {
                         )
                     })
             } else {
-                self.with_composer_bar(self.render_composer(p, cx), p, cx)
+                self.with_compose(self.with_composer_bar(self.render_composer(p, cx), p, cx), p, cx)
             })
     }
 
@@ -820,7 +823,7 @@ impl Hush {
                         .min_w_0()
                         .py(px(1.))
                         .text_size(px(14.))
-                        .child(Textarea::new(&self.composer).appearance(false).aria_label("Message")),
+                        .child(self.composer_field(p)),
                 )
                 .when(!self.composer_empty, |this| {
                     this.child(
@@ -967,17 +970,14 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
                     .min_w_0()
                     .text_size(px(14.))
                     .when(row.note, |this| this.italic().text_color(color.opacity(0.6)))
-                    .child(
-                        actions::view::Selectable::new("text", row.text.clone(), act).with_highlights(
-                            row.mentions.iter().map(|r| {
-                                let bold = HighlightStyle {
-                                    font_weight: Some(FontWeight::BOLD),
-                                    ..Default::default()
-                                };
-                                (r.clone(), bold)
-                            }),
-                        ),
-                    ),
+                    .child(actions::view::message_text(
+                        &row.actions,
+                        row.text.clone(),
+                        &row.runs,
+                        act,
+                        p,
+                        behind,
+                    )),
             )
         })
         .child(meta);
@@ -989,7 +989,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         .rounded(px(18.))
         .bg(fill)
         .text_color(color)
-        .children(actions::view::quote(&row.actions))
+        .children(actions::view::quote(&row.actions, act, p, behind))
         // files without a caption: the time sits under them on the right
         .when(row.text.is_empty(), |this| this.items_end())
         .children(files::render(&row.files, this, color, behind))
@@ -1053,7 +1053,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
 }
 
 /// A person's or chat's picture, or their initials on their colour.
-fn avatar(id: &str, name: &str, picture: Option<Arc<Image>>, size: f32) -> Div {
+pub(super) fn avatar(id: &str, name: &str, picture: Option<Arc<Image>>, size: f32) -> Div {
     let base = style::avatar_color(id);
     let top = Hsla {
         l: (base.l + 0.08).min(1.),

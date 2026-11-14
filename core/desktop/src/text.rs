@@ -17,7 +17,7 @@ pub fn plain(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) ->
     marked(body, ranges, name).0
 }
 
-/// `plain`, with where its "@name"s are (byte ranges, drawn bold).
+/// `plain`, with where its "@name"s are (byte ranges).
 pub fn marked(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
     let units: Vec<u16> = body.encode_utf16().collect();
     let span = |r: &BodyRange| (r.start as usize, r.start as usize + r.length as usize);
@@ -59,6 +59,107 @@ pub fn marked(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -
     let bytes = |unit: usize| String::from_utf16_lossy(&text[..unit]).len();
     let names = names.into_iter().rev().map(|r| bytes(r.start)..bytes(r.end)).collect();
     (String::from_utf16_lossy(&text), names)
+}
+
+/// A run's styles (`MessageText.Styles`), as bits.
+pub const BOLD: u8 = 1;
+pub const ITALIC: u8 = 2;
+pub const STRIKETHROUGH: u8 = 4;
+pub const MONOSPACE: u8 = 8;
+/// A hidden spoiler's cover in a bubble; in the composer, its shade.
+pub const SPOILER: u8 = 16;
+/// Only in the composer: a mention, in the accent colour (a bubble's are bold).
+pub const MENTION: u8 = 32;
+
+/// Styled runs: byte ranges of a text, in order, with their styles.
+pub type Runs = Vec<(Range<usize>, u8)>;
+
+/// A style's bit; 0 for a mention.
+pub fn bit(style: &TextStyle) -> u8 {
+    match style {
+        TextStyle::Bold => BOLD,
+        TextStyle::Italic => ITALIC,
+        TextStyle::Strikethrough => STRIKETHROUGH,
+        TextStyle::Monospace => MONOSPACE,
+        TextStyle::Spoiler => SPOILER,
+        TextStyle::Mention { .. } => 0,
+    }
+}
+
+/// `body` styled for a bubble (`MessageText.attributed`): mentions read "@name" in bold, in the
+/// styles of their placeholder; a hidden spoiler covers its text (one that doesn't fit runs to the
+/// end of the text) unless `reveal`. The styled runs are byte ranges of the text, in order.
+pub fn styled(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String, reveal: bool) -> (String, Runs) {
+    let mut units: Vec<(u16, u8)> = body.encode_utf16().map(|u| (u, 0)).collect();
+    let len = units.len();
+    let unit = |units: &[(u16, u8)], i: usize| units.get(i).map(|u| u.0);
+    // neither edge between the halves of a surrogate pair (an emoji)
+    let fits = |units: &[(u16, u8)], start: usize, end: usize| {
+        start < end && end <= units.len() && [start, end].iter().all(|&i| !unit(units, i).is_some_and(is_trail))
+    };
+    for r in ranges {
+        let start = r.start as usize;
+        let mut end = start.saturating_add(r.length as usize);
+        let bit = match r.style {
+            TextStyle::Spoiler if reveal => continue,
+            TextStyle::Spoiler => {
+                end = end.min(len);
+                SPOILER
+            }
+            ref style => bit(style),
+        };
+        if bit != 0 && fits(&units, start, end) {
+            units[start..end].iter_mut().for_each(|u| u.1 |= bit);
+        }
+    }
+    // last first, so the earlier offsets hold; one overlapping one already replaced is skipped
+    let mut mentions: Vec<(usize, usize, &str)> = ranges
+        .iter()
+        .filter_map(|r| match &r.style {
+            TextStyle::Mention { aci } => Some((
+                r.start as usize,
+                (r.start as usize).saturating_add(r.length as usize),
+                aci.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    mentions.sort_by_key(|m| std::cmp::Reverse(m.0));
+    let mut end = len;
+    for (start, stop, aci) in mentions {
+        if stop > end || !fits(&units, start, stop) {
+            continue;
+        }
+        let around = units[start].1 | BOLD;
+        let shown = format!("@{}", name(aci))
+            .encode_utf16()
+            .map(|u| (u, around))
+            .collect::<Vec<_>>();
+        units.splice(start..stop, shown);
+        end = start;
+    }
+    // into text, each character with its first unit's styles, and runs of the same styles
+    let mut text = String::with_capacity(body.len());
+    let mut runs: Runs = vec![];
+    let decoded = char::decode_utf16(units.iter().map(|u| u.0));
+    let mut i = 0;
+    for c in decoded {
+        let styles = units[i].1;
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        i += c.len_utf16();
+        let at = text.len();
+        text.push(c);
+        match runs.last_mut() {
+            Some((r, s)) if *s == styles && r.end == at => r.end = text.len(),
+            _ if styles != 0 => runs.push((at..text.len(), styles)),
+            _ => {}
+        }
+    }
+    (text, runs)
+}
+
+fn is_trail(unit: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&unit)
 }
 
 /// A chat's name ("Note to Self" for our own), or until it is known "Group", the contact's
@@ -125,9 +226,9 @@ pub fn preview(c: &Conversation, author: &str, name: impl Fn(&str) -> String) ->
     }
 }
 
-/// A message's text in the timeline, with where its "@name"s are. `files`: its files show above
-/// it, so without a caption it has none.
-pub fn message(m: &Message, files: bool, name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
+/// A message's text in the timeline, `styled` (its spoilers hidden unless `reveal`). `files`: its
+/// files show above it, so without a caption it has none.
+pub fn message(m: &Message, files: bool, reveal: bool, name: impl Fn(&str) -> String) -> (String, Runs) {
     if m.deleted {
         return ("This message was deleted".into(), vec![]);
     }
@@ -135,7 +236,7 @@ pub fn message(m: &Message, files: bool, name: impl Fn(&str) -> String) -> (Stri
         return (placeholder, vec![]);
     }
     match m.body.as_deref() {
-        Some(body) if !body.trim().is_empty() => marked(body, &m.ranges, name),
+        Some(body) if !body.trim().is_empty() => styled(body, &m.ranges, name, reveal),
         _ if files => (String::new(), vec![]),
         _ => ("Attachment".into(), vec![]),
     }
@@ -363,6 +464,83 @@ mod tests {
         }
     }
 
+    fn style(start: u32, length: u32, style: TextStyle) -> BodyRange {
+        BodyRange { start, length, style }
+    }
+
+    /// Each run's text and styles.
+    fn runs(body: &str, ranges: &[BodyRange], reveal: bool) -> Vec<(String, u8)> {
+        let (text, runs) = styled(body, ranges, name, reveal);
+        runs.into_iter().map(|(r, s)| (text[r].to_string(), s)).collect()
+    }
+
+    #[test]
+    fn styles_overlap_and_count_utf16_units() {
+        // 👋 is two units: "bold it" starts at 3
+        let ranges = [
+            style(3, 7, TextStyle::Bold),
+            style(8, 6, TextStyle::Italic),
+            style(16, 3, TextStyle::Strikethrough),
+            style(20, 4, TextStyle::Monospace),
+        ];
+        assert_eq!(
+            runs("👋 bold it now, not that", &ranges, false),
+            [
+                ("bold ".into(), BOLD),
+                ("it".into(), BOLD | ITALIC),
+                (" now".into(), ITALIC),
+                ("not".into(), STRIKETHROUGH),
+                ("that".into(), MONOSPACE),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mention_reads_as_a_bold_name_in_the_styles_around_it() {
+        let ranges = [style(0, 8, TextStyle::Italic), mention(4, "a")];
+        assert_eq!(
+            runs("ask \u{FFFC} now", &ranges, false),
+            [
+                ("ask ".into(), ITALIC),
+                ("@<a>".into(), ITALIC | BOLD),
+                (" no".into(), ITALIC)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_spoiler_covers_its_text_and_mentions_to_the_end_at_most_until_revealed() {
+        let ranges = [spoiler(4, 50), mention(4, "a")];
+        assert_eq!(
+            runs("the \u{FFFC} did it", &ranges, false),
+            [("@<a>".into(), SPOILER | BOLD), (" did it".into(), SPOILER)]
+        );
+        assert_eq!(
+            runs("the \u{FFFC} did it", &ranges, true),
+            [("@<a>".into(), BOLD)],
+            "revealed: plain text but the name"
+        );
+    }
+
+    #[test]
+    fn styled_ranges_that_dont_fit_leave_the_text_whole() {
+        for body in ["👍", "👍👍 hi", "🇷🇴🇩🇪", "👨‍👩‍👧 z", "a👍b"] {
+            for start in [0, 1, 2, 3, 5, u32::MAX] {
+                for length in [0, 1, 2, 3, u32::MAX] {
+                    for s in [
+                        TextStyle::Bold,
+                        TextStyle::Spoiler,
+                        TextStyle::Mention { aci: "a".into() },
+                    ] {
+                        let (text, runs) = styled(body, &[style(start, length, s)], name, false);
+                        assert!(!text.contains('\u{FFFD}'), "{body:?} {start} {length}: {text:?}");
+                        assert!(runs.iter().all(|(r, _)| text.get(r.clone()).is_some()));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_line_break_joins_the_preview_into_one_line() {
         assert_eq!(one_line("a\r\nb\u{2028}c\rd"), "a b c d");
@@ -443,11 +621,11 @@ mod tests {
             expires_at: None,
             story: None,
         };
-        assert_eq!(message(&m, false, name).0, "Attachment");
-        assert_eq!(message(&m, true, name).0, "");
+        assert_eq!(message(&m, false, false, name).0, "Attachment");
+        assert_eq!(message(&m, true, false, name).0, "");
         m.body = Some("the view from the hotel".into());
         assert_eq!(
-            message(&m, true, name).0,
+            message(&m, true, false, name).0,
             "the view from the hotel",
             "a caption stays with its file"
         );

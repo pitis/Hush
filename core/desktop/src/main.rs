@@ -29,6 +29,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
+            app::compose::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
             cx.set_menus([Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)])]);
@@ -72,6 +73,8 @@ pub enum Demo {
     Reply,
     /// A chat's pictures, recordings and files.
     Files,
+    /// The chat, writing a styled message with a mention, the mention picker open.
+    Compose,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -91,6 +94,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("new-group", Demo::NewGroup),
                 ("reply", Demo::Reply),
                 ("files", Demo::Files),
+                ("compose", Demo::Compose),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

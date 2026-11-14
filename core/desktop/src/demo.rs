@@ -17,6 +17,28 @@ pub fn names() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The Family group's members but us.
+pub fn members() -> Vec<String> {
+    vec![ANA.into(), BOGDAN.into()]
+}
+
+/// What `Hush::demo_compose` types: "Thanks" bold, a mention of Ana, "big pot" italic.
+pub fn compose_ranges() -> Vec<BodyRange> {
+    vec![
+        styled(0, 6, TextStyle::Bold),
+        BodyRange {
+            start: 7,
+            length: 1,
+            style: TextStyle::Mention { aci: ANA.into() },
+        },
+        styled(25, 7, TextStyle::Italic),
+    ]
+}
+
+fn styled(start: u32, length: u32, style: TextStyle) -> BodyRange {
+    BodyRange { start, length, style }
+}
+
 fn chat(id: &str, kind: ConversationKind, title: &str, ago_hours: i64, preview: &str) -> Conversation {
     let now = chrono::Utc::now().timestamp_millis();
     Conversation {
@@ -149,6 +171,13 @@ pub fn messages() -> Vec<Message> {
     let mut delivered = message(ME, 40, "On my way, 20 minutes");
     delivered.status = MessageStatus::Delivered;
     delivered.edited = true;
+    delivered.ranges = vec![styled(11, 10, TextStyle::Monospace)];
+    let mut booked = message(ANA, 44, "Mum says the table is booked for 8, the usual place near the park. Parking is tricky, so come early or take the tram.");
+    booked.ranges = vec![styled(33, 1, TextStyle::Bold), styled(36, 15, TextStyle::Italic)];
+    let mut surprise = message(ANA, 42, "Don't tell Mum: the surprise is a cake from Dulce 🎂");
+    surprise.ranges = vec![styled(32, 20, TextStyle::Spoiler)];
+    let mut traffic = message(BOGDAN, 5, "Traffic is terrible today");
+    traffic.ranges = vec![styled(11, 8, TextStyle::Strikethrough)];
     let mut failed = message(ME, 3, "Running a bit late");
     failed.status = MessageStatus::Failed;
     let mut sending = message(ME, 1, "Dinner at 8? I'll bring dessert 🍰");
@@ -161,10 +190,11 @@ pub fn messages() -> Vec<Message> {
         mention,
         salad,
         message(ANA, 45, "Great, everyone's in 🎉"),
-        message(ANA, 44, "Mum says the table is booked for 8, the usual place near the park. Parking is tricky, so come early or take the tram."),
+        booked,
+        surprise,
         delivered,
         deleted,
-        message(BOGDAN, 5, "Traffic is terrible today"),
+        traffic,
         failed,
         sending,
     ]

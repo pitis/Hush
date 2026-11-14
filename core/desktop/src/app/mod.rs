@@ -10,7 +10,7 @@ use async_compat::Compat;
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
-use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{InputEditsEvent, InputEvent, InputState, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::Theme;
 use gpui_kit::prelude::*;
@@ -21,6 +21,7 @@ use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, Gro
 use crate::{key, text};
 
 mod actions;
+pub mod compose;
 mod files;
 mod view;
 
@@ -134,6 +135,8 @@ pub struct Hush {
     /// The open chat's reactions, and the reply or edit in the composer.
     actions: actions::Actions,
     files: files::Files,
+    /// The composer's styles and mentions.
+    compose: compose::Compose,
 }
 
 /// The open core, for `quit`.
@@ -245,6 +248,10 @@ impl Hush {
             },
         )
         .detach();
+        cx.subscribe(&composer, |this, _, e: &InputEditsEvent, cx| {
+            this.composer_edited(e, cx)
+        })
+        .detach();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         cx.subscribe(&search, |this, search, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
@@ -290,6 +297,7 @@ impl Hush {
             cancelling: false,
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
+            compose: Default::default(),
         }
     }
 
@@ -307,7 +315,7 @@ impl Hush {
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
-            crate::Demo::Chat | crate::Demo::NewGroup | crate::Demo::Reply => {
+            crate::Demo::Chat | crate::Demo::NewGroup | crate::Demo::Reply | crate::Demo::Compose => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -317,6 +325,9 @@ impl Hush {
                 if let crate::Demo::NewGroup = screen {
                     let ana = app.contacts.first().map(|(aci, _)| aci.clone());
                     app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
+                }
+                if let crate::Demo::Compose = screen {
+                    app.demo_compose(window, cx);
                 }
             }
             crate::Demo::Files => {
@@ -549,17 +560,16 @@ impl Hush {
             return cx.notify();
         }
         let draft = self.drafts.remove(&id).unwrap_or_default();
-        let unsent = self.actions.leave(self.composer.read(cx).value().to_string());
+        // drafts keep the words, not their styles (the Mac app's too)
+        let unsent = self.actions.leave(self.typed(cx)).words();
         if let Some(left) = self.selected.replace(id) {
             if !unsent.trim().is_empty() {
                 self.drafts.insert(left, unsent);
             }
         }
-        self.composer_empty = draft.trim().is_empty();
-        self.composer.update(cx, |input, cx| {
-            input.set_value(draft, window, cx);
-            input.focus(window, cx);
-        });
+        self.set_typed(compose::Typed::plain(draft), window, cx);
+        self.composer.update(cx, |input, cx| input.focus(window, cx));
+        self.load_members(cx);
         self.generation += 1;
         self.messages.clear();
         self.clear_files(cx);
@@ -703,23 +713,23 @@ impl Hush {
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
             return;
         };
-        let body = self.composer.read(cx).value().trim().to_string();
-        if body.is_empty() || self.save_edit(body.clone(), window, cx) {
+        let typed = self.typed(cx);
+        let (body, ranges) = compose::message(&typed);
+        if body.is_empty() || self.save_edit(body.clone(), ranges.clone(), window, cx) {
             return;
         }
         let reply = self.take_reply();
         let quote = reply.as_ref().map(actions::quote);
-        self.composer.update(cx, |input, cx| input.clean(window, cx));
+        self.set_typed(compose::Typed::default(), window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], quote, None)).await;
+            let sent = Compat::new(client.send_text(id.clone(), body, ranges, quote, None)).await;
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
                 app.error = Some(format!("Couldn't send the message: {e}"));
                 // the text goes back to its chat: into the composer if that chat is still open
                 // and nothing new was typed, else into its draft
                 if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
-                    app.composer_empty = false;
-                    app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
+                    app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
                 } else {
                     if reply.is_some() {
@@ -727,7 +737,7 @@ impl Hush {
                             "Couldn't send the reply: {e}. Its text is back in its chat, without the quote."
                         ));
                     }
-                    app.drafts.entry(id).or_insert(body);
+                    app.drafts.entry(id).or_insert(typed.words());
                 }
                 cx.notify();
             });

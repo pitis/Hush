@@ -2,14 +2,14 @@
 //! react, reply, edit, copy, retry and delete for everyone; its reactions, and the reply or edit
 //! waiting in the composer.
 
-use std::collections::HashMap;
-use std::ops::Range;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use async_compat::Compat;
 use gpui_kit::*;
-use sig_core::projection::{Message, MessageDetails, MessageKey, MessageStatus, Quote, Reaction, TextStyle};
+use sig_core::projection::{BodyRange, Message, MessageDetails, MessageKey, MessageStatus, Quote, Reaction, TextStyle};
 
+use super::compose::{self, Typed};
 use super::Hush;
 use crate::text;
 
@@ -39,20 +39,13 @@ pub fn can_delete(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
 /// The Mac app's rule: as `can_delete`, and it has text to edit whose mentions a composer can
 /// hold (one placeholder each, inside the text): an edit would lose any other. Not a reply to a
 /// story: an edit goes without the story it answers.
-fn editable(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
+pub fn can_edit(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
     let length = m.body.as_deref().map_or(0, |b| b.encode_utf16().count());
     let holdable = m.ranges.iter().all(|r| match r.style {
         TextStyle::Mention { .. } => r.length == 1 && (r.start as usize) < length,
         _ => true,
     });
     can_delete(m, me, now_ms) && length > 0 && m.story.is_none() && holdable
-}
-
-/// `editable`, by this composer.
-/// shortcut: it holds no styles or mentions, so a message with any isn't offered (an edit would
-/// lose them); the Mac app's composer holds both. Lift this once it does.
-pub fn can_edit(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
-    editable(m, me, now_ms) && m.ranges.is_empty()
 }
 
 /// Our reaction among a message's reactions.
@@ -107,11 +100,9 @@ pub fn pill(reactions: &[Reaction], me: Option<&str>) -> Vec<PillEntry> {
     entries
 }
 
-/// ↑ in an empty composer: the newest message of ours the Mac app would edit, if this composer
-/// can (not an older one past it).
+/// ↑ in an empty composer: the newest message of ours that can be edited.
 pub fn last_editable<'a>(messages: &'a [Message], me: Option<&str>, now_ms: i64) -> Option<&'a Message> {
-    let newest = messages.iter().rev().find(|m| editable(m, me, now_ms))?;
-    can_edit(newest, me, now_ms).then_some(newest)
+    messages.iter().rev().find(|m| can_edit(m, me, now_ms))
 }
 
 /// A message's menu item (its right-click menu and its … button).
@@ -170,11 +161,13 @@ pub(super) struct Actions {
     /// Our message being edited in the composer; it ends replying (the two don't mix).
     editing: Option<Message>,
     /// What was typed before editing started; back once the edit is saved or cancelled.
-    draft_before_edit: Option<String>,
+    draft_before_edit: Option<Typed>,
     /// The edit is on its way to the core: ↩ again doesn't send it twice.
     saving: bool,
     /// The message whose reaction picker is open: its buttons stay shown.
     picking: Option<Key>,
+    /// Messages whose spoilers were clicked to show them.
+    revealed: HashSet<Key>,
     /// Takes the keyboard when message text is selected: in the composer, ⌘C would copy
     /// the composer's own (empty) selection.
     focus: FocusHandle,
@@ -193,6 +186,7 @@ impl Actions {
             draft_before_edit: None,
             saving: false,
             picking: None,
+            revealed: HashSet::new(),
             focus: cx.focus_handle(),
             window: window.window_handle(),
         }
@@ -200,7 +194,7 @@ impl Actions {
 
     /// Another chat opens: nothing follows it there (a load still running drops what it reads).
     /// Returns the draft of the one left (while editing, what was typed before).
-    pub(super) fn leave(&mut self, typed: String) -> String {
+    pub(super) fn leave(&mut self, typed: Typed) -> Typed {
         let draft = match self.editing.take() {
             Some(_) => self.draft_before_edit.take().unwrap_or_default(),
             None => typed,
@@ -212,6 +206,7 @@ impl Actions {
         self.reply_to = None;
         self.saving = false;
         self.picking = None;
+        self.revealed.clear();
         draft
     }
 
@@ -234,8 +229,8 @@ pub(super) struct RowActions {
     pub items: Vec<Item>,
     /// Ours, counting one just sent.
     pub mine: Option<String>,
-    /// The message it replies to, above its text: a header, the text and its "@name"s.
-    pub quote: Option<(&'static str, String, Vec<Range<usize>>)>,
+    /// The message it replies to, above its text: a header, the text and its styled runs.
+    pub quote: Option<(&'static str, String, text::Runs)>,
     pub pill: Vec<PillEntry>,
     /// Who reacted: emoji, name, ours.
     pub reactors: Vec<(String, String, bool)>,
@@ -249,11 +244,11 @@ impl Hush {
         let reactions = self.actions.reactions.get(&k).map(Vec::as_slice).unwrap_or_default();
         let quote = m.quote.as_ref().filter(|_| !m.deleted).map(|q| {
             let header = if q.author == m.author { "Reply" } else { "Quoted" };
-            let (text, mentions) = match &q.text {
-                Some(t) => text::marked(t, &q.ranges, |aci| self.name(aci)),
+            let (text, runs) = match &q.text {
+                Some(t) => text::styled(t, &q.ranges, |aci| self.name(aci), false),
                 None => ("Attachment".into(), vec![]),
             };
-            (header, text, mentions)
+            (header, text, runs)
         });
         Rc::new(RowActions {
             id: format!("{}:{}", m.author, m.sent_at).into(),
@@ -286,6 +281,17 @@ impl Hush {
             .collect();
         let body = m.body.as_deref().unwrap_or_default();
         text::plain(body, &shown, |aci| self.name(aci))
+    }
+
+    /// Whether a click showed the message's spoilers.
+    pub(super) fn revealed(&self, m: &Message) -> bool {
+        self.actions.revealed.contains(&key(m))
+    }
+
+    /// Shows a message's spoilers (until another chat opens).
+    pub(super) fn reveal(&mut self, m: &Message, cx: &mut Context<Self>) {
+        self.actions.revealed.insert(key(m));
+        cx.notify();
     }
 
     /// Our reaction to a message, counting one just sent.
@@ -431,17 +437,14 @@ impl Hush {
     pub(super) fn start_editing(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
         self.actions.reply_to = None;
         if self.actions.editing.is_none() {
-            self.actions.draft_before_edit = Some(self.composer.read(cx).value().to_string());
+            self.actions.draft_before_edit = Some(self.typed(cx));
         }
         self.actions.editing = Some(m.clone());
         self.actions.saving = false;
-        let body = m.body.clone().unwrap_or_default();
-        self.composer_empty = body.trim().is_empty();
-        self.composer.update(cx, |input, cx| {
-            input.set_value(body, window, cx);
-            input.focus(window, cx);
-        });
-        cx.notify();
+        let body = m.body.as_deref().unwrap_or_default();
+        let typed = compose::load(body, &m.ranges, |aci| self.name(aci));
+        self.set_typed(typed, window, cx);
+        self.composer.update(cx, |input, cx| input.focus(window, cx));
     }
 
     /// The edit ends: what was typed before comes back.
@@ -451,9 +454,7 @@ impl Hush {
         }
         self.actions.saving = false;
         let draft = self.actions.draft_before_edit.take().unwrap_or_default();
-        self.composer_empty = draft.trim().is_empty();
-        self.composer.update(cx, |input, cx| input.set_value(draft, window, cx));
-        cx.notify();
+        self.set_typed(draft, window, cx);
     }
 
     /// Esc: drops the edit or the reply. False if there was neither.
@@ -492,9 +493,15 @@ impl Hush {
         }
     }
 
-    /// Sends `body` as the new text of the message being edited; the composer keeps it until the
-    /// core took it. False if nothing is edited.
-    pub(super) fn save_edit(&mut self, body: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Sends `body` (and its styles and mentions) as the new text of the message being edited; the
+    /// composer keeps it until the core took it. False if nothing is edited.
+    pub(super) fn save_edit(
+        &mut self,
+        body: String,
+        ranges: Vec<BodyRange>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (Some(client), Some(m)) = (self.client.clone(), self.actions.editing.clone()) else {
             return false;
         };
@@ -502,7 +509,7 @@ impl Hush {
             return true;
         }
         cx.spawn_in(window, async move |this, cx| {
-            let saved = Compat::new(client.edit(m.key(), body, vec![])).await;
+            let saved = Compat::new(client.edit(m.key(), body, ranges)).await;
             let _ = this.update_in(cx, |app, window, cx| {
                 let still = app.actions.editing.as_ref().is_some_and(|e| key(e) == key(&m));
                 if still {
@@ -692,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn only_plain_text_that_isnt_a_story_reply_is_edited() {
+    fn text_with_styles_and_mentions_is_edited_but_not_a_story_reply() {
         use Item::*;
         let mut story = ours(0);
         story.story = Some(MessageKey {
@@ -712,18 +719,17 @@ mod tests {
             length: 1,
             style: TextStyle::Mention { aci: "ana".into() },
         }];
-        assert_eq!(
-            items(&mention),
-            [React, Reply, Copy, Delete],
-            "the composer can't hold it"
-        );
+        assert_eq!(items(&mention), [React, Reply, Edit, Copy, Delete]);
         let mut bold = ours(0);
         bold.ranges = vec![BodyRange {
             start: 0,
             length: 5,
             style: TextStyle::Bold,
         }];
-        assert!(!can_edit(&bold, Some(ME), NOW));
+        assert!(can_edit(&bold, Some(ME), NOW));
+        // a mention no composer can hold (the Mac app's neither): an edit would lose it
+        mention.ranges[0].length = 2;
+        assert!(!can_edit(&mention, Some(ME), NOW));
     }
 
     #[test]
@@ -774,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn up_does_nothing_when_this_composer_cant_edit_the_newest() {
+    fn up_edits_the_newest_styled_one_and_goes_past_mentions_no_composer_holds() {
         let plain = ours(20_000);
         let mut bold = ours(10_000);
         bold.ranges = vec![BodyRange {
@@ -783,9 +789,8 @@ mod tests {
             style: TextStyle::Bold,
         }];
         assert_eq!(
-            last_editable(&[plain.clone(), bold], Some(ME), NOW),
-            None,
-            "not the older one"
+            last_editable(&[plain.clone(), bold.clone()], Some(ME), NOW),
+            Some(&bold)
         );
         // a mention the Mac app's composer can't hold either: not editable there, so ↑ goes past it
         let mut wide = ours(10_000);
