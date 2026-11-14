@@ -1763,6 +1763,21 @@ final class AppStore {
         }
     }
 
+    /// Opens the chat of a link's group we're in; one with no chat here (no messages since
+    /// linking) is listed first. Nil, or why it couldn't be.
+    func openGroup(_ conversationId: String, link: String) async -> String? {
+        guard let client else { return "Not linked yet." }
+        if !conversations.contains(where: { $0.id == conversationId }) {
+            do { try await client.listGroup(link: link) } catch {
+                append("opening a group failed: \(error)")
+                return "Couldn't open the group: \(Self.describe(error))"
+            }
+        }
+        select(conversationId)
+        refreshConversations()
+        return nil
+    }
+
     /// Withdraws our request to join a group, and deletes its chat; nil, or why it failed (the
     /// chat then stays).
     func cancelJoinRequest(_ conversationId: String) async -> String? {

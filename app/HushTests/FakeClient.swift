@@ -194,6 +194,12 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let joinError { throw joinError }
         return lock.withLock { joinAnswers[link]! }
     }
+    var listGroupError: CoreError?
+    private(set) var listedGroups: [String] = []
+    func listGroup(link: String) async throws {
+        lock.withLock { listedGroups.append(link) }
+        if let listGroupError { throw listGroupError }
+    }
     func cancelJoinRequest(conversationId: String) async throws {
         lock.withLock { cancelledRequests.append(conversationId) }
         if let cancelError { throw cancelError }

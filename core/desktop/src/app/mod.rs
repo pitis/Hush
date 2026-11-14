@@ -978,18 +978,28 @@ impl Hush {
             }
             .boxed_local(),
             DialogKind::Join(Some(preview)) => {
-                if join_step(preview, listed(&preview.conversation_id)) == JoinStep::Open {
-                    let id = preview.conversation_id.clone();
-                    self.dialog = None;
-                    return self.select(id, window, cx);
-                }
-                async move {
-                    match client.join_group(value).await {
-                        Ok(joined) => Outcome::Open(joined.conversation_id),
-                        Err(e) => Outcome::Problem(server_failure("Couldn't join the group", &e)),
+                let (id, is_listed) = (preview.conversation_id.clone(), listed(&preview.conversation_id));
+                if join_step(preview, is_listed) == JoinStep::Open {
+                    if is_listed {
+                        self.dialog = None;
+                        return self.select(id, window, cx);
                     }
+                    async move {
+                        match client.list_group(value).await {
+                            Ok(()) => Outcome::Open(id),
+                            Err(e) => Outcome::Problem(format!("Couldn't open the group: {}", describe(&e))),
+                        }
+                    }
+                    .boxed_local()
+                } else {
+                    async move {
+                        match client.join_group(value).await {
+                            Ok(joined) => Outcome::Open(joined.conversation_id),
+                            Err(e) => Outcome::Problem(server_failure("Couldn't join the group", &e)),
+                        }
+                    }
+                    .boxed_local()
                 }
-                .boxed_local()
             }
         };
         if let Some(d) = &mut self.dialog {
@@ -1150,9 +1160,9 @@ fn matching<'a>(people: &'a [(String, String)], filter: &str) -> impl Iterator<I
 }
 
 fn join_step(p: &GroupPreview, listed: bool) -> JoinStep {
-    // no chat here (in it with no messages yet, or asked from another device): joining or asking
-    // again lists it; the Mac app's Open Chat would open nothing
-    if listed && (p.member || p.requested) {
+    // in it: its chat opens, listed first if it has none here (no messages since linking). Asked
+    // from another device, with no chat here: asking again lists it
+    if p.member || (listed && p.requested) {
         JoinStep::Open
     } else if p.approval {
         JoinStep::AskToJoin
@@ -1320,8 +1330,9 @@ mod tests {
             ..group.clone()
         };
         assert_eq!(join_step(&member, true), JoinStep::Open);
-        // in it, but its chat isn't listed here (no messages yet): joining lists it
-        assert_eq!(join_step(&member, false), JoinStep::Join);
+        // in it, but its chat isn't listed here (no messages yet): Open Chat lists it (the server
+        // refuses to add a member again)
+        assert_eq!(join_step(&member, false), JoinStep::Open);
         // asked here: its chat opens; asked elsewhere: asking again lists it
         let requested = GroupPreview {
             requested: true,

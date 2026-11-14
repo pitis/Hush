@@ -1777,6 +1777,23 @@ impl Client {
             .map_err(|message| CoreError::Network { message })
     }
 
+    /// Lists the chat of a link's group we're in but have no chat with here (no messages since
+    /// linking), so its Open Chat has a chat to open. An error if we're not in it. The link holds
+    /// the group's key: never logged.
+    pub async fn list_group(&self, link: String) -> Result<(), CoreError> {
+        let link = group_link(&link)?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::ListGroup {
+            key: link.master_key,
+            done,
+        })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::InvalidInput { message })
+    }
+
     /// Joins a group through its invite link, or asks to where admins approve; its chat is
     /// listed and accepted (as Signal's apps do: we chose it).
     pub async fn join_group(&self, link: String) -> Result<GroupJoined, CoreError> {

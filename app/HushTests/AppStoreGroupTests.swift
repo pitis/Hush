@@ -149,6 +149,21 @@ final class AppStoreGroupTests: XCTestCase {
         XCTAssertNil(store.selectedId)
     }
 
+    func testOpeningAGroupWereInListsItsChatIfItHasNone() async {
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        // in it, with no messages here since linking: not in the list
+        let opened = await store.openGroup(group, link: link)
+        XCTAssertNil(opened)
+        XCTAssertEqual(fake.listedGroups, [link])
+        XCTAssertEqual(store.selectedId, group)
+        store.select(nil)
+        fake.listGroupError = CoreError.InvalidInput(message: "You're not in this group.")
+        let failed = await store.openGroup(group, link: link)
+        XCTAssertEqual(failed, "Couldn't open the group: You're not in this group.")
+        XCTAssertNil(store.selectedId)
+    }
+
     func testACancelledRequestTakesItsChatAway() async {
         let fake = FakeClient(linked: true)
         let store = await linkedStore(fake)
