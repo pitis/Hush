@@ -438,3 +438,31 @@ pub fn reactions(messages: &[Message]) -> Vec<(MessageKey, Vec<Reaction>)> {
     .filter_map(|(body, r)| Some((to(body)?, r)))
     .collect()
 }
+
+const CARMEN: &str = "44444444-4444-4444-8444-444444444444";
+const IOANA: &str = "55555555-5555-4555-8555-555555555555";
+
+/// The names Group Info shows beyond the chats'.
+pub fn group_names() -> Vec<(String, String)> {
+    [(CARMEN, "Carmen Dobre"), (IOANA, "Ioana Marin")]
+        .into_iter()
+        .map(|(aci, name)| (aci.to_owned(), name.to_owned()))
+        .collect()
+}
+
+/// The Family group as its admin sees it: Ana an admin too, Ioana invited, Bogdan asking to join.
+pub fn group_info() -> sig_core::GroupInfo {
+    let member = |aci: &str, admin| sig_core::GroupMember { aci: aci.into(), admin };
+    sig_core::GroupInfo {
+        description: "Sunday dinners and who brings what".into(),
+        members: vec![member(CARMEN, false), member(ANA, true), member(ME, true)],
+        invited: vec![IOANA.into()],
+        requesting: vec![BOGDAN.into()],
+        link_access: sig_core::LinkAccess::Approval,
+        link: Some("https://signal.group/#demo".into()),
+        member: true,
+        admin: true,
+        can_edit_details: true,
+        can_add_members: true,
+    }
+}

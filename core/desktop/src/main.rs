@@ -126,6 +126,12 @@ pub enum Demo {
     Request,
     /// The archived chats listed.
     Archive,
+    /// The Family group's info, as an admin sees it.
+    GroupInfo,
+    /// Its name and description being edited.
+    EditGroup,
+    /// Members being added to it.
+    AddMembers,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -153,6 +159,9 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("chat-menu", Demo::ChatMenu),
                 ("request", Demo::Request),
                 ("archive", Demo::Archive),
+                ("group-info", Demo::GroupInfo),
+                ("edit-group", Demo::EditGroup),
+                ("add-members", Demo::AddMembers),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
