@@ -10,7 +10,7 @@ use async_compat::Compat;
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
-use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{InputEditsEvent, InputEvent, InputState, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::Theme;
 use gpui_kit::prelude::*;
@@ -22,6 +22,7 @@ use crate::{key, text};
 
 mod actions;
 pub mod attach;
+pub mod compose;
 mod files;
 pub mod search;
 mod view;
@@ -128,6 +129,10 @@ pub struct Hush {
     composer_empty: bool,
     /// Files to send with the next message.
     tray: Vec<attach::Outgoing>,
+    /// Files being added to the tray (read, a pasted picture written).
+    adding: usize,
+    /// ↩ was pressed while files were being added: the message goes once they're in.
+    send_waiting: bool,
     /// The sidebar's search field and its words (chats whose name has them; messages in `find`).
     search: Entity<InputState>,
     query: String,
@@ -142,6 +147,8 @@ pub struct Hush {
     /// The open chat's reactions, and the reply or edit in the composer.
     actions: actions::Actions,
     files: files::Files,
+    /// The composer's styles and mentions.
+    compose: compose::Compose,
 }
 
 /// The open core, for `quit`.
@@ -255,6 +262,10 @@ impl Hush {
             },
         )
         .detach();
+        cx.subscribe(&composer, |this, _, e: &InputEditsEvent, cx| {
+            this.composer_edited(e, cx)
+        })
+        .detach();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search").clean_on_escape());
         cx.subscribe_in(
             &search,
@@ -307,6 +318,8 @@ impl Hush {
             composer,
             composer_empty: true,
             tray: vec![],
+            adding: 0,
+            send_waiting: false,
             search,
             query: String::new(),
             find: Default::default(),
@@ -316,6 +329,7 @@ impl Hush {
             cancelling: false,
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
+            compose: Default::default(),
         }
     }
 
@@ -336,6 +350,7 @@ impl Hush {
             crate::Demo::Chat
             | crate::Demo::NewGroup
             | crate::Demo::Reply
+            | crate::Demo::Compose
             | crate::Demo::Search
             | crate::Demo::SearchInChat => {
                 app.screen = Screen::Chats;
@@ -347,6 +362,9 @@ impl Hush {
                 if let crate::Demo::NewGroup = screen {
                     let ana = app.contacts.first().map(|(aci, _)| aci.clone());
                     app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
+                }
+                if let crate::Demo::Compose = screen {
+                    app.demo_compose(window, cx);
                 }
                 if let crate::Demo::Search | crate::Demo::SearchInChat = screen {
                     app.demo_search(matches!(screen, crate::Demo::SearchInChat), window, cx);
@@ -588,17 +606,16 @@ impl Hush {
             return cx.notify();
         }
         let draft = self.drafts.remove(&id).unwrap_or_default();
-        let unsent = self.actions.leave(self.composer.read(cx).value().to_string());
+        // drafts keep the words, not their styles (the Mac app's too)
+        let unsent = self.actions.leave(self.typed(cx)).words();
         if let Some(left) = self.selected.replace(id) {
             if !unsent.trim().is_empty() {
                 self.drafts.insert(left, unsent);
             }
         }
-        self.composer_empty = draft.trim().is_empty();
-        self.composer.update(cx, |input, cx| {
-            input.set_value(draft, window, cx);
-            input.focus(window, cx);
-        });
+        self.set_typed(compose::Typed::plain(draft), window, cx);
+        self.composer.update(cx, |input, cx| input.focus(window, cx));
+        self.load_members(cx);
         self.generation += 1;
         self.depth = PAGE;
         self.messages.clear();
@@ -751,45 +768,51 @@ impl Hush {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
-            return;
-        };
-        let body = self.composer.read(cx).value().trim().to_string();
-        // an edit changes the text only: the files wait for the next message
-        let files = !self.tray.is_empty() && !self.actions.editing();
-        if (body.is_empty() && !files) || self.save_edit(body.clone(), window, cx) {
-            return;
+        let Some(id) = self.selected.clone() else { return };
+        let typed = self.typed(cx);
+        let (body, ranges) = compose::message(&typed);
+        let plan = attach::plan(&body, self.actions.editing(), self.adding > 0, !self.tray.is_empty());
+        match plan {
+            attach::Plan::Nothing => return,
+            attach::Plan::Edit => {
+                self.save_edit(body, ranges, window, cx);
+                return;
+            }
+            attach::Plan::Wait => return self.send_when_added(),
+            attach::Plan::Text | attach::Plan::Files { .. } => {}
         }
+        let Some(client) = self.client.clone() else { return };
         let reply = self.take_reply();
         let quote = reply.as_ref().map(actions::quote);
-        self.composer.update(cx, |input, cx| input.clean(window, cx));
+        self.set_typed(compose::Typed::default(), window, cx);
         let files = self.take_tray();
+        let worded = !body.is_empty();
         cx.spawn_in(window, async move |this, cx| {
-            let sent = if files.is_empty() {
-                Compat::new(client.send_text(id.clone(), body.clone(), vec![], quote, None)).await
-            } else {
-                // the text goes with the files, as their caption
-                let outgoing = files.iter().map(attach::Outgoing::file).collect();
-                let caption = Some(body.clone()).filter(|b| !b.is_empty());
-                Compat::new(client.send_attachments(id.clone(), outgoing, caption, vec![], quote)).await
+            let sent = match plan {
+                attach::Plan::Files { caption } => {
+                    let outgoing = files.iter().map(attach::Outgoing::file).collect();
+                    Compat::new(client.send_attachments(id.clone(), outgoing, caption, ranges, quote)).await
+                }
+                _ => Compat::new(client.send_text(id.clone(), body, ranges, quote, None)).await,
             };
+            let had_files = !files.is_empty();
             let _ = this.update(cx, |app, cx| app.tray_back(&id, files, sent.is_ok(), cx));
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
-                app.error = Some(format!("Couldn't send the message: {e}"));
+                // the Mac app's words: the core's
+                let e = describe(&e);
                 // the text goes back to its chat: into the composer if that chat is still open
                 // and nothing new was typed, else into its draft
-                if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
-                    app.composer_empty = body.is_empty();
-                    app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
+                let open = app.selected.as_deref() == Some(id.as_str());
+                if open && app.composer.read(cx).value().is_empty() {
+                    app.error = Some(e);
+                    app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
                 } else {
-                    if reply.is_some() {
-                        app.error = Some(format!(
-                            "Couldn't send the reply: {e}. Its text is back in its chat, without the quote."
-                        ));
-                    }
-                    app.drafts.entry(id).or_insert(body);
+                    // the files went back to the tray only if their chat is still open
+                    let lost_files = had_files && !open;
+                    app.error = Some(attach::unsent(&e, worded, reply.is_some(), lost_files));
+                    app.drafts.entry(id).or_insert(typed.words());
                 }
                 cx.notify();
             });

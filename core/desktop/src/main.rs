@@ -30,9 +30,7 @@ fn main() {
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
             cx.on_action(|_: &Quit, cx| app::quit(cx));
-            cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
-            cx.bind_keys(app::search::keys());
-            cx.bind_keys(app::attach::keys());
+            cx.bind_keys(key_bindings());
             cx.set_menus([
                 Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
                 Menu::new("Chats").items([
@@ -51,6 +49,15 @@ fn main() {
             app::attach::shortcut(window, hush.downgrade(), cx);
             cx.activate(true);
         });
+}
+
+/// Every shortcut the app binds, before the menus are set (which show them).
+fn key_bindings() -> Vec<KeyBinding> {
+    let mut all = vec![KeyBinding::new(QUIT_KEY, Quit, None)];
+    all.extend(app::search::keys());
+    all.extend(app::compose::keys());
+    all.extend(app::attach::keys());
+    all
 }
 
 fn window_options(cx: &App) -> WindowOptions {
@@ -84,6 +91,8 @@ pub enum Demo {
     Reply,
     /// A chat's pictures, recordings and files, and files waiting to be sent.
     Files,
+    /// The chat, writing a styled message with a mention, the mention picker open.
+    Compose,
     /// Every chat searched.
     Search,
     /// The open chat searched, its newest match opened.
@@ -107,6 +116,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("new-group", Demo::NewGroup),
                 ("reply", Demo::Reply),
                 ("files", Demo::Files),
+                ("compose", Demo::Compose),
                 ("search", Demo::Search),
                 ("search-in-chat", Demo::SearchInChat),
             ];
@@ -148,4 +158,13 @@ fn snapshot(dir: std::path::PathBuf) {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_shortcut_parses() {
+        // `KeyBinding::new` panics on a keystroke it can't read (`secondary-`, a typo): at launch
+        assert!(!super::key_bindings().is_empty());
+    }
 }

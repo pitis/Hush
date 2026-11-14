@@ -40,6 +40,55 @@ impl Outgoing {
     }
 }
 
+/// What ↩ sends.
+#[derive(Debug, PartialEq)]
+pub(super) enum Plan {
+    Nothing,
+    /// The edit's new words: an edit changes the text only, the files wait for the next message.
+    Edit,
+    /// Files are still being added: it goes once they're in, so words never go without the
+    /// picture they were typed for (the Mac app adds them at once).
+    Wait,
+    Text,
+    /// The tray's files, the words as their caption (none without words).
+    Files {
+        caption: Option<String>,
+    },
+}
+
+/// What ↩ does with the composer's words (trimmed), an edit, files being added and the tray's.
+pub(super) fn plan(body: &str, editing: bool, adding: bool, files: bool) -> Plan {
+    if editing {
+        if body.is_empty() {
+            Plan::Nothing
+        } else {
+            Plan::Edit
+        }
+    } else if adding {
+        Plan::Wait
+    } else if files {
+        Plan::Files {
+            caption: Some(body.to_owned()).filter(|b| !b.is_empty()),
+        }
+    } else if body.is_empty() {
+        Plan::Nothing
+    } else {
+        Plan::Text
+    }
+}
+
+/// What a failed send says when its words went to its chat's draft instead of the composer: the
+/// quote, and the files if another chat is open, are gone.
+pub(super) fn unsent(e: &str, words: bool, quote: bool, files: bool) -> String {
+    let quote = if quote { ", without the quote" } else { "" };
+    let files_lost = if files { ", and its files weren't sent" } else { "" };
+    match (words, files) {
+        (true, _) => format!("{e}. Its text is back in its chat{quote}{files_lost}."),
+        (false, true) => format!("{e}. Its files weren't sent."),
+        (false, false) => e.to_owned(),
+    }
+}
+
 /// What ⌘V attaches.
 #[derive(Debug, PartialEq)]
 enum Pasted<'a> {
@@ -74,17 +123,19 @@ pub fn shortcut(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
 }
 
 impl Hush {
-    /// Files can be added: the open chat has a composer, nothing is over it, and no edit is on
-    /// (an edit changes the text only).
-    fn can_attach(&self) -> bool {
+    /// Files can join the tray: the open chat has a composer, and no edit is on (an edit changes
+    /// the text only).
+    fn writable(&self) -> bool {
         let open = self
             .selected
             .as_ref()
             .and_then(|id| self.chats.iter().find(|c| &c.id == id));
-        matches!(self.screen, Screen::Chats)
-            && self.dialog.is_none()
-            && open.is_some_and(|c| !answer_first(c))
-            && !self.actions.editing()
+        open.is_some_and(|c| !answer_first(c)) && !self.actions.editing()
+    }
+
+    /// The picker can open, and the composer have the keys after it: nothing is over the chat.
+    fn can_attach(&self) -> bool {
+        matches!(self.screen, Screen::Chats) && self.dialog.is_none() && self.writable()
     }
 
     /// "+" and ⇧⌘A: the system's file picker, for several files.
@@ -103,12 +154,16 @@ impl Hush {
             let chosen = chosen.await;
             let _ = this.update_in(cx, |app, window, cx| {
                 match chosen {
-                    Ok(Ok(Some(paths))) => app.add_files(paths, generation, cx),
+                    Ok(Ok(Some(paths))) => app.add_files(paths, generation, window, cx),
                     Ok(Err(e)) => app.error = Some(format!("Couldn't choose files: {e}")),
                     // cancelled
                     Ok(Ok(None)) | Err(_) => {}
                 }
-                app.composer.update(cx, |input, cx| input.focus(window, cx));
+                // the picker doesn't block the window everywhere: a dialog opened meanwhile keeps
+                // the keys
+                if app.can_attach() {
+                    app.composer.update(cx, |input, cx| input.focus(window, cx));
+                }
                 cx.notify();
             });
         })
@@ -117,29 +172,44 @@ impl Hush {
 
     /// Adds files to the open chat's tray, each once, described off the main thread. Ones that
     /// come too late (another chat is open, an edit started) don't.
-    fn add_files(&mut self, paths: Vec<PathBuf>, generation: u64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    fn add_files(&mut self, paths: Vec<PathBuf>, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.adding += 1;
+        cx.spawn_in(window, async move |this, cx| {
             let found = cx
                 .background_spawn(async move { paths.into_iter().filter_map(describe).collect::<Vec<_>>() })
                 .await;
-            let _ = this.update(cx, |app, cx| {
+            let _ = this.update_in(cx, |app, window, cx| {
                 let mut found: Vec<Outgoing> = found
                     .into_iter()
                     .filter_map(|f| f.map_err(|e| app.error = Some(e)).ok())
                     .collect();
-                if app.generation == generation && app.can_attach() {
+                if app.generation == generation && app.writable() {
                     found = admit(&mut app.tray, found);
                 }
                 app.discard(found, cx);
+                app.added(window, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    /// An add is over: a message waiting for files goes once none is being added (not if an edit
+    /// started meanwhile).
+    fn added(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.adding = self.adding.saturating_sub(1);
+        if self.adding == 0 && std::mem::take(&mut self.send_waiting) && !self.actions.editing() {
+            self.send(window, cx);
+        }
+    }
+
     /// ⌘V in the composer: copied files or a copied picture go to the tray. False for text,
     /// which the field pastes.
-    fn paste(&mut self, cx: &mut Context<Self>) -> bool {
+    ///
+    /// shortcut: GPUI reads no copied files on Linux (text and pictures only), so files copied in
+    /// a file manager paste there as their paths' text; drop them or use "+". Read
+    /// `text/uri-list` once GPUI's clipboard does.
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(item) = cx.read_from_clipboard() else {
             return false;
         };
@@ -152,22 +222,24 @@ impl Hush {
                 if files.is_empty() {
                     return false;
                 }
-                if self.can_attach() {
-                    self.add_files(files, generation, cx);
+                if self.writable() {
+                    self.add_files(files, generation, window, cx);
                 }
                 true
             }
-            Some(Pasted::Picture(_)) if !self.can_attach() => true,
+            Some(Pasted::Picture(_)) if !self.writable() => true,
             Some(Pasted::Picture(image)) => {
                 let (dir, bytes) = (self.data_dir.join(PASTE_FOLDER), image.bytes.clone());
-                cx.spawn(async move |this, cx| {
+                self.adding += 1;
+                cx.spawn_in(window, async move |this, cx| {
                     let written = cx.background_spawn(async move { write_png(&dir, &bytes) }).await;
-                    let _ = this.update(cx, |app, cx| match written {
-                        Ok(path) => app.add_files(vec![path], generation, cx),
-                        Err(e) => {
-                            app.error = Some(format!("Couldn't attach what you pasted: {e}"));
-                            cx.notify();
+                    let _ = this.update_in(cx, |app, window, cx| {
+                        match written {
+                            Ok(path) => app.add_files(vec![path], generation, window, cx),
+                            Err(e) => app.error = Some(format!("Couldn't attach what you pasted: {e}")),
                         }
+                        app.added(window, cx);
+                        cx.notify();
                     });
                 })
                 .detach();
@@ -201,8 +273,19 @@ impl Hush {
         self.discard(files, cx);
     }
 
-    /// Leaving a chat: its tray empties.
+    /// ↩ was pressed while files are being added: the message goes once they're in.
+    pub(super) fn send_when_added(&mut self) {
+        self.send_waiting = true;
+    }
+
+    /// The send button shows when ↩ would do something: words, or files (not while editing).
+    pub(super) fn shows_send(&self) -> bool {
+        !self.composer_empty || (!self.tray.is_empty() && !self.actions.editing())
+    }
+
+    /// Leaving a chat: its tray empties, and a message waiting for files stays unsent.
     pub(super) fn clear_tray(&mut self, cx: &mut Context<Self>) {
+        self.send_waiting = false;
         let files = self.take_tray();
         self.discard(files, cx);
     }
@@ -300,12 +383,12 @@ impl Hush {
         let frame = p.bubble_out;
         chat.relative()
             .group("chat")
-            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
+            .on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| {
                 let generation = this.generation;
-                this.add_files(dropped.paths().to_vec(), generation, cx);
+                this.add_files(dropped.paths().to_vec(), generation, window, cx);
             }))
-            .capture_action(cx.listener(|this, _: &Paste, _, cx| {
-                if this.paste(cx) {
+            .capture_action(cx.listener(|this, _: &Paste, window, cx| {
+                if this.paste(window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -460,7 +543,7 @@ pub(super) fn clear_pasted(data_dir: &Path) {
 #[cfg(test)]
 mod tests {
     // not `super::*`: GPUI's `test` attribute would come with it
-    use super::{admit, clear_pasted, describe, forget, pasted, write_png, Outgoing, Pasted};
+    use super::{admit, clear_pasted, describe, forget, pasted, plan, unsent, write_png, Outgoing, Pasted, Plan};
     use gpui_kit::{ClipboardEntry, ClipboardItem, ExternalPaths, Image, ImageFormat};
     use sig_core::projection::OutgoingFile;
     use std::path::{Path, PathBuf};
@@ -592,6 +675,43 @@ mod tests {
     }
 
     #[test]
+    fn return_sends_files_with_their_caption_and_an_edit_only_its_words() {
+        assert_eq!(plan("hi", false, false, false), Plan::Text);
+        assert_eq!(plan("", false, false, false), Plan::Nothing);
+        // the words are the files' caption; without words, the files go alone
+        let caption = |c: Option<&str>| Plan::Files {
+            caption: c.map(Into::into),
+        };
+        assert_eq!(plan("the menu", false, false, true), caption(Some("the menu")));
+        assert_eq!(plan("", false, false, true), caption(None));
+        // an edit changes the words only: the files wait for the next message
+        assert_eq!(plan("fixed", true, false, true), Plan::Edit);
+        assert_eq!(plan("", true, false, true), Plan::Nothing);
+        assert_eq!(plan("fixed", true, true, false), Plan::Edit);
+        // a file still being added: the words wait for it
+        assert_eq!(plan("look", false, true, false), Plan::Wait);
+        assert_eq!(plan("", false, true, true), Plan::Wait);
+    }
+
+    #[test]
+    fn a_send_whose_words_went_to_a_draft_says_what_wasnt_sent() {
+        let e = "The server couldn't be reached: timed out";
+        assert_eq!(
+            unsent(e, true, false, false),
+            format!("{e}. Its text is back in its chat.")
+        );
+        assert_eq!(
+            unsent(e, true, true, false),
+            format!("{e}. Its text is back in its chat, without the quote.")
+        );
+        assert_eq!(
+            unsent(e, true, true, true),
+            format!("{e}. Its text is back in its chat, without the quote, and its files weren't sent.")
+        );
+        assert_eq!(unsent(e, false, false, true), format!("{e}. Its files weren't sent."));
+    }
+
+    #[test]
     fn each_file_waits_in_the_tray_once() {
         let mut tray = vec![outgoing(Path::new("/a/1.png"))];
         let again = admit(
@@ -638,9 +758,57 @@ mod window_tests {
         ExternalPaths, FileDropEvent, Image, ImageFormat, TestAppContext, VisualTestContext, WindowOptions,
     };
 
-    use super::super::Hush;
+    use std::sync::Arc;
+
+    use gpui_kit::Focusable as _;
+    use sig_core::projection::db::MAX_ATTACHMENT;
+
+    use super::super::{compose::Typed, DialogKind, Hush};
     use super::{keys, shortcut, AttachFiles, PASTE_FOLDER};
     use crate::Demo;
+
+    struct Quiet;
+
+    impl sig_core::EventListener for Quiet {
+        fn on_event(&self, _: sig_core::CoreEvent) {}
+    }
+
+    /// A core that isn't linked: a send of files it refuses fails at once, as a linked one's would.
+    fn with_core(hush: &Entity<Hush>, data: &Path, cx: &mut TestAppContext) {
+        let dir = data.join("core");
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = sig_core::Client::open(dir.to_str().unwrap().into(), "ab".repeat(32), Arc::new(Quiet)).unwrap();
+        hush.update(cx, |app, _| app.client = Some(client));
+    }
+
+    /// A file larger than the core sends (sparse: no 100 MB written).
+    fn too_large(dir: &Path) -> PathBuf {
+        let path = dir.join("big.pdf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_ATTACHMENT + 1)
+            .unwrap();
+        path
+    }
+
+    fn copied(path: &Path) -> ClipboardEntry {
+        ClipboardEntry::ExternalPaths(ExternalPaths(vec![path.to_path_buf()].into()))
+    }
+
+    fn error(hush: &Entity<Hush>, cx: &mut TestAppContext) -> Option<String> {
+        hush.read_with(cx, |app, _| app.error.clone())
+    }
+
+    fn in_window(
+        window: AnyWindowHandle,
+        hush: &Entity<Hush>,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Hush, &mut gpui_kit::Window, &mut gpui_kit::Context<Hush>),
+    ) {
+        window
+            .update(cx, |_, window, cx| hush.update(cx, |app, cx| f(app, window, cx)))
+            .unwrap();
+    }
 
     /// The demo's chat, with a data folder of its own and the composer focused.
     fn open(name: &str, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>, PathBuf) {
@@ -791,6 +959,110 @@ mod window_tests {
         paste(window, vec![screenshot()], cx);
         assert_eq!(tray(&hush, cx).len(), 1);
         assert_eq!(pasted(&data), 0);
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_pickers_answer_leaves_a_dialog_opened_meanwhile_its_keys(cx: &mut TestAppContext) {
+        let (window, hush, data) = open("dialog", cx);
+        let menu = file(&data, "Menu.pdf");
+        cx.simulate_keystrokes(window, "secondary-shift-a");
+        assert!(cx.did_prompt_for_paths());
+        // the picker doesn't block the window everywhere (macOS)
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.open_dialog(DialogKind::Username, window, cx)
+        });
+        let chosen = menu.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![chosen]));
+        cx.run_until_parked();
+        let field = hush.read_with(cx, |app, cx| app.dialog.as_ref().unwrap().field.focus_handle(cx));
+        let kept = window.update(cx, |_, window, _| field.is_focused(window)).unwrap();
+        assert!(kept, "the dialog keeps the keys");
+        assert_eq!(
+            tray(&hush, cx),
+            [menu.to_str().unwrap()],
+            "the files wait in the chat's tray"
+        );
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_send_button_shows_for_files_but_not_for_an_edit_without_words(cx: &mut TestAppContext) {
+        let (window, hush, data) = open("button", cx);
+        let shows = |cx: &mut TestAppContext| hush.read_with(cx, |app, _| app.shows_send());
+        assert!(!shows(cx));
+        paste(window, vec![copied(&file(&data, "Menu.pdf"))], cx);
+        assert!(shows(cx), "files without words");
+        in_window(window, &hush, cx, |app, window, cx| {
+            let ours = app.messages.iter().rev().find(|m| m.is_outgoing && !m.deleted).cloned();
+            app.start_editing(&ours.expect("one of ours"), window, cx);
+        });
+        assert!(shows(cx), "Save edit");
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.set_typed(Typed::default(), window, cx)
+        });
+        assert!(!shows(cx), "an edit without words: ↩ does nothing, the files wait");
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_send_brings_back_its_words_files_and_reply_in_the_mac_apps_words(cx: &mut TestAppContext) {
+        let (window, hush, data) = open("failed", cx);
+        let big = too_large(&data);
+        paste(window, vec![copied(&big)], cx);
+        with_core(&hush, &data, cx);
+        in_window(window, &hush, cx, |app, window, cx| {
+            let theirs = app
+                .messages
+                .iter()
+                .rev()
+                .find(|m| !m.is_outgoing && !m.deleted)
+                .cloned();
+            app.reply(&theirs.expect("one of theirs"), window, cx);
+            app.set_typed(Typed::plain("the menu".into()), window, cx);
+        });
+        in_window(window, &hush, cx, |app, window, cx| app.send(window, cx));
+        cx.run_until_parked();
+        // the files went, the words as their caption: the core refused the file
+        assert_eq!(error(&hush, cx).as_deref(), Some("big.pdf is larger than 100 MB"));
+        assert_eq!(tray(&hush, cx), [big.to_str().unwrap()]);
+        assert_eq!(typed(&hush, cx), "the menu");
+        let (empty, bar) = hush.read_with(cx, |app, _| (app.composer_empty, app.composer_bar().map(|b| b.0)));
+        assert!(!empty);
+        assert_eq!(bar, Some("reply"), "the reply is back too");
+
+        // files alone: they come back with no words, and the send button stays for them
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.set_typed(Typed::default(), window, cx)
+        });
+        in_window(window, &hush, cx, |app, window, cx| app.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(tray(&hush, cx), [big.to_str().unwrap()]);
+        let (empty, shows) = hush.read_with(cx, |app, _| (app.composer_empty, app.shows_send()));
+        assert!(empty && shows);
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn return_while_a_file_is_being_added_sends_the_words_with_it(cx: &mut TestAppContext) {
+        let (window, hush, data) = open("wait", cx);
+        let big = too_large(&data);
+        with_core(&hush, &data, cx);
+        cx.write_to_clipboard(ClipboardItem {
+            entries: vec![copied(&big)],
+        });
+        // ⌘V then ↩ at once: the file is still being read
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.set_typed(Typed::plain("the menu".into()), window, cx);
+            assert!(app.paste(window, cx));
+            app.send(window, cx);
+        });
+        assert_eq!(typed(&hush, cx), "the menu", "the words wait for the file");
+        cx.run_until_parked();
+        // then went with it (the core refused the file, so both are back)
+        assert_eq!(error(&hush, cx).as_deref(), Some("big.pdf is larger than 100 MB"));
+        assert_eq!(tray(&hush, cx), [big.to_str().unwrap()]);
+        assert_eq!(typed(&hush, cx), "the menu");
         std::fs::remove_dir_all(&data).unwrap();
     }
 
