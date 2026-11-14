@@ -39,8 +39,8 @@ struct Shown {
 #[derive(Default)]
 pub(super) struct Notifications {
     shown: Vec<Shown>,
-    /// What the Dock or launcher shows.
-    badge: u32,
+    /// What the Dock or launcher shows (and the tray).
+    pub(super) badge: u32,
     /// Counts again when the next timed mute ends (then): nothing else says so.
     mute_ends: Option<(i64, Task<()>)>,
 }
@@ -311,6 +311,7 @@ impl Hush {
             self.notifications.badge = count;
             show_badge(count);
         }
+        self.systray_changed(now);
         // a timer dropped stays queued with the system until it's due: one per mute end
         let next = next_mute_end(&self.chats, now);
         if next == self.notifications.mute_ends.as_ref().map(|(end, _)| *end) {
@@ -449,14 +450,16 @@ fn show_badge(count: u32) {
 /// The unread count, as Desktop counts it: unread messages in the chats that aren't archived or
 /// muted, plus one per chat marked unread (`ChatList.badge`).
 fn badge(chats: &[Conversation], now_ms: i64) -> u32 {
-    chats
-        .iter()
-        .filter(|c| !c.archived && c.mute_until <= now_ms)
-        .map(|c| match c.unread_count {
-            0 => u32::from(c.marked_unread),
-            n => n,
-        })
-        .sum()
+    chats.iter().map(|c| unread(c, now_ms)).sum()
+}
+
+/// What a chat adds to the unread count (the tray lists those that add any).
+pub(super) fn unread(c: &Conversation, now_ms: i64) -> u32 {
+    match c.unread_count {
+        _ if c.archived || c.mute_until > now_ms => 0,
+        0 => u32::from(c.marked_unread),
+        n => n,
+    }
 }
 
 /// When the next timed mute ends (`AppStore.recountWhenAMuteEnds`).

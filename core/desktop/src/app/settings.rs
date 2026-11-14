@@ -10,7 +10,8 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use sig_core::CoreError;
 
-use super::{attach, describe, files, navigate, server_failure, Core, Home, Hush, Screen};
+use super::systray::ShowInTray;
+use super::{attach, describe, files, login, navigate, server_failure, Core, Home, Hush, Screen};
 
 pub(super) mod view;
 
@@ -195,6 +196,7 @@ pub(super) fn load(window: &mut Window, cx: &mut Context<Hush>) {
     if let Some(folder) = cx.try_global::<Home>().map(|home| home.folder.clone()) {
         cx.set_global(NotificationContent::read(&folder));
         cx.set_global(Appearance::read(&folder));
+        cx.set_global(ShowInTray::read(&folder));
     }
     chosen::<Appearance>(cx).apply(window, cx);
     cx.observe_window_appearance(window, |_, window, cx| {
@@ -411,6 +413,14 @@ impl Hush {
         .detach();
     }
 
+    /// Opens Hush at login, or not; read back from its entry (`SettingsView`'s Open at login).
+    pub(super) fn set_open_at_login(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Err(e) = login::set(on) {
+            self.settings_failed(format!("Couldn't change the login item: {e}"), cx);
+        }
+        cx.notify();
+    }
+
     /// Takes the look chosen, at once and from the next launch on.
     pub(super) fn choose_appearance(&mut self, look: Appearance, window: &mut Window, cx: &mut Context<Self>) {
         look.apply(window, cx);
@@ -579,8 +589,12 @@ impl Hush {
             cx.remove_global::<Core>();
         }
         let notifications = self.start_over(forget_key, cx);
+        let systray = std::mem::take(&mut self.systray);
         *self = Self::window(window, cx);
         self.notifications = notifications;
+        // the tray icon stays, its unread chats gone with the rest
+        self.systray = systray;
+        self.systray_changed(chrono::Utc::now().timestamp_millis());
         self.boot(forget_key, cx);
         cx.notify();
     }
@@ -645,7 +659,7 @@ mod window_tests {
 
     use super::super::attach::window_tests::with_core;
     use super::super::{Home, Hush, Screen};
-    use super::{chosen, Appearance, Choice, NotificationContent, Profile};
+    use super::{chosen, Appearance, Choice, NotificationContent, Profile, ShowInTray};
     use crate::Demo;
 
     /// A test's key is refused: the app doesn't open a core again (it would start linking).
@@ -1047,6 +1061,7 @@ mod window_tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join(NotificationContent::FILE), "count\n").unwrap();
         std::fs::write(folder.join(Appearance::FILE), "dark").unwrap();
+        std::fs::write(folder.join(ShowInTray::FILE), "hidden").unwrap();
         let home = Home {
             folder: folder.clone(),
             key: refused,
@@ -1057,19 +1072,25 @@ mod window_tests {
         let content = cx.update(|cx| chosen::<NotificationContent>(cx));
         assert_eq!(content, NotificationContent::NoNameOrMessage, "the Mac app's words");
         assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Dark);
+        assert_eq!(cx.update(|cx| chosen::<ShowInTray>(cx)), ShowInTray::Hidden);
 
         act(window, &hush, cx, |app, window, cx| {
             app.open_settings(window, cx);
             app.choose_appearance(Appearance::Light, window, cx);
-            app.choose(NotificationContent::Off, cx)
+            app.choose(NotificationContent::Off, cx);
+            app.choose(ShowInTray::Shown, cx)
         });
         assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Light);
         let content = cx.update(|cx| chosen::<NotificationContent>(cx));
         assert_eq!(content, NotificationContent::Off, "what notifications show from now on");
         let kept = |file: &str| std::fs::read_to_string(folder.join(file)).unwrap();
         assert_eq!(
-            (kept(Appearance::FILE), kept(NotificationContent::FILE)),
-            ("light".into(), "off".into())
+            (
+                kept(Appearance::FILE),
+                kept(NotificationContent::FILE),
+                kept(ShowInTray::FILE)
+            ),
+            ("light".into(), "off".into(), "shown".into())
         );
         assert!(hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().problem.is_none()));
         std::fs::remove_dir_all(&folder).unwrap();

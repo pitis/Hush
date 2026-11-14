@@ -12,8 +12,9 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{chosen, Appearance, Choice, NotificationContent, Panel};
+use crate::app::systray::ShowInTray;
 use crate::app::view::{card, empty_state, field, icon, label, modal};
-use crate::app::{Hush, Screen};
+use crate::app::{login, Hush, Screen};
 use crate::style::Palette;
 
 /// The labels' column, as a macOS form's.
@@ -57,6 +58,26 @@ impl Hush {
                 };
                 let _ = this.update(cx, |app, cx| app.choose(*content, cx));
             });
+        let this = cx.entity().downgrade();
+        let login = Checkbox::new("open-at-login")
+            .label("Open at login")
+            // read each time: whether this copy's entry is there (and, on Windows, not switched off)
+            .checked(login::enabled())
+            .on_click(move |on, _, cx| {
+                let _ = this.update(cx, |app, cx| app.set_open_at_login(*on, cx));
+            });
+        let this = cx.entity().downgrade();
+        let tray = Checkbox::new("show-in-tray")
+            .label(if cfg!(target_os = "macos") {
+                "Show in menu bar"
+            } else {
+                "Show in system tray"
+            })
+            .checked(chosen::<ShowInTray>(cx) == ShowInTray::Shown)
+            .on_click(move |on, _, cx| {
+                let shown = if *on { ShowInTray::Shown } else { ShowInTray::Hidden };
+                let _ = this.update(cx, |app, cx| app.choose(shown, cx));
+            });
         let account = (s.account && matches!(self.screen, Screen::Chats)).then(|| self.render_account(s, p, cx));
         Some(modal(
             card(p)
@@ -81,6 +102,8 @@ impl Hush {
                 )
                 .child(row("Appearance", appearance))
                 .child(row("Notification content", notifications).items_start())
+                .child(row("", login))
+                .child(row("", tray))
                 .children(account)
                 .children(s.problem.clone().map(|why| {
                     label("settings-problem", Role::Alert, why)

@@ -29,7 +29,9 @@ mod drafts;
 mod events;
 mod files;
 mod group;
+mod login;
 pub mod navigate;
+pub mod network;
 pub mod notifications;
 mod options;
 mod paging;
@@ -39,6 +41,7 @@ pub mod search;
 pub mod settings;
 mod stickers;
 mod stories;
+pub mod systray;
 mod typing;
 mod view;
 mod view_once;
@@ -194,6 +197,7 @@ pub struct Hush {
     /// Back Up's or Restore's dialog, and the link screen's restore note.
     backup: backup::Backup,
     stickers: stickers::Stickers,
+    systray: systray::Systray,
 }
 
 /// This computer's data folder and keychain entry: set by `Hush::new` for the real window, and by
@@ -436,6 +440,7 @@ impl Hush {
             typing: Default::default(),
             backup: Default::default(),
             stickers: Default::default(),
+            systray: Default::default(),
         }
     }
 
