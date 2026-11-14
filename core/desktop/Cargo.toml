@@ -31,6 +31,8 @@ rodio = { version = "0.23", default-features = false, features = ["playback", "m
 mime_guess = { version = "2", default-features = false }
 # warnings (ids and errors only) into the core's log
 tracing = "0.1"
+# links parsed as the core and the browser parse them (already the core's)
+url = "2"
 # only for `snapshot`: GPUI's offscreen rendering is test support (gpui-kit's own test-support
 # would also pull in a second GPUI)
 gpui-pre-platform = { version = "=0.3.11", optional = true }

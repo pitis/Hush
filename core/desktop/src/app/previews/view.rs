@@ -16,7 +16,7 @@ use crate::style::Palette;
 /// is the bubble's words'.
 pub fn card(card: &Option<Card>, this: &WeakEntity<Hush>, color: Hsla) -> Option<Stateful<Div>> {
     let Card { preview, picture } = card.as_ref()?;
-    let site = host(&preview.url).to_string();
+    let site = host(&preview.url);
     let label = match &preview.title {
         Some(title) => format!("{title}, {site}"),
         None => site.clone(),
@@ -77,11 +77,8 @@ impl Hush {
     /// The preview that will go with the message, with ✕ to leave it off.
     pub(in crate::app) fn render_link_draft(&self, p: Palette, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let draft = self.previews.draft.as_ref()?;
-        let site = host(&draft.url).to_string();
-        let picture = draft
-            .image
-            .as_ref()
-            .map(|i| self.previews.pictures.get(&i.path).cloned().flatten());
+        let site = host(&draft.url);
+        let picture = draft.image.as_ref().and_then(|i| self.previews.picture(&i.path));
         Some(
             h_flex()
                 .id("link-draft")

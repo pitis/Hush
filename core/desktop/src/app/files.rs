@@ -737,16 +737,25 @@ fn open_with_system(file: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut opener = {
         let mut open = Command::new("/usr/bin/open");
-        open.arg("--");
+        open.arg("--").arg(file);
         open
     };
     #[cfg(windows)]
-    let mut opener = Command::new("explorer.exe");
+    let mut opener = {
+        use std::os::windows::process::CommandExt as _;
+        let target = explorer_arg(file.as_ref()).ok_or("Explorer can't be given its name")?;
+        let mut explorer = Command::new("explorer.exe");
+        explorer.raw_arg(target);
+        explorer
+    };
     #[cfg(not(any(target_os = "macos", windows)))]
-    let mut opener = Command::new("xdg-open");
+    let mut opener = {
+        let mut open = Command::new("xdg-open");
+        open.arg(file);
+        open
+    };
     // what they print names the file
     let done = opener
-        .arg(file)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -756,8 +765,24 @@ fn open_with_system(file: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
     if done.success() || cfg!(windows) {
         Ok(())
     } else {
-        Err("no app here opens this kind of file".into())
+        Err("no app here opens it".into())
     }
+}
+
+/// `target` as Explorer's whole command line: quoted, as Explorer splits it on `,` and `=` itself
+/// (a later `/root,<path>` would replace the target), and Rust quotes only around spaces. None
+/// with a `"` in it, or a final `\` (which would escape the closing quote): no file's path has
+/// either, and a link to open has neither (`previews::openable`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn explorer_arg(target: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let text = target.to_string_lossy();
+    if text.contains('"') || text.ends_with('\\') {
+        return None;
+    }
+    let mut quoted = std::ffi::OsString::from("\"");
+    quoted.push(target);
+    quoted.push("\"");
+    Some(quoted)
 }
 
 /// Copies a previous run left open, or this one: they go, at launch (once the core holds the
@@ -1495,6 +1520,31 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn a_file_no_app_opens_is_said() {
         let missing = std::env::temp_dir().join(format!("hush-desktop-none-{}", std::process::id()));
-        assert!(super::open_with_system(&missing).is_err());
+        assert_eq!(super::open_with_system(&missing), Err("no app here opens it".into()));
+    }
+
+    #[test]
+    fn explorer_gets_one_quoted_target_whatever_its_commas_and_equals_signs() {
+        use super::explorer_arg;
+        use std::ffi::OsStr;
+        let arg = |s: &str| explorer_arg(OsStr::new(s)).map(|a| a.to_string_lossy().into_owned());
+        assert_eq!(
+            arg("https://news.example/a,/root,file:///C:/Windows/System32/calc.exe").as_deref(),
+            Some("\"https://news.example/a,/root,file:///C:/Windows/System32/calc.exe\"")
+        );
+        assert_eq!(
+            arg("https://maps.example/@44.4,26.1,15z?q=a=b").as_deref(),
+            Some("\"https://maps.example/@44.4,26.1,15z?q=a=b\"")
+        );
+        assert_eq!(
+            arg(r"C:\Users\me\Hush Desktop\open\ab\Menu, final=2.pdf").as_deref(),
+            Some(r#""C:\Users\me\Hush Desktop\open\ab\Menu, final=2.pdf""#)
+        );
+        assert_eq!(arg("a\"b"), None, "a quote would end it early");
+        assert_eq!(
+            arg(r"C:\dir\"),
+            None,
+            "a final backslash would escape the closing quote"
+        );
     }
 }

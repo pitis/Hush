@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_compat::Compat;
 use gpui_kit::*;
 use sig_core::projection::{LinkPreview, Message, MessageDetails, MessageKey, MessageKind, PreviewDraft};
+use url::Url;
 
 use super::{files, DialogKind, Hush};
 use crate::text::LINK;
@@ -31,9 +32,9 @@ type Key = (String, i64);
 pub(super) struct Previews {
     /// The open chat's messages' previews, by message (author, sent at).
     by_message: HashMap<Key, LinkPreview>,
-    /// Their pictures and the draft's, by file, decoded small; None while asked for, or one that
-    /// didn't read (asked for again when the chat opens again).
-    pictures: HashMap<String, Option<Arc<RenderImage>>>,
+    /// Their pictures and the draft's, by file, decoded small (one that didn't read is asked for
+    /// again when the chat opens again).
+    pictures: HashMap<String, Picture>,
     /// The link preview for the composer's text, to go with the next message.
     draft: Option<PreviewDraft>,
     /// The link `draft` is (or will be) for.
@@ -45,10 +46,18 @@ pub(super) struct Previews {
     wait: Option<Task<()>>,
 }
 
+enum Picture {
+    Loading,
+    Shown(Arc<RenderImage>),
+    /// Didn't read, or isn't a picture this can decode: the card shows without it.
+    Failed,
+}
+
 /// A message's preview as its bubble shows it.
 pub(super) struct Card {
     pub preview: LinkPreview,
-    /// Its picture, once decoded; none if it has none (or it isn't downloaded yet).
+    /// Its picture, once decoded; none if it has none (or it isn't downloaded yet, or didn't
+    /// decode).
     pub picture: Option<Option<Arc<RenderImage>>>,
 }
 
@@ -126,6 +135,15 @@ impl Previews {
         changed
     }
 
+    /// The picture of file `path` as drawn: grey until it is decoded; none if it didn't.
+    fn picture(&self, path: &str) -> Option<Option<Arc<RenderImage>>> {
+        match self.pictures.get(path) {
+            Some(Picture::Failed) => None,
+            Some(Picture::Shown(picture)) => Some(Some(picture.clone())),
+            Some(Picture::Loading) | None => Some(None),
+        }
+    }
+
     /// The pictures to decode: the page's previews' and the draft's, not asked for yet.
     fn wanted(&mut self) -> Vec<String> {
         let received = self.by_message.values().filter_map(|p| ready(p)).map(str::to_owned);
@@ -134,7 +152,7 @@ impl Previews {
         let wanted = paths.into_iter().filter(|path| {
             let new = !self.pictures.contains_key(path);
             if new {
-                self.pictures.insert(path.clone(), None);
+                self.pictures.insert(path.clone(), Picture::Loading);
             }
             new
         });
@@ -156,10 +174,7 @@ fn ready(p: &LinkPreview) -> Option<&str> {
 fn first_link(text: &str) -> Option<&str> {
     text.split_whitespace().find_map(|word| {
         let link = word[word.find("https://")?..].trim_end_matches(CLOSING);
-        // shortcut: a host is anything up to the path; the core parses it, and finds none for
-        // one that isn't a host (the draft then stays empty)
-        let host = link["https://".len()..].split(['/', '?', '#']).next()?;
-        (!host.is_empty()).then_some(link)
+        https(link).map(|_| link)
     })
 }
 
@@ -204,40 +219,24 @@ pub(in crate::app) fn linked(len: usize, runs: &[(Range<usize>, u8)], links: &[R
     super::compose::runs(&styles, &[])
 }
 
-/// What the card says the link is: its host (`URL.host()`), else the link.
-fn host(url: &str) -> &str {
-    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    let host = match host.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => host.split(':').next().unwrap_or_default(),
-    };
-    if host.is_empty() {
-        url
-    } else {
-        host
-    }
+/// `link` parsed, if it is https with a host: what the core takes and the browser opens.
+fn https(link: &str) -> Option<Url> {
+    Url::parse(link)
+        .ok()
+        .filter(|u| u.scheme() == "https" && u.host_str().is_some())
 }
 
-/// `url` as handed to the system to open: https only (`LinkPreviewCard`), and nothing in it a
-/// command line could read as more than one link (anything but plain ASCII is percent-encoded).
-fn openable(url: &str) -> Option<String> {
-    if !url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
-        return None;
-    }
-    let mut out = String::with_capacity(url.len());
-    for c in url.chars() {
-        if c.is_ascii_graphic() && !"\"<>\\^`{|}".contains(c) {
-            out.push(c);
-        } else {
-            let mut bytes = [0; 4];
-            for b in c.encode_utf8(&mut bytes).bytes() {
-                out.push_str(&format!("%{b:02X}"));
-            }
-        }
-    }
-    Some(out)
+/// What the card says the link is: the host it goes to (a lookalike's as `xn--…`), else the link.
+fn host(url: &str) -> String {
+    let host = Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned));
+    host.unwrap_or_else(|| url.to_owned())
+}
+
+/// `url` as handed to the system to open: https only (`LinkPreviewCard`), as parsed, so the
+/// browser goes to the host the card names; its text then has no quote, space or other character
+/// a command line could split it on but `,` and `=` (`files::explorer_arg`).
+fn openable(url: &str) -> Option<Url> {
+    https(url)
 }
 
 impl Hush {
@@ -257,7 +256,7 @@ impl Hush {
             return None;
         }
         let preview = self.previews.by_message.get(&(m.author.clone(), m.sent_at))?.clone();
-        let picture = ready(&preview).map(|path| self.previews.pictures.get(path).cloned().flatten());
+        let picture = ready(&preview).and_then(|path| self.previews.picture(path));
         Some(Card { preview, picture })
     }
 
@@ -311,10 +310,12 @@ impl Hush {
 
     /// Leaving a chat: its previews, their pictures and the composer's go.
     pub(super) fn clear_previews(&mut self, cx: &mut Context<Self>) {
-        let shown: Vec<_> = std::mem::take(&mut self.previews)
-            .pictures
-            .into_values()
-            .flatten()
+        let pictures = std::mem::take(&mut self.previews).pictures.into_values();
+        let shown: Vec<_> = pictures
+            .filter_map(|p| match p {
+                Picture::Shown(picture) => Some(picture),
+                Picture::Loading | Picture::Failed => None,
+            })
             .collect();
         // once no window is being drawn, so each lets its copy go
         cx.defer(move |cx| {
@@ -345,14 +346,15 @@ impl Hush {
                     if app.generation != generation {
                         return false;
                     }
-                    match picture {
-                        Ok(picture) => {
-                            app.previews.pictures.insert(path, Some(Arc::new(picture)));
-                            cx.notify();
-                        }
-                        // the card shows without it
-                        Err(e) => tracing::warn!(error = %e, "a link preview's picture isn't shown"),
-                    }
+                    let picture = picture.map_or_else(
+                        |e| {
+                            tracing::warn!(error = %e, "a link preview's picture isn't shown");
+                            Picture::Failed
+                        },
+                        |picture| Picture::Shown(Arc::new(picture)),
+                    );
+                    app.previews.pictures.insert(path, picture);
+                    cx.notify();
                     true
                 });
                 if !shown.unwrap_or(false) {
@@ -366,7 +368,7 @@ impl Hush {
     /// A click on a preview card: its https link opens in the browser.
     pub(super) fn open_link(&mut self, url: &str, cx: &mut Context<Self>) {
         if let Some(url) = openable(url) {
-            files::open_link(url, cx);
+            files::open_link(url.into(), cx);
         }
     }
 
@@ -393,10 +395,12 @@ impl Hush {
         let mut messages = self.messages.clone();
         let (received, preview) = crate::demo::link_messages();
         let picture = files::thumbnail(&crate::demo::picture()).expect("the made-up picture decodes");
-        let picture = Some(Arc::new(picture));
+        let picture = Arc::new(picture);
         let with = &received[0];
         if let Some(path) = ready(&preview) {
-            self.previews.pictures.insert(path.into(), picture.clone());
+            self.previews
+                .pictures
+                .insert(path.into(), Picture::Shown(picture.clone()));
         }
         self.previews
             .by_message
@@ -405,7 +409,9 @@ impl Hush {
         self.set_messages(messages, cx);
         let draft = crate::demo::preview_draft();
         if let Some(image) = &draft.image {
-            self.previews.pictures.insert(image.path.clone(), picture);
+            self.previews
+                .pictures
+                .insert(image.path.clone(), Picture::Shown(picture));
         }
         let text = format!("Booked for 8! Directions: {}", draft.url);
         self.previews.link = Some(draft.url.clone());
@@ -421,7 +427,7 @@ mod tests {
         Attachment, AttachmentState, LinkPreview, MessageDetails, MessageKey, OutgoingFile, PreviewDraft,
     };
 
-    use super::{first_link, group_links, host, linked, openable, Previews};
+    use super::{first_link, group_links, host, linked, openable, Picture, Previews};
     use crate::text::{BOLD, LINK};
 
     fn draft(url: &str) -> PreviewDraft {
@@ -440,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_https_link_is_taken_as_typed_without_the_sentence_around_it() {
+    fn the_first_https_link_is_taken_as_the_core_takes_it() {
         assert_eq!(first_link("see https://example.com/a."), Some("https://example.com/a"));
         assert_eq!(
             first_link("(https://example.com/a?b=1)!"),
@@ -452,7 +458,11 @@ mod tests {
             "http isn't previewed; as typed, not normalised"
         );
         assert_eq!(first_link("x:https://example.com"), Some("https://example.com"));
-        assert_eq!(first_link("https:// nothing https:///path"), None, "no host");
+        assert_eq!(
+            first_link("https:// https://[oops"),
+            None,
+            "no host, one that doesn't parse"
+        );
         assert_eq!(first_link("no link here"), None);
     }
 
@@ -629,29 +639,52 @@ mod tests {
     }
 
     #[test]
-    fn the_card_names_the_links_host() {
+    fn the_card_names_the_host_the_link_goes_to() {
         assert_eq!(host("https://www.example.com/a/b?c#d"), "www.example.com");
         assert_eq!(host("https://example.com:8443"), "example.com");
-        assert_eq!(host("https://[2001:db8::1]:443/x"), "2001:db8::1");
-        assert_eq!(host("HTTPS://Example.com"), "Example.com");
+        assert_eq!(host("https://[2001:db8::1]:443/x"), "[2001:db8::1]");
+        assert_eq!(host("HTTPS://Example.com"), "example.com");
+        assert_eq!(
+            host("https://bücher.example/"),
+            "xn--bcher-kva.example",
+            "a lookalike shows as such"
+        );
+        assert_eq!(host("https://good.example\\@evil.example/"), "good.example");
         assert_eq!(host("not a link"), "not a link");
         assert_eq!(host("https://"), "https://");
     }
 
     #[test]
-    fn only_https_links_open_and_nothing_in_them_reads_as_more_than_one() {
+    fn only_https_links_open_where_the_card_says() {
+        let opened = |url: &str| openable(url).map(String::from);
         assert_eq!(
-            openable("https://example.com/a?b=1#c").as_deref(),
+            opened("https://example.com/a?b=1#c").as_deref(),
             Some("https://example.com/a?b=1#c")
         );
-        assert_eq!(openable("HTTPS://example.com").as_deref(), Some("HTTPS://example.com"));
+        assert_eq!(opened("HTTPS://example.com").as_deref(), Some("https://example.com/"));
         assert_eq!(
-            openable("https://ro.example/România\"&x|y").as_deref(),
-            Some("https://ro.example/Rom%C3%A2nia%22&x%7Cy")
+            opened("https://ro.example/România\"&x").as_deref(),
+            Some("https://ro.example/Rom%C3%A2nia%22&x"),
+            "no quote or space left in it"
         );
-        assert_eq!(openable("http://example.com"), None);
-        assert_eq!(openable("file:///etc/passwd"), None);
-        assert_eq!(openable("javascript:alert(1)"), None);
+        assert_eq!(
+            opened("https://good.example\\@evil.example/").as_deref(),
+            Some("https://good.example/@evil.example/"),
+            "the host the card names"
+        );
+        assert_eq!(opened("http://example.com"), None);
+        assert_eq!(opened("file:///etc/passwd"), None);
+        assert_eq!(opened("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn a_picture_shows_grey_until_decoded_and_not_at_all_if_it_didnt() {
+        let mut p = Previews::default();
+        p.pictures.insert("loading".into(), Picture::Loading);
+        p.pictures.insert("failed".into(), Picture::Failed);
+        assert!(matches!(p.picture("loading"), Some(None)));
+        assert!(matches!(p.picture("unasked"), Some(None)));
+        assert!(p.picture("failed").is_none());
     }
 }
 
@@ -688,14 +721,62 @@ mod window_tests {
     fn a_link_is_looked_at_once_typing_pauses(cx: &mut TestAppContext) {
         let (window, hush) = open(Demo::Chat, cx);
         cx.simulate_input(window, "see https://example.com/a");
-        let link =
-            |hush: &Entity<Hush>, cx: &mut TestAppContext| hush.read_with(cx, |app, _| app.previews.link.clone());
         cx.executor().advance_clock(WAIT - Duration::from_millis(1));
         cx.run_until_parked();
         assert_eq!(link(&hush, cx), None, "still typing");
         cx.executor().advance_clock(Duration::from_millis(1));
         cx.run_until_parked();
         assert_eq!(link(&hush, cx).as_deref(), Some("https://example.com/a"));
+    }
+
+    fn link(hush: &Entity<Hush>, cx: &mut TestAppContext) -> Option<String> {
+        hush.read_with(cx, |app, _| app.previews.link.clone())
+    }
+
+    #[gpui::test]
+    fn a_saved_drafts_link_is_looked_at_when_its_chat_opens(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        let ana = format!("c:{}", crate::demo::ANA);
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| {
+                    app.drafts.insert(ana.clone(), "see https://example.com/a".into());
+                    app.select(ana, window, cx);
+                })
+            })
+            .unwrap();
+        cx.executor().advance_clock(WAIT);
+        cx.run_until_parked();
+        assert_eq!(link(&hush, cx).as_deref(), Some("https://example.com/a"));
+    }
+
+    #[gpui::test]
+    fn after_an_edit_the_texts_link_is_looked_at(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        cx.simulate_input(window, "see https://example.com/a");
+        let ours = hush.read_with(cx, |app, _| {
+            let ours = app
+                .messages
+                .iter()
+                .find(|m| m.body.as_deref() == Some("On my way, 20 minutes"));
+            ours.cloned().expect("the demo has it")
+        });
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| app.start_editing(&ours, window, cx))
+            })
+            .unwrap();
+        cx.executor().advance_clock(WAIT);
+        cx.run_until_parked();
+        assert_eq!(link(&hush, cx), None, "not while editing");
+        cx.simulate_keystrokes(window, "escape");
+        cx.executor().advance_clock(WAIT);
+        cx.run_until_parked();
+        assert_eq!(
+            link(&hush, cx).as_deref(),
+            Some("https://example.com/a"),
+            "the draft's, back"
+        );
     }
 
     #[gpui::test]

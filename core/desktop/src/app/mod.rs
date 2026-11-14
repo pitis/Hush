@@ -629,6 +629,8 @@ impl Hush {
         self.messages.clear();
         self.clear_files(cx);
         self.clear_previews(cx);
+        // the draft's link, as if typed: putting text in the field says nothing
+        self.composer_changed(cx);
         self.clear_tray(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
