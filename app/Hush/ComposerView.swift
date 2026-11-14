@@ -220,7 +220,7 @@ enum Composer {
         guard let image = NSImage(pasteboard: board), let tiff = image.tiffRepresentation,
             let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
         else { throw PasteError() }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Hush-paste", isDirectory: true)
+        let dir = Files.pasteRoot
         let url = dir.appendingPathComponent("Pasted image \(UUID().uuidString.prefix(8)).png")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try png.write(to: url)

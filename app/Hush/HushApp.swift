@@ -55,7 +55,6 @@ struct HushApp: App {
         let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         if !isTestHost { Legacy.adoptSettings() }  // before any setting is read
         let core = AppStore(notifier: isTestHost ? nil : SystemNotifier())
-        if !isTestHost { Files.clearOpened() }
         self.isTestHost = isTestHost
         _core = State(initialValue: core)
         // set before launch finishes, so a click on a notification that launched the app arrives

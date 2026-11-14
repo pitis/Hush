@@ -202,6 +202,16 @@ pub fn spawn(
     own_aci: Arc<Mutex<Option<String>>>,
 ) -> Result<Handles, CoreError> {
     std::fs::create_dir_all(&data_dir).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+    // Ours alone, so other users can't reach the files inside, whatever their own modes (a home
+    // folder is often 0755 on Linux). On Windows the per-user app data folder's ACL already does.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)) {
+            // a file system without modes: refusing to open wouldn't make the folder private
+            tracing::warn!(error = %e, "the data folder couldn't be made private");
+        }
+    }
     // Two cores on one presage store would fight over the websocket and corrupt sessions.
     let lock = File::create(data_dir.join(".lock")).map_err(|e| CoreError::Storage { message: e.to_string() })?;
     lock.try_lock().map_err(|_| CoreError::AlreadyOpen)?;

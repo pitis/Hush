@@ -456,7 +456,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func exportChat(conversationId: String, folder: String) async throws -> String {
         if let exportError { throw exportError }
         lock.withLock { exports.append((conversationId, folder)) }
-        return folder + "/Chat"
+        // as the core makes it: the page, and the chat's files in `files/`
+        let made = URL(fileURLWithPath: folder).appendingPathComponent("Chat")
+        try FileManager.default.createDirectory(
+            at: made.appendingPathComponent("files"), withIntermediateDirectories: true)
+        try Data("<html>".utf8).write(to: made.appendingPathComponent("chat.html"))
+        try Data("echo hi".utf8).write(to: made.appendingPathComponent("files/1-run.command"))
+        return made.path
     }
 
     func restoreBackup(path: String, passphrase: String) async throws {
