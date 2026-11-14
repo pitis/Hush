@@ -450,14 +450,16 @@ fn show_badge(count: u32) {
 /// The unread count, as Desktop counts it: unread messages in the chats that aren't archived or
 /// muted, plus one per chat marked unread (`ChatList.badge`).
 fn badge(chats: &[Conversation], now_ms: i64) -> u32 {
-    chats
-        .iter()
-        .filter(|c| !c.archived && c.mute_until <= now_ms)
-        .map(|c| match c.unread_count {
-            0 => u32::from(c.marked_unread),
-            n => n,
-        })
-        .sum()
+    chats.iter().map(|c| unread(c, now_ms)).sum()
+}
+
+/// What a chat adds to the unread count (the tray lists those that add any).
+pub(super) fn unread(c: &Conversation, now_ms: i64) -> u32 {
+    match c.unread_count {
+        _ if c.archived || c.mute_until > now_ms => 0,
+        0 => u32::from(c.marked_unread),
+        n => n,
+    }
 }
 
 /// When the next timed mute ends (`AppStore.recountWhenAMuteEnds`).

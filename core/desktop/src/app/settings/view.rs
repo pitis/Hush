@@ -61,7 +61,7 @@ impl Hush {
         let this = cx.entity().downgrade();
         let login = Checkbox::new("open-at-login")
             .label("Open at login")
-            // the system's answer, each time: it can be changed there too
+            // read each time: whether this copy's entry is there (and, on Windows, not switched off)
             .checked(login::enabled())
             .on_click(move |on, _, cx| {
                 let _ = this.update(cx, |app, cx| app.set_open_at_login(*on, cx));

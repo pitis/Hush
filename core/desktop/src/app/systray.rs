@@ -1,6 +1,6 @@
 //! The tray icon, in the menu bar on macOS (the Mac app's `MenuBarItem`): the unread count, and a
-//! menu to open the window, jump to a chat with unread messages, or quit; Settings hides it. On
-//! macOS a click opens the menu; elsewhere a left click opens the window and a right click the
+//! menu to open the window, jump to a chat with unread messages, or quit; Settings takes it down.
+//! On macOS a click opens the menu; elsewhere a left click opens the window and a right click the
 //! menu. The count is the Dock's (`notifications`); the window still quits Hush when closed.
 
 use futures::channel::mpsc::unbounded;
@@ -12,6 +12,7 @@ use tray_icon::menu::accelerator::{Accelerator, Code, Modifiers};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+use super::notifications::{unread, APP_ID};
 use super::settings::{chosen, Choice};
 use super::Hush;
 use crate::text;
@@ -33,6 +34,7 @@ struct Shown {
 
 #[derive(Default)]
 pub(super) struct Systray {
+    /// None while Settings hides it.
     icon: Option<TrayIcon>,
     /// None until first drawn.
     shown: Option<Shown>,
@@ -54,11 +56,10 @@ impl Choice for ShowInTray {
         &[(Self::Shown, "shown", "Shown"), (Self::Hidden, "hidden", "Hidden")];
 }
 
-/// The chats with unread messages, in list order (newest first), as the menu lists them: the ones
-/// the unread count counts (`ChatList.unreadChats`), each with its count (`ChatList.menuTitle`).
+/// The chats with unread messages, in list order (pinned, then newest), as the menu lists them:
+/// the ones the unread count counts (`ChatList.unreadChats`), each with its count
+/// (`ChatList.menuTitle`).
 fn unread_chats(chats: &[Conversation], now_ms: i64, own_aci: Option<&str>) -> Vec<(String, String)> {
-    let counted = |c: &&Conversation| !c.archived && c.mute_until <= now_ms;
-    let unread = |c: &&Conversation| c.unread_count > 0 || c.marked_unread;
     let entry = |c: &Conversation| {
         // `&` marks the next letter as the item's key
         let title = text::title(c, own_aci).replace('&', "&&");
@@ -69,8 +70,7 @@ fn unread_chats(chats: &[Conversation], now_ms: i64, own_aci: Option<&str>) -> V
     };
     chats
         .iter()
-        .filter(counted)
-        .filter(unread)
+        .filter(|c| unread(c, now_ms) > 0)
         .take(CHATS_SHOWN)
         .map(|c| (c.id.clone(), entry(c)))
         .collect()
@@ -84,29 +84,22 @@ pub fn start(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = picks.unbounded_send(event.id.0);
     }));
-    if !cfg!(target_os = "macos") {
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            if let TrayIconEvent::Click {
+    // on every system: without a handler, tray-icon keeps each event (on macOS each hover) for good
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        let left_click = matches!(
+            event,
+            TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
-            } = event
-            {
-                let _ = clicks.unbounded_send(OPEN.into());
             }
-        }));
-    }
-    let built = TrayIconBuilder::new()
-        .with_tooltip("Hush")
-        .with_menu_on_left_click(cfg!(target_os = "macos"))
-        .build();
-    let icon = match built {
-        Ok(icon) => icon,
-        Err(e) => return tracing::warn!(error = %e, "no tray icon"),
-    };
+        );
+        // macOS opens the menu on any click
+        if left_click && !cfg!(target_os = "macos") {
+            let _ = clicks.unbounded_send(OPEN.into());
+        }
+    }));
     let _ = hush.update(cx, |app, cx| {
-        app.systray.icon = Some(icon);
-        app.systray_changed(chrono::Utc::now().timestamp_millis());
         app.systray_shown(cx);
         cx.observe_global::<ShowInTray>(Hush::systray_shown).detach();
     });
@@ -156,18 +149,27 @@ impl Hush {
             tracing::warn!(error = %e, "the tray's tooltip didn't change");
         }
         match menu(&shown) {
-            Ok(menu) => icon.set_menu(Some(Box::new(menu))),
+            Ok(menu) => {
+                icon.set_menu(Some(Box::new(menu)));
+                self.systray.shown = Some(shown);
+            }
+            // tried again at the next change
             Err(e) => tracing::warn!(error = %e, "the tray's menu didn't change"),
         }
-        self.systray.shown = Some(shown);
     }
 
-    /// Shown or hidden, as Settings has it.
+    /// Puts the icon up or takes it down, as Settings has it: taken down, as hiding it would leave
+    /// it in KDE's tray, among the hidden ones.
     fn systray_shown(&mut self, cx: &mut Context<Self>) {
-        let Some(icon) = &self.systray.icon else { return };
-        if let Err(e) = icon.set_visible(chosen::<ShowInTray>(cx) == ShowInTray::Shown) {
-            tracing::warn!(error = %e, "the tray icon didn't show or hide");
+        let shown = chosen::<ShowInTray>(cx) == ShowInTray::Shown;
+        if shown == self.systray.icon.is_some() {
+            return;
         }
+        self.systray = Systray {
+            icon: shown.then(build).flatten(),
+            shown: None,
+        };
+        self.systray_changed(chrono::Utc::now().timestamp_millis());
     }
 
     /// An item of the tray's menu, or a click on the tray (`OPEN`).
@@ -185,6 +187,54 @@ impl Hush {
                 }
             }
         }
+    }
+}
+
+/// The icon, its picture and menu to come (macOS wants its event loop going by now).
+fn build() -> Option<TrayIcon> {
+    let builder = TrayIconBuilder::new()
+        // the same each launch: KDE keeps what's chosen for the item by it
+        .with_id(APP_ID)
+        .with_tooltip("Hush")
+        .with_menu_on_left_click(cfg!(target_os = "macos"));
+    // the app's name on Linux; macOS shows the count there, and Windows nothing
+    let builder = if cfg!(target_os = "macos") {
+        builder
+    } else {
+        builder.with_title("Hush")
+    };
+    match builder.build() {
+        Ok(icon) => {
+            #[cfg(not(any(target_os = "macos", windows)))]
+            warn_without_host();
+            Some(icon)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no tray icon");
+            None
+        }
+    }
+}
+
+/// Linux: the icon is put up whether or not a tray shows such icons (GNOME's doesn't without the
+/// AppIndicator extension): said in the log when none does.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn warn_without_host() {
+    let ask = || -> zbus::Result<bool> {
+        let bus = zbus::blocking::Connection::session()?;
+        let dbus = zbus::blocking::fdo::DBusProxy::new(&bus)?;
+        Ok(dbus.name_has_owner("org.kde.StatusNotifierWatcher".try_into()?)?)
+    };
+    // off the main thread: the bus can be slow to answer
+    let asked = std::thread::Builder::new()
+        .name("tray-host".into())
+        .spawn(move || match ask() {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("no tray shows the icon: no StatusNotifierItem host is running"),
+            Err(e) => tracing::warn!(error = %e, "the tray's host couldn't be asked for"),
+        });
+    if let Err(e) = asked {
+        tracing::warn!(error = %e, "the tray's host couldn't be asked for");
     }
 }
 
@@ -315,5 +365,43 @@ mod tests {
         };
         assert!(opaque(false) > 0);
         assert!(opaque(true) > opaque(false));
+    }
+}
+
+/// Picks from the tray's menu in a real (headless) window over the made-up chats.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::{gpui, AppContext as _, TestAppContext, VisualTestContext, WindowOptions};
+
+    use super::super::Hush;
+    use super::{CHAT, OPEN};
+    use crate::demo::ANA;
+    use crate::Demo;
+
+    #[gpui::test]
+    fn a_pick_brings_up_the_window_and_its_chat(cx: &mut TestAppContext) {
+        let (window, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Chat, window, cx))
+            })
+            .expect("the window opens")
+        });
+        cx.run_until_parked();
+        let pick = |id: String, cx: &mut TestAppContext| {
+            VisualTestContext::from_window(window, cx).deactivate_window();
+            window
+                .update(cx, |_, window, cx| {
+                    hush.update(cx, |app, cx| app.tray_picked(&id, window, cx))
+                })
+                .expect("the window is open");
+            cx.run_until_parked();
+            hush.read_with(cx, |app, _| (app.window_active, app.selected.clone()))
+        };
+        let ana = format!("c:{ANA}");
+        assert_eq!(pick(format!("{CHAT}{ana}"), cx), (true, Some(ana.clone())));
+        // gone from the list since the menu was drawn (unlinked, deleted): the window only
+        assert_eq!(pick(format!("{CHAT}c:gone"), cx), (true, Some(ana.clone())));
+        assert_eq!(pick(OPEN.into(), cx), (true, Some(ana)));
     }
 }

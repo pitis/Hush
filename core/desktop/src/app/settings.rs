@@ -402,7 +402,7 @@ impl Hush {
         .detach();
     }
 
-    /// Opens Hush at login, or not; read back from the system (`SettingsView`'s Open at login).
+    /// Opens Hush at login, or not; read back from its entry (`SettingsView`'s Open at login).
     pub(super) fn set_open_at_login(&mut self, on: bool, cx: &mut Context<Self>) {
         if let Err(e) = login::set(on) {
             self.settings_failed(format!("Couldn't change the login item: {e}"), cx);
@@ -647,7 +647,7 @@ mod window_tests {
 
     use super::super::attach::window_tests::with_core;
     use super::super::{Home, Hush, Screen};
-    use super::{chosen, Appearance, Choice, NotificationContent, Profile};
+    use super::{chosen, Appearance, Choice, NotificationContent, Profile, ShowInTray};
     use crate::Demo;
 
     /// A test's key is refused: the app doesn't open a core again (it would start linking).
@@ -1049,6 +1049,7 @@ mod window_tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join(NotificationContent::FILE), "count\n").unwrap();
         std::fs::write(folder.join(Appearance::FILE), "dark").unwrap();
+        std::fs::write(folder.join(ShowInTray::FILE), "hidden").unwrap();
         let home = Home {
             folder: folder.clone(),
             key: refused,
@@ -1059,19 +1060,25 @@ mod window_tests {
         let content = cx.update(|cx| chosen::<NotificationContent>(cx));
         assert_eq!(content, NotificationContent::NoNameOrMessage, "the Mac app's words");
         assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Dark);
+        assert_eq!(cx.update(|cx| chosen::<ShowInTray>(cx)), ShowInTray::Hidden);
 
         act(window, &hush, cx, |app, window, cx| {
             app.open_settings(window, cx);
             app.choose_appearance(Appearance::Light, window, cx);
-            app.choose(NotificationContent::Off, cx)
+            app.choose(NotificationContent::Off, cx);
+            app.choose(ShowInTray::Shown, cx)
         });
         assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Light);
         let content = cx.update(|cx| chosen::<NotificationContent>(cx));
         assert_eq!(content, NotificationContent::Off, "what notifications show from now on");
         let kept = |file: &str| std::fs::read_to_string(folder.join(file)).unwrap();
         assert_eq!(
-            (kept(Appearance::FILE), kept(NotificationContent::FILE)),
-            ("light".into(), "off".into())
+            (
+                kept(Appearance::FILE),
+                kept(NotificationContent::FILE),
+                kept(ShowInTray::FILE)
+            ),
+            ("light".into(), "off".into(), "shown".into())
         );
         assert!(hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().problem.is_none()));
         std::fs::remove_dir_all(&folder).unwrap();

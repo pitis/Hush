@@ -1,18 +1,14 @@
 //! Reconnects as soon as the network comes back, or the computer wakes from sleep, rather than
 //! after the core's backoff (the Mac app's `NetworkWatch`). The network: NWPathMonitor on macOS,
 //! NetworkManager's state over D-Bus on Linux, the connectivity hint on Windows (10 2004 on).
-//! Without one (Linux without NetworkManager) only the core's own backoff reconnects, as before.
-
-use std::time::{Duration, SystemTime};
+//! Without one (Linux without NetworkManager, an older Windows) waking still reconnects at once,
+//! and a network coming back waits for the core's backoff, as before.
 
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::StreamExt;
 use gpui_kit::*;
 
 use super::{Hush, Screen};
-
-/// How often the clock is looked at, to tell a sleep.
-const TICK: Duration = Duration::from_secs(5);
 
 /// What a watcher tells.
 #[derive(Clone, Copy, Debug)]
@@ -34,25 +30,13 @@ fn next(was: Option<bool>, report: Report) -> (Option<bool>, bool) {
     }
 }
 
-/// A tick come this late: the computer slept in between (the clock went on, the timer didn't).
-fn slept(gap: Duration) -> bool {
-    gap > TICK * 4
-}
-
-/// Watches the network and the clock for as long as the app runs.
+/// Watches the network, and the system waking (GPUI's: NSWorkspace's, Windows' power broadcast,
+/// logind's), for as long as the app runs.
 pub fn watch(hush: WeakEntity<Hush>, cx: &mut App) {
     let (reports, mut reported) = unbounded();
     platform(reports.clone());
-    let executor = cx.background_executor().clone();
-    cx.background_spawn(async move {
-        loop {
-            let before = SystemTime::now();
-            executor.timer(TICK).await;
-            let gap = SystemTime::now().duration_since(before).unwrap_or_default();
-            if slept(gap) && reports.unbounded_send(Report::Woke).is_err() {
-                break;
-            }
-        }
+    cx.on_system_wake(move |_| {
+        let _ = reports.unbounded_send(Report::Woke);
     })
     .detach();
     cx.spawn(async move |cx| {
@@ -114,10 +98,12 @@ fn platform(reports: UnboundedSender<Report>) {
 /// NetworkManager's state, on a thread of its own.
 #[cfg(not(any(target_os = "macos", windows)))]
 fn platform(reports: UnboundedSender<Report>) {
-    /// `NM_STATE_CONNECTED_GLOBAL`: a way out to the internet.
-    const GLOBAL: u32 = 70;
+    /// From `NM_STATE_CONNECTED_SITE`: a network with a way out, as NWPathMonitor's satisfied path,
+    /// whether or not NetworkManager's own check reached the internet (a proxy can block it).
+    const ROUTED: u32 = 60;
 
-    let watch = move || -> zbus::Result<()> {
+    // Ok(true): the app is quitting
+    let watch = move || -> zbus::Result<bool> {
         let bus = zbus::blocking::Connection::system()?;
         let nm = zbus::blocking::Proxy::new(
             &bus,
@@ -128,20 +114,30 @@ fn platform(reports: UnboundedSender<Report>) {
         // before the state is read: no change is missed in between
         let changes = nm.receive_signal("StateChanged")?;
         let state: u32 = nm.get_property("State")?;
-        let _ = reports.unbounded_send(Report::Online(state == GLOBAL));
+        if reports.unbounded_send(Report::Online(state >= ROUTED)).is_err() {
+            return Ok(true);
+        }
         for change in changes {
-            let state: u32 = change.body().deserialize()?;
-            if reports.unbounded_send(Report::Online(state == GLOBAL)).is_err() {
-                break;
+            let state: u32 = match change.body().deserialize() {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!(error = %e, "a network state didn't read");
+                    continue;
+                }
+            };
+            if reports.unbounded_send(Report::Online(state >= ROUTED)).is_err() {
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     };
-    let started = std::thread::Builder::new().name("network-watch".into()).spawn(move || {
-        if let Err(e) = watch() {
-            tracing::warn!(error = %e, "no network watch: the core reconnects on its own");
-        }
-    });
+    let started = std::thread::Builder::new()
+        .name("network-watch".into())
+        .spawn(move || match watch() {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("the network watch stopped: the core reconnects on its own"),
+            Err(e) => tracing::warn!(error = %e, "no network watch: the core reconnects on its own"),
+        });
     if let Err(e) = started {
         tracing::warn!(error = %e, "no network watch: the core reconnects on its own");
     }
@@ -151,11 +147,19 @@ fn platform(reports: UnboundedSender<Report>) {
 #[cfg(windows)]
 fn platform(reports: UnboundedSender<Report>) {
     use std::ffi::c_void;
-    use windows_sys::Win32::NetworkManagement::IpHelper::NotifyNetworkConnectivityHintChange;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::NetworkManagement::IpHelper::PNETWORK_CONNECTIVITY_HINT_CHANGE_CALLBACK;
     use windows_sys::Win32::Networking::WinSock::{
-        NetworkConnectivityLevelHintHidden, NetworkConnectivityLevelHintInternetAccess,
-        NetworkConnectivityLevelHintUnknown, NL_NETWORK_CONNECTIVITY_HINT,
+        NetworkConnectivityLevelHintHidden, NetworkConnectivityLevelHintNone, NetworkConnectivityLevelHintUnknown,
+        NL_NETWORK_CONNECTIVITY_HINT,
     };
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+
+    /// `NotifyNetworkConnectivityHintChange`, from Windows 10 2004 on: looked up rather than
+    /// imported, so an older Windows still starts the app (GPUI runs from 1703).
+    type Notify =
+        unsafe extern "system" fn(PNETWORK_CONNECTIVITY_HINT_CHANGE_CALLBACK, *const c_void, bool, *mut HANDLE) -> u32;
+    type Found = unsafe extern "system" fn() -> isize;
 
     unsafe extern "system" fn changed(context: *const c_void, hint: NL_NETWORK_CONNECTIVITY_HINT) {
         // SAFETY: the sender registered with the callback, never freed while it is
@@ -164,15 +168,29 @@ fn platform(reports: UnboundedSender<Report>) {
         if level == NetworkConnectivityLevelHintUnknown || level == NetworkConnectivityLevelHintHidden {
             return;
         }
-        // not a captive portal's constrained access: the server can't be reached through it
-        let online = level == NetworkConnectivityLevelHintInternetAccess;
+        // any network, as NWPathMonitor's satisfied path: Windows' own internet check can fail
+        // behind a proxy
+        let online = level != NetworkConnectivityLevelHintNone;
         let _ = reports.unbounded_send(Report::Online(online));
     }
 
+    let dll: Vec<u16> = "iphlpapi.dll\0".encode_utf16().collect();
+    // SAFETY: a system DLL by a NUL-terminated name, kept loaded for the app's life
+    let module = unsafe { LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    let found = match module.is_null() {
+        true => None,
+        // SAFETY: a NUL-terminated name, in a module loaded
+        false => unsafe { GetProcAddress(module, c"NotifyNetworkConnectivityHintChange".as_ptr().cast()) },
+    };
+    let Some(found) = found else {
+        return tracing::warn!("no network watch before Windows 10 2004: the core reconnects on its own");
+    };
+    // SAFETY: the function's documented signature
+    let notify = unsafe { std::mem::transmute::<Found, Notify>(found) };
     let context = Box::into_raw(Box::new(reports));
     let mut handle = std::ptr::null_mut();
     // SAFETY: `context` stays valid for as long as the registration (the app's life)
-    let failed = unsafe { NotifyNetworkConnectivityHintChange(Some(changed), context.cast(), true, &mut handle) };
+    let failed = unsafe { notify(Some(changed), context.cast(), true, &mut handle) };
     if failed != 0 {
         // SAFETY: not registered: nothing else holds it
         drop(unsafe { Box::from_raw(context) });
@@ -182,7 +200,7 @@ fn platform(reports: UnboundedSender<Report>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{next, slept, Report, TICK};
+    use super::{next, Report};
     use std::time::Duration;
 
     #[test]
@@ -208,16 +226,6 @@ mod tests {
         assert_eq!(next(None, Report::Woke), (None, true));
     }
 
-    #[test]
-    fn a_tick_come_late_is_a_sleep() {
-        assert!(!slept(TICK));
-        // a busy computer, a clock set back
-        assert!(!slept(TICK + Duration::from_secs(3)));
-        assert!(!slept(Duration::ZERO));
-        assert!(slept(Duration::from_secs(60)));
-        assert!(slept(Duration::from_secs(8 * 3600)));
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn the_monitor_reports_the_network_at_once() {
@@ -230,5 +238,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("no report in 5 s");
+    }
+}
+
+/// The app's part, in a real (headless) window over a core that isn't linked.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use async_compat::Compat;
+    use gpui_kit::{gpui, AppContext as _, TestAppContext, WindowOptions};
+
+    use super::super::attach::window_tests::with_core;
+    use super::super::{Hush, Screen};
+    use crate::Demo;
+
+    #[gpui::test]
+    fn the_network_coming_back_reconnects_only_over_the_chats(cx: &mut TestAppContext) {
+        let (_, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Chat, window, cx))
+            })
+            .expect("the window opens")
+        });
+        let data = std::env::temp_dir().join(format!("hush-desktop-network-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        with_core(&hush, &data, cx);
+        // stopped: each reconnect asked of it fails, and says so
+        let client = hush.read_with(cx, |app, _| app.client.clone()).expect("a core");
+        futures::executor::block_on(Compat::new(client.stop()));
+        let reconnected = |screen: Screen, cx: &mut TestAppContext| {
+            hush.update(cx, |app, cx| {
+                app.screen = screen;
+                app.error = None;
+                app.network_returned(cx);
+                app.error.is_some()
+            })
+        };
+        assert!(reconnected(Screen::Chats, cx));
+        // starting an unlinked core would end linking, its code with it
+        let linking = Screen::Link {
+            url: Some("sgnl://linkdevice?uuid=demo".into()),
+        };
+        assert!(!reconnected(linking, cx));
+        assert!(!reconnected(Screen::Unlinked, cx));
+        assert!(!reconnected(Screen::Opening, cx));
+        std::fs::remove_dir_all(&data).unwrap();
     }
 }

@@ -1,8 +1,8 @@
 //! Opening Hush at login (the Mac app's `LoginItem`), with this executable where it is now.
 //! SMAppService registers only an app bundle and this app runs unbundled (`cargo run`), so macOS
-//! gets a LaunchAgent in ~/Library/LaunchAgents (System Settings ▸ General ▸ Login Items lists it
-//! under Allow in the Background); Windows a value in the user's Run key; Linux an XDG autostart
-//! entry.
+//! gets a LaunchAgent in ~/Library/LaunchAgents (System Settings ▸ General ▸ Login Items &
+//! Extensions lists it under Allow in the Background); Windows a value in the user's Run key; Linux
+//! an XDG autostart entry. It is on when Hush's entry is there and opens this executable.
 
 #[cfg(not(windows))]
 use std::path::{Path, PathBuf};
@@ -10,17 +10,25 @@ use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use super::notifications::APP_ID;
 
-/// This executable's path.
+/// This executable's path, while it is there (an entry for one moved or rebuilt opens nothing).
 fn exe() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if !exe.exists() {
+        return Err("this copy of Hush was moved or rebuilt since it opened: open it again first".into());
+    }
     exe.into_os_string()
         .into_string()
         .map_err(|_| "the app's path isn't valid text".into())
 }
 
+/// shortcut: an entry switched off in System Settings' Allow in the Background still reads as on;
+/// ask `SMAppService.statusForLegacyURL` if that matters.
 #[cfg(not(windows))]
 pub(super) fn enabled() -> bool {
-    entry().is_some_and(|path| path.exists())
+    let (Some(path), Ok(exe)) = (entry(), exe()) else {
+        return false;
+    };
+    opens(&path, &exe)
 }
 
 #[cfg(not(windows))]
@@ -55,12 +63,22 @@ fn write(path: &Path, exe: Option<&str>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let contents = if cfg!(target_os = "macos") {
+    std::fs::write(path, contents(exe)).map_err(|e| e.to_string())
+}
+
+/// The entry at `path` is the one that opens `exe` (not one for another copy, or edited).
+#[cfg(not(windows))]
+fn opens(path: &Path, exe: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|kept| kept == contents(exe))
+}
+
+#[cfg(not(windows))]
+fn contents(exe: &str) -> String {
+    if cfg!(target_os = "macos") {
         launch_agent(exe)
     } else {
         autostart(exe)
-    };
-    std::fs::write(path, contents).map_err(|e| e.to_string())
+    }
 }
 
 /// A LaunchAgent run once, at login.
@@ -107,31 +125,50 @@ fn autostart(exe: &str) -> String {
 
 #[cfg(windows)]
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-/// The Run key's value, by the name Windows shows in Settings ▸ Apps ▸ Startup.
+/// Where Settings ▸ Apps ▸ Startup and Task Manager switch a Run value off (an odd first byte).
+#[cfg(windows)]
+const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+/// The Run key's value.
 #[cfg(windows)]
 const NAME: &str = "Hush Desktop";
 
 #[cfg(windows)]
 pub(super) fn enabled() -> bool {
-    let key = windows_registry::CURRENT_USER.open(RUN);
-    key.and_then(|key| key.get_string(NAME)).is_ok()
+    use windows_registry::CURRENT_USER;
+    let Ok(exe) = exe() else { return false };
+    let kept = CURRENT_USER.open(RUN).and_then(|key| key.get_string(NAME));
+    let off = CURRENT_USER.open(APPROVED).and_then(|key| key.get_value(NAME));
+    kept.is_ok_and(|kept| kept == format!("\"{exe}\"")) && !off.is_ok_and(|v| v.first().is_some_and(|b| b & 1 == 1))
 }
 
 #[cfg(windows)]
 pub(super) fn set(on: bool) -> Result<(), String> {
-    let key = windows_registry::CURRENT_USER.create(RUN).map_err(|e| e.to_string())?;
-    let done = match on {
-        true => key.set_string(NAME, format!("\"{}\"", exe()?)),
-        // removing a value that isn't there fails
-        false if !enabled() => return Ok(()),
-        false => key.remove_value(NAME),
-    };
-    done.map_err(|e| e.to_string())
+    use windows_registry::CURRENT_USER;
+    let run = CURRENT_USER.create(RUN).map_err(|e| e.to_string())?;
+    if !on {
+        return gone(run.remove_value(NAME));
+    }
+    run.set_string(NAME, format!("\"{}\"", exe()?))
+        .map_err(|e| e.to_string())?;
+    // switched off in the system's settings before: on again
+    match CURRENT_USER.options().read().write().open(APPROVED) {
+        Ok(approved) => gone(approved.remove_value(NAME)),
+        Err(e) => gone(Err(e)),
+    }
+}
+
+/// Removed, or not there to remove (`ERROR_FILE_NOT_FOUND`).
+#[cfg(windows)]
+fn gone(removed: windows_registry::Result<()>) -> Result<(), String> {
+    match removed {
+        Err(e) if e.code().0 != 0x8007_0002_u32 as i32 => Err(e.to_string()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(all(test, not(windows)))]
 mod tests {
-    use super::{autostart, launch_agent, write};
+    use super::{autostart, launch_agent, opens, write};
 
     #[test]
     fn the_launch_agent_opens_the_app_at_login() {
@@ -159,7 +196,11 @@ mod tests {
     fn the_entry_is_written_and_removed() {
         let dir = std::env::temp_dir().join(format!("hush-desktop-login-{}", std::process::id()));
         let path = dir.join("agents").join("hush.plist");
+        assert!(!opens(&path, "/apps/hush"));
         write(&path, Some("/apps/hush")).unwrap();
+        assert!(opens(&path, "/apps/hush"));
+        // another copy's entry, or one edited: not this one's
+        assert!(!opens(&path, "/elsewhere/hush"));
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             written,

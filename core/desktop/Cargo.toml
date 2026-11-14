@@ -56,8 +56,8 @@ block2 = "0.6"
 [target.'cfg(windows)'.dependencies]
 # Hush in the Run key, to open at login; already GPUI's
 windows-registry = "0.6"
-# the network's connectivity changes; already GPUI's
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+# the network's connectivity changes; already in the tree (tokio's, and gpui-kit's through smol)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
 # the launcher's unread count and NetworkManager's state over D-Bus (GPUI has none); already the
