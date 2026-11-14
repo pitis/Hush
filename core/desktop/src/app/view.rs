@@ -192,7 +192,8 @@ impl Hush {
 
     fn render_sidebar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let shown = self.listed();
-        let pinned = self.query.is_empty() && shown.iter().any(|c| c.pinned_order.is_some());
+        let archive = self.in_archive();
+        let pinned = self.query.is_empty() && !archive && shown.iter().any(|c| c.pinned_order.is_some());
         let mut list = v_flex()
             .id("chat-list")
             .role(Role::List)
@@ -206,6 +207,10 @@ impl Hush {
         if !self.query.is_empty() && !shown.is_empty() {
             list = list.child(section("Chats", p));
         }
+        // no title while searching one chat: it lists none
+        if archive && self.find.scope.is_none() {
+            list = list.child(section("Archived", p));
+        }
         for (ix, c) in shown.iter().enumerate() {
             let first_unpinned = c.pinned_order.is_none() && ix > 0 && shown[ix - 1].pinned_order.is_some();
             if pinned && ix == 0 {
@@ -214,9 +219,11 @@ impl Hush {
             if pinned && first_unpinned {
                 list = list.child(section("Chats", p));
             }
-            list = list.child(self.render_chat_row(ix, c, p, cx));
+            list = list.child(self.with_chat_menu(self.render_chat_row(ix, c, p, cx), &c.id, cx));
         }
-        let list = list.children(self.render_results(p, cx));
+        let list = list
+            .children(self.render_archive_row(p, cx))
+            .children(self.render_results(p, cx));
         // macOS 26's sidebar: a panel floating in the window, inset from its edges
         v_flex()
             .w(px(SIDEBAR))
@@ -243,6 +250,7 @@ impl Hush {
                     .pt(px(8.))
                     .gap(px(6.))
                     .flex_none()
+                    .children(archive.then(|| self.render_archive_back(p, cx)))
                     .child(
                         h_flex()
                             .flex_1()
@@ -268,7 +276,7 @@ impl Hush {
                                     .flex_1(),
                             ),
                     )
-                    .child(self.render_new_chat(p, cx)),
+                    .children((!archive).then(|| self.render_new_chat(p, cx))),
             )
             .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
             .child(list)
@@ -484,8 +492,11 @@ impl Hush {
 
     fn render_chat_row(&self, ix: usize, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Stateful<Div> {
         let title = text::title(c, self.own_aci.as_deref());
-        let line = text::preview(c, &self.name(&c.last_message_author), |aci| self.name(aci));
         let selected = self.selected.as_deref() == Some(c.id.as_str());
+        let draft = self.listed_draft(&c.id);
+        let line = text::preview(c, draft, &self.name(&c.last_message_author), |aci| self.name(aci));
+        // unless the line says what the chat is
+        let drafted = draft.is_some() && line.starts_with(text::DRAFT);
         // the system's sidebar: the accent while the window is active, else grey
         let focused = selected && self.window_active;
         let (fg, secondary) = if focused {
@@ -495,22 +506,24 @@ impl Hush {
         };
         let unread = c.unread_count > 0 || c.marked_unread;
         let muted = c.mute_until > chrono::Utc::now().timestamp_millis();
-        let tick = (c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted).then(|| {
-            let behind = if focused {
-                p.accent
-            } else if selected {
-                p.selection
-            } else {
-                p.sidebar
-            };
-            tick(
-                c.last_message_status,
-                12.,
-                if unread { fg } else { secondary },
-                behind,
-                p,
-            )
-        });
+        // the last message's, not shown under a draft
+        let tick =
+            (!drafted && c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted).then(|| {
+                let behind = if focused {
+                    p.accent
+                } else if selected {
+                    p.selection
+                } else {
+                    p.sidebar
+                };
+                tick(
+                    c.last_message_status,
+                    12.,
+                    if unread { fg } else { secondary },
+                    behind,
+                    p,
+                )
+            });
         let badge = unread.then(|| {
             let (bg, color) = if focused {
                 (p.on_accent, p.accent)
@@ -536,6 +549,16 @@ impl Hush {
             (_, true) => format!("{title}, unread. {line}"),
             _ => format!("{title}. {line}"),
         };
+        // "Draft:" bold and italic, as `SidebarView` draws it
+        let mut shown = StyledText::new(line.clone());
+        if drafted {
+            let marked = HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            };
+            shown = shown.with_highlights([(0..text::DRAFT.len(), marked)]);
+        }
         // a blocked chat's or a request's picture isn't shown (a stranger chose it)
         let picture = c
             .avatar
@@ -594,7 +617,7 @@ impl Hush {
                                             .min_w_0()
                                             .truncate()
                                             .text_color(if unread { fg } else { secondary })
-                                            .child(line),
+                                            .child(shown),
                                     )
                                     .children(badge),
                             ),
@@ -672,7 +695,7 @@ impl Hush {
             .as_ref()
             .and_then(|id| self.chats.iter().find(|c| &c.id == id));
         let Some(c) = open else {
-            let (title, detail) = match (self.inbox().next().is_none(), &self.connection) {
+            let (title, detail) = match (self.chats.is_empty(), &self.connection) {
                 (false, _) => ("Select a chat", ""),
                 (true, ConnectionState::Online) => (
                     "Connected — no messages yet",
@@ -703,17 +726,7 @@ impl Hush {
                 _ => String::new(),
             },
         };
-        // shortcut: message requests, invitations and blocked chats are answered on the phone,
-        // and a join request's Delete and Cancel Request don't ask first; the Mac app offers
-        // Accept, Block and the others here, and asks: add them with a confirmation dialog
         let answer_first = answer_first(c);
-        let answer_where = if c.blocked {
-            "This chat is blocked. Unblock it on your phone to write here."
-        } else if c.group_join_requested {
-            "You asked to join this group. An admin has to let you in."
-        } else {
-            "Answer this chat on your phone to write here."
-        };
         let this = cx.entity().downgrade();
         let mut row_style = StyleRefinement::default();
         row_style.padding.bottom = Some(px(0.).into());
@@ -784,42 +797,7 @@ impl Hush {
                 ),
             )
             .child(if answer_first {
-                let id = c.id.clone();
-                v_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(18.))
-                    .py(px(14.))
-                    .child(
-                        label("answer-first", Role::Label, answer_where)
-                            .text_center()
-                            .text_color(p.secondary),
-                    )
-                    .when(c.group_join_requested && !c.blocked, |this| {
-                        let delete = id.clone();
-                        this.child(
-                            h_flex()
-                                .gap(px(10.))
-                                // here only, should cancelling fail for good (the request stays)
-                                .child(
-                                    Button::new("delete-chat")
-                                        .label("Delete")
-                                        .disabled(self.cancelling)
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| this.delete_chat(delete.clone(), cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("cancel-request")
-                                        .label("Cancel Request")
-                                        .disabled(self.cancelling)
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| this.cancel_join_request(id.clone(), cx)),
-                                        ),
-                                ),
-                        )
-                    })
+                self.render_request_bar(c, p, cx)
             } else {
                 let composer = self.with_attach(self.render_composer(p, cx), p, cx);
                 self.with_compose(self.with_composer_bar(composer, p, cx), p, cx)

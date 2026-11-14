@@ -23,7 +23,9 @@ use crate::{key, text};
 
 mod actions;
 pub mod attach;
+mod chats;
 pub mod compose;
+mod drafts;
 mod files;
 mod group;
 pub mod navigate;
@@ -104,7 +106,7 @@ pub struct Hush {
     /// The phone's message history on its way (stage, done, total), or a failed transfer:
     /// receiving waits for it, so it is shown with its ways out.
     history: Option<(HistoryStage, u64, u64)>,
-    /// Every chat, archived ones too (a dialog may open one): the sidebar leaves those out.
+    /// Every chat, archived ones too: the sidebar lists those in its archive.
     chats: Vec<Conversation>,
     chats_loading: bool,
     chats_again: bool,
@@ -125,10 +127,8 @@ pub struct Hush {
     /// Chats' pictures by their file, decrypted by the core (they are encrypted on disk); None
     /// while asked for, or one that isn't a picture. One that didn't read is asked for again.
     pictures: HashMap<String, Option<Arc<Image>>>,
-    /// Unsent text of the chats that aren't open.
-    /// shortcut: kept only while the app runs, and not shown in the chat list; the Mac app keeps
-    /// them and shows "Draft: …".
-    drafts: HashMap<String, String>,
+    /// Unsent text, kept by the core: a chat that isn't open shows "Draft: …".
+    drafts: drafts::Drafts,
     /// The chat whose `mark_read` is running, so a refresh in between doesn't start another.
     marking_read: Option<String>,
     window_active: bool,
@@ -154,8 +154,10 @@ pub struct Hush {
     dialog: Option<Dialog>,
     /// The Group Info panel, over the window.
     group: Option<group::Panel>,
-    /// A join request is being withdrawn.
-    cancelling: bool,
+    /// A join request is being withdrawn, or an invitation answered.
+    answering: bool,
+    /// The archive, and the chat changes on their way.
+    chat_actions: chats::ChatActions,
     /// The open chat's reactions, and the reply or edit in the composer.
     actions: actions::Actions,
     files: files::Files,
@@ -166,19 +168,22 @@ pub struct Hush {
     previews: previews::Previews,
 }
 
-/// The open core, for `quit`.
-struct Core(Arc<Client>);
+/// The open core and the draft writes on their way, for `quit`.
+struct Core(Arc<Client>, drafts::Writer);
 
 impl Global for Core {}
 
-/// Quits once the core has stopped (a few seconds at most): it first handles what it has already
-/// received, which the server counts as delivered and never sends again.
+/// Quits once the drafts typed are written and the core has stopped (a few seconds at most): it
+/// first handles what it has already received, which the server counts as delivered and never
+/// sends again.
 pub fn quit(cx: &mut App) {
-    let Some(Core(client)) = cx.try_global::<Core>() else {
+    let Some(Core(client, drafts)) = cx.try_global::<Core>() else {
         return cx.quit();
     };
-    let client = client.clone();
+    let (client, written) = (client.clone(), drafts.finish());
     cx.spawn(async move |cx| {
+        // the last thing typed is kept
+        written.await;
         Compat::new(client.stop()).await;
         // opened files' decrypted copies go with the app, and pasted pictures
         if let Some(dir) = dirs::data_local_dir() {
@@ -272,6 +277,7 @@ impl Hush {
                 InputEvent::Change => {
                     this.composer_empty = composer.read(cx).value().trim().is_empty();
                     this.composer_changed(cx);
+                    this.keep_draft(cx);
                     cx.notify();
                 }
                 _ => {}
@@ -329,7 +335,7 @@ impl Hush {
             names: HashMap::new(),
             asked: HashSet::new(),
             pictures: HashMap::new(),
-            drafts: HashMap::new(),
+            drafts: Default::default(),
             marking_read: None,
             window_active: window.is_window_active(),
             window_visible: window.is_visible(),
@@ -345,7 +351,8 @@ impl Hush {
             contacts: vec![],
             dialog: None,
             group: None,
-            cancelling: false,
+            answering: false,
+            chat_actions: Default::default(),
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
             paging: Default::default(),
@@ -385,6 +392,8 @@ impl Hush {
                 app.selected = Some("g:01".into());
                 app.set_messages(crate::demo::messages(), cx);
                 app.demo_actions(matches!(screen, crate::Demo::Reply));
+                let note = format!("c:{}", crate::demo::ME);
+                app.drafts.keep(&note, "Renew the passport\nbefore June".into());
                 if let crate::Demo::NewGroup = screen {
                     let ana = app.contacts.first().map(|(aci, _)| aci.clone());
                     app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
@@ -407,6 +416,11 @@ impl Hush {
                     crate::Demo::AddMembers => app.demo_group(Some(false), window, cx),
                     _ => {}
                 }
+            }
+            crate::Demo::ChatMenu | crate::Demo::Request | crate::Demo::Archive => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.demo_chats(screen, cx);
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;
@@ -444,7 +458,9 @@ impl Hush {
                 self.screen = Screen::Failed(e.to_string());
             }
         }
-        cx.set_global(Core(client.clone()));
+        // before the chats: one is opened only once the drafts are in (one database connection)
+        let drafts = self.load_drafts(client.clone(), cx);
+        cx.set_global(Core(client.clone(), drafts));
         self.client = Some(client);
         // an unlinked core has no chats yet: its `Ready` after linking loads them
         if linked {
@@ -582,22 +598,20 @@ impl Hush {
         }
         self.contacts = addable(&all, self.own_aci.as_deref());
         self.chats = all;
+        // an archive that emptied (the last chat unarchived, or written in) closes
+        self.chat_actions.archive &= self.chats.iter().any(|c| c.archived);
         // group rows say who wrote the last message
         let authors = self
-            .inbox()
+            .chats
+            .iter()
             .filter(|c| c.kind == ConversationKind::Group && !c.last_message_outgoing);
         let mut wanted: Vec<String> = authors.map(|c| c.last_message_author.clone()).collect();
-        wanted.extend(self.inbox().flat_map(|c| mentioned(&c.last_message_ranges)));
+        wanted.extend(self.chats.iter().flat_map(|c| mentioned(&c.last_message_ranges)));
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
         // any change stored reloads the chats: the open group may have changed, read it again
         self.read_group(cx);
-    }
-
-    /// The chats the sidebar lists: all but the archived ones.
-    fn inbox(&self) -> impl Iterator<Item = &Conversation> {
-        self.chats.iter().filter(|c| !c.archived)
     }
 
     /// The chat list's pictures not asked for yet (a new picture is a new file).
@@ -606,7 +620,6 @@ impl Hush {
         let wanted: Vec<String> = self
             .chats
             .iter()
-            .filter(|c| !c.archived)
             .filter_map(|c| c.avatar.clone())
             .filter(|path| {
                 let new = !self.pictures.contains_key(path);
@@ -658,13 +671,14 @@ impl Hush {
     /// Leaves the open chat, its unsent text kept as its draft, for `id` (into its composer) or for
     /// none.
     fn switch(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = id.as_ref().and_then(|id| self.drafts.remove(id)).unwrap_or_default();
-        // drafts keep the words, not their styles (the Mac app's too)
+        let draft = id
+            .as_ref()
+            .and_then(|id| self.drafts.get(id))
+            .cloned()
+            .unwrap_or_default();
         let unsent = self.actions.leave(self.typed(cx)).words();
         if let Some(left) = std::mem::replace(&mut self.selected, id) {
-            if !unsent.trim().is_empty() {
-                self.drafts.insert(left, unsent);
-            }
+            self.drafts.keep(&left, unsent);
         }
         self.set_typed(compose::Typed::plain(draft), window, cx);
         match self.selected {
@@ -871,9 +885,11 @@ impl Hush {
                 // the Mac app's words: the core's
                 let e = describe(&e);
                 // the text goes back to its chat: into the composer if that chat is still open
-                // and nothing new was typed, else into its draft
+                // and nothing new was typed, else into its draft if it has none (in an edit, the
+                // one from before it); a draft there stays, and the words are lost (as on the Mac)
                 let open = app.selected.as_deref() == Some(id.as_str());
-                if open && app.composer.read(cx).value().is_empty() {
+                let editing = open && app.actions.editing();
+                if open && !editing && app.composer.read(cx).value().trim().is_empty() {
                     app.error = Some(e);
                     app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
@@ -881,8 +897,14 @@ impl Hush {
                 } else {
                     // the files went back to the tray only if their chat is still open
                     let lost_files = had_files && !open;
-                    app.error = Some(attach::unsent(&e, worded, reply.is_some(), lost_files));
-                    app.drafts.entry(id).or_insert(typed.words());
+                    let back = worded && app.drafts.get(&id).is_none();
+                    app.error = Some(attach::unsent(&e, back, reply.is_some(), lost_files));
+                    if back {
+                        app.drafts.keep(&id, typed.words());
+                        if editing {
+                            app.actions.set_aside(typed);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -1057,15 +1079,15 @@ impl Hush {
     /// chat then stays).
     fn cancel_join_request(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
-        if self.cancelling {
+        if self.answering {
             return;
         }
-        self.cancelling = true;
+        self.answering = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let cancelled = Compat::new(client.cancel_join_request(id.clone())).await;
             let _ = this.update(cx, |app, cx| {
-                app.cancelling = false;
+                app.answering = false;
                 match cancelled {
                     Ok(()) => app.delete_chat(id, cx),
                     Err(e) => app.error = Some(server_failure("Couldn't cancel the request", &e)),
@@ -1090,14 +1112,16 @@ impl Hush {
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
         self.drop_chat_copies(&id);
-        self.drafts.remove(&id);
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let Err(e) = Compat::new(client.delete_chat(id)).await else {
-                return;
-            };
+            let deleted = Compat::new(client.delete_chat(id.clone())).await;
             let _ = this.update(cx, |app, cx| {
-                app.error = Some(format!("Couldn't delete the chat: {}", describe(&e)));
+                match deleted {
+                    // the core deleted its draft too: cleared after the writes on their way, so
+                    // none brings it back
+                    Ok(()) => app.drafts.keep(&id, String::new()),
+                    Err(e) => app.error = Some(format!("Couldn't delete the chat: {}", describe(&e))),
+                }
                 cx.notify();
             });
         })

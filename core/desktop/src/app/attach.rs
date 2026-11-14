@@ -78,8 +78,9 @@ pub(super) fn plan(body: &str, editing: bool, adding: bool, files: bool) -> Plan
     }
 }
 
-/// What a failed send says when its words went to its chat's draft instead of the composer: the
-/// quote, and the files if another chat is open, are gone.
+/// What a failed send says when its words didn't go back into the composer: `words` if they went
+/// to its chat's draft instead (else they're lost: it had one). The quote, and the files if another
+/// chat is open, are gone.
 pub(super) fn unsent(e: &str, words: bool, quote: bool, files: bool) -> String {
     let quote = if quote { ", without the quote" } else { "" };
     let files_lost = if files { ", and its files weren't sent" } else { "" };
@@ -742,7 +743,7 @@ mod tests {
 /// Attaching in a real (headless) window: keys, drops and the picker go through GPUI. Needs GPUI's
 /// test support, which `snapshot` turns on: `cargo test -p hush-desktop --features snapshot`.
 #[cfg(all(test, feature = "snapshot"))]
-mod window_tests {
+pub(in crate::app) mod window_tests {
     use std::path::{Path, PathBuf};
 
     use gpui_kit::{
@@ -766,10 +767,13 @@ mod window_tests {
     }
 
     /// A core that isn't linked: a send of files it refuses fails at once, as a linked one's would.
-    fn with_core(hush: &Entity<Hush>, data: &Path, cx: &mut TestAppContext) {
+    pub(in crate::app) fn with_core(hush: &Entity<Hush>, data: &Path, cx: &mut TestAppContext) {
         let dir = data.join("core");
         std::fs::create_dir_all(&dir).unwrap();
         let client = sig_core::Client::open(dir.to_str().unwrap().into(), "ab".repeat(32), Arc::new(Quiet)).unwrap();
+        // never dropped: a database still closing as the test binary exits crashes it (SQLCipher's
+        // exit handler frees what the close uses; the core's own tests wait for theirs)
+        std::mem::forget(client.clone());
         hush.update(cx, |app, _| app.client = Some(client));
     }
 
