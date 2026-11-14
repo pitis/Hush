@@ -13,7 +13,6 @@ use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
 use gpui_kit::component::input::{InputEditsEvent, InputEvent, InputState, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
-use gpui_kit::component::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, Message, TextStyle};
@@ -37,6 +36,7 @@ mod paging;
 mod polls;
 mod previews;
 pub mod search;
+pub mod settings;
 mod typing;
 mod view;
 mod view_once;
@@ -176,6 +176,10 @@ pub struct Hush {
     /// The open chat's events among its messages.
     events: events::Events,
     options: options::Options,
+    settings: settings::Settings,
+    /// The open core's events, handled; dropped with this state when it starts over, so an old
+    /// core's last ones never reach the new one.
+    listening: Task<()>,
     /// The open chat's polls, as their votes stand.
     polls: polls::Polls,
     /// View-once media's one look.
@@ -184,18 +188,18 @@ pub struct Hush {
     /// Who is typing where, and where we are.
     typing: typing::Typing,
     backup: backup::Backup,
-    /// The open core's events, handled; dropped with this state when it starts over, so an old
-    /// core's last ones never reach the new one.
-    listening: Task<()>,
 }
 
-/// This computer's data folder and database key. Only the real window has them: made-up screens
-/// and window tests never touch the owner's data.
+/// This computer's data folder and keychain entry: set by `Hush::new` for the real window, and by
+/// window tests over a folder of their own; made-up screens have none and never touch the owner's
+/// data.
 #[derive(Clone)]
 struct Home {
     folder: PathBuf,
     /// The database key, made on first use.
     key: fn() -> Result<String, String>,
+    /// Removes it, once the data it opened is gone (unlinking).
+    forget_key: fn() -> Result<(), String>,
 }
 
 impl Global for Home {}
@@ -213,14 +217,15 @@ pub fn quit(cx: &mut App) {
         return cx.quit();
     };
     let (client, written) = (client.clone(), drafts.finish());
+    let folder = cx.try_global::<Home>().map(|home| home.folder.clone());
     cx.spawn(async move |cx| {
         // the last thing typed is kept
         written.await;
         Compat::new(client.stop()).await;
         // opened files' decrypted copies go with the app, and pasted pictures
-        if let Some(dir) = dirs::data_local_dir() {
-            files::clear_open_copies(&dir.join(DATA_FOLDER));
-            attach::clear_pasted(&dir.join(DATA_FOLDER));
+        if let Some(folder) = folder {
+            files::clear_open_copies(&folder);
+            attach::clear_pasted(&folder);
         }
         cx.update(|cx| cx.quit());
     })
@@ -254,23 +259,22 @@ fn open(home: &Home, events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>,
 
 impl Hush {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Theme::sync_system_appearance(Some(window), cx);
-        cx.observe_window_appearance(window, |_, window, cx| Theme::sync_system_appearance(Some(window), cx))
-            .detach();
         if let Some(dir) = dirs::data_local_dir() {
             cx.set_global(Home {
                 folder: dir.join(DATA_FOLDER),
                 key: key::db_key,
+                forget_key: key::forget,
             });
         }
+        settings::load(window, cx);
         Self::observe(window, cx);
         let mut app = Self::window(window, cx);
-        app.boot(cx);
+        app.boot(false, cx);
         app
     }
 
-    /// Whether the window is active and seen; once, not with the state: starting over builds that
-    /// again.
+    /// Whether the window is active and seen: registered once, outside `window`, which starting
+    /// over runs again.
     fn observe(window: &mut Window, cx: &mut Context<Self>) {
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
@@ -285,8 +289,8 @@ impl Hush {
         .detach();
     }
 
-    /// Opens this computer's core.
-    fn boot(&mut self, cx: &mut Context<Self>) {
+    /// Opens this computer's core, its old key removed first if `forget_key` (its data is gone).
+    fn boot(&mut self, forget_key: bool, cx: &mut Context<Self>) {
         let Some(home) = cx.try_global::<Home>().cloned() else {
             self.screen = Screen::Failed("this system has no folder for app data".into());
             return;
@@ -301,7 +305,15 @@ impl Hush {
         });
 
         // off the main thread: the keychain may ask, and the store opens on disk
-        let opening = cx.background_spawn(async move { open(&home, events) });
+        let opening = cx.background_spawn(async move {
+            if forget_key {
+                // the old key opens nothing now: one left is used again, harmlessly
+                if let Err(e) = (home.forget_key)() {
+                    tracing::warn!(error = %e, "the old database key couldn't be removed");
+                }
+            }
+            open(&home, events)
+        });
         cx.spawn(async move |this, cx| {
             let client = opening.await;
             this.update(cx, |app, cx| app.opened(client, cx))
@@ -409,12 +421,13 @@ impl Hush {
             previews: Default::default(),
             events: Default::default(),
             options: Default::default(),
+            settings: Default::default(),
+            listening: Task::ready(()),
             polls: Default::default(),
             view_once: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
             backup: Default::default(),
-            listening: Task::ready(()),
         }
     }
 
@@ -498,6 +511,13 @@ impl Hush {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.demo_chats(screen, cx);
+            }
+            crate::Demo::Settings | crate::Demo::Unlinked => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.set_messages(crate::demo::messages(), cx);
+                app.demo_settings(matches!(screen, crate::Demo::Unlinked), window, cx);
             }
             crate::Demo::Polls | crate::Demo::ViewOnce => {
                 app.screen = Screen::Chats;

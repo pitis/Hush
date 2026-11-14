@@ -35,7 +35,7 @@ fn main() {
             cx.bind_keys(key_bindings());
             cx.set_menus([
                 Menu::new("Hush").items([
-                    MenuItem::action("Back Up…", app::backup::BackUp),
+                    MenuItem::action("Settings…", app::settings::OpenSettings),
                     MenuItem::separator(),
                     MenuItem::action("Quit Hush", Quit),
                 ]),
@@ -49,7 +49,7 @@ fn main() {
             app::search::shortcuts(window, hush.downgrade(), cx);
             app::attach::shortcut(window, hush.downgrade(), cx);
             app::navigate::shortcuts(window, hush.downgrade(), cx);
-            app::backup::shortcut(window, hush.downgrade(), cx);
+            app::settings::shortcut(window, hush.downgrade(), cx);
             app::notifications::responses(window, hush.downgrade(), cx);
             cx.activate(true);
         });
@@ -62,6 +62,7 @@ fn key_bindings() -> Vec<KeyBinding> {
     all.extend(app::compose::keys());
     all.extend(app::attach::keys());
     all.extend(app::navigate::keys());
+    all.extend(app::settings::keys());
     all
 }
 
@@ -146,13 +147,17 @@ pub enum Demo {
     EditGroup,
     /// Members being added to it.
     AddMembers,
+    /// Settings over the chat, with our made-up profile.
+    Settings,
+    /// Removed on the phone: Link Again.
+    Unlinked,
     /// The Family group's polls and view-once media.
     Polls,
     /// A view-once photo shown over that chat.
     ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
-    /// Back Up's dialog over the chat, its passphrase typed once.
+    /// Back Up's dialog over Settings, its passphrase typed once.
     BackUp,
     /// The link screen after a restore.
     Restored,
@@ -188,6 +193,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("group-info", Demo::GroupInfo),
                 ("edit-group", Demo::EditGroup),
                 ("add-members", Demo::AddMembers),
+                ("settings", Demo::Settings),
+                ("unlinked", Demo::Unlinked),
                 ("polls", Demo::Polls),
                 ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),

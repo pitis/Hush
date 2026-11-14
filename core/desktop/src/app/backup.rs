@@ -11,12 +11,9 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::*;
 use sig_core::CoreError;
 
-use super::navigate::on;
-use super::{describe, Core, Hush};
+use super::{describe, Hush};
 
 mod view;
-
-actions!(hush, [BackUp]);
 
 /// Backups' extension: the Mac app's pickers show no other files (`BackupFile.type`).
 const EXTENSION: &str = "hushbackup";
@@ -28,6 +25,13 @@ pub(super) struct Backup {
     dialog: Option<Dialog>,
     /// How the last restore went, on the link screen (`AppStore.restoreNote`).
     note: Option<String>,
+}
+
+impl Backup {
+    /// Its dialog is over the window.
+    pub(super) fn showing(&self) -> bool {
+        self.dialog.is_some()
+    }
 }
 
 /// Back Up's or Restore's dialog (the Mac app's sheets).
@@ -49,13 +53,6 @@ enum Kind {
     },
     /// The backup chosen.
     Restore(PathBuf),
-}
-
-/// What `BackUp` does from the menu.
-pub fn shortcut(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
-    on(window, &hush, cx, |app, _: &BackUp, window, cx| {
-        app.open_backup(window, cx)
-    });
 }
 
 /// The Save dialog's suggestion (`BackupFile.defaultName`).
@@ -88,7 +85,7 @@ fn file_failure(e: &CoreError) -> String {
 }
 
 impl Hush {
-    /// Back Up…: the passphrase twice, then where (Settings ▸ Backup on the Mac).
+    /// Settings ▸ Backup ▸ Back Up…: the passphrase twice, then where.
     pub(super) fn open_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.client.is_none() || self.backup.dialog.as_ref().is_some_and(|d| d.working) {
             return;
@@ -290,32 +287,22 @@ impl Hush {
             }
             Err(e) => format!("Couldn't restore the backup: {}", file_failure(&e)),
         };
-        self.restart(window, cx);
+        // the data stays, so its key does too
+        self.restart(false, window, cx);
         // the new code doesn't hide it
         self.backup.note = Some(note);
-    }
-
-    /// Starts over with a fresh core over the same data and key, all that showed forgotten
-    /// (`AppStore.restart(keepKey: true)`).
-    fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // the old core is stopped: quitting has nothing of it to wait for
-        if cx.has_global::<Core>() {
-            cx.remove_global::<Core>();
-        }
-        *self = Self::window(window, cx);
-        self.boot(cx);
-        cx.notify();
     }
 }
 
 #[cfg(feature = "snapshot")]
 impl Hush {
-    /// `--snapshot`'s Back Up dialog over the chat, or the link screen after a restore.
+    /// `--snapshot`'s Back Up dialog over Settings, or the link screen after a restore.
     pub(super) fn demo_backup(&mut self, restored: bool, window: &mut Window, cx: &mut Context<Self>) {
         if restored {
             self.backup.note = Some("Your backup is restored. Link this computer to your phone to finish.".into());
             return;
         }
+        self.demo_settings(false, window, cx);
         let passphrase = self.passphrase_field("Passphrase (at least 8 characters)", window, cx);
         let again = self.passphrase_field("Passphrase again", window, cx);
         passphrase.update(cx, |f, cx| f.set_value("correct horse", window, cx));
@@ -353,7 +340,7 @@ mod tests {
 /// Backing up and restoring in a real (headless) window, over real cores that aren't linked, in
 /// temporary folders: `cargo test --features hush-desktop/snapshot`. The app's own data folder and
 /// keychain are never touched: the test's `Home` refuses the key, so a restore's new core never
-/// opens (it would start linking).
+/// opens (it would start linking), and never forgets it.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
     use std::path::{Path, PathBuf};
@@ -366,7 +353,7 @@ mod window_tests {
 
     use super::super::attach::window_tests::with_core;
     use super::super::{Home, Hush, Screen};
-    use super::{BackUp, Kind};
+    use super::Kind;
     use crate::Demo;
 
     const REFUSED: &str = "not opened again in a test";
@@ -374,6 +361,10 @@ mod window_tests {
 
     fn refused() -> Result<String, String> {
         Err(REFUSED.into())
+    }
+
+    fn keep_key() -> Result<(), String> {
+        panic!("a restore keeps the key")
     }
 
     fn folder(name: &str) -> PathBuf {
@@ -390,7 +381,6 @@ mod window_tests {
                 cx.new(|cx| Hush::demo(screen, window, cx))
             })
             .expect("the window opens");
-            super::shortcut(window, hush.downgrade(), cx);
             (window, hush)
         });
         with_core(&hush, data, cx);
@@ -401,7 +391,13 @@ mod window_tests {
     /// The app's data folder is `data`'s core, which never opens again.
     fn home(data: &Path, cx: &mut TestAppContext) {
         let folder = data.join("core");
-        cx.update(|cx| cx.set_global(Home { folder, key: refused }));
+        cx.update(|cx| {
+            cx.set_global(Home {
+                folder,
+                key: refused,
+                forget_key: keep_key,
+            })
+        });
     }
 
     fn act(
@@ -474,9 +470,8 @@ mod window_tests {
         let (chat, text) = marker();
         futures::executor::block_on(Compat::new(client.set_draft(chat, text))).unwrap();
 
-        // from the menu: the passphrase twice, then where
-        cx.dispatch_action(window, BackUp);
-        cx.run_until_parked();
+        // Settings ▸ Back Up…: the passphrase twice, then where
+        act(window, &hush, cx, |app, window, cx| app.open_backup(window, cx));
         submit(window, &hush, "correct horse", "correct horsy", cx);
         assert!(!cx.did_prompt_for_new_path(), "typed differently: nothing asked");
         submit(window, &hush, "short", "short", cx);
