@@ -159,6 +159,8 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     private(set) var groupChanges: [(String, GroupChange)] = []
     /// This change is refused (the server's word: "refused"); the others go through.
     var failingGroupChange: GroupChange?
+    var safetyNumbers: [String: SafetyNumber] = [:]
+    func safetyNumber(aci: String) async throws -> SafetyNumber? { lock.withLock { safetyNumbers[aci] } }
     func groupInfo(conversationId: String) async throws -> GroupInfo? {
         if let groupInfoError { throw groupInfoError }
         return lock.withLock { groupInfoAnswers[conversationId] }

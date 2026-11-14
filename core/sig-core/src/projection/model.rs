@@ -430,16 +430,20 @@ pub enum ChatEventKind {
     IncomingCall,
     /// `author` called us and we never connected (unanswered or declined).
     MissedCall,
+    /// `author`'s identity key changed (a new phone, or someone else): our safety number with
+    /// them is a new one.
+    SafetyNumberChanged,
 }
 
 impl ChatEventKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DecryptionFailed,
         Self::SessionReset,
         Self::TimerChanged,
         Self::OutgoingCall,
         Self::IncomingCall,
         Self::MissedCall,
+        Self::SafetyNumberChanged,
     ];
 
     pub fn to_i64(self) -> i64 {
@@ -450,6 +454,7 @@ impl ChatEventKind {
             Self::OutgoingCall => 3,
             Self::IncomingCall => 4,
             Self::MissedCall => 5,
+            Self::SafetyNumberChanged => 6,
         }
     }
 
@@ -654,6 +659,7 @@ mod tests {
             (ChatEventKind::OutgoingCall, 3),
             (ChatEventKind::IncomingCall, 4),
             (ChatEventKind::MissedCall, 5),
+            (ChatEventKind::SafetyNumberChanged, 6),
         ] {
             assert_eq!(kind.to_i64(), n);
             assert_eq!(ChatEventKind::from_i64(n), Some(kind));

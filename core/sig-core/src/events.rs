@@ -1,5 +1,5 @@
 use crate::projection::db::Applied;
-use crate::projection::{MessageKey, Op};
+use crate::projection::{ChatEventKind, MessageKey, Op};
 
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum ConnectionState {
@@ -53,6 +53,7 @@ pub enum CoreEvent {
     /// Something was added to a chat's timeline that isn't a message (`Client::chat_events`).
     ChatEventAdded {
         conversation_id: String,
+        kind: ChatEventKind,
     },
     /// How the history import is doing. `done`/`total` are bytes while `Downloading` (total 0
     /// until known), imported items while `Importing` (total 0: unknown).
@@ -108,7 +109,7 @@ pub fn from_applied(a: Applied) -> CoreEvent {
             message,
             id,
         },
-        Applied::ChatEvent { conversation_id } => CoreEvent::ChatEventAdded { conversation_id },
+        Applied::ChatEvent { conversation_id, kind } => CoreEvent::ChatEventAdded { conversation_id, kind },
         Applied::ConversationsChanged => CoreEvent::ConversationsChanged,
         Applied::StoriesChanged => CoreEvent::StoriesChanged,
     }

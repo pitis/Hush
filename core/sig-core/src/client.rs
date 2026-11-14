@@ -17,6 +17,7 @@ use crate::projection::{
     MessageKind, MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, RequestResponse, SearchHit,
     StickerPackInfo,
 };
+use crate::safety::SafetyNumber;
 use crate::send::{self, Job, SendJob};
 
 /// Signal's limit for attachments in one message.
@@ -1650,6 +1651,21 @@ impl Client {
         self.own_aci().ok_or(CoreError::NotLinked)?;
         let (done, answer) = tokio::sync::oneshot::channel();
         self.send(Command::GroupInfo { key, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Storage { message })
+    }
+
+    /// Our safety number with a contact (their ACI), to compare with theirs; None before any
+    /// session with them (no key of theirs yet).
+    pub async fn safety_number(&self, aci: String) -> Result<Option<SafetyNumber>, CoreError> {
+        let aci = presage::libsignal_service::prelude::Uuid::parse_str(&aci).map_err(|_| CoreError::InvalidInput {
+            message: "not an ACI".into(),
+        })?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::SafetyNumber { aci, done })?;
         answer
             .await
             .map_err(|_| CoreError::Closed)?
