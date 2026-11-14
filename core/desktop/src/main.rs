@@ -157,6 +157,10 @@ pub enum Demo {
     ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
+    /// The chat with stickers received, sent and still to download.
+    Stickers,
+    /// The sticker picker open over it.
+    StickerPicker,
     /// The stories window over the chats, this many stories on from the first.
     Stories(usize),
 }
@@ -196,6 +200,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("polls", Demo::Polls),
                 ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),
+                ("stickers", Demo::Stickers),
+                ("sticker-picker", Demo::StickerPicker),
                 ("stories", Demo::Stories(0)),
                 ("story-text", Demo::Stories(1)),
                 ("story-photo", Demo::Stories(2)),

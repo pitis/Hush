@@ -3,7 +3,7 @@
 use sig_core::projection::{
     Attachment, AttachmentState, BodyRange, ChatEvent, ChatEventKind, Conversation, ConversationKind, FileSummary,
     LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile, Poll, PollOption, PreviewDraft, Quote,
-    Reaction, SearchHit, Story, StoryText, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
+    Reaction, SearchHit, StickerInfo, StickerPackInfo, Story, StoryText, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
@@ -595,6 +595,101 @@ pub fn view_once_files(messages: &[Message]) -> Vec<Attachment> {
         .map(|m| file(m, "video/mp4", AttachmentState::Pending));
     let photos = photo.into_iter().map(|m| file(m, "image/jpeg", AttachmentState::Ready));
     videos.chain(photos).collect()
+}
+
+/// The packs the sticker picker lists: Faces, of eight, and Moods, of five; their pictures are
+/// `sticker`'s, a colour each (`sticker_colour`).
+pub fn sticker_packs() -> Vec<StickerPackInfo> {
+    let pack = |n: usize, title: &str, emoji: &[&str]| StickerPackInfo {
+        id: format!("{n:032x}"),
+        title: title.into(),
+        author: "Ana".into(),
+        stickers: emoji
+            .iter()
+            .enumerate()
+            .map(|(i, e)| StickerInfo {
+                id: i as u32,
+                emoji: Some((*e).into()),
+                path: format!("demo-sticker-{n}-{i}"),
+            })
+            .collect(),
+    };
+    vec![
+        pack(1, "Faces", &["😀", "😂", "😍", "😎", "🤔", "😴", "😮", "🥳"]),
+        pack(2, "Moods", &["🙂", "😢", "😡", "🥰", "😇"]),
+    ]
+}
+
+/// Made-up sticker colour `i`, of eight, round again past the last.
+pub fn sticker_colour(i: usize) -> [u8; 3] {
+    const COLOURS: [[u8; 3]; 8] = [
+        [255, 196, 0],
+        [255, 120, 80],
+        [240, 90, 160],
+        [80, 170, 255],
+        [120, 200, 120],
+        [160, 130, 230],
+        [255, 160, 60],
+        [60, 200, 200],
+    ];
+    COLOURS[i % COLOURS.len()]
+}
+
+/// A made-up sticker, as PNG: a round smiling face of `colour`, on nothing (512², as stickers are).
+pub fn sticker(colour: [u8; 3]) -> Vec<u8> {
+    let face = image::RgbaImage::from_fn(512, 512, |x, y| {
+        let at = |cx: f32, cy: f32| ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+        let [r, g, b] = colour;
+        let eye = at(190., 210.) < 30. || at(322., 210.) < 30.;
+        let smile = (130. ..150.).contains(&at(256., 260.)) && y > 300;
+        match at(256., 256.) {
+            _ if eye || smile => image::Rgba([40, 30, 30, 255]),
+            d if d < 230. => image::Rgba([r, g, b, 255]),
+            _ => image::Rgba([0, 0, 0, 0]),
+        }
+    });
+    let mut out = std::io::Cursor::new(vec![]);
+    face.write_to(&mut out, image::ImageFormat::Png)
+        .expect("a picture in memory is written");
+    out.into_inner()
+}
+
+/// The Family group's newest: Ana's "Table booked!", then stickers: hers, Bogdan's (not
+/// downloaded yet) and ours; and their files.
+pub fn sticker_messages() -> (Vec<Message>, Vec<Attachment>) {
+    let sticker = |author: &str, ago: i64, emoji: &str| {
+        let mut m = message(author, ago, "");
+        m.body = None;
+        m.kind = MessageKind::Sticker {
+            emoji: Some(emoji.into()),
+        };
+        m
+    };
+    let messages = vec![
+        message(ANA, 3, "Table booked!"),
+        sticker(ANA, 2, "🥳"),
+        sticker(BOGDAN, 1, "😎"),
+        sticker(ME, 0, "😍"),
+    ];
+    let file = |m: &Message, state: AttachmentState| Attachment {
+        id: m.sent_at,
+        message: m.key(),
+        content_type: "image/webp".into(),
+        file_name: None,
+        size: 24_000,
+        width: Some(512),
+        height: Some(512),
+        is_voice_note: false,
+        path: (state == AttachmentState::Ready).then(|| format!("demo-sticker-{}", m.sent_at)),
+        state,
+        available: true,
+    };
+    let files = vec![
+        file(&messages[1], AttachmentState::Ready),
+        file(&messages[2], AttachmentState::Pending),
+        file(&messages[3], AttachmentState::Ready),
+    ];
+    (messages, files)
 }
 
 /// The last day's stories: ours on a gradient (seen), Ana's words with a link and her photo, a

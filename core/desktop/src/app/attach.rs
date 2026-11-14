@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Paste;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{h_flex, Disableable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -126,8 +127,9 @@ impl Hush {
         open.is_some_and(|c| !answer_first(c)) && !self.actions.editing()
     }
 
-    /// The picker can open, and the composer have the keys after it: nothing is over the chat.
-    fn can_attach(&self) -> bool {
+    /// A picker (files or stickers) can open, and the composer have the keys after it: nothing is
+    /// over the chat.
+    pub(super) fn can_attach(&self) -> bool {
         matches!(self.screen, Screen::Chats)
             && self.dialog.is_none()
             && self.group.is_none()
@@ -301,8 +303,10 @@ impl Hush {
         }
     }
 
-    /// "+", beside `composer` (as tall as its one-line field), for the open chat's files.
+    /// "+", beside `composer` (as tall as its one-line field): Attach Files… and Stickers… for the
+    /// open chat (`ComposerView.addMenu`), and the sticker picker above it.
     pub(super) fn with_attach(&self, composer: Div, p: Palette, cx: &mut Context<Self>) -> Div {
+        let this = cx.entity().downgrade();
         let button = Button::new("attach")
             .ghost()
             .icon(icon("plus", 15., p.text))
@@ -310,14 +314,28 @@ impl Hush {
             .size(px(35.))
             .bg(p.field)
             .accessibility_label("Attach")
-            .tooltip("Attach files")
+            .tooltip("Attach files or a sticker")
             .disabled(self.actions.editing())
-            .on_click(cx.listener(|this, _, window, cx| this.choose_files(window, cx)));
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let (files, stickers) = (this.clone(), this.clone());
+                menu.item(PopupMenuItem::new("Attach Files…").on_click(move |_, window, cx| {
+                    let _ = files.update(cx, |app, cx| app.choose_files(window, cx));
+                }))
+                .item(PopupMenuItem::new("Stickers…").on_click(move |_, window, cx| {
+                    let _ = stickers.update(cx, |app, cx| app.open_stickers(window, cx));
+                }))
+            });
         h_flex()
             .flex_none()
             .items_end()
             .pl(px(14.))
-            .child(div().flex_none().pb(px(12.)).child(button))
+            .child(
+                div()
+                    .flex_none()
+                    .pb(px(12.))
+                    .child(self.render_stickers(p, cx))
+                    .child(button),
+            )
             .child(composer.flex_1().min_w_0().pl(px(8.)))
     }
 
