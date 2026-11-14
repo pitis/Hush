@@ -769,8 +769,12 @@ final class AppStore {
     /// Deletes the chat's messages here and, for a person, on the phone too. It closes.
     func deleteChat(_ conversationId: String) {
         if selectedId == conversationId { select(nil) }
-        drafts[conversationId] = nil  // the core's goes with the chat
-        change(conversationId, "delete the chat") { try await $0.deleteChat(conversationId: conversationId) }
+        drafts[conversationId] = nil  // the core's goes with the chat, after a write still on its way
+        let drafting = lastDraftWrite
+        change(conversationId, "delete the chat") {
+            await drafting?.value
+            try await $0.deleteChat(conversationId: conversationId)
+        }
     }
 
     /// The chat flag changes run one after the other, so two quick ones land in order.

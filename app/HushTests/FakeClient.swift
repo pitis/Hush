@@ -251,7 +251,10 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     }
     func block(conversationId: String) async throws { try await flag("block \(conversationId)") }
     func acceptRequest(conversationId: String) async throws { try await flag("accept \(conversationId)") }
-    func deleteChat(conversationId: String) async throws { try await flag("delete \(conversationId)") }
+    func deleteChat(conversationId: String) async throws {
+        try await flag("delete \(conversationId)")
+        lock.withLock { draftStore[conversationId] = nil }  // its draft goes with it, as in the core
+    }
     var storageWritesAnswer = true
     private(set) var storageWritesSet: [Bool] = []
     func storageWrites() async throws -> Bool { lock.withLock { storageWritesAnswer } }
@@ -264,7 +267,10 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     /// The drafts the core keeps, by chat id.
     var draftStore: [String: String] = [:]
     var draftError: Error?
+    /// Each draft write waits this long first.
+    var draftDelay: Duration?
     func setDraft(conversationId: String, text: String) async throws {
+        if let draftDelay { try? await Task.sleep(for: draftDelay) }
         if let draftError { throw draftError }
         lock.withLock {
             draftStore[conversationId] = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text

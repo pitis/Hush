@@ -118,8 +118,14 @@ final class ComposerTests: XCTestCase {
         store.saveDraft("  ", for: "c:b")
         XCTAssertEqual(store.draft("c:b"), "")
         await eventually { fake.draftStore == ["c:a": "for a, more"] }
+        // a draft still on its way when the chat goes doesn't bring it back
+        fake.draftDelay = .milliseconds(50)
+        store.saveDraft("for a, last", for: "c:a")
         store.deleteChat("c:a")
         XCTAssertEqual(store.draft("c:a"), "", "it goes with the chat")
+        await eventually { fake.flagCalls.contains("delete c:a") }
+        try? await Task.sleep(for: .milliseconds(100))  // past the write's delay
+        XCTAssertEqual(fake.draftStore, [:])
     }
 
     @MainActor func testDraftsKeptInThePreferencesMoveIntoTheCoreAndLeaveThem() async {
