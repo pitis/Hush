@@ -36,8 +36,7 @@ impl Hush {
             return;
         }
         let near_top = t.logical_scroll_top().item_ix < NEAR_TOP;
-        // fewer than asked for is the whole chat; fewer than wanted, a load still on its way
-        let more = !self.messages.is_empty() && self.messages.len() as u32 >= self.depth;
+        let more = self.may_have_older();
         // one on its way (back to the newest, say) would move the reader once in: it comes first
         let loading = self.messages_loading == Some(self.generation);
         if near_top && more && !loading {
@@ -46,6 +45,13 @@ impl Hush {
             self.reload_messages(cx);
             cx.notify();
         }
+    }
+
+    /// Older messages than those loaded may be in the chat: as many came as were asked for. While
+    /// a deeper load is on its way (`depth` is raised first), it says no.
+    pub(super) fn may_have_older(&self) -> bool {
+        // fewer than asked for is the whole chat; fewer than wanted, a load still on its way
+        !self.messages.is_empty() && self.messages.len() as u32 >= self.depth
     }
 
     /// The open chat's messages loaded (or didn't): the older page asked for is in.

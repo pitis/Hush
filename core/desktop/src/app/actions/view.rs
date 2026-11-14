@@ -434,7 +434,7 @@ pub(in crate::app) fn retry(row: &Rc<RowActions>, act: &ActionCx, p: Palette) ->
 }
 
 /// Our own look as a popover's trigger.
-struct Trigger(Stateful<Div>);
+pub(in crate::app) struct Trigger(pub(in crate::app) Stateful<Div>);
 
 impl SelectableTrigger for Trigger {
     fn selected(self, _: bool) -> Self {

@@ -111,6 +111,25 @@ pub fn bubble_fill(color: Option<&sig_core::projection::ChatColor>, fallback: Hs
     }
 }
 
+/// A chat's wallpaper as a fill, dimmed in dark mode as Signal does (`Wallpaper`).
+pub fn wallpaper_fill(wallpaper: &sig_core::projection::ChatColor, dark: bool) -> gpui_kit::Background {
+    let shown = sig_core::projection::ChatColor {
+        colors: wallpaper
+            .colors
+            .iter()
+            .map(|&c| if dark { dimmed(c) } else { c })
+            .collect(),
+        angle: wallpaper.angle,
+    };
+    bubble_fill(Some(&shown), gpui_kit::transparent_black())
+}
+
+/// A wallpaper colour (0xAARRGGBB) in dark mode: under black at 40%.
+fn dimmed(argb: u32) -> u32 {
+    let channel = |shift: u32| ((argb >> shift & 0xFF) * 3 / 5) << shift;
+    argb & 0xFF00_0000 | channel(16) | channel(8) | channel(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +142,13 @@ mod tests {
         assert_eq!(initials("🎉 party 2024"), "P2");
         assert_eq!(initials("🎉"), "#");
         assert_eq!(initials(""), "#");
+    }
+
+    #[test]
+    fn a_wallpaper_dims_in_dark_mode_as_under_black_at_40_percent() {
+        assert_eq!(dimmed(0xFFFFFFFF), 0xFF999999);
+        assert_eq!(dimmed(0xFFE26983), 0xFF873F4E);
+        assert_eq!(dimmed(0x80000000), 0x80000000, "black stays, and its alpha");
     }
 
     #[test]

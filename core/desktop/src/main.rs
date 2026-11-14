@@ -120,6 +120,10 @@ pub enum Demo {
     /// The chat with a received link preview and a group's invite link, writing a link with its
     /// preview above the composer.
     LinkPreview,
+    /// A chat with disappearing messages on, and events of each kind among its messages.
+    Events,
+    /// That chat in its colour, on its wallpaper, the picker open.
+    ChatStyle,
     /// The chat, a row's right-click menu open.
     ChatMenu,
     /// A message request open: its answers in place of the composer.
@@ -156,6 +160,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("search-in-chat", Demo::SearchInChat),
                 ("history", Demo::History),
                 ("link-preview", Demo::LinkPreview),
+                ("events", Demo::Events),
+                ("chat-style", Demo::ChatStyle),
                 ("chat-menu", Demo::ChatMenu),
                 ("request", Demo::Request),
                 ("archive", Demo::Archive),

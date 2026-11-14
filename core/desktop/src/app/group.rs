@@ -158,7 +158,7 @@ impl Hush {
     /// Makes the changes to group `id` one after the other (the core updates the chat as each
     /// lands), its panel's controls waiting meanwhile. The first failure shows in its panel, or
     /// above the chat list, with the group's name, once the panel is closed or shows another group.
-    fn change_group_in(&mut self, id: String, changes: Vec<GroupChange>, cx: &mut Context<Self>) {
+    pub(super) fn change_group_in(&mut self, id: String, changes: Vec<GroupChange>, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         if changes.is_empty() {
             return;
@@ -439,24 +439,6 @@ fn sorted<'a>(members: &'a [GroupMember], me: Option<&str>, name: impl Fn(&str) 
     sorted
 }
 
-/// The timers offered, as in Desktop (seconds; 0: off), with `current` among them when the phone
-/// set another (`Placeholder.timerChoices`).
-fn timer_choices(current: u32) -> Vec<u32> {
-    let mut choices = vec![0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200];
-    if !choices.contains(&current) {
-        choices.push(current);
-        choices.sort();
-    }
-    choices
-}
-
-fn timer_choice(seconds: u32) -> String {
-    match seconds {
-        0 => "Off".into(),
-        s => text::duration(s),
-    }
-}
-
 /// A group picture as Signal's apps send one: a JPEG at most `PICTURE_SIDE` on its longer side,
 /// upright, transparency on white (`GroupPicture.jpeg`); or why not.
 /// shortcut: a colour profile isn't applied (the Mac app converts from it to sRGB), so the colours
@@ -500,7 +482,7 @@ impl Hush {
 
 #[cfg(test)]
 mod tests {
-    use super::{detail_changes, group_picture, sorted, timer_choices, PICTURE_SIDE};
+    use super::{detail_changes, group_picture, sorted, PICTURE_SIDE};
     use sig_core::{GroupChange, GroupMember};
 
     #[test]
@@ -548,18 +530,6 @@ mod tests {
             .map(|m| m.aci.as_str())
             .collect();
         assert_eq!(order, ["me", "c", "b", "z", "a"]);
-    }
-
-    #[test]
-    fn the_timers_offered_include_the_one_set() {
-        let usual = [0, 30, 300, 3_600, 28_800, 86_400, 604_800, 2_419_200];
-        assert_eq!(timer_choices(0), usual);
-        assert_eq!(timer_choices(3_600), usual);
-        // two days, set on the phone
-        assert_eq!(
-            timer_choices(172_800),
-            [0, 30, 300, 3_600, 28_800, 86_400, 172_800, 604_800, 2_419_200]
-        );
     }
 
     #[test]

@@ -8,41 +8,17 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{h_flex, v_flex, Disableable, FocusTrapElement, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use sig_core::projection::{Conversation, ConversationKind};
+use sig_core::projection::Conversation;
 use sig_core::{GroupChange, GroupInfo, LinkAccess};
 
-use super::{sorted, timer_choice, timer_choices, Panel, Sheet};
+use super::{sorted, Panel, Sheet};
+use crate::app::options::{timer_choice, timer_choices};
 use crate::app::view::{avatar, card, field, icon, label, modal};
 use crate::app::Hush;
 use crate::style::Palette;
 use crate::text;
 
 impl Hush {
-    /// The toolbar's Chat Options menu (ⓘ): Group Info… in a group.
-    pub(in crate::app) fn chat_options(
-        &self,
-        c: &Conversation,
-        p: Palette,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        if c.kind != ConversationKind::Group {
-            return None;
-        }
-        let (this, id) = (cx.entity().downgrade(), c.id.clone());
-        let menu = Button::new("chat-options")
-            .ghost()
-            .icon(icon("info", 16., p.secondary))
-            .accessibility_label("Chat Options")
-            .tooltip("Chat options")
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                let (this, id) = (this.clone(), id.clone());
-                menu.item(PopupMenuItem::new("Group Info…").on_click(move |_, window, cx| {
-                    let _ = this.update(cx, |app, cx| app.open_group_info(id.clone(), window, cx));
-                }))
-            });
-        Some(menu)
-    }
-
     /// The Group Info panel over the window, and its sheet over that.
     pub(in crate::app) fn render_group_info(&self, p: Palette, cx: &mut Context<Self>) -> Vec<Div> {
         let Some(g) = &self.group else { return vec![] };
@@ -251,7 +227,11 @@ impl Hush {
                 timer,
                 timers,
                 busy,
-                |app, seconds, cx| app.change_group(vec![GroupChange::Timer { seconds }], cx),
+                |app, seconds, cx| {
+                    if let Some(id) = app.group.as_ref().map(|g| g.id.clone()) {
+                        app.set_timer(id, seconds, cx);
+                    }
+                },
                 cx,
             ))
     }

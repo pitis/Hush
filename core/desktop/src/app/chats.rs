@@ -357,8 +357,12 @@ impl Hush {
     /// said. Each waits for the one before.
     /// shortcut: Delete doesn't wait in this line, and a later change that works leaves an earlier
     /// failure up; the Mac app does both. Add them if changes ever come quicker than prompts.
-    fn change<F>(&mut self, what: &'static str, cx: &mut Context<Self>, call: impl FnOnce(Arc<Client>) -> F + 'static)
-    where
+    pub(super) fn change<F>(
+        &mut self,
+        what: &'static str,
+        cx: &mut Context<Self>,
+        call: impl FnOnce(Arc<Client>) -> F + 'static,
+    ) where
         F: Future<Output = Result<(), CoreError>> + 'static,
     {
         let Some(client) = self.client.clone() else { return };

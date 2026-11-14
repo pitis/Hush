@@ -26,9 +26,11 @@ pub mod attach;
 mod chats;
 pub mod compose;
 mod drafts;
+mod events;
 mod files;
 mod group;
 pub mod navigate;
+mod options;
 mod paging;
 mod previews;
 pub mod search;
@@ -166,6 +168,9 @@ pub struct Hush {
     /// The composer's styles and mentions.
     compose: compose::Compose,
     previews: previews::Previews,
+    /// The open chat's events among its messages.
+    events: events::Events,
+    options: options::Options,
 }
 
 /// The open core and the draft writes on their way, for `quit`.
@@ -358,6 +363,8 @@ impl Hush {
             paging: Default::default(),
             compose: Default::default(),
             previews: Default::default(),
+            events: Default::default(),
+            options: Default::default(),
         }
     }
 
@@ -415,6 +422,14 @@ impl Hush {
                     crate::Demo::EditGroup => app.demo_group(Some(true), window, cx),
                     crate::Demo::AddMembers => app.demo_group(Some(false), window, cx),
                     _ => {}
+                }
+            }
+            crate::Demo::Events | crate::Demo::ChatStyle => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.demo_events(cx);
+                if let crate::Demo::ChatStyle = screen {
+                    app.demo_style();
                 }
             }
             crate::Demo::ChatMenu | crate::Demo::Request | crate::Demo::Archive => {
@@ -495,6 +510,8 @@ impl Hush {
                 self.forget_hit(key);
             }
             CoreEvent::MessageChanged { key, .. } => self.recheck_hit(key, cx),
+            CoreEvent::ChatEventAdded { conversation_id, kind } => self.event_added(conversation_id, *kind, cx),
+            CoreEvent::Error { .. } => self.resets_failed(),
             _ => {}
         }
         match event {
@@ -782,6 +799,7 @@ impl Hush {
         self.load_names(wanted, cx);
         self.messages_loaded(came, cx);
         self.reveal_found(cx);
+        self.reload_events(cx);
     }
 
     /// Looks up each unknown contact's name; a failed lookup is tried again next time.
