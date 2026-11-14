@@ -298,12 +298,13 @@ impl Hush {
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
-            crate::Demo::Chat | crate::Demo::NewGroup => {
+            crate::Demo::Chat | crate::Demo::NewGroup | crate::Demo::Reply => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
                 app.selected = Some("g:01".into());
                 app.set_messages(crate::demo::messages(), cx);
+                app.demo_actions(matches!(screen, crate::Demo::Reply));
                 if let crate::Demo::NewGroup = screen {
                     let ana = app.contacts.first().map(|(aci, _)| aci.clone());
                     app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
@@ -410,7 +411,8 @@ impl Hush {
                 }
             }
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, reactions, calls, stories, files, notifications
+            // not in this version: typing, calls, stories, files, notifications (a reaction shows with
+            // its message's `MessageChanged`)
             _ => return,
         }
         // a dialog belongs to the chats it was over: linking again doesn't bring it back

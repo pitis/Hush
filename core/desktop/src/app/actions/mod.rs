@@ -510,6 +510,27 @@ impl Hush {
     }
 }
 
+#[cfg(feature = "snapshot")]
+impl Hush {
+    /// `--snapshot`'s made-up reactions; `reply`: a reply waits in the composer, the buttons of the
+    /// message it answers show.
+    pub(super) fn demo_actions(&mut self, reply: bool) {
+        for (k, reactions) in crate::demo::reactions(&self.messages) {
+            self.actions.reactions.insert((k.author, k.sent_at), reactions);
+        }
+        let answered = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.is_outgoing && !m.deleted)
+            .cloned();
+        if let Some(m) = answered.filter(|_| reply) {
+            self.actions.picking = Some(key(&m));
+            self.actions.reply_to = Some(m);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // not `super::*`: GPUI's glob brings its own `test` macro

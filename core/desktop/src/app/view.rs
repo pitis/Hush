@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, MoveUp, Textarea};
+use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
@@ -715,8 +715,9 @@ impl Hush {
             .bg(p.window)
             .track_focus(self.actions.focus())
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
-                if e.keystroke.key != "escape" || !this.cancel(window, cx) {
-                    cx.propagate();
+                // Esc drops the reply or the edit
+                if e.keystroke.key == "escape" && this.cancel(window, cx) {
+                    cx.stop_propagation();
                 }
             }))
             .child(
@@ -787,66 +788,53 @@ impl Hush {
                         )
                     })
             } else {
-                self.render_composer(p, cx)
+                self.with_composer_bar(self.render_composer(p, cx), p, cx)
             })
     }
 
     fn render_composer(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let editing = self.actions.editing();
-        v_flex()
-            .flex_none()
-            .gap(px(8.))
-            .px(px(14.))
-            .pt(px(8.))
-            .pb(px(12.))
-            // ↑ in an empty field edits your last message, as in Desktop
-            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                if this.edit_last(window, cx) {
-                    cx.stop_propagation();
-                }
-            }))
-            .children(self.render_composer_bar(p, cx))
-            .child(
-                h_flex()
-                    .items_end()
-                    .min_h(px(35.))
-                    .rounded(px(18.))
-                    .bg(p.field)
-                    // with the field's own 10×8 padding: the Mac app's 14×9
-                    .pl(px(4.))
-                    .pr(px(if self.composer_empty { 4. } else { 6. }))
-                    .child(
+        div().flex_none().px(px(14.)).pt(px(8.)).pb(px(12.)).child(
+            h_flex()
+                .items_end()
+                .min_h(px(35.))
+                .rounded(px(18.))
+                .bg(p.field)
+                // with the field's own 10×8 padding: the Mac app's 14×9
+                .pl(px(4.))
+                .pr(px(if self.composer_empty { 4. } else { 6. }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .py(px(1.))
+                        .text_size(px(14.))
+                        .child(Textarea::new(&self.composer).appearance(false).aria_label("Message")),
+                )
+                .when(!self.composer_empty, |this| {
+                    this.child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .py(px(1.))
-                            .text_size(px(14.))
-                            .child(Textarea::new(&self.composer).appearance(false).aria_label("Message")),
+                            .id("send")
+                            .role(Role::Button)
+                            .aria_label(if editing { "Save edit" } else { "Send" })
+                            .h(px(35.))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .size(px(24.))
+                                    .rounded_full()
+                                    .bg(p.accent)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(icon("arrow-up", 15., p.on_accent)),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     )
-                    .when(!self.composer_empty, |this| {
-                        this.child(
-                            div()
-                                .id("send")
-                                .role(Role::Button)
-                                .aria_label(if editing { "Save edit" } else { "Send" })
-                                .h(px(35.))
-                                .flex()
-                                .items_center()
-                                .cursor_pointer()
-                                .child(
-                                    div()
-                                        .size(px(24.))
-                                        .rounded_full()
-                                        .bg(p.accent)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(icon("arrow-up", 15., p.on_accent)),
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-                        )
-                    }),
-            )
+                }),
+        )
     }
 
     /// The history transfer's progress over the chats, with a way out at every stage (the Mac
@@ -1042,7 +1030,7 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, act: &ActionCx, p: Pa
                                 .child(name)
                         }))
                         .child(actions::view::beside(bubble, ix, &row.actions, row.outgoing, act, p))
-                        .children(actions::view::pill(ix, &row.actions, act, p)),
+                        .children(actions::view::pill(ix, &row.actions, row.outgoing, act, p)),
                 )
                 .map(|line| actions::view::with_menu(line, &row.actions, act)),
         )

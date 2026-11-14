@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::MoveUp;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::{h_flex, v_flex, Icon, Selectable as SelectableTrigger};
@@ -38,10 +39,10 @@ impl Hush {
         }
     }
 
-    /// The reply or the edit above the composer, with ✕ (or Esc) to drop it.
-    pub(in crate::app) fn render_composer_bar(&self, p: Palette, cx: &mut Context<Self>) -> Option<Div> {
-        let (symbol, title, detail, close) = self.composer_bar()?;
-        Some(
+    /// The composer, under the reply or the edit (with ✕, or Esc, to drop it); ↑ in its empty
+    /// field edits our last message, as in Desktop.
+    pub(in crate::app) fn with_composer_bar(&self, composer: Div, p: Palette, cx: &mut Context<Self>) -> Div {
+        let bar = self.composer_bar().map(|(symbol, title, detail, close)| {
             h_flex()
                 .gap(px(8.))
                 .p(px(8.))
@@ -73,8 +74,17 @@ impl Hush {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.cancel(window, cx);
                         })),
-                ),
-        )
+                )
+        });
+        v_flex()
+            .flex_none()
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if this.edit_last(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .children(bar.map(|bar| div().px(px(14.)).pt(px(8.)).child(bar)))
+            .child(composer)
     }
 }
 
@@ -329,7 +339,7 @@ impl IntoElement for Trigger {
 }
 
 /// Each emoji with how many, ours tinted, half over the bubble's edge. A click shows who reacted.
-pub(in crate::app) fn pill(ix: usize, row: &Rc<RowActions>, act: &ActionCx, p: Palette) -> Option<Div> {
+pub(in crate::app) fn pill(ix: usize, row: &Rc<RowActions>, outgoing: bool, act: &ActionCx, p: Palette) -> Option<Div> {
     if row.pill.is_empty() {
         return None;
     }
@@ -363,7 +373,14 @@ pub(in crate::app) fn pill(ix: usize, row: &Rc<RowActions>, act: &ActionCx, p: P
     let popover = Popover::new(("reactors", ix))
         .trigger(Trigger(trigger))
         .content(move |_, _, cx| reactors(&row, &act, cx.entity()));
-    Some(div().mt(px(-8.)).px(px(6.)).child(popover))
+    // as wide as its emoji, on the bubble's side
+    Some(
+        h_flex()
+            .when(outgoing, |this| this.justify_end())
+            .mt(px(-8.))
+            .px(px(6.))
+            .child(popover),
+    )
 }
 
 /// Who reacted with what; ours can be taken back.
