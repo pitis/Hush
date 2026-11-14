@@ -1172,7 +1172,7 @@ fn length(bytes: Vec<u8>, content_type: &str) -> Option<Duration> {
 /// Marks a copy as come from someone else, as browsers mark downloads, so the system checks it
 /// before it runs (a script or a program a contact sent): Gatekeeper's quarantine on macOS.
 #[cfg(target_os = "macos")]
-fn mark_from_elsewhere(file: &Path) -> std::io::Result<()> {
+pub(super) fn mark_from_elsewhere(file: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     // Launch Services' download flags, as the Mac app writes them
@@ -1197,7 +1197,7 @@ fn mark_from_elsewhere(file: &Path) -> std::io::Result<()> {
 
 /// Windows: the Mark of the Web, the Internet zone's, which SmartScreen and Office check.
 #[cfg(windows)]
-fn mark_from_elsewhere(file: &Path) -> std::io::Result<()> {
+pub(super) fn mark_from_elsewhere(file: &Path) -> std::io::Result<()> {
     let mut stream = file.as_os_str().to_owned();
     stream.push(":Zone.Identifier");
     std::fs::write(stream, "[ZoneTransfer]\r\nZoneId=3\r\n")
@@ -1205,7 +1205,7 @@ fn mark_from_elsewhere(file: &Path) -> std::io::Result<()> {
 
 /// Linux has no such mark; a copy is never made executable.
 #[cfg(not(any(target_os = "macos", windows)))]
-fn mark_from_elsewhere(_: &Path) -> std::io::Result<()> {
+pub(super) fn mark_from_elsewhere(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

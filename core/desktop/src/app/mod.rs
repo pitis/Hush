@@ -23,6 +23,7 @@ use crate::{key, text};
 
 mod actions;
 pub mod attach;
+mod chats;
 pub mod compose;
 mod files;
 pub mod navigate;
@@ -103,7 +104,7 @@ pub struct Hush {
     /// The phone's message history on its way (stage, done, total), or a failed transfer:
     /// receiving waits for it, so it is shown with its ways out.
     history: Option<(HistoryStage, u64, u64)>,
-    /// Every chat, archived ones too (a dialog may open one): the sidebar leaves those out.
+    /// Every chat, archived ones too: the sidebar lists those in its archive.
     chats: Vec<Conversation>,
     chats_loading: bool,
     chats_again: bool,
@@ -151,8 +152,10 @@ pub struct Hush {
     /// Who a new group can have, by name: (ACI, name).
     contacts: Vec<(String, String)>,
     dialog: Option<Dialog>,
-    /// A join request is being withdrawn.
-    cancelling: bool,
+    /// A join request is being withdrawn, or an invitation answered.
+    answering: bool,
+    /// The archive, and the chat changes on their way.
+    chat_actions: chats::ChatActions,
     /// The open chat's reactions, and the reply or edit in the composer.
     actions: actions::Actions,
     files: files::Files,
@@ -341,7 +344,8 @@ impl Hush {
             timeline,
             contacts: vec![],
             dialog: None,
-            cancelling: false,
+            answering: false,
+            chat_actions: Default::default(),
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
             paging: Default::default(),
@@ -394,6 +398,11 @@ impl Hush {
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
                 }
+            }
+            crate::Demo::ChatMenu | crate::Demo::Request | crate::Demo::Archive => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.demo_chats(screen, cx);
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;
@@ -570,16 +579,17 @@ impl Hush {
         self.chats = all;
         // group rows say who wrote the last message
         let authors = self
-            .inbox()
+            .chats
+            .iter()
             .filter(|c| c.kind == ConversationKind::Group && !c.last_message_outgoing);
         let mut wanted: Vec<String> = authors.map(|c| c.last_message_author.clone()).collect();
-        wanted.extend(self.inbox().flat_map(|c| mentioned(&c.last_message_ranges)));
+        wanted.extend(self.chats.iter().flat_map(|c| mentioned(&c.last_message_ranges)));
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
     }
 
-    /// The chats the sidebar lists: all but the archived ones.
+    /// The inbox: all but the archived chats.
     fn inbox(&self) -> impl Iterator<Item = &Conversation> {
         self.chats.iter().filter(|c| !c.archived)
     }
@@ -590,7 +600,6 @@ impl Hush {
         let wanted: Vec<String> = self
             .chats
             .iter()
-            .filter(|c| !c.archived)
             .filter_map(|c| c.avatar.clone())
             .filter(|path| {
                 let new = !self.pictures.contains_key(path);
@@ -1041,15 +1050,15 @@ impl Hush {
     /// chat then stays).
     fn cancel_join_request(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
-        if self.cancelling {
+        if self.answering {
             return;
         }
-        self.cancelling = true;
+        self.answering = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let cancelled = Compat::new(client.cancel_join_request(id.clone())).await;
             let _ = this.update(cx, |app, cx| {
-                app.cancelling = false;
+                app.answering = false;
                 match cancelled {
                     Ok(()) => app.delete_chat(id, cx),
                     Err(e) => app.error = Some(server_failure("Couldn't cancel the request", &e)),

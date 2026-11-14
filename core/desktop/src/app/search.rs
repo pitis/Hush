@@ -33,7 +33,7 @@ const HIGHLIGHT: Duration = Duration::from_secs(2);
 #[derive(Default)]
 pub(super) struct Find {
     /// Searching only this chat, or every chat.
-    scope: Option<String>,
+    pub(super) scope: Option<String>,
     hits: Vec<SearchHit>,
     /// A search for the current text is on its way (no results meanwhile, never stale ones).
     pending: bool,
@@ -201,6 +201,7 @@ impl Hush {
             &self.chats,
             &self.query,
             self.find.scope.is_some(),
+            self.chat_actions.archive,
             self.own_aci.as_deref(),
         )
     }
@@ -501,12 +502,18 @@ fn matches(text: &str, query: &str) -> bool {
     query.chars().filter(|c| *c != ' ').all(|q| rest.any(|t| t == q))
 }
 
-/// The chats the sidebar lists: the inbox; while searching, every chat whose name matches,
-/// archived ones too; none while searching one chat (`AppStore.visibleConversations`).
-fn listed<'a>(chats: &'a [Conversation], query: &str, in_chat: bool, own_aci: Option<&str>) -> Vec<&'a Conversation> {
+/// The chats the sidebar lists: the inbox, or the archive; while searching, every chat whose name
+/// matches, archived ones too; none while searching one chat (`AppStore.visibleConversations`).
+fn listed<'a>(
+    chats: &'a [Conversation],
+    query: &str,
+    in_chat: bool,
+    archive: bool,
+    own_aci: Option<&str>,
+) -> Vec<&'a Conversation> {
     match () {
         _ if in_chat => vec![],
-        _ if query.trim().is_empty() => chats.iter().filter(|c| !c.archived).collect(),
+        _ if query.trim().is_empty() => chats.iter().filter(|c| c.archived == archive).collect(),
         _ => chats
             .iter()
             .filter(|c| matches(&text::title(c, own_aci), query))
@@ -587,18 +594,24 @@ mod tests {
         };
         let all = [chat("g:1", "Book club"), chat("c:a", "Ana"), archived];
         let ids = |shown: Vec<&Conversation>| -> Vec<String> { shown.into_iter().map(|c| c.id.clone()).collect() };
-        assert_eq!(ids(listed(&all, "", false, None)), ["g:1", "c:a"]);
-        assert_eq!(ids(listed(&all, "book", false, None)), ["g:1", "g:2"]);
+        assert_eq!(ids(listed(&all, "", false, false, None)), ["g:1", "c:a"]);
+        assert_eq!(ids(listed(&all, "book", false, false, None)), ["g:1", "g:2"]);
         assert_eq!(
-            ids(listed(&all, "  ", false, None)),
+            ids(listed(&all, "  ", false, false, None)),
             ["g:1", "c:a"],
             "spaces alone aren't a search"
         );
+        // the archive lists the archived ones; a search in it still covers every chat
+        assert_eq!(ids(listed(&all, "", false, true, None)), ["g:2"]);
+        assert_eq!(ids(listed(&all, "book", false, true, None)), ["g:1", "g:2"]);
         // searching one chat lists none, typed or not
-        assert!(listed(&all, "book", true, None).is_empty());
-        assert!(listed(&all, "", true, None).is_empty());
+        assert!(listed(&all, "book", true, false, None).is_empty());
+        assert!(listed(&all, "", true, false, None).is_empty());
         // our own chat by the name it shows
-        assert_eq!(ids(listed(&[chat("c:me", "")], "note", false, Some("me"))), ["c:me"]);
+        assert_eq!(
+            ids(listed(&[chat("c:me", "")], "note", false, false, Some("me"))),
+            ["c:me"]
+        );
     }
 
     #[test]
