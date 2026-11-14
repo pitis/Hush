@@ -537,15 +537,11 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         }
         attachments.push(image);
     }
-    // as Signal's apps do: a card only for an https link the message shows, so it can't name one
-    // place and open another
-    let shown = |url: &String| {
-        url::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
-            && dm.body.as_ref().is_some_and(|b| b.contains(url.as_str()))
-    };
+    // checked against the text as kept (a view-once caption isn't, so it gets no card)
+    let text = message.body.as_deref().unwrap_or_default();
     let preview = dm.preview.first().and_then(|p| {
         Some(NewPreview {
-            url: p.url.clone().filter(shown)?,
+            url: p.url.clone().filter(|u| crate::link_preview::previewable(text, u))?,
             title: p.title.clone(),
             description: p.description.clone(),
             image: p.image.as_ref().map(new_attachment),
@@ -1706,8 +1702,9 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_is_kept_only_if_its_https_link_is_in_the_message() {
-        let preview = |body: &str, url: &str| {
+    fn a_preview_is_kept_only_if_its_https_link_is_in_the_message_whole() {
+        // the preview's url as kept from a received message and from one sent from the phone
+        let kept = |body: &str, url: &str| {
             let mut dm = text(100, body);
             dm.preview = vec![Preview {
                 url: Some(url.into()),
@@ -1726,23 +1723,70 @@ mod tests {
                 _ => panic!("{ops:?}"),
             })
         };
-        let kept = Some("https://docs.example/d/1".to_string());
-        assert_eq!(
-            preview("see https://docs.example/d/1", "https://docs.example/d/1"),
-            [kept.clone(), kept]
+        let yes = |body: &str, url: &str| assert_eq!(kept(body, url), [Some(url.into()), Some(url.into())], "{body}");
+        let no = |body: &str, url: &str| assert_eq!(kept(body, url), [None, None], "{body} / {url}");
+        yes("see https://docs.example/d/1", "https://docs.example/d/1");
+        // sentence punctuation and brackets around a link aren't part of it
+        yes("look: https://example.org.", "https://example.org");
+        yes(
+            "(https://en.wikipedia.org/wiki/Rust_(language))",
+            "https://en.wikipedia.org/wiki/Rust_(language)",
+        );
+        yes(
+            "(https://en.wikipedia.org/wiki/Rust_(language))",
+            "https://en.wikipedia.org/wiki/Rust_(language",
         );
         // a card for a link the message doesn't have: the message stays, the card goes
-        assert_eq!(
-            preview("see https://docs.example/d/1", "https://elsewhere.example"),
-            [None, None]
+        no("see https://docs.example/d/1", "https://elsewhere.example");
+        no("see https://docs.example/d/1", "https://docs.example/d/2");
+        no("no link here", "https://docs.example/d/1");
+        // nor for part of a link
+        no("see https://github.com/acme/repo", "https://github.co");
+        no(
+            "see https://accounts.google.com.au/login",
+            "https://accounts.google.com",
         );
-        assert_eq!(preview("no link here", "https://docs.example/d/1"), [None, None]);
-        // only https links get a card
-        assert_eq!(
-            preview("see http://docs.example/d/1", "http://docs.example/d/1"),
-            [None, None]
+        no(
+            "see https://docs.google.com/d/1#https://evil.example",
+            "https://evil.example",
         );
-        assert_eq!(preview("see https://", "https://"), [None, None]);
+        no(
+            "see https://www.google.com/url?q=https://evil.example/x",
+            "https://evil.example/x",
+        );
+        // https links only, unparseable ones and ones with a name before the host left out
+        no("see http://docs.example/d/1", "http://docs.example/d/1");
+        no("see https://", "https://");
+        no(
+            "see https://docs.google.com@evil.example/d/1",
+            "https://docs.google.com@evil.example/d/1",
+        );
+        // the files stay without the card: its link elsewhere, no text, or a view-once caption
+        let photo = |body: Option<&str>, view_once| DataMessage {
+            body: body.map(Into::into),
+            timestamp: Some(100),
+            attachments: vec![pointer("image/jpeg", 1000, 0)],
+            is_view_once: Some(view_once),
+            preview: vec![Preview {
+                url: Some("https://docs.example/d/1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for dm in [
+            photo(Some("see https://elsewhere.example"), false),
+            photo(None, false),
+            photo(Some("see https://docs.example/d/1"), true),
+        ] {
+            let ops = project(&content(ALICE, 150, ContentBody::DataMessage(dm)), ME);
+            let [Op::InsertMessage(_), Op::AddAttachments {
+                attachments, preview, ..
+            }] = ops.as_slice()
+            else {
+                panic!("{ops:?}")
+            };
+            assert_eq!((attachments.len(), preview), (1, &None));
+        }
     }
 
     fn placeholder(dm: DataMessage) -> MessageKind {
