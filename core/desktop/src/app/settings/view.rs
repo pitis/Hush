@@ -126,6 +126,7 @@ impl Hush {
                 "Backup",
                 Button::new("back-up")
                     .label("Back Up…")
+                    .disabled(working)
                     .on_click(cx.listener(|this, _, window, cx| this.open_backup(window, cx))),
             ))
             .child(row("", sync))

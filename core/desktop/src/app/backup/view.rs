@@ -61,9 +61,12 @@ impl Hush {
                 .role(Role::Dialog)
                 .aria_label(title.clone())
                 .w(px(420.))
-                .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                    if e.keystroke.key == "escape" {
-                        this.close_backup(cx);
+                .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                    match e.keystroke.key.as_str() {
+                        "escape" => this.close_backup(window, cx),
+                        // Done is the default button (the fields' Enter submits the others)
+                        "enter" if done => this.close_backup(window, cx),
+                        _ => {}
                     }
                 }))
                 .child(
@@ -92,7 +95,7 @@ impl Hush {
                                 Button::new("backup-cancel")
                                     .label("Cancel")
                                     .disabled(d.working)
-                                    .on_click(cx.listener(|this, _, _, cx| this.close_backup(cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| this.close_backup(window, cx))),
                             )
                         })
                         .child(

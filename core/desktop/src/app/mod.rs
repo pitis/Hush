@@ -187,6 +187,7 @@ pub struct Hush {
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
+    /// Back Up's or Restore's dialog, and the link screen's restore note.
     backup: backup::Backup,
 }
 

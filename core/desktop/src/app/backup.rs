@@ -23,7 +23,8 @@ const MIN_PASSPHRASE: usize = 8;
 #[derive(Default)]
 pub(super) struct Backup {
     dialog: Option<Dialog>,
-    /// How the last restore went, on the link screen (`AppStore.restoreNote`).
+    /// How the last restore went, or why no backup could be picked, on the link screen
+    /// (`AppStore.restoreNote`).
     note: Option<String>,
 }
 
@@ -32,13 +33,40 @@ impl Backup {
     pub(super) fn showing(&self) -> bool {
         self.dialog.is_some()
     }
+
+    /// The core is backing up or restoring: its dialog stays.
+    fn busy(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|d| d.working)
+    }
+}
+
+/// Asks whether the backup `file` (named by its extension added after the Save dialog) is
+/// replaced, as the Save dialog asks of a name it knows.
+async fn replace(this: &WeakEntity<Hush>, file: &std::path::Path, cx: &mut AsyncWindowContext) -> bool {
+    let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let asked = this.update_in(cx, |_, window, cx| {
+        let question = format!("“{name}” already exists. Do you want to replace it?");
+        let detail = "The backup in it is replaced by this one.";
+        window.prompt(
+            PromptLevel::Warning,
+            &question,
+            Some(detail),
+            &["Replace", "Cancel"],
+            cx,
+        )
+    });
+    match asked {
+        Ok(answer) => answer.await == Ok(0),
+        Err(_) => false,
+    }
 }
 
 /// Back Up's or Restore's dialog (the Mac app's sheets).
 struct Dialog {
     kind: Kind,
     passphrase: Entity<InputState>,
-    /// Tab and Shift-Tab stay inside it.
+    /// Tab and Shift-Tab stay inside it; its own keys (Esc, and Enter for Done) once its fields
+    /// are gone.
     focus: FocusHandle,
     /// The core is at it: the dialog stays until it's done.
     working: bool,
@@ -55,12 +83,13 @@ enum Kind {
     Restore(PathBuf),
 }
 
-/// The Save dialog's suggestion (`BackupFile.defaultName`).
+/// The Save dialog's suggestion (`BackupFile.defaultName`), on the local date (the Mac's is UTC's).
 fn default_name(today: chrono::NaiveDate) -> String {
     format!("Hush Backup {}.{EXTENSION}", today.format("%Y-%m-%d"))
 }
 
-/// `path`, ending in the backups' extension (the Save dialog here doesn't add it).
+/// `path`, ending in the backups' extension (the Save dialog here doesn't add it, nor ask about
+/// replacing a file of the name with it: `choose_backup_file` does).
 fn with_extension(path: PathBuf) -> PathBuf {
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION)) {
         return path;
@@ -75,7 +104,7 @@ fn acceptable(passphrase: &str, again: &str) -> bool {
     passphrase.chars().count() >= MIN_PASSPHRASE && again == passphrase
 }
 
-/// A backup's file failure as it is ("disk full"), not as one to open Hush's data
+/// A backup's file failure as it is ("disk full"), not as a failure to open Hush's data
 /// (`AppStore.fileFailure`).
 fn file_failure(e: &CoreError) -> String {
     match e {
@@ -87,7 +116,7 @@ fn file_failure(e: &CoreError) -> String {
 impl Hush {
     /// Settings ▸ Backup ▸ Back Up…: the passphrase twice, then where.
     pub(super) fn open_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.client.is_none() || self.backup.dialog.as_ref().is_some_and(|d| d.working) {
+        if self.client.is_none() || self.backup.busy() {
             return;
         }
         let passphrase = self.passphrase_field("Passphrase (at least 8 characters)", window, cx);
@@ -97,6 +126,9 @@ impl Hush {
 
     /// The link screen's Restore from a Backup…: picks the file, then asks for its passphrase.
     pub(super) fn choose_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backup.busy() {
+            return;
+        }
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -109,11 +141,14 @@ impl Hush {
                     .into_iter()
                     .next()
                     .ok_or_else(|| "That file isn't on this computer's disk.".to_string()),
-                Ok(Err(e)) => Err(format!("Couldn't open the file picker: {e}")),
+                Ok(Err(e)) => Err(e.to_string()),
                 // cancelled
                 Ok(Ok(None)) | Err(_) => return,
             };
             let _ = this.update_in(cx, |app, window, cx| match file {
+                // a second picker, opened as the first restore began (the picker doesn't block the
+                // window on macOS): that restore goes on
+                _ if app.backup.busy() => {}
                 Ok(file) => {
                     let passphrase = app.passphrase_field("Passphrase", window, cx);
                     app.show_backup(Kind::Restore(file), passphrase, window, cx);
@@ -155,10 +190,11 @@ impl Hush {
         cx.notify();
     }
 
-    /// Cancel or Done: not while the core is at it.
-    fn close_backup(&mut self, cx: &mut Context<Self>) {
+    /// Cancel, Done or Esc: not while the core is at it. Back to Settings' keys, if it's under.
+    fn close_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.backup.dialog.as_ref().is_some_and(|d| !d.working) {
             self.backup.dialog = None;
+            self.focus_settings(window, cx);
             cx.notify();
         }
     }
@@ -170,7 +206,7 @@ impl Hush {
             return;
         }
         match &d.kind {
-            Kind::BackUp { saved: Some(_), .. } => self.close_backup(cx),
+            Kind::BackUp { saved: Some(_), .. } => self.close_backup(window, cx),
             Kind::BackUp { again, saved: None } => {
                 if acceptable(&d.passphrase.read(cx).value(), &again.read(cx).value()) {
                     self.choose_backup_file(window, cx);
@@ -186,8 +222,15 @@ impl Hush {
         let chosen = cx.prompt_for_new_path(&folder, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
             let file = match chosen.await {
-                Ok(Ok(Some(file))) => Ok(with_extension(file)),
-                Ok(Err(e)) => Err(format!("Couldn't open the file picker: {e}")),
+                Ok(Ok(Some(picked))) => {
+                    let file = with_extension(picked.clone());
+                    // the Save dialog asked about the name typed, not this one
+                    if file != picked && file.exists() && !replace(&this, &file, cx).await {
+                        return;
+                    }
+                    Ok(file)
+                }
+                Ok(Err(e)) => Err(e.to_string()),
                 // cancelled
                 Ok(Ok(None)) | Err(_) => return,
             };
@@ -207,14 +250,18 @@ impl Hush {
     /// Writes the backup to `file` (replaced), encrypted with the passphrase typed.
     fn back_up(&mut self, file: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
-        // closed while the Save dialog was up, or the fields changed since
+        // closed while the Save dialog was up, or the fields no longer agree
         let Some(d) = &mut self.backup.dialog else { return };
         let Kind::BackUp { again, saved: None } = &d.kind else {
             return;
         };
         let passphrase = d.passphrase.read(cx).value().to_string();
-        if d.working || !acceptable(&passphrase, &again.read(cx).value()) {
+        if d.working {
             return;
+        }
+        if !acceptable(&passphrase, &again.read(cx).value()) {
+            d.failure = Some("The passphrases changed: type them again, then Back Up….".into());
+            return cx.notify();
         }
         let Some(at) = file.to_str().map(str::to_owned) else {
             d.failure = Some("Couldn't back up: the file's path isn't valid text".into());
@@ -227,9 +274,9 @@ impl Hush {
         d.failure = None;
         cx.notify();
         let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let written = Compat::new(client.back_up(at, passphrase)).await;
-            let _ = this.update(cx, |app, cx| {
+            let _ = this.update_in(cx, |app, window, cx| {
                 let Some(d) = &mut app.backup.dialog else { return };
                 d.working = false;
                 match written {
@@ -237,6 +284,8 @@ impl Hush {
                         if let Kind::BackUp { saved, .. } = &mut d.kind {
                             *saved = Some(name);
                         }
+                        // the fields go: Done takes the keys
+                        d.focus.focus(window, cx);
                     }
                     Err(e) => d.failure = Some(format!("Couldn't back up: {}", file_failure(&e))),
                 }
@@ -247,8 +296,8 @@ impl Hush {
     }
 
     /// The chosen backup replaces everything here, then a new linking code follows. A wrong
-    /// passphrase, a damaged file or one that can't be read is said in the dialog, and the code
-    /// stays; otherwise the core has stopped and starts over (finishing a swap cut short), and the
+    /// passphrase, a damaged file or one that can't be read, or this computer linked meanwhile, is
+    /// said in the dialog, and the code stays; otherwise the core has stopped and starts over (finishing a swap cut short), and the
     /// link screen says how it went.
     fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
@@ -259,7 +308,7 @@ impl Hush {
             return;
         }
         let Some(at) = file.to_str().map(str::to_owned) else {
-            d.failure = Some("the file's path isn't valid text".into());
+            d.failure = Some("Couldn't restore the backup: the file's path isn't valid text".into());
             return cx.notify();
         };
         d.passphrase.update(cx, |f, cx| f.set_value("", window, cx));
@@ -287,9 +336,9 @@ impl Hush {
             }
             Err(e) => format!("Couldn't restore the backup: {}", file_failure(&e)),
         };
-        // the data stays, so its key does too
+        // the restored data is under this computer's key: it stays
         self.restart(false, window, cx);
-        // the new code doesn't hide it
+        // after the restart, which forgets everything shown; a new linking code doesn't hide it
         self.backup.note = Some(note);
     }
 }
@@ -340,7 +389,7 @@ mod tests {
 /// Backing up and restoring in a real (headless) window, over real cores that aren't linked, in
 /// temporary folders: `cargo test --features hush-desktop/snapshot`. The app's own data folder and
 /// keychain are never touched: the test's `Home` refuses the key, so a restore's new core never
-/// opens (it would start linking), and never forgets it.
+/// opens (it would start linking), and would panic if the key were forgotten.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
     use std::path::{Path, PathBuf};
@@ -349,7 +398,7 @@ mod window_tests {
 
     use async_compat::Compat;
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Context, Entity, TestAppContext, Window, WindowOptions};
-    use sig_core::CoreError;
+    use sig_core::{CoreError, CoreEvent};
 
     use super::super::attach::window_tests::with_core;
     use super::super::{Home, Hush, Screen};
@@ -425,9 +474,10 @@ mod window_tests {
         });
     }
 
-    /// Waits for the core's answer (on its own threads) until `done`.
+    /// Waits for the core's answer (on its own threads) until `done`: in a debug build, a backup's
+    /// key derivation (Argon2) alone takes seconds.
     fn until(hush: &Entity<Hush>, cx: &mut TestAppContext, done: impl Fn(&Hush) -> bool) {
-        for _ in 0..500 {
+        for _ in 0..3000 {
             cx.run_until_parked();
             if hush.read_with(cx, |app, _| done(app)) {
                 return;
@@ -471,11 +521,56 @@ mod window_tests {
         futures::executor::block_on(Compat::new(client.set_draft(chat, text))).unwrap();
 
         // Settings ▸ Back Up…: the passphrase twice, then where
-        act(window, &hush, cx, |app, window, cx| app.open_backup(window, cx));
+        act(window, &hush, cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.open_backup(window, cx)
+        });
         submit(window, &hush, "correct horse", "correct horsy", cx);
         assert!(!cx.did_prompt_for_new_path(), "typed differently: nothing asked");
         submit(window, &hush, "short", "short", cx);
         assert!(!cx.did_prompt_for_new_path(), "too short: nothing asked");
+
+        // the Save dialog cancelled: nothing changes
+        submit(window, &hush, "correct horse", "correct horse", cx);
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| None);
+        cx.run_until_parked();
+        assert!(!cleared(&hush, cx) && failure(&hush, cx).is_none());
+        assert!(!hush.read_with(cx, |app, _| working(app)));
+
+        // a file that can't be written: said, and the dialog stays until the core has answered
+        let gone = from.join("gone").join("x.hushbackup");
+        act(window, &hush, cx, |app, window, cx| {
+            app.back_up(gone, window, cx);
+            app.close_backup(window, cx);
+            assert!(app.backup.dialog.is_some(), "not while working");
+        });
+        until(&hush, cx, |app| !working(app));
+        let why = failure(&hush, cx).unwrap_or_default();
+        assert!(why.starts_with("Couldn't back up: can't "), "{why}");
+        assert!(cleared(&hush, cx), "the passphrase isn't kept");
+        let saved = |hush: &Entity<Hush>, cx: &mut TestAppContext| {
+            hush.read_with(cx, |app, _| match &app.backup.dialog.as_ref().unwrap().kind {
+                Kind::BackUp { saved, .. } => saved.clone(),
+                Kind::Restore(_) => None,
+            })
+        };
+        assert_eq!(saved(&hush, cx), None);
+
+        // named without the extension, as a backup that's there: asked first, as the Save dialog
+        // would have of that name
+        let old = from.join("Old.hushbackup");
+        std::fs::write(&old, b"last week's backup").unwrap();
+        submit(window, &hush, "correct horse", "correct horse", cx);
+        cx.simulate_new_path_selection(|_| Some(from.join("Old")));
+        cx.run_until_parked();
+        let (question, _) = cx.pending_prompt().expect("asked");
+        assert_eq!(question, "“Old.hushbackup” already exists. Do you want to replace it?");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(std::fs::read(&old).unwrap(), b"last week's backup");
+        assert!(!cleared(&hush, cx) && !hush.read_with(cx, |app, _| working(app)));
+
         submit(window, &hush, "correct horse", "correct horse", cx);
         assert!(cx.did_prompt_for_new_path());
         // named without the extension: the Mac app's picker shows only `.hushbackup` files
@@ -483,20 +578,22 @@ mod window_tests {
         until(&hush, cx, |app| !working(app));
         assert!(cleared(&hush, cx), "the passphrase isn't kept");
         assert_eq!(failure(&hush, cx), None);
-        let saved = hush.read_with(cx, |app, _| match &app.backup.dialog.as_ref().unwrap().kind {
-            Kind::BackUp { saved, .. } => saved.clone(),
-            Kind::Restore(_) => None,
-        });
-        assert_eq!(saved.as_deref(), Some("Hush Backup.hushbackup"));
+        assert_eq!(saved(&hush, cx).as_deref(), Some("Hush Backup.hushbackup"));
         let file = from.join("Hush Backup.hushbackup");
         assert!(file.exists());
-        // Done
-        act(window, &hush, cx, |app, window, cx| app.submit_backup(window, cx));
+        // Done takes Enter, and Settings has the keys again: Esc closes it
+        cx.simulate_keystrokes(window, "enter");
         assert!(hush.read_with(cx, |app, _| app.backup.dialog.is_none()));
+        cx.simulate_keystrokes(window, "escape");
+        assert!(!hush.read_with(cx, |app, _| app.settings_open()));
 
         // another computer, not linked: Restore from a Backup… on the link screen
         let (window, hush) = open(Demo::Link, &to, cx);
-        act(window, &hush, cx, |app, window, cx| app.choose_restore(window, cx));
+        // clicked twice: two pickers (one doesn't block the window on macOS)
+        act(window, &hush, cx, |app, window, cx| {
+            app.choose_restore(window, cx);
+            app.choose_restore(window, cx);
+        });
         assert!(cx.did_prompt_for_paths());
         let picked = file.clone();
         cx.simulate_path_prompt_response(move |options| {
@@ -523,9 +620,20 @@ mod window_tests {
             assert_eq!(app.backup.note, None);
         });
 
-        // the right one: restored, and the app starts over over the same folder (whose key the
-        // test refuses), saying so
-        submit(window, &hush, "correct horse", "", cx);
+        // the right one: restored, and the app starts over on the same folder (whose key the
+        // test refuses), saying so; meanwhile no other backup is picked, nor replaces this one
+        act(window, &hush, cx, |app, window, cx| {
+            let d = app.backup.dialog.as_ref().expect("the dialog is open");
+            d.passphrase
+                .update(cx, |f, cx| f.set_value("correct horse", window, cx));
+            app.submit_backup(window, cx);
+            app.choose_restore(window, cx);
+        });
+        let again = file.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![again]));
+        cx.run_until_parked();
+        assert!(!cx.did_prompt_for_paths(), "no picker while restoring");
+        assert!(hush.read_with(cx, |app, _| working(app) || app.backup.note.is_some()));
         until(&hush, cx, |app| app.backup.note.is_some());
         hush.read_with(cx, |app, _| {
             assert_eq!(app.backup.note.as_deref(), Some(RESTORED));
@@ -534,6 +642,15 @@ mod window_tests {
                 matches!(&app.screen, Screen::Failed(why) if why == REFUSED),
                 "a new core was asked for"
             );
+        });
+        // a new core's linking code doesn't hide it
+        act(window, &hush, cx, |app, _, cx| {
+            let url = "sgnl://linkdevice?uuid=new".to_string();
+            app.handle(CoreEvent::LinkUrl { url }, cx)
+        });
+        hush.read_with(cx, |app, _| {
+            assert!(matches!(app.screen, Screen::Link { url: Some(_) }));
+            assert_eq!(app.backup.note.as_deref(), Some(RESTORED));
         });
 
         // the chats are there for the next core, under this computer's key

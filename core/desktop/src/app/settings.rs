@@ -254,6 +254,13 @@ impl Hush {
         self.settings.panel.is_some()
     }
 
+    /// Back to the panel's keys, from a dialog over it that closed.
+    pub(super) fn focus_settings(&self, window: &mut Window, cx: &mut App) {
+        if let Some(p) = &self.settings.panel {
+            p.focus.focus(window, cx);
+        }
+    }
+
     /// Done or Esc: back to the open chat's composer. A save or an unlink on its way still lands.
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.panel.take().is_some() {

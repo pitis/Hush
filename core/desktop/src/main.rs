@@ -157,7 +157,7 @@ pub enum Demo {
     ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
-    /// Back Up's dialog over Settings, its passphrase typed once.
+    /// Back Up's dialog over Settings, its passphrase in the first field only.
     BackUp,
     /// The link screen after a restore.
     Restored,
