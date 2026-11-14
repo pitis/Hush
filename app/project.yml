@@ -39,9 +39,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.pitis.hush
-        # The app then loads only code signed by its own team and, outside Debug, ignores DYLD_*
-        # variables: no other app can run code in the app the Keychain gives the database key to.
-        # Xcode leaves it off in ad-hoc Debug builds, whose debug dylib would fail that check.
+        # A Release build then loads only code signed by its own team and ignores DYLD_* variables:
+        # no other app can run code in the app the Keychain gives the database key to. Debug builds
+        # keep get-task-allow for the debugger and XCTest, so a debugger can still attach to them;
+        # Xcode leaves the runtime off in ad-hoc Debug builds, whose debug dylib would fail it.
         ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: YES
         # RingRTC's WebRTC and cubeb are C++
@@ -55,6 +56,9 @@ targets:
           DEPLOYMENT_POSTPROCESSING: YES
           STRIP_INSTALLED_PRODUCT: YES
           STRIP_STYLE: non-global
+          # Xcode may add get-task-allow when signing with a development certificate; it would let a
+          # debugger attach to the installed app and read the database key.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
   HushTests:
     type: bundle.unit-test
     platform: macOS
