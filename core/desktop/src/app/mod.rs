@@ -167,8 +167,9 @@ struct Core(Arc<Client>, drafts::Writer);
 
 impl Global for Core {}
 
-/// Quits once the core has stopped (a few seconds at most): it first handles what it has already
-/// received, which the server counts as delivered and never sends again.
+/// Quits once the drafts typed are written and the core has stopped (a few seconds at most): it
+/// first handles what it has already received, which the server counts as delivered and never
+/// sends again.
 pub fn quit(cx: &mut App) {
     let Some(Core(client, drafts)) = cx.try_global::<Core>() else {
         return cx.quit();
@@ -435,6 +436,7 @@ impl Hush {
                 self.screen = Screen::Failed(e.to_string());
             }
         }
+        // before the chats: one is opened only once the drafts are in (one database connection)
         let drafts = self.load_drafts(client.clone(), cx);
         cx.set_global(Core(client.clone(), drafts));
         self.client = Some(client);
@@ -861,9 +863,11 @@ impl Hush {
                 // the Mac app's words: the core's
                 let e = describe(&e);
                 // the text goes back to its chat: into the composer if that chat is still open
-                // and nothing new was typed, else into its draft
+                // and nothing new was typed, else into its draft if it has none (in an edit, the
+                // one from before it); a draft there stays, and the words are lost (as on the Mac)
                 let open = app.selected.as_deref() == Some(id.as_str());
-                if open && app.composer.read(cx).value().is_empty() {
+                let editing = open && app.actions.editing();
+                if open && !editing && app.composer.read(cx).value().trim().is_empty() {
                     app.error = Some(e);
                     app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
@@ -871,9 +875,13 @@ impl Hush {
                 } else {
                     // the files went back to the tray only if their chat is still open
                     let lost_files = had_files && !open;
-                    app.error = Some(attach::unsent(&e, worded, reply.is_some(), lost_files));
-                    if app.drafts.get(&id).is_none() {
+                    let back = worded && app.drafts.get(&id).is_none();
+                    app.error = Some(attach::unsent(&e, back, reply.is_some(), lost_files));
+                    if back {
                         app.drafts.keep(&id, typed.words());
+                        if editing {
+                            app.actions.set_aside(typed);
+                        }
                     }
                 }
                 cx.notify();
@@ -1082,16 +1090,16 @@ impl Hush {
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
         self.drop_chat_copies(&id);
-        // the core deletes it with the chat; cleared in turn too, so a write still on its way
-        // doesn't bring it back
-        self.drafts.keep(&id, String::new());
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let Err(e) = Compat::new(client.delete_chat(id)).await else {
-                return;
-            };
+            let deleted = Compat::new(client.delete_chat(id.clone())).await;
             let _ = this.update(cx, |app, cx| {
-                app.error = Some(format!("Couldn't delete the chat: {}", describe(&e)));
+                match deleted {
+                    // the core deleted its draft too: cleared after the writes on their way, so
+                    // none brings it back
+                    Ok(()) => app.drafts.keep(&id, String::new()),
+                    Err(e) => app.error = Some(format!("Couldn't delete the chat: {}", describe(&e))),
+                }
                 cx.notify();
             });
         })

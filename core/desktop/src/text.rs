@@ -169,7 +169,7 @@ pub fn short_id(aci: &str) -> String {
     aci.chars().take(8).collect()
 }
 
-/// What a row's second line says before a chat's draft (`ChatList.line`).
+/// What a row's second line says before a chat's draft (`ChatList.line`, `SidebarView`).
 pub const DRAFT: &str = "Draft:";
 
 /// A chat row's second line. `draft` is the chat's unsent text (not blank) if it isn't open;
