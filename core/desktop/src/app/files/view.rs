@@ -9,7 +9,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Attachment, AttachmentState};
 
-use super::{byte_count, clock, display_size, openable, Audio, Look, Shown, TRACK};
+use super::{byte_count, clock, display_size, openable, Audio, Look, Shown, Sticker, TRACK};
 use crate::app::view::icon;
 use crate::app::Hush;
 
@@ -58,6 +58,31 @@ fn picture(
             .flex()
             .items_center()
             .justify_center()
+            .children(download_state(a, color, behind))
+            .when(wants_download(a), |this_| {
+                this_.cursor_pointer().on_click(on(this, a, Hush::download))
+            })
+            .into_any_element(),
+    }
+}
+
+/// A sticker's picture on its own, at most 160×160 (while it decodes, its place greyed); not
+/// downloaded, its download beside its words.
+pub fn sticker(s: &Sticker, this: &WeakEntity<Hush>, color: Hsla, behind: Hsla) -> AnyElement {
+    match s {
+        Sticker::Picture(Some(picture)) => img(picture.clone())
+            .size(px(160.))
+            .flex_none()
+            .object_fit(ObjectFit::Contain)
+            .into_any_element(),
+        Sticker::Picture(None) => div()
+            .size(px(160.))
+            .flex_none()
+            .bg(black().opacity(0.25))
+            .into_any_element(),
+        Sticker::Fetch(a) => div()
+            .id(("file", a.id as u64))
+            .flex_none()
             .children(download_state(a, color, behind))
             .when(wants_download(a), |this_| {
                 this_.cursor_pointer().on_click(on(this, a, Hush::download))
