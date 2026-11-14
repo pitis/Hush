@@ -826,8 +826,8 @@ impl ProjectionDb {
     }
 
     /// Deletes a chat's contents here: messages, their files, reactions, edits, events and held
-    /// receipts; its request is no longer accepted (`whitelisted` off, for the phone to learn, and
-    /// `has_sent`).
+    /// receipts; its request is no longer accepted: `whitelisted` off (for the phone to learn) and
+    /// `has_sent` off.
     /// The row and its other flags stay, unlisted until a new message. presage's copy of the
     /// thread is queued (`presage_forget_threads`) in the same transaction.
     pub async fn delete_chat(&self, id: &str) -> Result<(), sqlx::Error> {
@@ -3324,7 +3324,7 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     if inserted {
         if m.is_outgoing {
             // writing in an archived chat brings it back (Desktop's rule; an incoming message
-            // doesn't), and accepts it for good (`has_sent`)
+            // doesn't), and accepts it until the chat is deleted (`has_sent`)
             sqlx::query("UPDATE conversations SET archived = 0, has_sent = 1 WHERE id = ?1")
                 .bind(&m.conversation_id)
                 .execute(&mut *conn)
@@ -7643,6 +7643,7 @@ mod tests {
         let db = db().await;
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&in_conv(G, msg("bob", 2, "b"))).await.unwrap();
+        db.insert_message(&mine(G, 3)).await.unwrap();
         let alice = |response| Op::RequestResponse {
             thread: RequestThread::Aci("alice".into()),
             response,
@@ -7661,6 +7662,10 @@ mod tests {
         .unwrap();
         assert!(db.message(&k("bob", 2)).await.unwrap().is_none());
         assert!(db.dirty_chats().await.unwrap().is_empty());
+        // deleted there, our message there no longer accepts it
+        phone_state_known(&db).await;
+        db.insert_message(&in_conv(G, msg("bob", 4, "again"))).await.unwrap();
+        assert!(conv(&db, G).await.message_request);
     }
 
     #[tokio::test]

@@ -73,7 +73,8 @@ Signal Desktop's rules (main, `ts/util/isConversationAccepted`, `MessageReceiver
   presage's own contact list can't stand in: it saves every sender "on first sight";
 - we have never written in the chat (`has_sent`, set when a message of ours is stored: from
   this Mac, synced from the phone, or imported history — Note to Self always has them). It
-  stays when our messages expire, as Desktop's sent-message count; only `delete_chat` clears it.
+  stays when our messages expire, as Desktop's sent-message count; only deleting the chat
+  clears it (`delete_chat`, or the phone's Delete / Block-and-Delete answer).
 
 A chat with no messages isn't listed, so the empty-chat rule needs nothing.
 
@@ -157,7 +158,8 @@ GroupV2Record 2/3); `clear_dirty` compares all five flags. Everything else in #5
 - `conversations.has_sent` (migration 0027): set from the outgoing messages already stored.
 
 ## Testing
-- db: `message_request` true/false across whitelisted, blocked, outgoing present, storage state
+- db: `message_request` true/false across whitelisted, blocked, `has_sent` (kept when our messages
+  expire, cleared by deleting the chat; set by migration 0027 from outgoing rows), storage state
   unknown; `unsent_receipts` skips requests and blocked chats, and returns them after accept;
   `delete_chat` removes messages, events, files and queues the thread; block/accept set flags and
   dirty; the `Blocked` list replace (added, removed, unknown ACI, group by identifier); MRR types.
