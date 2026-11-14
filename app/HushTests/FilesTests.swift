@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import XCTest
 
@@ -168,6 +169,45 @@ final class FilesTests: XCTestCase {
         try Data("mine".utf8).write(to: mine)
         let bytes = try await Files.bytes(mine.path)
         XCTAssertEqual(bytes, Data("mine".utf8))
+    }
+
+    /// A recording's length shows before it plays: read from what the core decrypts, in memory,
+    /// and remembered; a large one's isn't read for it.
+    @MainActor func testARecordingsLengthIsKnownBeforeItPlays() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-length-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // a second of AAC in an M4A, as a recording comes
+        let made = dir.appendingPathComponent("made.m4a")
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+        do {
+            let file = try AVAudioFile(
+                forWriting: made,
+                settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 44100, AVNumberOfChannelsKey: 1])
+            let second = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 44100)!
+            second.frameLength = 44100
+            try file.write(from: second)
+        }
+        let fake = FakeClient(linked: true)
+        Files.core = fake
+        defer { Files.core = nil }
+        let stored = dir.appendingPathComponent("7").path  // encrypted on disk: only the core reads it
+        fake.decrypted[stored] = try Data(contentsOf: made)
+        var a = Attachment(
+            id: Int64.random(in: 1_000_000...Int64.max), message: MessageKey(author: "a", sentAt: 1),
+            contentType: "audio/aac", fileName: nil, size: 20_000, width: nil, height: nil, isVoiceNote: true,
+            path: stored, state: .ready)
+        let read = await AudioAttachmentView.length(of: a)
+        let length = try XCTUnwrap(read)
+        XCTAssertEqual(length, 1, accuracy: 0.1)
+        fake.decrypted[stored] = Data("unreadable now".utf8)
+        let again = await AudioAttachmentView.length(of: a)
+        XCTAssertEqual(again, length, "remembered")
+        a.id += 1
+        a.size = AudioAttachmentView.lengthReadLimit + 1
+        let large = await AudioAttachmentView.length(of: a)
+        XCTAssertNil(large, "shown once played")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["made.m4a"], "no copy on disk")
     }
 
     /// Stored files are encrypted: they are read, and copied out to open, through the core.

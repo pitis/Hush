@@ -145,21 +145,37 @@ struct AudioAttachmentView: View {
                     DownloadState(state: attachment.state, download: download)
                 }
                 Track(fraction: duration > 0 ? elapsed / duration : 0)
-                Text(
-                    Self.clock(
-                        playing || elapsed > 0 ? elapsed : (duration > 0 ? duration : Self.lengths[attachment.id] ?? 0))
-                )
-                .font(.system(size: 11).monospacedDigit()).opacity(0.8)
+                Text(Self.clock(playing || elapsed > 0 ? elapsed : duration))
+                    .font(.system(size: 11).monospacedDigit()).opacity(0.8)
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(attachment.isVoiceNote ? "Voice message" : (attachment.fileName ?? "Audio"))
         .onDisappear { stop() }
+        .task(id: attachment.state) {
+            if let length = await Self.length(of: attachment) { duration = length }
+        }
     }
 
-    /// Recordings' lengths once played, by attachment: shown before they play again (a length
-    /// isn't worth decrypting a recording to disk for when its row only shows).
+    /// Recordings' lengths, by attachment.
     private static var lengths: [Int64: Double] = [:]
+    /// A larger recording isn't read whole just for its length: it shows once played.
+    static let lengthReadLimit: UInt64 = 20 << 20
+
+    /// A recording's length before it plays, as in Desktop: remembered, or read from its bytes in
+    /// memory (never a decrypted copy on disk) for one up to `lengthReadLimit`.
+    static func length(of a: Attachment) async -> Double? {
+        if let known = lengths[a.id] { return known }
+        guard a.state == .ready, let path = a.path, a.size <= lengthReadLimit,
+            let data = try? await Files.bytes(path)
+        else { return nil }
+        let type = UTType(mimeType: a.contentType)?.identifier
+        let length = await Task.detached(priority: .utility) {
+            (try? AVAudioPlayer(data: data, fileTypeHint: type)).map(\.duration).flatMap { $0 > 0 ? $0 : nil }
+        }.value
+        if let length { lengths[a.id] = length }
+        return length
+    }
 
     private func toggle() {
         guard opening == nil else { return }
