@@ -15,6 +15,7 @@ use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, MessageStatus};
 use sig_core::{ConnectionState, HistoryStage};
 
+use super::actions::{self, view::ActionCx};
 use super::{files, join_step, matching, Dialog, DialogKind, Hush, JoinStep, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
@@ -47,6 +48,7 @@ struct Row {
     status: Option<MessageStatus>,
     /// What assistive technology reads: who, what, when.
     label: String,
+    actions: Rc<actions::RowActions>,
 }
 
 /// The space beside incoming messages in a group: the sender's picture by the last of a run.
@@ -60,6 +62,7 @@ impl Hush {
     fn rows(&self, c: &Conversation) -> Vec<Row> {
         let group = c.kind == ConversationKind::Group;
         let now = chrono::Local::now();
+        let now_ms = now.timestamp_millis();
         let ms = &self.messages;
         let joins = |a: &sig_core::projection::Message, b: &sig_core::projection::Message| {
             a.author == b.author
@@ -105,6 +108,7 @@ impl Hush {
                 edited: m.edited && !m.deleted,
                 time,
                 status,
+                actions: self.row_actions(m, now_ms),
             }
         });
         rows.collect()
@@ -712,11 +716,21 @@ impl Hush {
         let this = cx.entity().downgrade();
         let mut row_style = StyleRefinement::default();
         row_style.padding.bottom = Some(px(0.).into());
+        let act = self.action_cx(cx);
         v_flex()
             .flex_1()
             .h_full()
             .min_w_0()
             .bg(p.window)
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                // Esc drops the reply or the edit
+                if e.keystroke.key == "escape" && this.cancel(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // where the keyboard goes while message text is selected; on no area, so clicks in
+            // the chat leave the composer's focus alone
+            .child(div().track_focus(self.actions.focus()))
             .child(
                 v_flex()
                     .h(px(TOOLBAR))
@@ -741,7 +755,7 @@ impl Hush {
             )
             .child(
                 MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
-                    render_row(ix, &rows[ix], &out_fill, &this, style::palette(cx))
+                    render_row(&rows[ix], &out_fill, &act, &this, style::palette(cx))
                 })
                 .with_row_style(row_style)
                 .flex_1()
@@ -785,11 +799,12 @@ impl Hush {
                         )
                     })
             } else {
-                self.render_composer(p, cx)
+                self.with_composer_bar(self.render_composer(p, cx), p, cx)
             })
     }
 
     fn render_composer(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let editing = self.actions.editing();
         div().flex_none().px(px(14.)).pt(px(8.)).pb(px(12.)).child(
             h_flex()
                 .items_end()
@@ -812,7 +827,7 @@ impl Hush {
                         div()
                             .id("send")
                             .role(Role::Button)
-                            .aria_label("Send")
+                            .aria_label(if editing { "Save edit" } else { "Send" })
                             .h(px(35.))
                             .flex()
                             .items_center()
@@ -923,7 +938,7 @@ impl Hush {
     }
 }
 
-fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hush>, p: Palette) -> Stateful<Div> {
+fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntity<Hush>, p: Palette) -> Stateful<Div> {
     let (fill, color, behind) = if row.outgoing {
         (*out_fill, p.on_accent, p.bubble_out)
     } else {
@@ -938,7 +953,10 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hus
         .text_color(meta_color)
         .when(row.edited, |this| this.child("edited"))
         .child(row.time.clone())
-        .children(row.status.map(|s| tick(s, 10., meta_color, p.bubble_out, p)));
+        .children(row.status.map(|s| match s {
+            MessageStatus::Failed => actions::view::retry(&row.actions, act, p),
+            s => tick(s, 10., meta_color, p.bubble_out, p),
+        }));
     let line = h_flex()
         .max_w_full()
         .items_end()
@@ -950,13 +968,15 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hus
                     .text_size(px(14.))
                     .when(row.note, |this| this.italic().text_color(color.opacity(0.6)))
                     .child(
-                        StyledText::new(row.text.clone()).with_highlights(row.mentions.iter().map(|r| {
-                            let bold = HighlightStyle {
-                                font_weight: Some(FontWeight::BOLD),
-                                ..Default::default()
-                            };
-                            (r.clone(), bold)
-                        })),
+                        actions::view::Selectable::new("text", row.text.clone(), act).with_highlights(
+                            row.mentions.iter().map(|r| {
+                                let bold = HighlightStyle {
+                                    font_weight: Some(FontWeight::BOLD),
+                                    ..Default::default()
+                                };
+                                (r.clone(), bold)
+                            }),
+                        ),
                     ),
             )
         })
@@ -969,6 +989,7 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hus
         .rounded(px(18.))
         .bg(fill)
         .text_color(color)
+        .children(actions::view::quote(&row.actions))
         // files without a caption: the time sits under them on the right
         .when(row.text.is_empty(), |this| this.items_end())
         .children(files::render(&row.files, this, color, behind))
@@ -979,7 +1000,7 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hus
         Gutter::Avatar { id, name } => Some(avatar(id, name, None, 28.)),
     };
     v_flex()
-        .id(ix)
+        .id(row.actions.id.clone())
         .role(Role::ListItem)
         .aria_label(row.label.clone())
         .w_full()
@@ -1024,8 +1045,10 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, this: &WeakEntity<Hus
                                 .text_color(color)
                                 .child(name)
                         }))
-                        .child(bubble),
-                ),
+                        .child(actions::view::beside(bubble, &row.actions, row.outgoing, act, p))
+                        .children(actions::view::pill(&row.actions, row.outgoing, act, p)),
+                )
+                .map(|line| actions::view::with_menu(line, &row.actions, act)),
         )
 }
 

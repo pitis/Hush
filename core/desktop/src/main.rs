@@ -68,6 +68,8 @@ pub enum Demo {
     Chat,
     /// The chat, with the New Group dialog over it.
     NewGroup,
+    /// The chat, replying to a message whose buttons and reaction picker show.
+    Reply,
     /// A chat's pictures, recordings and files.
     Files,
 }
@@ -87,6 +89,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("empty", Demo::Empty),
                 ("chat", Demo::Chat),
                 ("new-group", Demo::NewGroup),
+                ("reply", Demo::Reply),
                 ("files", Demo::Files),
             ];
             cx.spawn(async move |cx| {

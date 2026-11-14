@@ -132,8 +132,6 @@ type Key = (String, i64);
 pub(super) struct Files {
     /// The open chat's messages' files, by message (author, sent at).
     by_message: HashMap<Key, Vec<Attachment>>,
-    loading: bool,
-    again: bool,
     /// Pictures by their file, decoded small.
     /// shortcut: every picture of the open chat's page is kept, up to 1.6 MB each (160 MB for
     /// 100 photos), until another chat opens; the Mac app keeps 32 MB, least recently shown going
@@ -334,19 +332,16 @@ impl Files {
 fn with_details(
     shown: &HashMap<Key, Vec<Attachment>>,
     keys: &[MessageKey],
-    details: Vec<MessageDetails>,
+    details: &[MessageDetails],
 ) -> HashMap<Key, Vec<Attachment>> {
-    let mut read: HashMap<Key, Vec<Attachment>> = details
-        .into_iter()
-        .map(|d| ((d.key.author, d.key.sent_at), d.attachments))
+    let read: HashMap<Key, &Vec<Attachment>> = details
+        .iter()
+        .map(|d| ((d.key.author.clone(), d.key.sent_at), &d.attachments))
         .collect();
     let files = keys.iter().filter_map(|k| {
         let k = (k.author.clone(), k.sent_at);
-        let files = match read.remove(&k) {
-            Some(files) => files,
-            None => shown.get(&k)?.clone(),
-        };
-        (!files.is_empty()).then_some((k, files))
+        let files = read.get(&k).copied().or_else(|| shown.get(&k))?;
+        (!files.is_empty()).then(|| (k, files.clone()))
     });
     files.collect()
 }
@@ -359,43 +354,17 @@ enum Unplayed {
 }
 
 impl Hush {
-    /// Reads the open chat's messages' files; calls while a read runs are folded into one more.
-    pub(super) fn load_files(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        if self.files.loading {
-            self.files.again = true;
-            return;
-        }
-        self.files.loading = true;
-        cx.spawn(async move |this, cx| loop {
-            let page = this.update(cx, |app, _| {
-                let keys: Vec<_> = app.messages.iter().map(Message::key).collect();
-                (app.generation, keys)
-            });
-            let Ok((generation, keys)) = page else { return };
-            // one call for the page
-            let details = Compat::new(client.details(keys.clone())).await;
-            let again = this.update(cx, |app, cx| {
-                // another chat was opened meanwhile: its messages read its files
-                if app.generation == generation {
-                    app.files.by_message = with_details(&app.files.by_message, &keys, details);
-                    app.load_media(cx);
-                }
-                app.files.loading = std::mem::take(&mut app.files.again);
-                cx.notify();
-                app.files.loading
-            });
-            if !again.unwrap_or(false) {
-                break;
-            }
-        })
-        .detach();
+    /// The open chat's messages' details were read (with their reactions, `load_reactions`).
+    pub(super) fn files_loaded(&mut self, keys: &[MessageKey], details: &[MessageDetails], cx: &mut Context<Self>) {
+        self.files.by_message = with_details(&self.files.by_message, keys, details);
+        self.load_media(cx);
     }
 
-    /// A file was added or changed state (downloading, ready, failed).
+    /// A file was added or changed state (downloading, ready, failed): the page's details are
+    /// read again.
     pub(super) fn attachment_changed(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         if self.selected.as_deref() == Some(conversation_id) {
-            self.load_files(cx);
+            self.messages_loaded(cx);
         }
     }
 
@@ -1485,7 +1454,7 @@ mod tests {
         ]);
         // 1 lost its file, 2 wasn't read, 3 got one, 9 left the page
         let found = vec![details(1, vec![]), details(3, vec![file("video/mp4", None)])];
-        let new = with_details(&old, &[key(1), key(2), key(3)], found);
+        let new = with_details(&old, &[key(1), key(2), key(3)], &found);
         let mut kept: Vec<i64> = new.keys().map(|k| k.1).collect();
         kept.sort();
         assert_eq!(kept, [2, 3]);

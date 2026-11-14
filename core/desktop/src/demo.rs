@@ -1,8 +1,8 @@
 //! Made-up chats for `--snapshot`: the screens render without a core or anyone's real messages.
 
 use sig_core::projection::{
-    Attachment, AttachmentState, BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKind,
-    MessageStatus, TextStyle,
+    Attachment, AttachmentState, BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKey,
+    MessageKind, MessageStatus, Quote, Reaction, TextStyle,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
@@ -139,8 +139,18 @@ pub fn messages() -> Vec<Message> {
         length: 1,
         style: TextStyle::Mention { aci: ME.into() },
     }];
+    let mut salad = message(ME, 26 * 60 - 3, "Sure! And I'll make the salad.");
+    salad.quote = Some(Quote {
+        author: BOGDAN.into(),
+        sent_at: mention.sent_at,
+        text: mention.body.clone(),
+        ranges: mention.ranges.clone(),
+    });
     let mut delivered = message(ME, 40, "On my way, 20 minutes");
     delivered.status = MessageStatus::Delivered;
+    delivered.edited = true;
+    let mut failed = message(ME, 3, "Running a bit late");
+    failed.status = MessageStatus::Failed;
     let mut sending = message(ME, 1, "Dinner at 8? I'll bring dessert 🍰");
     sending.status = MessageStatus::Pending;
     let mut deleted = message(ANA, 30, "");
@@ -149,12 +159,13 @@ pub fn messages() -> Vec<Message> {
     vec![
         message(ANA, 26 * 60 + 5, "Who's coming on Sunday?"),
         mention,
-        message(ME, 26 * 60 - 3, "Sure! And I'll make the salad."),
+        salad,
         message(ANA, 45, "Great, everyone's in 🎉"),
         message(ANA, 44, "Mum says the table is booked for 8, the usual place near the park. Parking is tricky, so come early or take the tram."),
         delivered,
         deleted,
         message(BOGDAN, 5, "Traffic is terrible today"),
+        failed,
         sending,
     ]
 }
@@ -254,4 +265,27 @@ pub fn picture() -> Vec<u8> {
     sky.write_to(&mut out, image::ImageFormat::Png)
         .expect("a picture in memory is written");
     out.into_inner()
+}
+
+/// Reactions to "everyone's in" (ours among them) and to the salad.
+pub fn reactions(messages: &[Message]) -> Vec<(MessageKey, Vec<Reaction>)> {
+    let react = |reactor: &str, emoji: &str| Reaction {
+        reactor: reactor.into(),
+        emoji: emoji.into(),
+    };
+    let to = |body: &str| {
+        messages
+            .iter()
+            .find(|m| m.body.as_deref() == Some(body))
+            .map(Message::key)
+    };
+    let everyone = [react(BOGDAN, "❤️"), react(ME, "❤️"), react(ANA, "🎉")];
+    let salad = [react(ANA, "👍")];
+    [
+        ("Great, everyone's in 🎉", everyone.to_vec()),
+        ("Sure! And I'll make the salad.", salad.to_vec()),
+    ]
+    .into_iter()
+    .filter_map(|(body, r)| Some((to(body)?, r)))
+    .collect()
 }
