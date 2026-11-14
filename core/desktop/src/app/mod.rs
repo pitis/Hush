@@ -100,8 +100,7 @@ pub struct Hush {
     selected: Option<String>,
     /// The open chat's newest messages, oldest first.
     messages: Vec<Message>,
-    /// Bumped on every selection (and on opening a found message), so a load of what was shown
-    /// before is dropped.
+    /// Bumped on every selection, so a load for the chat open before is dropped.
     generation: u64,
     /// How many of the open chat's newest messages load: `PAGE`, or back to a found message.
     depth: u32,
@@ -269,8 +268,12 @@ impl Hush {
         )
         .detach();
         let timeline = cx.new(|cx| MessageScrollerState::new(0, cx));
-        // scrolling down to the newest message reads it
-        cx.observe(&timeline, |this, _, cx| this.mark_read(false, cx)).detach();
+        // scrolling down to the newest message reads it, and drops a deep jump's older rows
+        cx.observe(&timeline, |this, _, cx| {
+            this.mark_read(false, cx);
+            this.back_to_newest(cx);
+        })
+        .detach();
 
         Self {
             client: None,
@@ -407,9 +410,13 @@ impl Hush {
     }
 
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
-        if let CoreEvent::MessageExpired { key, .. } = &event {
-            self.message_expired(key, cx);
-            self.forget_hit(key);
+        match &event {
+            CoreEvent::MessageExpired { key, .. } => {
+                self.message_expired(key, cx);
+                self.forget_hit(key);
+            }
+            CoreEvent::MessageChanged { key, .. } => self.recheck_hit(key, cx),
+            _ => {}
         }
         match event {
             CoreEvent::LinkUrl { url } => {
@@ -600,7 +607,7 @@ impl Hush {
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
             return;
         };
-        let (generation, depth) = (self.generation, self.depth);
+        let (generation, mut depth) = (self.generation, self.depth);
         if self.messages_loading == Some(generation) {
             self.messages_again = true;
             return;
@@ -611,21 +618,30 @@ impl Hush {
             let page = Compat::new(client.messages(id.clone(), None, depth)).await;
             let again = this.update(cx, |app, cx| {
                 if app.generation != generation {
-                    return false; // another chat was opened meanwhile
+                    return None; // another chat was opened meanwhile
+                }
+                // more is wanted now (back to a found message): not shown, read again
+                if depth < app.depth {
+                    app.messages_again = false;
+                    return Some(app.depth);
                 }
                 match page {
                     Ok(page) => app.set_messages(page, cx),
-                    Err(e) => app.error = Some(format!("Couldn't load the messages: {e}")),
+                    Err(e) => {
+                        app.messages_failed();
+                        app.error = Some(format!("Couldn't load the messages: {e}"));
+                    }
                 }
                 let again = std::mem::take(&mut app.messages_again);
                 if !again {
                     app.messages_loading = None;
                 }
                 cx.notify();
-                again
+                again.then_some(app.depth)
             });
-            if !again.unwrap_or(false) {
-                break;
+            match again {
+                Ok(Some(wanted)) => depth = wanted,
+                _ => break,
             }
         })
         .detach();

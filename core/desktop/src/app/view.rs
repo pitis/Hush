@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, MoveDown, MoveUp, Textarea};
+use gpui_kit::component::input::{Escape, Input, MoveDown, MoveUp, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
@@ -254,6 +254,7 @@ impl Hush {
                             .capture_action(
                                 cx.listener(|this, _: &MoveDown, window, cx| this.step_results(1, window, cx)),
                             )
+                            .capture_action(cx.listener(|this, _: &Escape, window, cx| this.escape_search(window, cx)))
                             .child(icon("search", 14., p.secondary))
                             .child(
                                 Input::new(&self.search)

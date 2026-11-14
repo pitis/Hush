@@ -51,37 +51,55 @@ pub(super) struct Find {
     pub(super) scroll: ScrollHandle,
 }
 
-/// ⌘F and ⇧⌘F (Ctrl elsewhere) for the window, wherever its focus is (none at first): the window's
-/// views see a shortcut only on the way from the focused element.
+/// ⌘F and ⇧⌘F (Ctrl elsewhere); bound before the menus are set, which show them.
+pub fn keys() -> [KeyBinding; 2] {
+    // `secondary-` is for keymap files: `KeyBinding::new` doesn't know the system and panics on it
+    let (find, in_chat) = if cfg!(target_os = "macos") {
+        ("cmd-f", "cmd-shift-f")
+    } else {
+        ("ctrl-f", "ctrl-shift-f")
+    };
+    [
+        KeyBinding::new(find, Search, None),
+        KeyBinding::new(in_chat, SearchInChat, None),
+    ]
+}
+
+/// What `keys` do, wherever the window's focus is (none at first): the window's views see a
+/// shortcut only on the way from the focused element.
 pub fn shortcuts(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-f", Search, None),
-        KeyBinding::new("secondary-shift-f", SearchInChat, None),
-    ]);
+    let on = move |hush: WeakEntity<Hush>, f: fn(&mut Hush, &mut Window, &mut Context<Hush>), cx: &mut App| {
+        // once the dispatch is over: it holds the window, which can't be updated inside it
+        cx.defer(move |cx| {
+            let done = window.update(cx, |_, window, cx| hush.update(cx, |app, cx| f(app, window, cx)));
+            if let Err(e) = done.and_then(|r| r) {
+                tracing::warn!(error = %e, "a search shortcut found no window");
+            }
+        });
+    };
     let weak = hush.clone();
-    cx.on_action(move |_: &Search, cx| {
-        let _ = window.update(cx, |_, window, cx| {
-            weak.update(cx, |app, cx| app.focus_search(window, cx))
-        });
-    });
-    cx.on_action(move |_: &SearchInChat, cx| {
-        let _ = window.update(cx, |_, window, cx| {
-            hush.update(cx, |app, cx| app.search_in_chat(window, cx))
-        });
-    });
+    cx.on_action(move |_: &Search, cx| on(weak.clone(), Hush::focus_search, cx));
+    cx.on_action(move |_: &SearchInChat, cx| on(hush.clone(), Hush::search_in_chat, cx));
 }
 
 impl Hush {
+    /// The sidebar is there, with no dialog over it.
+    fn can_search(&self) -> bool {
+        matches!(self.screen, Screen::Chats) && self.dialog.is_none()
+    }
+
     /// The sidebar's search field gets the keys.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.screen, Screen::Chats) && self.dialog.is_none() {
+        if self.can_search() {
             self.search.update(cx, |s, cx| s.focus(window, cx));
         }
     }
 
-    /// Searches the open chat only.
+    /// Searches the open chat only; nothing with no chat open (the Mac app's item is disabled).
     fn search_in_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.clone() else { return };
+        let Some(id) = self.selected.clone().filter(|_| self.can_search()) else {
+            return;
+        };
         if self.find.scope.as_ref() != Some(&id) {
             self.find.scope = Some(id);
             self.schedule_search(cx);
@@ -94,6 +112,21 @@ impl Hush {
     pub(super) fn end_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find.scope = None;
         self.clear_search(window, cx);
+    }
+
+    /// Esc in the search field: its text goes (the field clears itself); once it is empty, the
+    /// search ends and the keys go back to the open chat.
+    pub(super) fn escape_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search.read(cx).value().is_empty() {
+            return;
+        }
+        cx.stop_propagation();
+        self.end_search(window, cx);
+        if self.selected.is_some() {
+            self.composer.update(cx, |c, cx| c.focus(window, cx));
+        } else {
+            window.blur(cx);
+        }
     }
 
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -135,6 +168,28 @@ impl Hush {
                 cx.notify();
             });
         }));
+    }
+
+    /// A result's message changed: one deleted for everyone leaves the results, its text with it.
+    pub(super) fn recheck_hit(&mut self, key: &MessageKey, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        if !self.find.hits.iter().any(|h| h.message.key() == *key) {
+            return;
+        }
+        let key = key.clone();
+        cx.spawn(async move |this, cx| {
+            // one that didn't read stays: that isn't a deletion
+            let Ok(now) = Compat::new(client.message(key.clone())).await else {
+                return;
+            };
+            if now.is_none_or(|m| m.deleted) {
+                let _ = this.update(cx, |app, cx| {
+                    app.forget_hit(&key);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// A message gone for good leaves no result behind.
@@ -222,8 +277,7 @@ impl Hush {
                     Ok(Some(depth)) => {
                         app.depth = depth;
                         app.find.jump = Some(key);
-                        // what is loading now (the newest messages) is dropped
-                        app.generation += 1;
+                        // a load of the newest messages still on its way is read again this deep
                         app.reload_messages(cx);
                     }
                     Ok(None) => app.error = Some("That message is too far back to show yet.".into()),
@@ -233,6 +287,23 @@ impl Hush {
             });
         })
         .detach();
+    }
+
+    /// The open chat's messages didn't load: a found message waiting for them isn't scrolled to
+    /// by a later load.
+    pub(super) fn messages_failed(&mut self) {
+        self.find.jump = None;
+    }
+
+    /// Back at the newest message after a found one was shown: only the newest page loads again
+    /// (the rows back to it are off screen by then), so a deep jump isn't reloaded and redrawn
+    /// for as long as the chat stays open.
+    pub(super) fn back_to_newest(&mut self, cx: &mut Context<Self>) {
+        let at_end = !self.timeline.read(cx).is_scrolled_up();
+        if self.depth > PAGE && self.find.jump.is_none() && at_end {
+            self.depth = PAGE;
+            self.reload_messages(cx);
+        }
     }
 
     /// Once the opened message's chat is loaded: to it, highlighted for a moment.
@@ -581,5 +652,131 @@ mod tests {
         assert_eq!(chat_to_open(&shown, Some("g:x")).as_deref(), Some("c:a"));
         assert_eq!(chat_to_open(&shown, None).as_deref(), Some("c:a"));
         assert_eq!(chat_to_open(&[], Some("c:a")), None);
+    }
+}
+
+/// The search in a real (headless) window: keys and actions go through GPUI's dispatch. Needs GPUI's
+/// test support, which `snapshot` turns on: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::WindowOptions;
+    use gpui_kit::{gpui, AnyWindowHandle, App, AppContext as _, Entity, FocusHandle, Focusable as _, TestAppContext};
+
+    use super::super::{Hush, PAGE};
+    use super::{keys, shortcuts, Search, SearchInChat};
+    use crate::Demo;
+
+    fn open(screen: Demo, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>) {
+        let opened = cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.bind_keys(keys());
+            let (window, hush) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(screen, window, cx))
+            })
+            .expect("the window opens");
+            shortcuts(window, hush.downgrade(), cx);
+            (window, hush)
+        });
+        cx.run_until_parked();
+        opened
+    }
+
+    /// Whether `field` of the app has the keys.
+    fn focused(
+        window: AnyWindowHandle,
+        hush: &Entity<Hush>,
+        field: fn(&Hush, &App) -> FocusHandle,
+        cx: &mut TestAppContext,
+    ) -> bool {
+        window
+            .update(cx, |_, window, cx| field(hush.read(cx), cx).is_focused(window))
+            .expect("the window is open")
+    }
+
+    fn search(app: &Hush, cx: &App) -> FocusHandle {
+        app.search.focus_handle(cx)
+    }
+
+    fn scope(hush: &Entity<Hush>, cx: &mut TestAppContext) -> Option<String> {
+        hush.read_with(cx, |app, _| app.find.scope.clone())
+    }
+
+    #[gpui::test]
+    fn search_shortcuts_and_menu_items_reach_the_field_from_anywhere(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        // nothing has the keys yet
+        cx.simulate_keystrokes(window, "secondary-f");
+        assert!(focused(window, &hush, search, cx), "⌘F with nothing focused");
+
+        // from the composer, whose own find is off
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| app.composer.update(cx, |c, cx| c.focus(window, cx)))
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window, "secondary-f");
+        assert!(focused(window, &hush, search, cx), "⌘F from the composer");
+
+        // ⇧⌘F: the open chat only
+        cx.simulate_keystrokes(window, "secondary-shift-f");
+        assert_eq!(scope(&hush, cx).as_deref(), Some("g:01"));
+
+        // the menu items dispatch the same actions
+        let (window, hush) = open(Demo::Chat, cx);
+        cx.dispatch_action(window, Search);
+        assert!(focused(window, &hush, search, cx), "the Search menu item");
+        cx.dispatch_action(window, SearchInChat);
+        assert_eq!(
+            scope(&hush, cx).as_deref(),
+            Some("g:01"),
+            "the Search in Chat menu item"
+        );
+    }
+
+    #[gpui::test]
+    fn search_in_chat_waits_for_the_dialog(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::NewGroup, cx);
+        cx.dispatch_action(window, SearchInChat);
+        assert_eq!(scope(&hush, cx), None, "the sidebar behind the dialog stays as it is");
+    }
+
+    #[gpui::test]
+    fn escape_clears_the_search_then_ends_it(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        cx.simulate_keystrokes(window, "secondary-shift-f");
+        cx.simulate_input(window, "pot");
+        assert_eq!(hush.read_with(cx, |app, _| app.query.clone()), "pot");
+
+        // with text: the text goes, the chat search stays
+        cx.simulate_keystrokes(window, "escape");
+        assert_eq!(hush.read_with(cx, |app, _| app.query.clone()), "");
+        assert_eq!(scope(&hush, cx).as_deref(), Some("g:01"));
+        assert!(focused(window, &hush, search, cx));
+
+        // empty: the search ends, and the keys go back to the chat
+        cx.simulate_keystrokes(window, "escape");
+        assert_eq!(scope(&hush, cx), None);
+        assert!(focused(window, &hush, |app, cx| app.composer.focus_handle(cx), cx));
+    }
+
+    #[gpui::test]
+    fn back_at_the_newest_message_a_chat_loads_only_its_newest_again(cx: &mut TestAppContext) {
+        let (_, hush) = open(Demo::Chat, cx);
+        let notify = |hush: &Entity<Hush>, cx: &mut TestAppContext| {
+            hush.update(cx, |app, cx| app.timeline.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+        };
+        // a found message is still on its way: its load is kept
+        hush.update(cx, |app, _| {
+            app.depth = 500;
+            app.find.jump = Some(app.messages[0].key());
+        });
+        notify(&hush, cx);
+        assert_eq!(hush.read_with(cx, |app, _| app.depth), 500);
+
+        // shown, and the timeline is at its end again (the demo chat fits the window)
+        hush.update(cx, |app, _| app.find.jump = None);
+        notify(&hush, cx);
+        assert_eq!(hush.read_with(cx, |app, _| app.depth), PAGE);
     }
 }

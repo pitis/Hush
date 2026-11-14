@@ -31,6 +31,7 @@ fn main() {
             gpui_kit::init(cx);
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
+            cx.bind_keys(app::search::keys());
             cx.set_menus([
                 Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
                 Menu::new("Chats").items([
