@@ -40,13 +40,16 @@ pub(super) struct Row {
     /// Above the first of a run in a group: the sender's name, in their colour.
     sender: Option<(String, Hsla)>,
     gutter: Gutter,
-    text: String,
+    pub(super) text: String,
     /// Its styles (`text::styled`).
     runs: text::Runs,
     /// Deleted: said in italics.
     note: bool,
     /// Above the text, which is empty without a caption.
     files: Vec<files::Shown>,
+    /// A sticker message's picture, in place of its words and its bubble; or, not downloaded,
+    /// its download beside its words.
+    pub(super) sticker: Option<files::Sticker>,
     /// Under the files.
     preview: Option<previews::Card>,
     // a poll's card or view-once media's button, in place of its words
@@ -56,7 +59,7 @@ pub(super) struct Row {
     time: String,
     status: Option<MessageStatus>,
     /// What assistive technology reads: who, what, when.
-    label: String,
+    pub(super) label: String,
     actions: Rc<actions::RowActions>,
     /// Just opened from the search: outlined for a moment.
     found: bool,
@@ -111,9 +114,10 @@ impl Hush {
             _ if hidden => text::plain(m.body.as_deref().unwrap_or_default(), &m.ranges, |aci| self.name(aci)),
             _ => body.clone(),
         };
-        let (poll, view_once) = (self.poll_card(m), self.view_once_state(m));
-        // its card or button stands for its words (still read out)
-        let (body, runs) = match poll.is_some() || view_once.is_some() {
+        let (poll, view_once, sticker) = (self.poll_card(m), self.view_once_state(m), self.files.sticker(m));
+        // its card, button or picture stands for its words (still read out)
+        let pictured = matches!(sticker, Some(files::Sticker::Picture(_)));
+        let (body, runs) = match poll.is_some() || view_once.is_some() || pictured {
             true => (String::new(), vec![]),
             false => (body, runs),
         };
@@ -138,6 +142,7 @@ impl Hush {
             label: format!("{name}: {spoken}. {time}{gone}{said}"),
             text: body,
             files,
+            sticker,
             preview: self.preview_card(m),
             poll,
             view_once,
@@ -985,6 +990,9 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
     } else {
         (p.bubble_in.into(), p.text_in, p.bubble_in)
     };
+    // a sticker stands on its own, without a bubble (`MessageRow`): its time is on the timeline
+    let lone = matches!(row.sticker, Some(files::Sticker::Picture(_)));
+    let (color, behind) = if lone { (p.text, p.window) } else { (color, behind) };
     let meta_color = color.opacity(0.6);
     let meta = h_flex()
         .flex_none()
@@ -997,7 +1005,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         .child(row.time.clone())
         .children(row.status.map(|s| match s {
             MessageStatus::Failed => actions::view::retry(&row.actions, act, p),
-            s => tick(s, 10., meta_color, p.bubble_out, p),
+            s => tick(s, 10., meta_color, behind, p),
         }));
     let line = h_flex()
         .max_w_full()
@@ -1021,14 +1029,15 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         })
         .children(polls::card(&row.poll, this, color, behind))
         .children(view_once::bubble(&row.view_once, this, color))
-        .child(meta);
+        .children(row.sticker.as_ref().map(|s| files::sticker(s, this, color, behind)))
+        .child(if lone { backed(meta, row.backed, p) } else { meta });
     let bubble = v_flex()
         .max_w_full()
         .gap(px(4.))
         .px(px(12.))
         .py(px(8.))
         .rounded(px(18.))
-        .bg(fill)
+        .when(!lone, |this| this.bg(fill))
         .text_color(color)
         .children(actions::view::quote(&row.actions, act, p, behind))
         // files without a caption: the time sits under them on the right

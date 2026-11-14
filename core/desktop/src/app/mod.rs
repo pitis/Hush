@@ -38,6 +38,7 @@ mod polls;
 mod previews;
 pub mod search;
 pub mod settings;
+mod stickers;
 pub mod systray;
 mod typing;
 mod view;
@@ -189,6 +190,7 @@ pub struct Hush {
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
+    stickers: stickers::Stickers,
     systray: systray::Systray,
 }
 
@@ -429,6 +431,7 @@ impl Hush {
             view_once: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
+            stickers: Default::default(),
             systray: Default::default(),
         }
     }
@@ -522,6 +525,12 @@ impl Hush {
                 if let crate::Demo::ViewOnce = screen {
                     app.demo_view_once(window, cx);
                 }
+            }
+            crate::Demo::Stickers | crate::Demo::StickerPicker => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.demo_stickers(matches!(screen, crate::Demo::StickerPicker), window, cx);
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;

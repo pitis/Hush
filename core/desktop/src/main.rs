@@ -159,6 +159,10 @@ pub enum Demo {
     ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
+    /// The chat with stickers received, sent and still to download.
+    Stickers,
+    /// The sticker picker open over it.
+    StickerPicker,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -196,6 +200,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("polls", Demo::Polls),
                 ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),
+                ("stickers", Demo::Stickers),
+                ("sticker-picker", Demo::StickerPicker),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
