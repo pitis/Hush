@@ -9,6 +9,8 @@ use sig_core::projection::{
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
 pub const ANA: &str = "11111111-1111-4111-8111-111111111111";
 pub const BOGDAN: &str = "22222222-2222-4222-8222-222222222222";
+/// Asks to message us: a message request.
+pub const STRANGER: &str = "33333333-3333-4333-8333-333333333333";
 const HOUR: i64 = 3_600_000;
 
 pub fn names() -> Vec<(String, String)> {
@@ -105,13 +107,15 @@ pub fn chats() -> Vec<Conversation> {
         file_name: None,
         is_voice_note: false,
     });
-    let note = chat(
+    let mut note = chat(
         &format!("c:{ME}"),
         ConversationKind::Direct,
         "",
         30,
         "Passport number is in the drawer",
     );
+    // all of Note to Self's are ours
+    note.last_message_outgoing = true;
     let mut club = chat(
         "g:02",
         ConversationKind::Group,
@@ -121,16 +125,10 @@ pub fn chats() -> Vec<Conversation> {
     );
     club.last_message_author = BOGDAN.into();
     club.unread_count = 12;
-    let mut stranger = chat(
-        "c:33333333-3333-4333-8333-333333333333",
-        ConversationKind::Direct,
-        "",
-        200,
-        "Hi!",
-    );
+    let mut stranger = chat(&format!("c:{STRANGER}"), ConversationKind::Direct, "", 200, "Hi!");
     stranger.message_request = true;
     stranger.username = Some("radu.42".into());
-    // only a search shows it
+    // archived: the archive, or a search, shows it
     let mut swap = chat("g:03", ConversationKind::Group, "Book swap", 900, "Who has Dune?");
     swap.archived = true;
     vec![family, ana, bogdan, note, club, stranger, swap]
@@ -197,6 +195,13 @@ pub fn timed_chat() -> (Vec<Message>, Vec<ChatEvent>) {
         event(9, 10, DecryptionFailed, None),
     ];
     (messages, events)
+}
+
+/// The message request's messages.
+pub fn request() -> Vec<Message> {
+    let mut hi = message(STRANGER, 200 * 60, "Hi!");
+    hi.conversation_id = format!("c:{STRANGER}");
+    vec![hi]
 }
 
 /// Messages found for "book" in every chat, newest first.

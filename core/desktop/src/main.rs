@@ -124,6 +124,12 @@ pub enum Demo {
     Events,
     /// That chat in its colour, on its wallpaper, the picker open.
     ChatStyle,
+    /// The chat, a row's right-click menu open.
+    ChatMenu,
+    /// A message request open: its answers in place of the composer.
+    Request,
+    /// The archived chats listed.
+    Archive,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -150,6 +156,9 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("link-preview", Demo::LinkPreview),
                 ("events", Demo::Events),
                 ("chat-style", Demo::ChatStyle),
+                ("chat-menu", Demo::ChatMenu),
+                ("request", Demo::Request),
+                ("archive", Demo::Archive),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
@@ -167,11 +176,14 @@ fn snapshot(dir: std::path::PathBuf) {
                         });
                         let Ok((window, _)) = opened else { continue };
                         // layout settles over a few frames (the timeline measures its rows)
-                        for _ in 0..4 {
+                        for frame in 0..4 {
                             cx.background_executor()
                                 .timer(std::time::Duration::from_millis(150))
                                 .await;
                             let _ = window.update(cx, |_, window, cx| {
+                                if frame == 1 && matches!(screen, Demo::ChatMenu) {
+                                    right_click_ana(window, cx);
+                                }
                                 window.refresh();
                                 let _ = window.draw(cx);
                             });
@@ -189,6 +201,37 @@ fn snapshot(dir: std::path::PathBuf) {
             })
             .detach();
         });
+}
+
+/// A right-click on Ana's row, under the search field, the pinned Family and the Chats title, and
+/// on macOS the window buttons' strip (the rows laid out by a frame already).
+#[cfg(feature = "snapshot")]
+fn right_click_ana(window: &mut Window, cx: &mut App) {
+    let at = point(px(120.), px(if cfg!(target_os = "macos") { 238. } else { 194. }));
+    let modifiers = Modifiers::default();
+    let events = [
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: at,
+            pressed_button: None,
+            modifiers,
+        }),
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        }),
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Right,
+            position: at,
+            modifiers,
+            click_count: 1,
+        }),
+    ];
+    for event in events {
+        window.dispatch_event(event, cx);
+    }
 }
 
 #[cfg(test)]

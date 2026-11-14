@@ -565,12 +565,11 @@ mod tests {
 /// The events in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
-    use std::sync::Arc;
-
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Entity, TestAppContext, WindowOptions};
     use sig_core::projection::{ChatEvent, ChatEventKind, Conversation, ConversationKind};
     use sig_core::CoreEvent;
 
+    use super::super::attach::window_tests::with_core;
     use super::super::{Hush, PAGE};
     use super::Line;
     use crate::demo::{ANA, ME};
@@ -597,21 +596,6 @@ mod window_tests {
         window
             .update(cx, |_, window, cx| hush.update(cx, |app, cx| f(app, window, cx)))
             .unwrap();
-    }
-
-    struct Quiet;
-
-    impl sig_core::EventListener for Quiet {
-        fn on_event(&self, _: CoreEvent) {}
-    }
-
-    /// A core that isn't linked, in a data folder of its own.
-    fn with_core(hush: &Entity<Hush>, name: &str, cx: &mut TestAppContext) {
-        let dir = std::env::temp_dir().join(format!("hush-desktop-events-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let client = sig_core::Client::open(dir.to_str().unwrap().into(), "ab".repeat(32), Arc::new(Quiet)).unwrap();
-        hush.update(cx, |app, _| app.client = Some(client));
     }
 
     fn open_chat(app: &Hush) -> Conversation {
@@ -673,7 +657,9 @@ mod window_tests {
     #[gpui::test]
     fn the_reset_asks_first_and_one_the_core_refuses_is_said(cx: &mut TestAppContext) {
         let (window, hush) = open(cx);
-        with_core(&hush, "reset", cx);
+        let data = std::env::temp_dir().join(format!("hush-desktop-events-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        with_core(&hush, &data, cx);
         let chat = format!("c:{ANA}");
         let ask = |cx: &mut TestAppContext| {
             let chat = chat.clone();

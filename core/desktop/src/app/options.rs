@@ -2,9 +2,6 @@
 //! disappearing-message timer, and its colour and wallpaper (`ChatStylePicker`), which are this
 //! computer's only.
 
-use async_compat::Compat;
-use futures::future::LocalBoxFuture;
-use futures::FutureExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
@@ -12,11 +9,10 @@ use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{ChatColor, Conversation, ConversationKind};
-use sig_core::CoreError;
 
 use super::actions::view::Trigger;
 use super::view::icon;
-use super::{describe, Hush};
+use super::Hush;
 use crate::style::{self, Palette};
 use crate::text;
 
@@ -137,38 +133,21 @@ impl Hush {
 
     /// Sets a direct chat's disappearing-message timer, for both sides.
     fn set_timer(&mut self, id: String, seconds: u32, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        let work = async move { client.set_disappearing_timer(id, seconds).await };
-        self.change("set the disappearing timer", work.boxed_local(), cx);
+        self.change("set the disappearing timer", cx, move |client| async move {
+            client.set_disappearing_timer(id, seconds).await
+        });
     }
 
     fn set_chat_color(&mut self, id: String, color: Option<ChatColor>, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        let work = async move { client.set_chat_color(id, color).await };
-        self.change("set the chat colour", work.boxed_local(), cx);
+        self.change("set the chat colour", cx, move |client| async move {
+            client.set_chat_color(id, color).await
+        });
     }
 
     fn set_wallpaper(&mut self, id: String, wallpaper: Option<ChatColor>, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        let work = async move { client.set_wallpaper(id, wallpaper).await };
-        self.change("set the wallpaper", work.boxed_local(), cx);
-    }
-
-    /// A change to the chat, said if it fails (it shows once the core has it).
-    fn change(
-        &mut self,
-        what: &'static str,
-        work: LocalBoxFuture<'static, Result<(), CoreError>>,
-        cx: &mut Context<Self>,
-    ) {
-        cx.spawn(async move |this, cx| {
-            let Err(e) = Compat::new(work).await else { return };
-            let _ = this.update(cx, |app, cx| {
-                app.error = Some(format!("Couldn't {what}: {}", describe(&e)));
-                cx.notify();
-            });
-        })
-        .detach();
+        self.change("set the wallpaper", cx, move |client| async move {
+            client.set_wallpaper(id, wallpaper).await
+        });
     }
 
     /// `--snapshot`'s chat colour and wallpaper, with the picker open.
@@ -322,18 +301,11 @@ mod tests {
 /// The options in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
-    use std::sync::Arc;
-
     use gpui_kit::{gpui, AppContext as _, TestAppContext, WindowOptions};
 
+    use super::super::attach::window_tests::with_core;
     use super::super::Hush;
     use crate::Demo;
-
-    struct Quiet;
-
-    impl sig_core::EventListener for Quiet {
-        fn on_event(&self, _: sig_core::CoreEvent) {}
-    }
 
     #[gpui::test]
     fn a_change_the_core_refuses_is_said(cx: &mut TestAppContext) {
@@ -344,13 +316,11 @@ mod window_tests {
             })
             .expect("the window opens")
         });
-        let dir = std::env::temp_dir().join(format!("hush-desktop-options-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let data = std::env::temp_dir().join(format!("hush-desktop-options-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
         // not linked: it sends nothing
-        let client = sig_core::Client::open(dir.to_str().unwrap().into(), "ab".repeat(32), Arc::new(Quiet)).unwrap();
+        with_core(&hush, &data, cx);
         hush.update(cx, |app, cx| {
-            app.client = Some(client);
             let chat = app.selected.clone().unwrap();
             app.set_timer(chat, 30, cx);
         });

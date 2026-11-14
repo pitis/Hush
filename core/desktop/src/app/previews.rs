@@ -774,7 +774,7 @@ mod window_tests {
         window
             .update(cx, |_, window, cx| {
                 hush.update(cx, |app, cx| {
-                    app.drafts.insert(ana.clone(), "see https://example.com/a".into());
+                    app.drafts.keep(&ana, "see https://example.com/a".into());
                     app.select(ana, window, cx);
                 })
             })
