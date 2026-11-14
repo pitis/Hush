@@ -23,12 +23,14 @@ use super::Hush;
 
 mod view;
 
-pub(super) use view::{disc, render};
+pub(super) use view::{disc, render, sticker};
 
 /// An image bubble's longest side at most (`Files.imageBox`).
 const IMAGE_BOX: f64 = 320.;
 /// Pictures are decoded at most this many pixels either way: the box at 2× (`Thumbnails.maxPixels`).
 const MAX_PIXELS: u32 = 640;
+/// A sticker in the timeline: at most 160×160, at 2×.
+pub(super) const STICKER_PIXELS: u32 = 320;
 
 /// Decoded pictures are kept up to this many bytes (20 photos), least recently drawn going first,
 /// as the Mac app's `Thumbnails` does: a chat with hundreds of photos holds no more.
@@ -144,8 +146,9 @@ pub(super) struct Files {
     drawn: RefCell<HashMap<String, u64>>,
     /// Frames drawn (`new_frame`).
     frame: Cell<u64>,
-    /// Pictures whose rows were drawn with none decoded (or it was let go): decoded next.
-    wanted: RefCell<Vec<(i64, String)>>,
+    /// Pictures whose rows were drawn with none decoded (or it was let go), and at most how many
+    /// pixels either way: decoded next.
+    wanted: RefCell<Vec<(i64, String, u32)>>,
     /// A picture is being decoded: one at a time (a full photo is decoded before it's shrunk).
     decoding: bool,
     /// Recordings' lengths by file; None: unknown until played.
@@ -253,6 +256,14 @@ pub(super) struct Shown {
     pub look: Look,
 }
 
+/// A sticker message's picture as its row shows it.
+pub(super) enum Sticker {
+    /// Its picture, once decoded: on its own, without a bubble.
+    Picture(Option<Arc<RenderImage>>),
+    /// Not downloaded (yet): its words, with the download.
+    Fetch(Attachment),
+}
+
 pub(super) enum Look {
     /// Its picture, once decoded.
     Picture(Option<Arc<RenderImage>>),
@@ -304,7 +315,7 @@ impl Files {
             let path = ready_path(a);
             let thumb = path.as_ref().and_then(|path| self.thumbs.get(path));
             if let Some(path) = path {
-                self.drew(a.id, path, thumb.is_none());
+                self.drew(a.id, path, MAX_PIXELS, thumb.is_none());
             }
             return match thumb {
                 // one that didn't read or says it is a picture but isn't: still there to open
@@ -328,15 +339,52 @@ impl Files {
         Look::File
     }
 
+    /// A sticker message's picture (`Placeholder.stickerImage`), its file still to fetch, or None
+    /// for one that shows its words: deleted, an animated (Lottie) one, which isn't a picture,
+    /// or one that doesn't decode. An animated picture shows its first frame, as on the Mac.
+    pub(super) fn sticker(&self, m: &Message) -> Option<Sticker> {
+        if m.deleted || !matches!(m.kind, MessageKind::Sticker { .. }) {
+            return None;
+        }
+        let a = self.by_message.get(&(m.author.clone(), m.sent_at))?.first()?;
+        if !is_image(a) {
+            return None;
+        }
+        let Some(path) = ready_path(a) else {
+            return Some(Sticker::Fetch(a.clone()));
+        };
+        let thumb = self.thumbs.get(&path);
+        self.drew(a.id, path, STICKER_PIXELS, thumb.is_none());
+        match thumb {
+            Some(Thumb::Failed) => None,
+            Some(Thumb::Shown(thumb)) => Some(Sticker::Picture(Some(thumb.clone()))),
+            _ => Some(Sticker::Picture(None)),
+        }
+    }
+
+    /// A picture that isn't a message's (a sticker in the picker) at most `max` pixels either way,
+    /// decoded and let go as the timeline's are, within their budget; None until decoded, or if
+    /// it doesn't decode.
+    pub(super) fn picture_at(&self, path: &str, max: u32) -> Option<Arc<RenderImage>> {
+        let thumb = self.thumbs.get(path);
+        // no file id: the log names it 0
+        self.drew(0, path.to_owned(), max, thumb.is_none());
+        match thumb {
+            Some(Thumb::Shown(thumb)) => Some(thumb.clone()),
+            _ => None,
+        }
+    }
+
     /// A frame is being drawn: rows drawn from now on are in it.
     pub(super) fn new_frame(&self) {
         self.frame.set(self.frame.get() + 1);
     }
 
-    /// A picture's row is drawn in this frame, and its picture is decoded if it isn't.
-    fn drew(&self, id: i64, path: String, missing: bool) {
+    /// A picture's row is drawn in this frame, and its picture is decoded (at most `max` pixels
+    /// either way) if it isn't.
+    fn drew(&self, id: i64, path: String, max: u32, missing: bool) {
         if missing {
-            self.wanted.borrow_mut().push((id, path.clone()));
+            self.wanted.borrow_mut().push((id, path.clone(), max));
         }
         self.drawn.borrow_mut().insert(path, self.frame.get());
     }
@@ -349,13 +397,13 @@ impl Files {
     /// The next drawn picture to decode, the last drawn first: it's loading from now. One whose
     /// row wasn't drawn in the last frame (scrolled past) is skipped; drawn again, it's asked for
     /// again.
-    fn next_wanted(&mut self) -> Option<(i64, String)> {
+    fn next_wanted(&mut self) -> Option<(i64, String, u32)> {
         let frame = self.frame.get();
-        while let Some((id, path)) = self.wanted.get_mut().pop() {
+        while let Some((id, path, max)) = self.wanted.get_mut().pop() {
             let on_screen = self.drawn.get_mut().get(&path) == Some(&frame);
             if on_screen && !self.thumbs.contains_key(&path) {
                 self.thumbs.insert(path.clone(), Thumb::Loading);
-                return Some((id, path));
+                return Some((id, path, max));
             }
         }
         None
@@ -416,6 +464,12 @@ impl Files {
         }
         shown
     }
+
+    /// A made-up picture for file `path`, for `--snapshot`.
+    #[cfg(feature = "snapshot")]
+    pub(super) fn demo_picture(&mut self, path: String, picture: RenderImage) {
+        self.thumbs.insert(path, Thumb::Shown(Arc::new(picture)));
+    }
 }
 
 /// The files after the core's details of some messages were read: theirs as read, the others'
@@ -473,17 +527,18 @@ impl Hush {
     }
 
     /// Only the `loaded` messages' files stay, with what is shown of them: rows that went let
-    /// their pictures' memory go (one still decoding isn't).
+    /// their pictures' memory go (one still decoding isn't), but the open sticker picker's.
     pub(super) fn keep_files(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
+        let picked = self.picker_paths();
         let f = &mut self.files;
         f.by_message.retain(|k, _| loaded.contains(k));
         let files = f.by_message.values().flatten();
         let ids: HashSet<i64> = files.clone().map(|a| a.id).collect();
-        let paths: HashSet<String> = files.filter_map(ready_path).collect();
+        let paths: HashSet<String> = files.filter_map(ready_path).chain(picked).collect();
         let gone = f.thumbs.extract_if(|path, _| !paths.contains(path));
         drop_thumbs(gone.map(|(_, thumb)| thumb).collect(), cx);
         f.drawn.get_mut().retain(|path, _| paths.contains(path));
-        f.wanted.get_mut().retain(|(_, path)| paths.contains(path));
+        f.wanted.get_mut().retain(|(_, path, _)| paths.contains(path));
         f.lengths.retain(|id, _| ids.contains(id));
         f.unplayable.retain(|id| ids.contains(id));
     }
@@ -502,10 +557,10 @@ impl Hush {
                 app.files.decoding = next.is_some();
                 next
             });
-            let Ok(Some((id, path))) = next else { return };
+            let Ok(Some((id, path, max))) = next else { return };
             // decrypted in memory only
             let thumb = match Compat::new(client.file_bytes(path.clone())).await {
-                Ok(bytes) => cx.background_spawn(async move { thumbnail(&bytes) }).await,
+                Ok(bytes) => cx.background_spawn(async move { picture(&bytes, max) }).await,
                 Err(e) => Err(format!("it didn't read: {e}")),
             };
             let shown = this.update(cx, |app, cx| {
@@ -1143,7 +1198,7 @@ pub(super) fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
 }
 
 /// A picture decoded at most `max` pixels either way, turned as its photo says, in GPUI's BGRA;
-/// or why not.
+/// or why not. An animated picture's first frame (as the Mac app's `Thumbnails`).
 pub(super) fn picture(bytes: &[u8], max: u32) -> Result<RenderImage, String> {
     let mut pixels = upright(bytes, max)?.into_rgba8();
     for pixel in pixels.as_chunks_mut::<4>().0 {
@@ -1242,9 +1297,9 @@ pub(super) fn mark_from_elsewhere(_: &Path) -> std::io::Result<()> {
 mod tests {
     // not `super::*`: GPUI's `test` attribute would come with it
     use super::{
-        byte_count, clear_open_copies, clock, display_size, file_name, is_audio, is_image, length, openable,
-        picture_bytes, thumbnail, view, with_details, Attachment, Clock, Copy, Duration, Files, Look, Thumb, Tick,
-        PICTURE_BUDGET, PLAY_LIMIT,
+        byte_count, clear_open_copies, clock, display_size, file_name, is_audio, is_image, length, openable, picture,
+        picture_bytes, thumbnail, view, with_details, Attachment, Clock, Copy, Duration, Files, Look, Sticker, Thumb,
+        Tick, MAX_PIXELS, PICTURE_BUDGET, PLAY_LIMIT, STICKER_PIXELS,
     };
     use gpui_kit::{DevicePixels, Size};
     use sig_core::projection::{AttachmentState, Message, MessageDetails, MessageKey, MessageKind, MessageStatus};
@@ -1323,7 +1378,7 @@ mod tests {
             for a in rows {
                 files.look(a);
             }
-            while let Some((_, path)) = files.next_wanted() {
+            while let Some((_, path, _)) = files.next_wanted() {
                 decodes.set(decodes.get() + 1);
                 let gone = files.decoded(path, Thumb::Shown(decoded.clone()));
                 let_go.set(let_go.get() + gone.len());
@@ -1355,7 +1410,7 @@ mod tests {
         // scrolled down again: the photos let go are decoded again as their rows show
         files.new_frame();
         files.look(&photo(149));
-        assert_eq!(files.next_wanted(), Some((149, "p149".to_string())));
+        assert_eq!(files.next_wanted(), Some((149, "p149".to_string(), MAX_PIXELS)));
 
         // an album of 30 photos is one row, more than the budget: while it shows, all of it
         // stays, and nothing is decoded again and again
@@ -1591,6 +1646,86 @@ mod tests {
         let mut other = message(MessageKind::Normal);
         other.sent_at = 2;
         assert!(files.of(&other).is_empty(), "another message's");
+    }
+
+    #[test]
+    fn a_sticker_shows_its_picture_once_decoded_else_its_words() {
+        let sticker = message(MessageKind::Sticker {
+            emoji: Some("🦊".into()),
+        });
+        let with = |a: Attachment, thumb: Option<Thumb>| {
+            let mut files = Files::default();
+            if let (Some(path), Some(thumb)) = (a.path.clone(), thumb) {
+                files.thumbs.insert(path, thumb);
+            }
+            files.by_message.insert(("a".into(), 1), vec![a]);
+            files
+        };
+        let webp = Attachment {
+            path: Some("s1".into()),
+            ..file("image/webp", None)
+        };
+        // downloaded: decoded at a sticker's size, then shown
+        let mut files = with(webp.clone(), None);
+        files.new_frame();
+        assert!(matches!(files.sticker(&sticker), Some(Sticker::Picture(None))));
+        assert_eq!(files.next_wanted(), Some((1, "s1".into(), STICKER_PIXELS)));
+        let decoded = Thumb::Shown(Arc::new(thumbnail(&png(4, 4)).unwrap()));
+        let files = with(webp.clone(), Some(decoded));
+        assert!(matches!(files.sticker(&sticker), Some(Sticker::Picture(Some(_)))));
+        assert!(files.of(&sticker).is_empty(), "not a file under it");
+        // one that doesn't decode, and an animated (Lottie) one, which isn't a picture: its words
+        assert!(with(webp.clone(), Some(Thumb::Failed)).sticker(&sticker).is_none());
+        let lottie = Attachment {
+            path: Some("s2".into()),
+            ..file("text/x-signal-sticker-lottie", None)
+        };
+        assert!(with(lottie, None).sticker(&sticker).is_none());
+        // not downloaded yet: its words, with the download
+        let pending = Attachment {
+            state: AttachmentState::Pending,
+            ..file("image/webp", None)
+        };
+        assert!(matches!(with(pending, None).sticker(&sticker), Some(Sticker::Fetch(_))));
+        let mut deleted = sticker.clone();
+        deleted.deleted = true;
+        assert!(with(webp.clone(), None).sticker(&deleted).is_none());
+        assert!(with(webp, None).sticker(&message(MessageKind::Normal)).is_none());
+    }
+
+    #[test]
+    fn a_picture_outside_the_timeline_is_decoded_at_its_size_once_drawn() {
+        let mut files = Files::default();
+        files.new_frame();
+        assert!(files.picture_at("pack/1", 144).is_none());
+        assert_eq!(files.next_wanted(), Some((0, "pack/1".into(), 144)));
+        let gone = files.decoded("pack/1".into(), Thumb::Shown(Arc::new(thumbnail(&png(4, 4)).unwrap())));
+        assert!(gone.is_empty());
+        assert!(files.picture_at("pack/1", 144).is_some());
+        assert!(!files.wants_pictures(), "nothing more to decode");
+        // one that didn't decode stays blank, and isn't asked for again
+        files.decoded("pack/2".into(), Thumb::Failed);
+        assert!(files.picture_at("pack/2", 144).is_none());
+        assert!(!files.wants_pictures());
+    }
+
+    #[test]
+    fn an_animated_picture_shows_its_first_frame_decoded_small() {
+        let frame = |c: [u8; 4]| image::Frame::new(image::RgbaImage::from_pixel(8, 8, image::Rgba(c)));
+        let mut gif = vec![];
+        image::codecs::gif::GifEncoder::new(&mut gif)
+            .encode_frames([frame([255, 0, 0, 255]), frame([0, 0, 255, 255])])
+            .unwrap();
+        let shown = picture(&gif, STICKER_PIXELS).unwrap();
+        assert_eq!(shown.frame_count(), 1);
+        // the first frame's red, in BGRA
+        let pixel = &shown.as_bytes(0).unwrap()[..4];
+        assert!(pixel[2] > 200 && pixel[0] < 50, "{pixel:?}");
+        assert_eq!(
+            picture(&png(512, 512), STICKER_PIXELS).unwrap().size(0),
+            size2(320, 320)
+        );
+        assert_eq!(thumbnail(&png(512, 512)).unwrap().size(0), size2(512, 512));
     }
 
     #[test]
