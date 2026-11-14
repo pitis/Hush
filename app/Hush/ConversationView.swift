@@ -325,6 +325,9 @@ struct TimelineList: View {
                             reactions: store.reactions[key] ?? [],
                             files: store.attachments[key] ?? [], preview: store.previews[key],
                             poll: store.polls[key],
+                            story: m.story.flatMap { s in
+                                store.stories.first { $0.author == s.author && $0.sentAt == s.sentAt }
+                            },
                             highlighted: store.highlighted == key,
                             reply: { store.reply(to: m) },
                             retry: { Task { await store.retry(key) } },
@@ -485,6 +488,8 @@ struct MessageRow: View {
     let files: [Attachment]
     let preview: LinkPreview?
     var poll: Poll?
+    /// The story it replies or reacts to, while Hush still has it (a day).
+    var story: Story?
     /// Just opened from search: outlined for a moment.
     var highlighted = false
     let reply: () -> Void
@@ -669,21 +674,27 @@ struct MessageRow: View {
         let filesOnly = !files.isEmpty && (message.body ?? "").isEmpty && !message.deleted
         return VStack(alignment: filesOnly ? .trailing : .leading, spacing: 4) {
             if let q = message.quote, !message.deleted {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(q.author == message.author ? "Reply" : "Quoted").font(.system(size: 11, weight: .semibold))
-                    Group {
-                        if let text = q.text {
-                            MessageText.text(
-                                MessageText.attributed(text, ranges: q.ranges, name: mentionName), size: 12)
-                        } else {
-                            Text("Attachment")
+                quoteBox(q.author == message.author ? "Reply" : "Quoted") {
+                    if let text = q.text {
+                        MessageText.text(MessageText.attributed(text, ranges: q.ranges, name: mentionName), size: 12)
+                    } else {
+                        Text("Attachment")
+                    }
+                }
+            }
+            if let header = Placeholder.storyHeader(message), !message.deleted {
+                // the story while Hush has it; after its day, the header alone
+                quoteBox(header) {
+                    if let story {
+                        HStack(spacing: 6) {
+                            if let file = story.file, file.state == .ready, let path = file.path, Files.isImage(file) {
+                                ThumbnailImage(path: path, shownAt: 32).frame(width: 32, height: 32)
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                            }
+                            Text(Placeholder.storyText(story))
                         }
                     }
-                    .font(.system(size: 12)).lineLimit(2)
                 }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
             if !message.deleted && !isViewOnce && !isSticker {
                 AttachmentList(files: files, download: download, open: { _ = open($0) })
@@ -702,6 +713,9 @@ struct MessageRow: View {
                         PollCard(
                             question: question, poll: poll, me: actions.me, mine: message.author == actions.me,
                             vote: actions.vote, end: actions.endPoll)
+                    } else if case .storyReaction = message.kind {
+                        // its emoji is in the story's header
+                        EmptyView()
                     } else if let placeholder = Placeholder.text(message.kind) {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
                         HStack(spacing: 6) {
@@ -744,6 +758,17 @@ struct MessageRow: View {
             RoundedRectangle(cornerRadius: Theme.bubbleRadius).stroke(.yellow, lineWidth: highlighted ? 3 : 0)
                 .animation(.easeOut(duration: 0.4), value: highlighted)
         }
+    }
+
+    /// A quote's box above the bubble's text: what it answers, under a small header.
+    private func quoteBox(_ header: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(header).font(.system(size: 11, weight: .semibold))
+            content().font(.system(size: 12)).lineLimit(2)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var isSticker: Bool {
@@ -864,7 +889,7 @@ extension MessageRow: @MainActor Equatable {
     static func == (a: MessageRow, b: MessageRow) -> Bool {
         a.message == b.message && a.first == b.first && a.last == b.last && a.isGroup == b.isGroup
             && a.senderName == b.senderName && a.reactions == b.reactions && a.files == b.files
-            && a.preview == b.preview && a.poll == b.poll && a.highlighted == b.highlighted
+            && a.preview == b.preview && a.poll == b.poll && a.story == b.story && a.highlighted == b.highlighted
             && a.actions.me == b.actions.me && a.actions.mine == b.actions.mine
             && a.actions.canEdit == b.actions.canEdit && a.actions.canDelete == b.actions.canDelete
     }

@@ -3290,8 +3290,8 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     let res = sqlx::query(
         "INSERT OR IGNORE INTO messages(conversation_id, author, sent_at, received_at, body, is_outgoing,
            status, edited, deleted, quote_author, quote_sent_at, quote_text, kind, kind_text, expires_in,
-           expires_at, body_ranges, quote_ranges)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+           expires_at, body_ranges, quote_ranges, story_author, story_sent_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
     )
     .bind(&m.conversation_id)
     .bind(&m.author)
@@ -3311,6 +3311,8 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     .bind(m.expires_at)
     .bind(body_ranges)
     .bind(quote_ranges)
+    .bind(m.story.as_ref().map(|s| &s.author))
+    .bind(m.story.as_ref().map(|s| s.sent_at))
     .execute(&mut *conn)
     .await?;
     let inserted = res.rows_affected() == 1;
@@ -3619,6 +3621,10 @@ fn row_to_message(r: &SqliteRow) -> Result<Message, sqlx::Error> {
         kind: message_kind(r.try_get("kind")?, r.try_get("kind_text")?)?,
         expires_in: u32::try_from(r.try_get::<i64, _>("expires_in")?).unwrap_or(0),
         expires_at: r.try_get("expires_at")?,
+        story: match (r.try_get("story_author")?, r.try_get("story_sent_at")?) {
+            (Some(author), Some(sent_at)) => Some(MessageKey { author, sent_at }),
+            _ => None,
+        },
     })
 }
 
@@ -3650,6 +3656,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         }
     }
 
@@ -4497,6 +4504,32 @@ mod tests {
         db.insert_message(&m).await.unwrap();
         db.insert_message(&no_quote_text).await.unwrap();
         assert_eq!(db.messages("c:alice", None, 10).await.unwrap(), vec![m, no_quote_text]);
+    }
+
+    #[tokio::test]
+    async fn replies_and_reactions_to_stories_keep_their_story() {
+        let db = db().await;
+        let story = Some(MessageKey {
+            author: "me".into(),
+            sent_at: 3,
+        });
+        let reply = Message {
+            story: story.clone(),
+            ..msg("alice", 10, "nice")
+        };
+        let reaction = Message {
+            body: None,
+            kind: MessageKind::StoryReaction { emoji: "🔥".into() },
+            story,
+            ..msg("alice", 11, "")
+        };
+        db.insert_message(&reply).await.unwrap();
+        db.insert_message(&reaction).await.unwrap();
+        assert_eq!(
+            db.messages("c:alice", None, 10).await.unwrap(),
+            vec![reply, reaction.clone()]
+        );
+        assert_eq!(conv(&db, "c:alice").await.last_message_kind, reaction.kind);
     }
 
     #[tokio::test]

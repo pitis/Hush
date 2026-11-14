@@ -120,6 +120,7 @@ impl Client {
             },
             expires_in,
             expires_at: None,
+            story: None,
         };
         let was_archived = self.is_archived(&conversation_id).await?;
         // as in send_text: a timestamp collision takes the next one
@@ -833,6 +834,7 @@ impl Client {
             kind: MessageKind::Normal,
             expires_in,
             expires_at: None,
+            story: None,
         };
         let was_archived = self.is_archived(&conversation_id).await?;
         // (author, sent_at) is the identity: on a collision (a phone-sent message in the same ms,
@@ -2455,6 +2457,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         }
     }
 

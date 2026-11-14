@@ -555,6 +555,7 @@ impl Importer {
                 kind,
                 expires_in,
                 expires_at,
+                story: None,
             },
             reactions,
             attachments,

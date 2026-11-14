@@ -511,5 +511,5 @@ func message(_ conv: String, _ author: String, _ sentAt: Int64, _ body: String =
         conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, ranges: [],
         isOutgoing: outgoing,
         status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil, kind: .normal, expiresIn: 0,
-        expiresAt: nil)
+        expiresAt: nil, story: nil)
 }

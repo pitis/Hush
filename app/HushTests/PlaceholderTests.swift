@@ -11,7 +11,36 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(Placeholder.text(.payment), "💳 Payment")
         XCTAssertEqual(Placeholder.text(.poll(question: "Pizza?")), "📊 Poll: Pizza?")
         XCTAssertEqual(Placeholder.text(.giftBadge), "✨ Gift badge")
+        XCTAssertEqual(Placeholder.text(.storyReaction(emoji: "👍")), "Reacted 👍 to a story")
         XCTAssertNil(Placeholder.text(.normal))
+    }
+
+    func testRepliesAndReactionsToStoriesSayWhoseStoryTheyAnswer() {
+        var m = message("c:a", "a", 5, "nice")
+        XCTAssertNil(Placeholder.storyHeader(m), "not about a story")
+        m.story = MessageKey(author: "me", sentAt: 1)
+        XCTAssertEqual(Placeholder.storyHeader(m), "Replied to your story")
+        m.kind = .storyReaction(emoji: "👍")
+        XCTAssertEqual(Placeholder.storyHeader(m), "Reacted 👍 to your story")
+        // ours, from the phone
+        var mine = message("c:a", "me", 6, "ha", outgoing: true)
+        mine.story = MessageKey(author: "a", sentAt: 2)
+        XCTAssertEqual(Placeholder.storyHeader(mine), "You replied to their story")
+        mine.kind = .storyReaction(emoji: "🔥")
+        XCTAssertEqual(Placeholder.storyHeader(mine), "You reacted 🔥 to their story")
+    }
+
+    func testTheStoryAReplyAnswersShowsItsWordsOrWhatItIs() {
+        let story = { (text: StoryText?, file: Attachment?) in
+            Story(conversationId: "c:me", author: "me", sentAt: 1, text: text, file: file, viewed: true)
+        }
+        let words = StoryText(
+            text: "at the beach", style: 0, foreground: nil, textBackground: nil, background: [], angle: 0, link: nil)
+        XCTAssertEqual(Placeholder.storyText(story(words, nil)), "at the beach")
+        let photo = Attachment(
+            id: 1, message: MessageKey(author: "me", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
+            width: nil, height: nil, isVoiceNote: false, path: nil, state: .pending)
+        XCTAssertEqual(Placeholder.storyText(story(nil, photo)), "📷 Photo")
     }
 
     func testViewOnceMediaOffersOneLookThenSaysViewed() {

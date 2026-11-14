@@ -3137,6 +3137,7 @@ mod tests {
                 kind: crate::projection::MessageKind::Normal,
                 expires_in: 0,
                 expires_at: None,
+                story: None,
             })
         };
         let sink = Sink(Default::default());
@@ -3300,6 +3301,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         };
         let image = |author: &str| Op::AddAttachments {
             message: MessageKey {
@@ -3469,6 +3471,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 1,
             expires_at: Some(1),
+            story: None,
         };
         db.insert_message(&expired(format!("c:{ALICE}"), 100)).await.unwrap();
         // a copy presage can't be asked to delete (a bad id) stays queued and fails the sweep

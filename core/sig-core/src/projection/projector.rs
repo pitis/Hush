@@ -394,12 +394,21 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     let Some(sent_at) = dm.timestamp.and_then(|t| i64::try_from(t).ok()) else {
         return vec![];
     };
-    // Not shown yet: story replies (they belong to the story, M4).
-    if dm.story_context.is_some() {
-        return vec![];
-    }
+    // a reply or reaction to a story shows in the 1:1 chat, as in Signal's apps
+    let story = match &dm.story_context {
+        None => None,
+        // a group story's belong under the story, not in the group's chat
+        Some(_) if dm.group_v2.is_some() => return vec![],
+        Some(c) => match (
+            aci(c.author_aci.as_deref(), c.author_aci_binary.as_deref()),
+            c.sent_timestamp.and_then(|t| i64::try_from(t).ok()),
+        ) {
+            (Some(author), Some(sent_at)) => Some(MessageKey { author, sent_at }),
+            _ => return vec![],
+        },
+    };
     let view_once = dm.is_view_once == Some(true);
-    if let Some(r) = &dm.reaction {
+    if let Some(r) = dm.reaction.as_ref().filter(|_| story.is_none()) {
         let target = (|| {
             Some(MessageKey {
                 author: aci(r.target_author_aci.as_deref(), r.target_author_aci_binary.as_deref())?,
@@ -472,7 +481,13 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         }];
     }
     // what we can't show yet becomes a placeholder rather than vanishing
-    let kind = if view_once {
+    let kind = if let Some(r) = &dm.reaction {
+        // a story's (a reaction to a message returned above); one taken back isn't shown
+        match r.emoji.clone().filter(|e| !e.is_empty() && r.remove != Some(true)) {
+            Some(emoji) => MessageKind::StoryReaction { emoji },
+            None => return vec![],
+        }
+    } else if view_once {
         // we can't open what we sent
         MessageKind::ViewOnce { viewed: outgoing }
     } else if let Some(s) = &dm.sticker {
@@ -527,6 +542,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         expires_in,
         // ours start disappearing when sent; others' once read
         expires_at: (outgoing && expires_in > 0).then(|| sent_at + i64::from(expires_in) * 1000),
+        story,
     };
     let mut attachments: Vec<_> = dm.attachments.iter().map(new_attachment).collect();
     // a sticker's image is its file (most are WebP, often sent untyped)
@@ -1095,11 +1111,53 @@ mod tests {
         );
     }
 
+    fn on_story(mut dm: DataMessage, author: &str, sent_at: u64) -> DataMessage {
+        dm.story_context = Some(StoryContext {
+            author_aci: Some(author.into()),
+            sent_timestamp: Some(sent_at),
+            ..Default::default()
+        });
+        dm
+    }
+
     #[test]
-    fn story_replies_are_not_shown_yet() {
-        let mut reply = text(460, "nice story");
-        reply.story_context = Some(StoryContext::default());
-        for dm in [reply.clone(), in_group(reply, KEY.to_vec())] {
+    fn a_reply_to_a_story_shows_in_the_chat_with_its_story() {
+        let reply = on_story(text(460, "nice story"), ME, 300);
+        let m = one(project(
+            &content(ALICE, 470, ContentBody::DataMessage(reply.clone())),
+            ME,
+        ));
+        assert_eq!(
+            (m.conversation_id, m.body.as_deref(), m.kind, m.story),
+            (
+                format!("c:{ALICE}"),
+                Some("nice story"),
+                MessageKind::Normal,
+                Some(key(ME, 300))
+            )
+        );
+        // ours, from the phone, to their story
+        let mine = one(project(
+            &content(ME, 480, sent_sync(ALICE, on_story(text(475, "ha"), ALICE, 310))),
+            ME,
+        ));
+        assert_eq!(
+            (mine.conversation_id, mine.is_outgoing, mine.story),
+            (format!("c:{ALICE}"), true, Some(key(ALICE, 310)))
+        );
+        // the story's author as binary
+        let mut binary = reply.clone();
+        binary.story_context = Some(StoryContext {
+            author_aci_binary: Some(uuid(ME).as_bytes().to_vec()),
+            sent_timestamp: Some(300),
+            ..Default::default()
+        });
+        let m = one(project(&content(ALICE, 470, ContentBody::DataMessage(binary)), ME));
+        assert_eq!(m.story, Some(key(ME, 300)));
+        // a group story's replies belong to the story; a story we can't name is dropped
+        let mut nameless = reply.clone();
+        nameless.story_context = Some(StoryContext::default());
+        for dm in [in_group(reply, KEY.to_vec()), nameless] {
             assert!(
                 project(&content(ALICE, 470, ContentBody::DataMessage(dm.clone())), ME).is_empty(),
                 "{dm:?}"
@@ -1285,10 +1343,29 @@ mod tests {
     }
 
     #[test]
-    fn story_reaction_is_ignored() {
-        let mut dm = reaction("🔥", false, ME, 100);
-        dm.story_context = Some(StoryContext::default());
-        assert!(project(&content(ALICE, 604, ContentBody::DataMessage(dm)), ME).is_empty());
+    fn a_reaction_to_a_story_is_a_message_in_the_chat() {
+        let dm = on_story(reaction("🔥", false, ME, 300), ME, 300);
+        let m = one(project(&content(ALICE, 604, ContentBody::DataMessage(dm.clone())), ME));
+        assert_eq!(
+            (m.conversation_id, m.body, m.kind, m.story),
+            (
+                format!("c:{ALICE}"),
+                None,
+                MessageKind::StoryReaction { emoji: "🔥".into() },
+                Some(key(ME, 300))
+            )
+        );
+        // taking it back, or a group story's: nothing in the chat
+        for dm in [
+            on_story(reaction("🔥", true, ME, 300), ME, 300),
+            on_story(reaction("", false, ME, 300), ME, 300),
+            in_group(dm, KEY.to_vec()),
+        ] {
+            assert!(
+                project(&content(ALICE, 604, ContentBody::DataMessage(dm.clone())), ME).is_empty(),
+                "{dm:?}"
+            );
+        }
     }
 
     #[test]
