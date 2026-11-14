@@ -56,7 +56,18 @@ enum Files {
             height: height, isVoiceNote: false)
     }
 
-    /// Where opened files are linked; swapped only by tests.
+    /// The core, which decrypts the files Hush keeps (they are encrypted on disk); set while one
+    /// is open. Without one, files are read as they are.
+    nonisolated(unsafe) static var core: (any ClientProtocol)?
+
+    /// A file's bytes: one Hush keeps decrypted by the core, in memory only; any other (one to
+    /// send) as it is.
+    static func bytes(_ path: String) async throws -> Data {
+        if let core { return try await core.fileBytes(path: path) }
+        return try Data(contentsOf: URL(fileURLWithPath: path))
+    }
+
+    /// Where opened files are copied; swapped only by tests.
     static let defaultOpenRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
         "Hush-open", isDirectory: true)
     nonisolated(unsafe) static var openRoot = defaultOpenRoot
@@ -73,28 +84,31 @@ enum Files {
     }
 
     /// The downloaded file under its own name (or one with the right extension), for Quick Look
-    /// and players: stored files are named by id only. A hard link (a copy across volumes),
-    /// made fresh each time; `close` removes it, so a message deleted for everyone leaves nothing
-    /// readable here.
-    static func openable(_ a: Attachment) throws -> URL {
+    /// and players: stored files are named by id only, and encrypted. A decrypted copy, made
+    /// fresh each time in a folder of its own; `close` removes it, so a message deleted for
+    /// everyone leaves nothing readable here.
+    static func openable(_ a: Attachment) async throws -> URL {
         guard a.state == .ready, let path = a.path else { throw OpenError.notDownloaded }
         let ext = UTType(mimeType: a.contentType)?.preferredFilenameExtension
         // only the last part of a sender-chosen name, so it stays in our folder
         let given = a.fileName.map { URL(fileURLWithPath: $0).lastPathComponent }
             .flatMap { ["", ".", "..", "/"].contains($0) ? nil : $0 }
         let name = given ?? (ext.map { "file.\($0)" } ?? "file")
-        let dir = openRoot.appendingPathComponent(String(a.id), isDirectory: true)
+        let dir = openRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let url = dir.appendingPathComponent(name)
         let fm = FileManager.default
-        try? fm.removeItem(at: dir)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         do {
-            try fm.linkItem(at: URL(fileURLWithPath: path), to: url)
+            if let core {
+                try await core.copyFile(path: path, to: url.path)
+            } else {
+                try fm.copyItem(at: URL(fileURLWithPath: path), to: url)
+            }
+            try quarantine(url)
         } catch {
-            try fm.copyItem(at: URL(fileURLWithPath: path), to: url)  // e.g. another volume
+            try? fm.removeItem(at: dir)
+            throw error
         }
-        // a link marks the stored file too: harmless, Hush only reads it
-        try quarantine(url)
         return url
     }
 
@@ -125,7 +139,7 @@ enum Files {
         } catch { return [error] }
     }
 
-    /// Done with an opened file: its link goes.
+    /// Done with an opened file: its copy goes.
     static func close(_ url: URL) {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
     }

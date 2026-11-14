@@ -37,8 +37,8 @@ pub(crate) fn new_key() -> FileKey {
     rand::random()
 }
 
-/// Writes `input` sealed under `key` to a new file at `to` (replacing one there) and syncs it.
-/// Returns the plaintext's length.
+/// Writes `input` sealed under `key` to a new file at `to` (replacing one there). Returns the
+/// plaintext's length.
 pub(crate) fn seal(mut input: impl Read, to: &Path, key: &FileKey) -> std::io::Result<u64> {
     let salt: [u8; 16] = rand::random();
     let mut header = MAGIC.to_vec();
@@ -46,8 +46,25 @@ pub(crate) fn seal(mut input: impl Read, to: &Path, key: &FileKey) -> std::io::R
     let out = std::io::BufWriter::new(std::fs::File::create(to)?);
     let mut sealer = Sealer::new(out, &cipher_key(key, &salt), header)?;
     let n = std::io::copy(&mut input, &mut sealer)?;
-    sealer.finish()?.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    sealer.finish()?.into_inner().map_err(|e| e.into_error())?;
     Ok(n)
+}
+
+/// Writes the file at `path` out to the disk; with `drive`, out of the drive's own cache too, as
+/// that is slow on Apple platforms (F_FULLFSYNC, milliseconds a file): a batch ends with one.
+pub(crate) fn sync(path: &Path, drive: bool) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    #[cfg(target_vendor = "apple")]
+    if !drive {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` is open for as long as the call
+        return match unsafe { libc::fsync(file.as_raw_fd()) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        };
+    }
+    let _ = drive;
+    file.sync_all()
 }
 
 /// The plaintext of the file at `path`, sealed under `key`, decrypted as it is read. A wrong key,
@@ -139,7 +156,7 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("hush-files-{tag}-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hush-sealed-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -33,4 +33,16 @@ final class ThumbnailsTests: XCTestCase {
         XCTAssertEqual([bubble.width, bubble.height], [640, 320])
         XCTAssertEqual(Thumbnails.cached(path, filling: 80)?.width, 160)
     }
+
+    /// A stored picture is encrypted on disk: what shows is what the core decrypts, in memory.
+    func testAStoredPictureIsDecodedFromWhatTheCoreDecrypts() async throws {
+        let png = try Data(contentsOf: URL(fileURLWithPath: try picture(width: 300, height: 100)))
+        let stored = "/nonexistent/attachments/\(UUID().uuidString)"
+        let fake = FakeClient(linked: true)
+        fake.decrypted[stored] = png
+        Files.core = fake
+        defer { Files.core = nil }
+        let image = await Thumbnails.load(stored, filling: 50)
+        XCTAssertEqual(image.map { [$0.width, $0.height] }, [150, 50])
+    }
 }

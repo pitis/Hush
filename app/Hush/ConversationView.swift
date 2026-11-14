@@ -10,7 +10,7 @@ struct ConversationView: View {
     var body: some View {
         TimelineList(store: store, conversation: conversation) { a in
             do {
-                quickLook = try Files.openable(a)
+                quickLook = try await Files.openable(a)
                 return true
             } catch {
                 store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
@@ -30,7 +30,7 @@ struct ConversationView: View {
         }
         .modifier(ConversationChrome(store: store, conversation: conversation))
         .quickLookPreview($quickLook)
-        // the preview closed: its link goes
+        // the preview closed: its copy goes
         .onChange(of: quickLook) { old, _ in if let old { Files.close(old) } }
         .onDisappear { if let quickLook { Files.close(quickLook) } }
         // files dropped anywhere on the chat wait in the composer's tray
@@ -301,7 +301,7 @@ struct TimelineList: View {
     let store: AppStore
     let conversation: Conversation
     /// Shows a file; false if it couldn't be.
-    let open: (Attachment) -> Bool
+    let open: (Attachment) async -> Bool
     @State private var atBottom = true
     @State private var nearTop = false
     @State private var unseenNew = false
@@ -515,7 +515,7 @@ struct MessageRow: View {
     let retry: () -> Void
     let download: (Int64) -> Void
     /// Shows a file; false if it couldn't be.
-    let open: (Attachment) -> Bool
+    let open: (Attachment) async -> Bool
     var actions = Actions()
     @Environment(\.chatColor) private var chatColor
     @Environment(\.colorScheme) private var colorScheme
@@ -716,7 +716,7 @@ struct MessageRow: View {
                 }
             }
             if !message.deleted && !isViewOnce && !isSticker {
-                AttachmentList(files: files, download: download, open: { _ = open($0) })
+                AttachmentList(files: files, download: download, open: { a in Task { _ = await open(a) } })
                 if let preview { LinkPreviewCard(preview: preview) }
             }
             HStack(alignment: .lastTextBaseline, spacing: 8) {
@@ -810,13 +810,14 @@ struct MessageRow: View {
         switch state {
         case .open(let file):
             Button {
-                // linked for the viewer first: the core drops the file next
-                viewOnceOpening = ViewOnce.open(file, with: open, then: actions.viewOnce)
+                // copied out for the viewer first: the core drops the file next
+                viewOnceOpening = true
+                Task { viewOnceOpening = await ViewOnce.open(file, with: open, then: actions.viewOnce) }
             } label: {
                 label
             }
             .buttonStyle(.bordered)
-            .disabled(viewOnceOpening)  // one look: a second click would relink what's showing
+            .disabled(viewOnceOpening)  // one look: a second click would copy out what's showing
         case .download(let id):
             Button {
                 download(id)

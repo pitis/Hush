@@ -19,7 +19,9 @@ packs with their images: it installs a pack when our phone says it installed one
 - **Listing:** `Client::sticker_packs` lists presage's pack ids on the actor thread. A pack the
   projection keeps (migration 0026: title, author, key, and each sticker's id, emoji and content
   type) is shown from there, once its images are checked to be on disk. Any other pack is read from
-  presage, and each sticker's image is written once to `stickers/<hex pack id>/<sticker id>`. The
+  presage, and each sticker's image is written once to `sticker-images/<hex pack id>/<sticker id>`,
+  encrypted under a key derived from the projection's install key (#167; the plain `stickers/`
+  folder of before goes at open, its images written again from presage's copy). The
   pack is kept only when it is whole: every sticker has an image, and every image is written.
   presage stores a pack with every image byte as a JSON number, so reading it costs several times
   the images' size: it happens once per pack, not on every open. Kept packs that presage no longer

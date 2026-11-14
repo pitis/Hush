@@ -1,7 +1,7 @@
 //! What the window draws: the Mac app's components (`DESIGN.md`, its views' sizes), in GPUI.
 
-use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, Textarea};
@@ -305,7 +305,11 @@ impl Hush {
             _ => format!("{title}. {line}"),
         };
         // a blocked chat's or a request's picture isn't shown (a stranger chose it)
-        let picture = c.avatar.as_deref().filter(|_| !c.blocked && !c.message_request);
+        let picture = c
+            .avatar
+            .as_deref()
+            .filter(|_| !c.blocked && !c.message_request)
+            .and_then(|p| self.picture(p));
         let id = c.id.clone();
         div()
             .id(("chat", ix))
@@ -755,7 +759,7 @@ fn render_row(ix: usize, row: &Row, out_fill: &Background, p: Palette) -> Statef
 }
 
 /// A person's or chat's picture, or their initials on their colour.
-fn avatar(id: &str, name: &str, picture: Option<&str>, size: f32) -> Div {
+fn avatar(id: &str, name: &str, picture: Option<Arc<Image>>, size: f32) -> Div {
     let base = style::avatar_color(id);
     let top = Hsla {
         l: (base.l + 0.08).min(1.),
@@ -770,7 +774,7 @@ fn avatar(id: &str, name: &str, picture: Option<&str>, size: f32) -> Div {
         .items_center()
         .justify_center();
     match picture {
-        Some(path) => circle.child(img(PathBuf::from(path)).size_full().object_fit(ObjectFit::Cover)),
+        Some(image) => circle.child(img(image).size_full().object_fit(ObjectFit::Cover)),
         None => circle
             .bg(linear_gradient(
                 180.,

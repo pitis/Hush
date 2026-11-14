@@ -258,6 +258,7 @@ final class AppStore {
         do {
             let client = try opened.get()
             self.client = client
+            Files.core = client
             await loadDrafts(client)
             if client.isLinked() {
                 ownAci = client.ownAci()
@@ -1388,6 +1389,7 @@ final class AppStore {
     private func restart(keepKey: Bool = false) async {
         listenerGeneration += 1
         client = nil
+        Files.core = nil
         if !keepKey {
             forgetKey()
             notifier?.removeAll()  // message previews go with the data

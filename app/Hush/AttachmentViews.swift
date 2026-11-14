@@ -121,6 +121,8 @@ struct AudioAttachmentView: View {
     let download: () -> Void
     @State private var player: AVPlayer?
     @State private var opened: URL?
+    /// Its decrypted copy is being made: another click waits for it.
+    @State private var preparing = false
     @State private var playing = false
     @State private var unplayable = false
     @State private var elapsed: Double = 0
@@ -151,22 +153,27 @@ struct AudioAttachmentView: View {
         .accessibilityLabel(attachment.isVoiceNote ? "Voice message" : (attachment.fileName ?? "Audio"))
         .onDisappear { stop() }
         .task(id: attachment.state) {
-            // the length shows before playing, as in Desktop (read from the stored file: no link)
-            guard attachment.state == .ready, let path = attachment.path else { return }
-            let asset = AVURLAsset(
-                url: URL(fileURLWithPath: path), options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
+            // the length shows before playing, as in Desktop (from a decrypted copy, gone at once)
+            guard attachment.state == .ready, let url = try? await Files.openable(attachment) else { return }
+            defer { Files.close(url) }
+            let asset = AVURLAsset(url: url, options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
             if let length = try? await asset.load(.duration).seconds, length.isFinite { duration = length }
         }
     }
 
     private func toggle() {
-        if player == nil { prepare() }
-        guard let player else { return }
-        if playing { player.pause() } else { player.play() }
-        playing.toggle()
-        guard playing else { return }
-        // a format AVFoundation can't play fails after starting: say so instead of a stuck Pause
+        guard !preparing else { return }
         Task {
+            if player == nil {
+                preparing = true
+                await prepare()
+                preparing = false
+            }
+            guard let player else { return }
+            if playing { player.pause() } else { player.play() }
+            playing.toggle()
+            guard playing else { return }
+            // a format AVFoundation can't play fails after starting: say so instead of a stuck Pause
             try? await Task.sleep(for: .milliseconds(500))
             if player.currentItem?.status == .failed {
                 stop()
@@ -175,8 +182,8 @@ struct AudioAttachmentView: View {
         }
     }
 
-    private func prepare() {
-        guard let url = try? Files.openable(attachment) else {
+    private func prepare() async {
+        guard let url = try? await Files.openable(attachment) else {
             unplayable = true
             return
         }
@@ -311,7 +318,9 @@ enum Thumbnails {
     static func load(_ path: String, filling side: CGFloat? = nil) async -> CGImage? {
         if let hit = cached(path, filling: side) { return hit }
         if undecodable.contains(path) { return nil }
-        let image = await Task.detached(priority: .userInitiated) { decode(path, side) }.value
+        // decrypted in memory only
+        let data = try? await Files.bytes(path)
+        let image = await Task.detached(priority: .userInitiated) { data.flatMap { decode($0, side) } }.value
         if let image {
             cache.setObject(image, forKey: key(path, side), cost: image.bytesPerRow * image.height)
         } else {
@@ -324,8 +333,8 @@ enum Thumbnails {
         "\(Int(side ?? 0)) \(path)" as NSString
     }
 
-    nonisolated private static func decode(_ path: String, _ side: CGFloat?) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+    nonisolated private static func decode(_ data: Data, _ side: CGFloat?) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         var longest = maxPixels
         if let side {
             // its shorter side spans the square and the longer one is cropped (never more than a bubble's)

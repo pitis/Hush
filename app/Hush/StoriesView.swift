@@ -193,7 +193,7 @@ struct StoryCard: View {
             case .ready:
                 if let path = file.path {
                     if file.contentType.hasPrefix("video/") {
-                        StoryVideo(path: path).clipShape(RoundedRectangle(cornerRadius: 14))
+                        StoryVideo(file: file).clipShape(RoundedRectangle(cornerRadius: 14))
                     } else {
                         ThumbnailImage(path: path).scaledToFit().clipShape(RoundedRectangle(cornerRadius: 14))
                     }
@@ -238,16 +238,26 @@ struct StoryCard: View {
 }
 
 /// A story's video, with one player for as long as it shows (a redraw doesn't restart it).
+/// Plays a story's video from its decrypted copy, which goes when it stops showing.
 struct StoryVideo: View {
-    let path: String
+    let file: Attachment
     @State private var player: AVPlayer?
+    @State private var opened: URL?
 
     var body: some View {
         VideoPlayer(player: player)
-            .task(id: path) {
-                player?.pause()
-                player = AVPlayer(url: URL(fileURLWithPath: path))
+            .task(id: file.id) {
+                stop()
+                opened = try? await Files.openable(file)
+                player = opened.map { AVPlayer(url: $0) }
             }
-            .onDisappear { player?.pause() }
+            .onDisappear { stop() }
+    }
+
+    private func stop() {
+        player?.pause()
+        player = nil
+        if let opened { Files.close(opened) }
+        opened = nil
     }
 }
