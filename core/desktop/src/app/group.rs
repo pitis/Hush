@@ -27,15 +27,24 @@ pub(super) struct Panel {
     reading: bool,
     read_again: bool,
     /// Changes on their way to the server: the controls wait.
-    busy: bool,
+    changing: usize,
+    /// Why the last change or picture failed.
     failure: Option<String>,
-    /// The link was copied.
+    /// Why the last read failed; a read that works clears it.
+    read_failure: Option<String>,
+    /// The link shown was copied.
     copied: bool,
     /// Tab and Shift-Tab stay inside it.
     focus: FocusHandle,
     /// The same for a sheet over it.
     sheet_focus: FocusHandle,
     sheet: Option<Sheet>,
+}
+
+impl Panel {
+    fn busy(&self) -> bool {
+        self.changing > 0
+    }
 }
 
 /// A dialog over the panel.
@@ -53,7 +62,7 @@ enum Sheet {
 }
 
 impl Hush {
-    /// Chat Options › Group Info…: the panel over the chat, read from the core.
+    /// Chat Options › Group Info…: the panel over the window, read from the core.
     pub(super) fn open_group_info(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialog.is_some() {
             return;
@@ -67,8 +76,9 @@ impl Hush {
             loaded: false,
             reading: false,
             read_again: false,
-            busy: false,
+            changing: 0,
             failure: None,
+            read_failure: None,
             copied: false,
             focus,
             sheet_focus: cx.focus_handle(),
@@ -78,7 +88,8 @@ impl Hush {
         cx.notify();
     }
 
-    /// Done or Esc: back to the chat's composer. Changes on their way still land.
+    /// Done or Esc: back to the chat's composer. Changes on their way still land, and a picture
+    /// being chosen.
     pub(super) fn close_group_info(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.group.take().is_some() {
             self.composer.update(cx, |input, cx| input.focus(window, cx));
@@ -112,9 +123,15 @@ impl Hush {
                             people.extend(i.members.iter().map(|m| m.aci.clone()));
                             people.extend(i.invited.iter().chain(&i.requesting).cloned());
                         }
+                        // a new link isn't the one copied
+                        let link = |i: &Option<GroupInfo>| i.as_ref().and_then(|i| i.link.clone());
+                        if link(&info) != link(&g.info) {
+                            g.copied = false;
+                        }
                         g.info = info;
+                        g.read_failure = None;
                     }
-                    Err(e) => g.failure = Some(format!("Couldn't read the group: {}", describe(&e))),
+                    Err(e) => g.read_failure = Some(format!("Couldn't read the group: {}", describe(&e))),
                 }
                 g.loaded = true;
                 g.reading = std::mem::take(&mut g.read_again);
@@ -131,33 +148,47 @@ impl Hush {
         .detach();
     }
 
-    /// Makes the changes to the open panel's group one after the other (the core updates the chat
-    /// as each lands); the first failure shows, in the panel or, once it's closed, over the chats.
+    /// Makes the changes to the open panel's group (`change_group_in`).
     pub(super) fn change_group(&mut self, changes: Vec<GroupChange>, cx: &mut Context<Self>) {
-        let (Some(client), Some(g)) = (self.client.clone(), self.group.as_mut()) else {
-            return;
-        };
-        if changes.is_empty() || g.busy {
+        if let Some(id) = self.group.as_ref().map(|g| g.id.clone()) {
+            self.change_group_in(id, changes, cx);
+        }
+    }
+
+    /// Makes the changes to group `id` one after the other (the core updates the chat as each
+    /// lands), its panel's controls waiting meanwhile. The first failure shows in its panel, or
+    /// above the chat list, with the group's name, once the panel is closed or shows another group.
+    fn change_group_in(&mut self, id: String, changes: Vec<GroupChange>, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        if changes.is_empty() {
             return;
         }
-        g.busy = true;
-        g.failure = None;
-        let id = g.id.clone();
+        if let Some(g) = self.group.as_mut().filter(|g| g.id == id) {
+            g.changing += 1;
+            g.failure = None;
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
             let mut failure = None;
             for change in changes {
                 if let Err(e) = Compat::new(client.change_group(id.clone(), change)).await {
-                    failure.get_or_insert_with(|| server_failure("Couldn't change the group", &e));
+                    failure.get_or_insert(e);
                 }
             }
             let _ = this.update(cx, |app, cx| {
                 match app.group.as_mut().filter(|g| g.id == id) {
                     Some(g) => {
-                        g.busy = false;
-                        g.failure = failure;
+                        g.changing = g.changing.saturating_sub(1);
+                        // another change's failure stays shown
+                        let failed = failure.map(|e| server_failure("Couldn't change the group", &e));
+                        g.failure = failed.or(g.failure.take());
                     }
-                    None => app.error = failure.or(app.error.take()),
+                    None => {
+                        if let Some(e) = failure {
+                            let what = format!("Couldn't change {}", app.group_name(&id));
+                            app.error = Some(server_failure(&what, &e));
+                        }
+                    }
                 }
                 app.read_group(cx);
                 // the mention picker offers whoever is in it now
@@ -170,7 +201,14 @@ impl Hush {
         .detach();
     }
 
-    /// Asks first, as the Mac app's confirmations, then makes the change.
+    /// A group's name, for a failure said away from its panel.
+    fn group_name(&self, id: &str) -> String {
+        let chat = self.chats.iter().find(|c| c.id == id);
+        chat.map_or("the group".into(), |c| text::title(c, self.own_aci.as_deref()))
+    }
+
+    /// Asks first, as the Mac app's confirmations, then makes the change, to the group asked
+    /// about (the prompt doesn't block the window everywhere).
     fn confirm_group_change(
         &mut self,
         (title, detail, button): (&str, Option<&str>, &str),
@@ -178,10 +216,13 @@ impl Hush {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(id) = self.group.as_ref().map(|g| g.id.clone()) else {
+            return;
+        };
         let answer = window.prompt(PromptLevel::Warning, title, detail, &[button, "Cancel"], cx);
         cx.spawn(async move |this, cx| {
             if answer.await == Ok(0) {
-                let _ = this.update(cx, |app, cx| app.change_group(vec![change], cx));
+                let _ = this.update(cx, |app, cx| app.change_group_in(id, vec![change], cx));
             }
         })
         .detach();
@@ -219,8 +260,12 @@ impl Hush {
         }
     }
 
-    /// Picture › Choose…: a picture file, sent as Signal's apps send one.
+    /// Picture › Choose…: a picture file, sent as Signal's apps send one, to the group it was
+    /// chosen for (the picker doesn't block the window everywhere).
     pub(super) fn choose_group_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.group.as_ref().map(|g| g.id.clone()) else {
+            return;
+        };
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -232,7 +277,7 @@ impl Hush {
                 Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.swap_remove(0),
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |app, cx| {
-                        app.group_failed(format!("Couldn't choose a picture: {e}"), cx)
+                        app.group_failed(&id, format!("Couldn't choose a picture: {e}"), cx)
                     });
                     return;
                 }
@@ -240,21 +285,26 @@ impl Hush {
                 _ => return,
             };
             let jpeg = cx
-                .background_spawn(async move { std::fs::read(path).ok().and_then(|b| group_picture(&b).ok()) })
+                .background_spawn(async move {
+                    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't open that file: {e}"))?;
+                    group_picture(&bytes).map_err(|e| format!("That file isn't a picture Hush can read: {e}"))
+                })
                 .await;
             let _ = this.update(cx, |app, cx| match jpeg {
-                Some(image) => app.change_group(vec![GroupChange::Avatar { image }], cx),
-                None => app.group_failed("That file isn't a picture Hush can read.".into(), cx),
+                Ok(image) => app.change_group_in(id, vec![GroupChange::Avatar { image }], cx),
+                Err(why) => app.group_failed(&id, why, cx),
             });
         })
         .detach();
     }
 
-    fn group_failed(&mut self, why: String, cx: &mut Context<Self>) {
-        if let Some(g) = &mut self.group {
-            g.failure = Some(why);
-            cx.notify();
+    /// Says why in group `id`'s panel, or above the chat list once that panel is gone.
+    fn group_failed(&mut self, id: &str, why: String, cx: &mut Context<Self>) {
+        match self.group.as_mut().filter(|g| g.id == id) {
+            Some(g) => g.failure = Some(why),
+            None => self.error = Some(why),
         }
+        cx.notify();
     }
 
     /// Edit Name and Description…, filled in with them.
@@ -299,7 +349,7 @@ impl Hush {
     }
 
     fn open_sheet(&mut self, sheet: Sheet, cx: &mut Context<Self>) {
-        if let Some(g) = self.group.as_mut().filter(|g| !g.busy) {
+        if let Some(g) = self.group.as_mut().filter(|g| !g.busy()) {
             g.sheet = Some(sheet);
             cx.notify();
         }
@@ -331,6 +381,12 @@ impl Hush {
         addable.cloned().collect()
     }
 
+    /// The people ticked who are still to add (one may have joined meanwhile).
+    fn adding(&self, chosen: &HashSet<String>) -> Vec<String> {
+        let candidates = self.candidates().into_iter().map(|(aci, _)| aci);
+        candidates.filter(|aci| chosen.contains(aci)).collect()
+    }
+
     /// The sheet's Save or Add: its changes, made from the panel.
     pub(super) fn save_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(g) = &self.group else { return };
@@ -347,15 +403,14 @@ impl Hush {
                     (&title, &description.read(cx).value()),
                 )
             }
-            Some(Sheet::Add { chosen, .. }) if !chosen.is_empty() => {
-                let candidates = self.candidates();
-                let acis = candidates
-                    .into_iter()
-                    .map(|(aci, _)| aci)
-                    .filter(|a| chosen.contains(a));
-                vec![GroupChange::AddMembers { acis: acis.collect() }]
+            Some(Sheet::Add { chosen, .. }) => {
+                let acis = self.adding(chosen);
+                if acis.is_empty() {
+                    return;
+                }
+                vec![GroupChange::AddMembers { acis }]
             }
-            Some(Sheet::Add { .. }) | None => return,
+            None => return,
         };
         self.close_sheet(window, cx);
         self.change_group(changes, cx);
@@ -404,8 +459,8 @@ fn timer_choice(seconds: u32) -> String {
 
 /// A group picture as Signal's apps send one: a JPEG at most `PICTURE_SIDE` on its longer side,
 /// upright, transparency on white (`GroupPicture.jpeg`); or why not.
-/// shortcut: its colours are taken as sRGB (a colour profile isn't applied, as the Mac app does);
-/// convert with the profile if a wide-gamut photo looks dull on the phones.
+/// shortcut: a colour profile isn't applied (the Mac app converts from it to sRGB), so the colours
+/// are taken as sRGB; convert with the profile if a wide-gamut photo looks dull on the phones.
 fn group_picture(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let picture = files::upright(bytes, PICTURE_SIDE)?.into_rgba8();
     let on_white = |c: u8, a: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a))) / 255) as u8;
@@ -422,7 +477,8 @@ fn group_picture(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(feature = "snapshot")]
 impl Hush {
-    /// `--snapshot`'s Group Info: an admin's view of the Family group, with `sheet` over it.
+    /// `--snapshot`'s Group Info: an admin's view of the Family group, with a sheet over it:
+    /// `Some(true)` Edit Name and Description…, `Some(false)` Add Members… with the first one ticked.
     pub(super) fn demo_group(&mut self, sheet: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
         self.open_group_info("g:01".into(), window, cx);
         if let Some(g) = &mut self.group {
@@ -535,9 +591,14 @@ mod tests {
 
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
-    use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Entity, Focusable as _, TestAppContext, WindowOptions};
+    use std::path::PathBuf;
 
-    use super::super::{navigate, Hush};
+    use gpui_kit::{
+        gpui, AnyWindowHandle, AppContext as _, Context, Entity, Focusable as _, TestAppContext, Window, WindowOptions,
+    };
+
+    use super::super::{attach, navigate, Hush};
+    use super::Sheet;
     use crate::demo::BOGDAN;
     use crate::Demo;
 
@@ -550,14 +611,33 @@ mod window_tests {
             })
             .expect("the window opens");
             navigate::shortcuts(window, hush.downgrade(), cx);
+            attach::shortcut(window, hush.downgrade(), cx);
             (window, hush)
         });
         cx.run_until_parked();
         opened
     }
 
+    fn in_window(
+        window: AnyWindowHandle,
+        hush: &Entity<Hush>,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Hush, &mut Window, &mut Context<Hush>),
+    ) {
+        window
+            .update(cx, |_, window, cx| hush.update(cx, |app, cx| f(app, window, cx)))
+            .unwrap();
+    }
+
+    /// A file of its own in the temporary folder.
+    fn file(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("hush-desktop-group-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[gpui::test]
-    fn the_panel_keeps_the_keys_until_esc_closes_its_sheet_then_it(cx: &mut TestAppContext) {
+    fn the_panel_keeps_the_keys_until_esc_closes_its_sheet_then_the_panel(cx: &mut TestAppContext) {
         let (window, hush) = open(Demo::AddMembers, cx);
         // whoever isn't a member yet: Bogdan, who asked to join, and not Ana
         let offered: Vec<String> =
@@ -593,5 +673,92 @@ mod window_tests {
             hush.read_with(cx, |app, _| app.selected.clone()).as_deref(),
             Some("g:01")
         );
+    }
+
+    #[gpui::test]
+    fn the_files_picker_answered_after_the_panel_opened_leaves_it_the_keys(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        let menu = file("Menu.txt", b"soup");
+        cx.simulate_keystrokes(window, "secondary-shift-a");
+        assert!(cx.did_prompt_for_paths());
+        // the picker doesn't block the window everywhere (macOS)
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.open_group_info("g:01".into(), window, cx)
+        });
+        let chosen = menu.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![chosen]));
+        cx.run_until_parked();
+        let panel = window
+            .update(cx, |_, window, cx| {
+                hush.read(cx).group.as_ref().is_some_and(|g| g.focus.is_focused(window))
+            })
+            .unwrap();
+        assert!(panel, "the composer behind doesn't take the keys");
+        std::fs::remove_file(menu).unwrap();
+    }
+
+    #[gpui::test]
+    fn enter_saves_the_name_and_description_only_with_a_name(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::EditGroup, cx);
+        let name = hush.read_with(cx, |app, _| match app.group.as_ref().and_then(|g| g.sheet.as_ref()) {
+            Some(Sheet::Details { name, .. }) => name.clone(),
+            _ => panic!("the sheet is open"),
+        });
+        let sheet = |hush: &Entity<Hush>, cx: &mut TestAppContext| {
+            hush.read_with(cx, |app, _| app.group.as_ref().map(|g| g.sheet.is_some()))
+        };
+        let blank = name.clone();
+        in_window(window, &hush, cx, move |_, window, cx| {
+            blank.update(cx, |n, cx| n.set_value("  ", window, cx))
+        });
+        cx.simulate_keystrokes(window, "enter");
+        assert_eq!(sheet(&hush, cx), Some(true), "a group needs a name");
+
+        in_window(window, &hush, cx, move |_, window, cx| {
+            name.update(cx, |n, cx| n.set_value("Walkers", window, cx))
+        });
+        cx.simulate_keystrokes(window, "enter");
+        assert_eq!(sheet(&hush, cx), Some(false), "saved, back to the panel");
+    }
+
+    #[gpui::test]
+    fn a_picture_that_cant_be_read_is_said_for_the_group_it_was_chosen_for(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::GroupInfo, cx);
+        let note = file("note.txt", b"not a picture");
+        let said = |hush: &Entity<Hush>, cx: &mut TestAppContext| {
+            hush.read_with(cx, |app, _| {
+                let panel = app.group.as_ref().map(|g| (g.id.clone(), g.failure.clone()));
+                (panel, app.error.clone())
+            })
+        };
+        let unreadable =
+            |why: Option<String>| why.is_some_and(|w| w.starts_with("That file isn't a picture Hush can read"));
+
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.choose_group_picture(window, cx)
+        });
+        assert!(cx.did_prompt_for_paths());
+        let chosen = note.clone();
+        cx.simulate_path_prompt_response(move |options| {
+            assert!(options.files && !options.multiple && !options.directories);
+            Some(vec![chosen])
+        });
+        cx.run_until_parked();
+        let (panel, _) = said(&hush, cx);
+        assert!(unreadable(panel.and_then(|(_, why)| why)), "said in its panel");
+
+        // chosen for Family, answered once Book club's panel is open: not Book club's to say (or set)
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.choose_group_picture(window, cx);
+            app.close_group_info(window, cx);
+            app.open_group_info("g:02".into(), window, cx);
+        });
+        let chosen = note.clone();
+        cx.simulate_path_prompt_response(move |_| Some(vec![chosen]));
+        cx.run_until_parked();
+        let (panel, error) = said(&hush, cx);
+        assert_eq!(panel, Some(("g:02".to_string(), None)));
+        assert!(unreadable(error), "said above the chat list");
+        std::fs::remove_file(note).unwrap();
     }
 }

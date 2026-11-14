@@ -59,7 +59,9 @@ impl Hush {
             None => {
                 let says = match () {
                     _ if !g.loaded => "Loading…",
-                    _ if g.failure.is_none() => "This group isn't known yet: it shows once a message arrives in it.",
+                    _ if g.read_failure.is_none() => {
+                        "This group isn't known yet: it shows once a message arrives in it."
+                    }
                     _ => "Nothing to show.",
                 };
                 div()
@@ -82,8 +84,8 @@ impl Hush {
             .p(px(12.))
             .border_t_1()
             .border_color(p.separator)
-            .when(g.busy, |this| this.child(Spinner::new().xsmall()))
-            .children(g.failure.clone().map(|why| {
+            .when(g.busy(), |this| this.child(Spinner::new().xsmall()))
+            .children(g.failure.clone().or(g.read_failure.clone()).map(|why| {
                 label("group-failure", Role::Alert, why)
                     .flex_1()
                     .min_w_0()
@@ -130,9 +132,11 @@ impl Hush {
         p: Palette,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let picture = chat
-            .and_then(|c| c.avatar.as_deref())
-            .and_then(|path| self.picture(path));
+        // a blocked group's or an invitation's picture isn't shown (a stranger chose it)
+        let path = chat
+            .filter(|c| !c.blocked && !c.message_request)
+            .and_then(|c| c.avatar.as_deref());
+        let picture = path.and_then(|path| self.picture(path));
         let header = h_flex()
             .items_start()
             .gap(px(14.))
@@ -164,7 +168,7 @@ impl Hush {
                     Button::new("leave-group")
                         .label("Leave Group…")
                         .text_color(p.danger)
-                        .disabled(g.busy)
+                        .disabled(g.busy())
                         .on_click(cx.listener(move |this, _, window, cx| this.confirm_leave(&title, window, cx))),
                 )
                 .into_any_element()
@@ -183,9 +187,9 @@ impl Hush {
             .gap(px(18.))
             .child(header)
             .when(info.can_edit_details, |this| {
-                this.child(self.render_details(picture.is_some(), timer, g.busy, cx))
+                this.child(self.render_details(path.is_some(), timer, g.busy(), cx))
             })
-            .child(self.render_members(info, g.busy, p, cx))
+            .child(self.render_members(info, g.busy(), p, cx))
             .when(!info.invited.is_empty(), |this| {
                 let invited = info.invited.iter().enumerate();
                 this.child(
@@ -196,7 +200,7 @@ impl Hush {
                 )
             })
             .when(info.admin && !info.requesting.is_empty(), |this| {
-                this.child(self.render_requests(info, g.busy, p, cx))
+                this.child(self.render_requests(info, g.busy(), p, cx))
             })
             .when(info.admin || info.link.is_some(), |this| {
                 this.child(self.render_group_link(info, g, p, cx))
@@ -339,7 +343,7 @@ impl Hush {
             (LinkAccess::Approval, "Admins approve who joins"),
         ];
         let access = access.map(|(a, s)| (a, s.to_string())).to_vec();
-        let busy = g.busy;
+        let busy = g.busy();
         v_flex()
             .gap(px(8.))
             .child(heading("group-link", "Group link".into()))
@@ -381,7 +385,8 @@ impl Hush {
             })
     }
 
-    /// A person in the group: their picture, name and role (`GroupInfoView.row`).
+    /// A person the panel lists (member, invited or asking to join): their picture, their name, and
+    /// Admin if they are one (`GroupInfoView.row`).
     fn person(&self, id: impl Into<ElementId>, aci: &str, admin: bool, p: Palette) -> Stateful<Div> {
         let name = self.name(aci);
         let chat = format!("c:{aci}");
@@ -430,11 +435,12 @@ impl Hush {
             Sheet::Add { search, chosen } => {
                 let no_one = "Everyone you chat with is in this group.";
                 let body = self.people(&self.candidates(), chosen, search, no_one, Hush::toggle_new_member, cx);
-                let primary = match chosen.len() {
+                let adding = self.adding(chosen).len();
+                let primary = match adding {
                     n if n > 1 => format!("Add {n}"),
                     _ => "Add".into(),
                 };
-                ("Add members", 380., primary, !chosen.is_empty(), body)
+                ("Add members", 380., primary, adding > 0, body)
             }
         };
         modal(

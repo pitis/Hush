@@ -152,7 +152,7 @@ pub struct Hush {
     /// Who a new group can have, by name: (ACI, name).
     contacts: Vec<(String, String)>,
     dialog: Option<Dialog>,
-    /// The Group Info panel, over the chat.
+    /// The Group Info panel, over the window.
     group: Option<group::Panel>,
     /// A join request is being withdrawn.
     cancelling: bool,
@@ -591,7 +591,7 @@ impl Hush {
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
-        // the chat changes with every change stored: the group too, maybe
+        // any change stored reloads the chats: the open group may have changed, read it again
         self.read_group(cx);
     }
 
