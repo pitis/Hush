@@ -88,8 +88,35 @@ impl Panel {
     }
 }
 
-/// The look the app takes: the system's, or always light or dark (the Mac app's `Appearance`),
-/// kept in the data folder.
+/// A choice in Settings, kept as one word in a file of its own in the data folder (the Mac app's
+/// user defaults); the core's unlink leaves it. One not kept, or not known, is the default.
+pub(super) trait Choice: Global + Copy + Default + PartialEq {
+    const FILE: &'static str;
+    /// Each choice, its word in the file (the Mac app's) and its label.
+    const ALL: &'static [(Self, &'static str, &'static str)];
+
+    fn read(folder: &Path) -> Self {
+        let kept = std::fs::read_to_string(folder.join(Self::FILE)).unwrap_or_default();
+        let found = Self::ALL.iter().find(|(_, word, _)| *word == kept.trim());
+        found.map_or_else(Self::default, |(choice, _, _)| *choice)
+    }
+
+    fn save(self, folder: &Path) -> std::io::Result<()> {
+        let word = Self::ALL
+            .iter()
+            .find(|(choice, _, _)| *choice == self)
+            .map_or("", |(_, word, _)| word);
+        std::fs::create_dir_all(folder)?;
+        std::fs::write(folder.join(Self::FILE), word)
+    }
+}
+
+/// The choice made, or the default (none kept: made-up screens, tests).
+pub(super) fn chosen<C: Choice>(cx: &App) -> C {
+    cx.try_global::<C>().copied().unwrap_or_default()
+}
+
+/// The look the app takes: the system's, or always light or dark (the Mac app's `Appearance`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) enum Appearance {
     #[default]
@@ -100,33 +127,16 @@ pub(super) enum Appearance {
 
 impl Global for Appearance {}
 
-/// The file in the data folder that keeps it (the core's unlink leaves it).
-const APPEARANCE: &str = "appearance";
+impl Choice for Appearance {
+    const FILE: &'static str = "appearance";
+    const ALL: &'static [(Self, &'static str, &'static str)] = &[
+        (Self::System, "system", "System"),
+        (Self::Light, "light", "Light"),
+        (Self::Dark, "dark", "Dark"),
+    ];
+}
 
 impl Appearance {
-    const ALL: [(Self, &'static str); 3] = [(Self::System, "System"), (Self::Light, "Light"), (Self::Dark, "Dark")];
-
-    fn read(folder: &Path) -> Self {
-        match std::fs::read_to_string(folder.join(APPEARANCE))
-            .as_deref()
-            .map(str::trim)
-        {
-            Ok("light") => Self::Light,
-            Ok("dark") => Self::Dark,
-            _ => Self::System,
-        }
-    }
-
-    fn save(self, folder: &Path) -> std::io::Result<()> {
-        let word = match self {
-            Self::System => "system",
-            Self::Light => "light",
-            Self::Dark => "dark",
-        };
-        std::fs::create_dir_all(folder)?;
-        std::fs::write(folder.join(APPEARANCE), word)
-    }
-
     /// The colours, and on macOS the window's own chrome too (`NSApp.appearance`).
     fn apply(self, window: &mut Window, cx: &mut App) {
         let (forced, mode) = match self {
@@ -142,15 +152,37 @@ impl Appearance {
     }
 }
 
-/// The appearance kept, applied now, and the system's followed while it's chosen.
-pub(super) fn follow_appearance(window: &mut Window, cx: &mut Context<Hush>) {
-    let chosen = cx
-        .try_global::<Home>()
-        .map_or(Appearance::System, |home| Appearance::read(&home.folder));
-    cx.set_global(chosen);
-    chosen.apply(window, cx);
+/// What notifications show (the Mac app's `NotificationContent`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum NotificationContent {
+    #[default]
+    NameAndMessage,
+    NameOnly,
+    NoNameOrMessage,
+    Off,
+}
+
+impl Global for NotificationContent {}
+
+impl Choice for NotificationContent {
+    const FILE: &'static str = "notifications";
+    const ALL: &'static [(Self, &'static str, &'static str)] = &[
+        (Self::NameAndMessage, "message", "Name, content, and actions"),
+        (Self::NameOnly, "name", "Name only"),
+        (Self::NoNameOrMessage, "count", "No name or content"),
+        (Self::Off, "off", "Off"),
+    ];
+}
+
+/// The choices kept, the appearance applied now, and the system's followed while it's chosen.
+pub(super) fn load(window: &mut Window, cx: &mut Context<Hush>) {
+    if let Some(folder) = cx.try_global::<Home>().map(|home| home.folder.clone()) {
+        cx.set_global(NotificationContent::read(&folder));
+        cx.set_global(Appearance::read(&folder));
+    }
+    chosen::<Appearance>(cx).apply(window, cx);
     cx.observe_window_appearance(window, |_, window, cx| {
-        if *cx.global::<Appearance>() == Appearance::System {
+        if chosen::<Appearance>(cx) == Appearance::System {
             Theme::sync_system_appearance(Some(window), cx)
         }
     })
@@ -341,12 +373,17 @@ impl Hush {
     }
 
     /// Takes the look chosen, at once and from the next launch on.
-    pub(super) fn choose_appearance(&mut self, chosen: Appearance, window: &mut Window, cx: &mut Context<Self>) {
-        cx.set_global(chosen);
-        chosen.apply(window, cx);
+    pub(super) fn choose_appearance(&mut self, look: Appearance, window: &mut Window, cx: &mut Context<Self>) {
+        look.apply(window, cx);
+        self.choose(look, cx);
+    }
+
+    /// Takes a choice from now on, and keeps it for the next launch.
+    pub(super) fn choose<C: Choice>(&mut self, choice: C, cx: &mut Context<Self>) {
+        cx.set_global(choice);
         let folder = cx.try_global::<Home>().map(|home| home.folder.clone());
-        if let Some(Err(e)) = folder.map(|folder| chosen.save(&folder)) {
-            self.settings_failed(format!("Couldn't keep the appearance: {e}"), cx);
+        if let Some(Err(e)) = folder.map(|folder| choice.save(&folder)) {
+            self.settings_failed(format!("Couldn't keep the setting: {e}"), cx);
         }
         cx.notify();
     }
@@ -526,18 +563,22 @@ impl Hush {
 
 #[cfg(test)]
 mod tests {
-    use super::Appearance;
+    use super::{Appearance, Choice, NotificationContent};
 
     #[test]
-    fn the_appearance_chosen_is_kept_and_read_back() {
-        let folder = std::env::temp_dir().join(format!("hush-desktop-appearance-{}", std::process::id()));
+    fn a_choice_is_kept_and_read_back() {
+        let folder = std::env::temp_dir().join(format!("hush-desktop-choices-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         assert_eq!(Appearance::read(&folder), Appearance::System, "none kept yet");
-        for chosen in [Appearance::Dark, Appearance::Light, Appearance::System] {
-            chosen.save(&folder).unwrap();
-            assert_eq!(Appearance::read(&folder), chosen);
+        assert_eq!(NotificationContent::read(&folder), NotificationContent::NameAndMessage);
+        for look in [Appearance::Dark, Appearance::Light, Appearance::System] {
+            look.save(&folder).unwrap();
+            assert_eq!(Appearance::read(&folder), look);
         }
-        std::fs::write(folder.join(super::APPEARANCE), "sepia").unwrap();
+        NotificationContent::Off.save(&folder).unwrap();
+        assert_eq!(NotificationContent::read(&folder), NotificationContent::Off);
+        assert_eq!(Appearance::read(&folder), Appearance::System, "each in its own file");
+        std::fs::write(folder.join(Appearance::FILE), "sepia\n").unwrap();
         assert_eq!(Appearance::read(&folder), Appearance::System, "one it doesn't know");
         std::fs::remove_dir_all(&folder).unwrap();
     }
@@ -556,7 +597,7 @@ mod window_tests {
 
     use super::super::attach::window_tests::with_core;
     use super::super::{Home, Hush, Screen};
-    use super::{Appearance, Profile};
+    use super::{Appearance, NotificationContent, Profile};
     use crate::Demo;
 
     /// A test's key is refused: the app doesn't open a core again (it would start linking).
@@ -839,7 +880,7 @@ mod window_tests {
     }
 
     #[gpui::test]
-    fn the_appearance_chosen_applies_at_once_and_esc_closes_the_panel(cx: &mut TestAppContext) {
+    fn a_choice_applies_at_once_and_esc_closes_the_panel(cx: &mut TestAppContext) {
         let (window, hush) = open(Demo::Chat, cx);
         cx.simulate_keystrokes(window, "secondary-,");
         assert!(
@@ -854,6 +895,15 @@ mod window_tests {
             app.choose_appearance(Appearance::Light, window, cx)
         });
         assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Light);
+        act(window, &hush, cx, |app, _, cx| {
+            app.choose(NotificationContent::NameOnly, cx)
+        });
+        let content = cx.update(|cx| super::chosen::<NotificationContent>(cx));
+        assert_eq!(
+            content,
+            NotificationContent::NameOnly,
+            "what notifications show from now on"
+        );
         // no data folder here: nothing was kept, nor failed to be
         assert!(hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().problem.is_none()));
         cx.simulate_keystrokes(window, "escape");

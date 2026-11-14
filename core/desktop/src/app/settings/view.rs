@@ -5,12 +5,13 @@
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{h_flex, v_flex, Disableable, FocusTrapElement, Selectable as _, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::{Appearance, Panel};
+use super::{chosen, Appearance, Choice, NotificationContent, Panel};
 use crate::app::view::{card, empty_state, field, icon, label, modal};
 use crate::app::{Hush, Screen};
 use crate::style::Palette;
@@ -22,18 +23,39 @@ impl Hush {
     /// The Settings panel over the window: the account's part only while linked and in use.
     pub(in crate::app) fn render_settings(&self, p: Palette, cx: &mut Context<Self>) -> Option<Div> {
         let s = self.settings.panel.as_ref()?;
-        let chosen = cx.try_global::<Appearance>().copied().unwrap_or_default();
+        let look = chosen::<Appearance>(cx);
         let this = cx.entity().downgrade();
-        let looks = Appearance::ALL.map(|(look, name)| Button::new(name).label(name).selected(look == chosen));
+        let looks = Appearance::ALL
+            .iter()
+            .map(|(each, _, name)| Button::new(*name).label(*name).selected(*each == look));
         let appearance = ButtonGroup::new("appearance")
             .outline()
             .small()
             .children(looks)
             .on_click(move |clicked: &Vec<usize>, window, cx| {
-                let Some((look, _)) = clicked.first().and_then(|&ix| Appearance::ALL.get(ix)) else {
+                let Some((look, _, _)) = clicked.first().and_then(|&ix| Appearance::ALL.get(ix)) else {
                     return;
                 };
                 let _ = this.update(cx, |app, cx| app.choose_appearance(*look, window, cx));
+            });
+        let content = chosen::<NotificationContent>(cx);
+        let this = cx.entity().downgrade();
+        let contents = NotificationContent::ALL
+            .iter()
+            .enumerate()
+            .map(|(ix, (_, _, name))| Radio::new(("content", ix)).label(*name));
+        let notifications = RadioGroup::vertical("notification-content")
+            .children(contents)
+            .selected_index(
+                NotificationContent::ALL
+                    .iter()
+                    .position(|(each, _, _)| *each == content),
+            )
+            .on_click(move |&ix, _, cx| {
+                let Some((content, _, _)) = NotificationContent::ALL.get(ix) else {
+                    return;
+                };
+                let _ = this.update(cx, |app, cx| app.choose(*content, cx));
             });
         let account = matches!(self.screen, Screen::Chats).then(|| self.render_account(s, p, cx));
         Some(modal(
@@ -42,6 +64,9 @@ impl Hush {
                 .role(Role::Dialog)
                 .aria_label("Settings")
                 .w(px(440.))
+                // a short window scrolls it
+                .max_h_full()
+                .overflow_y_scroll()
                 .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                     if e.keystroke.key == "escape" {
                         this.close_settings(window, cx);
@@ -55,6 +80,7 @@ impl Hush {
                         .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(row("Appearance", appearance))
+                .child(row("Notification content", notifications).items_start())
                 .children(account)
                 .children(s.problem.clone().map(|why| {
                     label("settings-problem", Role::Alert, why)
