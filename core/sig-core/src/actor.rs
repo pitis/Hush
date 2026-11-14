@@ -1394,8 +1394,10 @@ async fn preview_link(
     let id = group_id(&link.master_key);
     let me = m.registration_data().service_ids.aci;
     let ours = m.store().group(link.master_key).await.map_err(|e| e.to_string())?;
-    if ours.is_some_and(|g| crate::groups::is_member(&g, me)) {
-        // a removed member can't fetch it: then they're asked as anyone with the link
+    // none here yet (relinked without history): the server says whether we're in it, and the
+    // fetch stores it for `list_group`. A removed member, or one never in it, can't fetch it:
+    // then they're asked as anyone with the link
+    if ours.is_none_or(|g| crate::groups::is_member(&g, me)) {
         if let Ok(Ok(g)) =
             tokio::time::timeout(Duration::from_secs(20), Box::pin(m.fetch_group(&link.master_key))).await
         {
@@ -4050,12 +4052,11 @@ mod tests {
         store.save_group(ours, g).await.unwrap();
         store.save_group(theirs, hikers(2)).await.unwrap();
 
-        assert!(
-            super::list_group(&store, &own(), &db, &sink, &theirs).await.is_err(),
-            "not in it"
-        );
-        assert!(
-            super::list_group(&store, &own(), &db, &sink, &[7; 32]).await.is_err(),
+        let refused = Err("You're not in this group.".to_string());
+        assert_eq!(super::list_group(&store, &own(), &db, &sink, &theirs).await, refused);
+        assert_eq!(
+            super::list_group(&store, &own(), &db, &sink, &[7; 32]).await,
+            refused,
             "presage hasn't it"
         );
         assert!(sink.0.lock().unwrap().is_empty());
@@ -4073,6 +4074,11 @@ mod tests {
             sink.0.lock().unwrap().as_slice(),
             [CoreEvent::ConversationsChanged]
         ));
+        // listed already (the app's list was behind): it keeps its place
+        let at = chat.last_message_at;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        super::list_group(&store, &own(), &db, &sink, &ours).await.unwrap();
+        assert_eq!(db.conversations().await.unwrap()[0].last_message_at, at);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

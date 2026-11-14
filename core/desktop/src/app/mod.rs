@@ -87,6 +87,8 @@ enum Outcome {
 #[derive(Debug, PartialEq)]
 enum JoinStep {
     Open,
+    /// In it, with no chat here (no messages since linking): listed first, then opened.
+    List,
     Join,
     AskToJoin,
 }
@@ -978,27 +980,26 @@ impl Hush {
             }
             .boxed_local(),
             DialogKind::Join(Some(preview)) => {
-                let (id, is_listed) = (preview.conversation_id.clone(), listed(&preview.conversation_id));
-                if join_step(preview, is_listed) == JoinStep::Open {
-                    if is_listed {
+                let id = preview.conversation_id.clone();
+                match join_step(preview, listed(&id)) {
+                    JoinStep::Open => {
                         self.dialog = None;
                         return self.select(id, window, cx);
                     }
-                    async move {
+                    JoinStep::List => async move {
                         match client.list_group(value).await {
                             Ok(()) => Outcome::Open(id),
                             Err(e) => Outcome::Problem(format!("Couldn't open the group: {}", describe(&e))),
                         }
                     }
-                    .boxed_local()
-                } else {
-                    async move {
+                    .boxed_local(),
+                    JoinStep::Join | JoinStep::AskToJoin => async move {
                         match client.join_group(value).await {
                             Ok(joined) => Outcome::Open(joined.conversation_id),
                             Err(e) => Outcome::Problem(server_failure("Couldn't join the group", &e)),
                         }
                     }
-                    .boxed_local()
+                    .boxed_local(),
                 }
             }
         };
@@ -1160,10 +1161,12 @@ fn matching<'a>(people: &'a [(String, String)], filter: &str) -> impl Iterator<I
 }
 
 fn join_step(p: &GroupPreview, listed: bool) -> JoinStep {
-    // in it: its chat opens, listed first if it has none here (no messages since linking). Asked
-    // from another device, with no chat here: asking again lists it
-    if p.member || (listed && p.requested) {
+    // asked from another device, with no chat here: asking again lists it
+    if listed && (p.member || p.requested) {
         JoinStep::Open
+    } else if p.member {
+        // the server refuses to add a member again
+        JoinStep::List
     } else if p.approval {
         JoinStep::AskToJoin
     } else {
@@ -1330,9 +1333,9 @@ mod tests {
             ..group.clone()
         };
         assert_eq!(join_step(&member, true), JoinStep::Open);
-        // in it, but its chat isn't listed here (no messages yet): Open Chat lists it (the server
-        // refuses to add a member again)
-        assert_eq!(join_step(&member, false), JoinStep::Open);
+        // in it, but its chat isn't listed here (no messages yet): Open Chat lists it first (the
+        // server refuses to add a member again)
+        assert_eq!(join_step(&member, false), JoinStep::List);
         // asked here: its chat opens; asked elsewhere: asking again lists it
         let requested = GroupPreview {
             requested: true,
