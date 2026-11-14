@@ -151,6 +151,8 @@ pub enum Demo {
     Settings,
     /// Removed on the phone: Link Again.
     Unlinked,
+    /// The chat with someone typing in it, and in another chat.
+    Typing,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -185,6 +187,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("add-members", Demo::AddMembers),
                 ("settings", Demo::Settings),
                 ("unlinked", Demo::Unlinked),
+                ("typing", Demo::Typing),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
