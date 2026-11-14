@@ -1560,3 +1560,46 @@ mod tests {
         );
     }
 }
+
+/// The files in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::{gpui, AppContext as _, Entity, TestAppContext, WindowOptions};
+
+    use super::super::Hush;
+    use crate::Demo;
+
+    fn open(cx: &mut TestAppContext) -> Entity<Hush> {
+        let (_, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Files, window, cx))
+            })
+            .expect("the window opens")
+        });
+        cx.run_until_parked();
+        hush
+    }
+
+    /// Messages with files, pictures decoded, recordings' lengths.
+    fn kept(hush: &Entity<Hush>, cx: &mut TestAppContext) -> (usize, usize, usize) {
+        hush.read_with(cx, |app, _| {
+            let f = &app.files;
+            (f.by_message.len(), f.thumbs.len(), f.lengths.len())
+        })
+    }
+
+    #[gpui::test]
+    fn rows_that_go_take_their_pictures_and_lengths_with_them(cx: &mut TestAppContext) {
+        let hush = open(cx);
+        // a recording, files, and two photos last
+        assert_eq!(kept(&hush, cx), (7, 2, 1));
+        // the recording's row and the photos' go (scrolled back to the newest, say)
+        hush.update(cx, |app, cx| {
+            let middle = app.messages[1..5].to_vec();
+            app.set_messages(middle, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(kept(&hush, cx), (4, 0, 0));
+    }
+}

@@ -138,6 +138,7 @@ mod window_tests {
 
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Entity, TestAppContext, WindowOptions};
     use sig_core::projection::{Message, MessageKey};
+    use sig_core::CoreEvent;
 
     use super::super::{Hush, PAGE};
     use crate::Demo;
@@ -308,6 +309,60 @@ mod window_tests {
         draw(window, cx);
         assert_eq!(depth(&hush, cx), 3 * PAGE);
         assert!(!loading_older(&hush, cx));
+    }
+
+    #[gpui::test]
+    fn a_page_or_a_changed_message_reads_only_its_own_details(cx: &mut TestAppContext) {
+        let (_, hush) = open(cx);
+        let all = crate::demo::history(300);
+        let asked = |hush: &Entity<Hush>, cx: &mut TestAppContext| hush.update(cx, |app, _| app.take_wanted());
+        let keys = |ms: &[Message]| ms.iter().map(Message::key).collect::<Vec<_>>();
+        show(&hush, &all[200..], cx);
+        assert_eq!(asked(&hush, cx), keys(&all[200..]));
+        // an older page: its rows only
+        show(&hush, &all[100..], cx);
+        assert_eq!(asked(&hush, cx), keys(&all[100..200]));
+        // a message that changed, a file that did
+        let changed = |chat: &str, k: MessageKey| CoreEvent::MessageChanged {
+            conversation_id: chat.into(),
+            key: k,
+        };
+        hush.update(cx, |app, cx| app.handle(changed("g:01", all[250].key()), cx));
+        assert_eq!(asked(&hush, cx), [all[250].key()]);
+        hush.update(cx, |app, cx| {
+            let file = CoreEvent::AttachmentChanged {
+                conversation_id: "g:01".into(),
+                message: all[260].key(),
+                id: 7,
+            };
+            app.handle(file, cx)
+        });
+        assert_eq!(asked(&hush, cx), [all[260].key()]);
+        // another chat's, or a message not loaded: nothing
+        hush.update(cx, |app, cx| app.handle(changed("g:02", all[270].key()), cx));
+        hush.update(cx, |app, cx| app.handle(changed("g:01", all[3].key()), cx));
+        assert!(asked(&hush, cx).is_empty());
+        // back to the newest: none read again
+        show(&hush, &all[200..], cx);
+        assert!(asked(&hush, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn no_page_is_asked_for_while_a_load_is_on_its_way(cx: &mut TestAppContext) {
+        let (window, hush) = open(cx);
+        let all = crate::demo::history(100);
+        show(&hush, &all, cx);
+        draw(window, cx);
+        // back at the newest, say: its reload still running would move the reader
+        hush.update(cx, |app, _| app.messages_loading = Some(app.generation));
+        scroll_to(&hush, 5, cx);
+        draw(window, cx);
+        assert_eq!(depth(&hush, cx), PAGE);
+        // in: scrolling on asks
+        hush.update(cx, |app, _| app.messages_loading = None);
+        scroll_to(&hush, 4, cx);
+        draw(window, cx);
+        assert_eq!(depth(&hush, cx), 2 * PAGE);
     }
 
     #[gpui::test]

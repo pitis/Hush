@@ -870,3 +870,32 @@ mod tests {
         assert!(!gone(&m, &[]));
     }
 }
+
+/// The actions in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::{gpui, AppContext as _, TestAppContext, WindowOptions};
+
+    use super::super::Hush;
+    use crate::Demo;
+
+    #[gpui::test]
+    fn rows_that_go_take_their_reactions_with_them(cx: &mut TestAppContext) {
+        let (_, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Chat, window, cx))
+            })
+            .expect("the window opens")
+        });
+        cx.run_until_parked();
+        assert_eq!(hush.read_with(cx, |app, _| app.actions.reactions.len()), 2);
+        // only the newest rows stay, without reactions
+        hush.update(cx, |app, cx| {
+            let newest = app.messages[app.messages.len() - 2..].to_vec();
+            app.set_messages(newest, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(hush.read_with(cx, |app, _| app.actions.reactions.len()), 0);
+    }
+}
