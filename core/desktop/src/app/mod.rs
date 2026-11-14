@@ -32,9 +32,11 @@ mod group;
 pub mod navigate;
 mod options;
 mod paging;
+mod polls;
 mod previews;
 pub mod search;
 mod view;
+mod view_once;
 
 /// How the phone lists this computer.
 const DEVICE_NAME: &str = "Hush Desktop";
@@ -171,6 +173,10 @@ pub struct Hush {
     /// The open chat's events among its messages.
     events: events::Events,
     options: options::Options,
+    /// The open chat's polls, as their votes stand.
+    polls: polls::Polls,
+    /// View-once media's one look.
+    view_once: view_once::ViewOnce,
 }
 
 /// The open core and the draft writes on their way, for `quit`.
@@ -365,6 +371,8 @@ impl Hush {
             previews: Default::default(),
             events: Default::default(),
             options: Default::default(),
+            polls: Default::default(),
+            view_once: Default::default(),
         }
     }
 
@@ -436,6 +444,15 @@ impl Hush {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.demo_chats(screen, cx);
+            }
+            crate::Demo::Polls | crate::Demo::ViewOnce => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.demo_polls(cx);
+                if let crate::Demo::ViewOnce = screen {
+                    app.demo_view_once(window, cx);
+                }
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;

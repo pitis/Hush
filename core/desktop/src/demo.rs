@@ -2,8 +2,8 @@
 
 use sig_core::projection::{
     Attachment, AttachmentState, BodyRange, ChatEvent, ChatEventKind, Conversation, ConversationKind, FileSummary,
-    LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile, PreviewDraft, Quote, Reaction,
-    SearchHit, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
+    LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile, Poll, PollOption, PreviewDraft, Quote,
+    Reaction, SearchHit, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
@@ -507,4 +507,92 @@ pub fn group_info() -> sig_core::GroupInfo {
         can_edit_details: true,
         can_add_members: true,
     }
+}
+
+/// The "Family" group's polls and view-once media, oldest first: ours (open, so it can be ended),
+/// Ana's ended with our vote; view-once media viewed, still to download and to open. With each
+/// poll's votes.
+pub fn poll_messages() -> (Vec<Message>, Vec<(MessageKey, Poll)>) {
+    let kind = |m: &mut Message, kind: MessageKind| {
+        m.body = None;
+        m.kind = kind;
+    };
+    let poll = |author: &str, ago: i64, question: &str| {
+        let mut m = message(author, ago, "");
+        kind(
+            &mut m,
+            MessageKind::Poll {
+                question: Some(question.into()),
+            },
+        );
+        m
+    };
+    let once = |author: &str, ago: i64, viewed: bool| {
+        let mut m = message(author, ago, "");
+        kind(&mut m, MessageKind::ViewOnce { viewed });
+        m
+    };
+    let option = |text: &str, voters: &[&str]| PollOption {
+        text: text.into(),
+        voters: voters.iter().map(|v| v.to_string()).collect(),
+    };
+    let trip = poll(ME, 60, "Which weekend for the trip?");
+    let dinner = poll(ANA, 30, "Where should we eat on Saturday?");
+    let polls = vec![
+        (
+            trip.key(),
+            Poll {
+                options: vec![option("June 7–8", &[ANA, ME]), option("June 14–15", &[ANA, BOGDAN, ME])],
+                allow_multiple: true,
+                ended: false,
+            },
+        ),
+        (
+            dinner.key(),
+            Poll {
+                options: vec![
+                    option("The pizza place", &[ANA, BOGDAN]),
+                    option("Thai", &[ME]),
+                    option("Cooking at home", &[]),
+                ],
+                allow_multiple: false,
+                ended: true,
+            },
+        ),
+    ];
+    let messages = vec![
+        trip,
+        dinner,
+        once(BOGDAN, 20, true),
+        once(BOGDAN, 10, false),
+        once(ANA, 5, false),
+    ];
+    (messages, polls)
+}
+
+/// The view-once media's files of `poll_messages` still to open: Bogdan's video still to download,
+/// Ana's photo here. None is a file on disk.
+pub fn view_once_files(messages: &[Message]) -> Vec<Attachment> {
+    let unopened = messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::ViewOnce { viewed: false });
+    let file = |m: &Message, content_type: &str, state: AttachmentState| Attachment {
+        id: m.sent_at,
+        message: m.key(),
+        content_type: content_type.into(),
+        file_name: None,
+        size: 2_400_000,
+        width: None,
+        height: None,
+        is_voice_note: false,
+        path: None,
+        state,
+        available: true,
+    };
+    let (video, photo): (Vec<&Message>, Vec<&Message>) = unopened.partition(|m| m.author == BOGDAN);
+    let videos = video
+        .into_iter()
+        .map(|m| file(m, "video/mp4", AttachmentState::Pending));
+    let photos = photo.into_iter().map(|m| file(m, "image/jpeg", AttachmentState::Ready));
+    videos.chain(photos).collect()
 }
