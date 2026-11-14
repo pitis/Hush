@@ -490,7 +490,7 @@ struct TimelineList: View {
     }
 
     /// Under a right-click or control-click on read-only text, the menu of the nearest view around it
-    /// (a message's), which the text's own (Look Up, Translate…) would hide; nil for any other click,
+    /// (a message's), which the text's own menu would hide; nil for any other click,
     /// or with no menu around the text.
     static func menuAround(_ event: NSEvent) -> (menu: NSMenu, view: NSView)? {
         guard event.type == .rightMouseDown || event.modifierFlags.contains(.control),
@@ -498,11 +498,12 @@ struct TimelineList: View {
             event.window?.attachedSheet == nil, NSApp.modalWindow == nil
         else { return nil }
         let hit = event.window?.contentView?.hitTest(event.locationInWindow)
-        // text clicked into shows in the window's field editor, whose delegate is the text
+        // a text field clicked into shows in the window's field editor, whose delegate is the field
         let editor = (hit as? NSTextView).flatMap { $0.isFieldEditor ? $0.delegate as? NSTextField : nil }
         let text: NSView? =
             if let field = editor ?? hit as? NSTextField { field.isEditable ? nil : field }
-            // from macOS 27 selectable text is a view of its own, static text to accessibility
+            // from macOS 27 selectable text is a private view, not a text field: static text to
+            // accessibility, so never editable
             else if hit?.accessibilityRole() == .staticText { hit } else { nil }
         guard let text else { return nil }
         var view = text.superview

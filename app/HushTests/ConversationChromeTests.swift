@@ -68,7 +68,7 @@ final class MessageRowTests: XCTestCase {
     /// The first text in the view, clicked into as a click does: a text field shows in the window's
     /// field editor, the field its delegate; other text takes the click itself. The view showing it,
     /// and its middle, in the window.
-    private func clickInto(_ hosting: NSView) throws -> (editor: NSView, point: NSPoint) {
+    private func clickInto(_ hosting: NSView) throws -> (view: NSView, point: NSPoint) {
         let text = try XCTUnwrap(Self.find(in: hosting))
         let point = text.convert(NSPoint(x: text.bounds.midX, y: text.bounds.midY), to: nil)
         guard let field = text as? NSTextField else {
@@ -93,13 +93,28 @@ final class MessageRowTests: XCTestCase {
     }
 
     func testRightClickOnTextClickedIntoShowsTheMessageMenu() throws {
-        let (editor, point) = try clickInto(host(row()))
-        // the text's own menu: Look Up, Translate… (from macOS 27 Copy, Paste…)
-        XCTAssertFalse(Self.isMessageMenu(editor.menu(for: click(at: point))))
+        let (text, point) = try clickInto(host(row()))
+        // the text's own menu: Look Up, Translate… (from macOS 27 Cut, Copy, Paste…)
+        XCTAssertFalse(Self.isMessageMenu(text.menu(for: click(at: point))))
         XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(click(at: point))?.menu))
         XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(click(.leftMouseDown, at: point, .control))?.menu))
         // a plain click selects as before
         XCTAssertNil(TimelineList.menuAround(click(.leftMouseDown, at: point)))
+    }
+
+    func testRightClickOnALabelClickedIntoShowsTheMenuAround() throws {
+        // selectable text on macOS 26 is one; from 27 any AppKit label still is
+        let (_, point) = try clickInto(host(Label().contextMenu { Button("Reply") {} }))
+        XCTAssertTrue(Self.isMessageMenu(TimelineList.menuAround(click(at: point))?.menu))
+    }
+
+    private struct Label: NSViewRepresentable {
+        func makeNSView(context: Context) -> NSTextField {
+            let label = NSTextField(labelWithString: "hi")
+            label.isSelectable = true
+            return label
+        }
+        func updateNSView(_ label: NSTextField, context: Context) {}
     }
 
     func testEditableTextKeepsItsOwnMenu() throws {
