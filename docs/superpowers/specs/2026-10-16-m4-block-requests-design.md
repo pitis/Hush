@@ -110,14 +110,18 @@ it's accepted (Desktop sends them on accept).
 Typing needs nothing: the composer isn't there.
 
 ### Calls and media (owner, 2026-11-14; #161)
-- A call from a request, or from a stranger we have no chat with yet (once the state is known),
-  doesn't ring, as in Signal's apps: the call router drops all its messages (offer, ICE, hangup)
-  before the call engine, so no connection is set up and the caller can't learn our IP. An offer
-  is recorded as a missed call in that chat. Nothing is sent back, as with receipts (Signal-Android,
-  as remembered and not checked against its source, answers with a `NEED_PERMISSION` hangup).
+- A call from a request, from a stranger we have no chat with yet (once the state is known), or
+  from a blocked chat doesn't ring, as in Signal's apps: the call router drops all its messages
+  (offer, ICE, hangup) before the call engine, so no connection is set up and the caller can't
+  learn our IP; if the check fails, the call is held back too. An offer is recorded as a missed
+  call in that chat and lists it, so a call alone makes the request. Nothing is sent back, as
+  with receipts (Signal-Android, as remembered and not checked against its source, answers with
+  a `NEED_PERMISSION` hangup). While the state is unknown (before the first pull) calls ring, as
+  every chat counts as accepted then.
 - Pictures and voice notes of requests and blocked chats don't download by themselves
-  (`auto_downloads`); accepting here, or on the phone (`MessageRequestResponse`, `Blocked`),
-  queues a pass that fetches them. Opening one by hand still downloads it.
+  (`auto_downloads`); accepting here, or on the phone (`MessageRequestResponse`, `Blocked`, or a
+  storage pull that changed chats), queues a pass that fetches them. Opening one by hand still
+  downloads it.
 
 ### From the phone (projector + db)
 - `Blocked`: the list replaces ours. Each listed ACI or group (matched by identifier against

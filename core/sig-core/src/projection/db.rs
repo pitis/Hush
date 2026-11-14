@@ -584,11 +584,12 @@ impl ProjectionDb {
         Ok(was.unwrap_or(false))
     }
 
-    /// Whether the chat is a message request, or would be one once a stranger's first message
-    /// or call makes it (a chat we don't have yet, once the phone's state is known).
-    pub async fn is_message_request(&self, id: &str) -> Result<bool, sqlx::Error> {
+    /// Whether the chat is blocked or a message request, or would be a request once a
+    /// stranger's first message or call makes it (a chat we don't have yet, once the phone's
+    /// state is known).
+    pub async fn is_unaccepted(&self, id: &str) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(concat!(
-            "SELECT COALESCE((SELECT ",
+            "SELECT COALESCE((SELECT c.blocked OR ",
             is_request!(),
             " FROM conversations c WHERE c.id = ?1), EXISTS (SELECT 1 FROM storage_sync WHERE version > 0))"
         ))
@@ -7338,50 +7339,64 @@ mod tests {
         phone_state_known(&db).await;
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        db.insert_message(&in_conv("c:carol", msg("carol", 3, "c")))
+            .await
+            .unwrap();
         let image = || {
             vec![
                 new_attachment("image/jpeg", 3, false),
                 new_attachment("image/jpeg", 3, false),
             ]
         };
-        db.apply(&add(k("alice", 1), image(), None)).await.unwrap();
-        db.apply(&add(k("bob", 2), image(), None)).await.unwrap();
+        for key in [k("alice", 1), k("bob", 2), k("carol", 3)] {
+            db.apply(&add(key, image(), None)).await.unwrap();
+        }
         db.accept("c:bob").await.unwrap();
         db.block("c:bob").await.unwrap();
-        assert!(db.auto_downloads().await.unwrap().is_empty());
+        db.accept("c:carol").await.unwrap();
+        let ids = |key| {
+            let db = &db;
+            async move {
+                db.attachments(&key)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|a| a.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let carol = ids(k("carol", 3)).await;
+        assert_eq!(db.auto_downloads().await.unwrap(), carol, "only the accepted chat's");
         let [a, a2] = <[Attachment; 2]>::try_from(db.attachments(&k("alice", 1)).await.unwrap()).unwrap();
         assert!(db.start_download(a2.id).await.unwrap().is_some(), "by hand");
         db.accept("c:alice").await.unwrap();
         db.accept("c:bob").await.unwrap();
-        let bob: Vec<i64> = db
-            .attachments(&k("bob", 2))
-            .await
-            .unwrap()
-            .iter()
-            .map(|a| a.id)
-            .collect();
-        assert_eq!(db.auto_downloads().await.unwrap(), [vec![a.id], bob].concat());
+        let bob = ids(k("bob", 2)).await;
+        assert_eq!(db.auto_downloads().await.unwrap(), [vec![a.id], bob, carol].concat());
     }
 
     /// A call rings only from a chat we accepted: not from a message request, nor from a
-    /// stranger we have no chat with yet (once the phone's state is known, as for requests).
+    /// stranger we have no chat with yet (once the phone's state is known, as for requests), nor
+    /// from a blocked chat.
     #[tokio::test]
     async fn a_call_is_from_a_request_as_its_chat_would_be() {
         let db = db().await;
         assert!(
-            !db.is_message_request("c:stranger").await.unwrap(),
+            !db.is_unaccepted("c:stranger").await.unwrap(),
             "state unknown: accepted"
         );
         phone_state_known(&db).await;
-        assert!(db.is_message_request("c:stranger").await.unwrap());
+        assert!(db.is_unaccepted("c:stranger").await.unwrap());
         db.insert_message(&msg("alice", 1, "hello?")).await.unwrap();
-        assert!(db.is_message_request("c:alice").await.unwrap());
+        assert!(db.is_unaccepted("c:alice").await.unwrap());
         db.accept("c:alice").await.unwrap();
         db.set_phone_contact("c:bob", true).await.unwrap();
         db.insert_message(&mine("c:carol", 2)).await.unwrap();
         for c in ["c:alice", "c:bob", "c:carol"] {
-            assert!(!db.is_message_request(c).await.unwrap(), "{c}");
+            assert!(!db.is_unaccepted(c).await.unwrap(), "{c}");
         }
+        db.block("c:bob").await.unwrap();
+        assert!(db.is_unaccepted("c:bob").await.unwrap(), "blocked");
     }
 
     #[tokio::test]
