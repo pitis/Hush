@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use async_compat::Compat;
 use futures::channel::mpsc::{unbounded, UnboundedSender};
-use futures::StreamExt;
+use futures::future::LocalBoxFuture;
+use futures::{FutureExt, StreamExt};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, Message, MessageKey, TextStyle};
-use sig_core::{Client, ConnectionState, CoreEvent, EventListener, HistoryStage};
+use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, GroupPreview, HistoryStage};
 
 use crate::{key, text};
 
@@ -41,6 +42,44 @@ enum Screen {
     Failed(String),
 }
 
+/// One of the New Chat menu's dialogs (the Mac app's sheets in `SidebarView.swift` and
+/// `GroupInfo.swift`), with its one text field.
+struct Dialog {
+    kind: DialogKind,
+    /// The username, the group's name or the link.
+    field: Entity<InputState>,
+    /// New Group's search over the people to add (`PeoplePicker`).
+    search: Option<Entity<InputState>>,
+    /// Tab and Shift-Tab stay inside it.
+    focus: FocusHandle,
+    /// Asking the server: the dialog stays until the answer is in.
+    busy: bool,
+    problem: Option<String>,
+}
+
+enum DialogKind {
+    Username,
+    /// The contacts ticked to be in it.
+    Group(HashSet<String>),
+    /// The group the link shows, once asked.
+    Join(Option<GroupPreview>),
+}
+
+/// How a dialog's request ended.
+enum Outcome {
+    Open(String),
+    Preview(GroupPreview),
+    Problem(String),
+}
+
+/// What the join dialog's button does for the group a link shows (`JoinGroupSheet.primary`).
+#[derive(Debug, PartialEq)]
+enum JoinStep {
+    Open,
+    Join,
+    AskToJoin,
+}
+
 pub struct Hush {
     client: Option<Arc<Client>>,
     data_dir: PathBuf,
@@ -51,7 +90,7 @@ pub struct Hush {
     /// The phone's message history on its way (stage, done, total), or a failed transfer:
     /// receiving waits for it, so it is shown with its ways out.
     history: Option<(HistoryStage, u64, u64)>,
-    /// The chat list: archived chats are left out.
+    /// Every chat, archived ones too (a dialog may open one): the sidebar leaves those out.
     chats: Vec<Conversation>,
     chats_loading: bool,
     chats_again: bool,
@@ -85,6 +124,11 @@ pub struct Hush {
     search: Entity<InputState>,
     query: String,
     timeline: Entity<MessageScrollerState>,
+    /// Who a new group can have, by name: (ACI, name).
+    contacts: Vec<(String, String)>,
+    dialog: Option<Dialog>,
+    /// A join request is being withdrawn.
+    cancelling: bool,
 }
 
 /// The open core, for `quit`.
@@ -230,6 +274,9 @@ impl Hush {
             search,
             query: String::new(),
             timeline,
+            contacts: vec![],
+            dialog: None,
+            cancelling: false,
         }
     }
 
@@ -247,11 +294,16 @@ impl Hush {
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
-            crate::Demo::Chat => {
+            crate::Demo::Chat | crate::Demo::NewGroup => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
+                app.contacts = addable(&app.chats, app.own_aci.as_deref());
                 app.selected = Some("g:01".into());
                 app.set_messages(crate::demo::messages(), cx);
+                if let crate::Demo::NewGroup = screen {
+                    let ana = app.contacts.first().map(|(aci, _)| aci.clone());
+                    app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
+                }
             }
         }
         app
@@ -357,6 +409,10 @@ impl Hush {
             // not in this version: typing, reactions, calls, stories, files, notifications
             _ => return,
         }
+        // a dialog belongs to the chats it was over: linking again doesn't bring it back
+        if !matches!(self.screen, Screen::Chats) {
+            self.dialog = None;
+        }
         cx.notify();
     }
 
@@ -394,17 +450,22 @@ impl Hush {
                 }
             }
         }
-        self.chats = all.into_iter().filter(|c| !c.archived).collect();
+        self.contacts = addable(&all, self.own_aci.as_deref());
+        self.chats = all;
         // group rows say who wrote the last message
         let authors = self
-            .chats
-            .iter()
+            .inbox()
             .filter(|c| c.kind == ConversationKind::Group && !c.last_message_outgoing);
         let mut wanted: Vec<String> = authors.map(|c| c.last_message_author.clone()).collect();
-        wanted.extend(self.chats.iter().flat_map(|c| mentioned(&c.last_message_ranges)));
+        wanted.extend(self.inbox().flat_map(|c| mentioned(&c.last_message_ranges)));
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
+    }
+
+    /// The chats the sidebar lists: all but the archived ones.
+    fn inbox(&self) -> impl Iterator<Item = &Conversation> {
+        self.chats.iter().filter(|c| !c.archived)
     }
 
     /// The chat list's pictures not asked for yet (a new picture is a new file).
@@ -413,6 +474,7 @@ impl Hush {
         let wanted: Vec<String> = self
             .chats
             .iter()
+            .filter(|c| !c.archived)
             .filter_map(|c| c.avatar.clone())
             .filter(|path| {
                 let new = !self.pictures.contains_key(path);
@@ -454,7 +516,9 @@ impl Hush {
 
     fn select(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected.as_ref() == Some(&id) {
-            return;
+            // from a dialog, whose field had the focus
+            self.composer.update(cx, |input, cx| input.focus(window, cx));
+            return cx.notify();
         }
         let draft = self.drafts.remove(&id).unwrap_or_default();
         let unsent = self.composer.read(cx).value().to_string();
@@ -628,6 +692,207 @@ impl Hush {
         .detach();
     }
 
+    fn open_dialog(&mut self, kind: DialogKind, window: &mut Window, cx: &mut Context<Self>) {
+        // one still asking the server stays: its outcome must be seen
+        if self.dialog.as_ref().is_some_and(|d| d.busy) {
+            return;
+        }
+        let placeholder = match kind {
+            DialogKind::Username => "name.42",
+            DialogKind::Group(_) => "Group name",
+            DialogKind::Join(_) => "Group link",
+        };
+        let field = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        cx.subscribe_in(&field, window, |this, _, event: &InputEvent, window, cx| match event {
+            InputEvent::PressEnter { .. } => this.submit_dialog(window, cx),
+            InputEvent::Change => {
+                let Some(d) = &mut this.dialog else { return };
+                // another link: the group shown isn't the one it joins
+                if let DialogKind::Join(preview) = &mut d.kind {
+                    *preview = None;
+                }
+                d.problem = None;
+                cx.notify();
+            }
+            _ => {}
+        })
+        .detach();
+        field.update(cx, |f, cx| f.focus(window, cx));
+        let search = matches!(kind, DialogKind::Group(_)).then(|| {
+            let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+            cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            })
+            .detach();
+            search
+        });
+        self.dialog = Some(Dialog {
+            kind,
+            field,
+            search,
+            focus: cx.focus_handle(),
+            busy: false,
+            problem: None,
+        });
+        cx.notify();
+    }
+
+    /// Cancel: not while the server is asked, as its outcome (a group made, say) must be seen.
+    fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.dialog.as_ref().is_some_and(|d| !d.busy) {
+            self.dialog = None;
+            cx.notify();
+        }
+    }
+
+    fn toggle_member(&mut self, aci: String, cx: &mut Context<Self>) {
+        if let Some(Dialog {
+            kind: DialogKind::Group(chosen),
+            ..
+        }) = &mut self.dialog
+        {
+            if !chosen.remove(&aci) {
+                chosen.insert(aci);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The dialog's default button: Find, Create, Show Group, then Join (or Open Chat).
+    fn submit_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        let listed = |id: &str| self.chats.iter().any(|c| c.id == id);
+        let Some(d) = &self.dialog else { return };
+        let asked = d.field.read(cx).value().trim().to_string();
+        if d.busy || asked.is_empty() {
+            return;
+        }
+        let value = asked.clone();
+        let work: LocalBoxFuture<Outcome> = match &d.kind {
+            DialogKind::Username => async move {
+                match client.find_username(value).await {
+                    Ok(Some(id)) => Outcome::Open(id),
+                    Ok(None) => Outcome::Problem("No one has this username.".into()),
+                    Err(e) => Outcome::Problem(describe(&e)),
+                }
+            }
+            .boxed_local(),
+            DialogKind::Group(chosen) => {
+                let members = self.contacts.iter().map(|(aci, _)| aci).filter(|a| chosen.contains(*a));
+                let members: Vec<String> = members.cloned().collect();
+                async move {
+                    match client.create_group(value, members).await {
+                        Ok(id) => Outcome::Open(id),
+                        Err(e) => Outcome::Problem(server_failure("Couldn't make the group", &e)),
+                    }
+                }
+                .boxed_local()
+            }
+            DialogKind::Join(None) => async move {
+                match client.group_link_preview(value).await {
+                    Ok(preview) => Outcome::Preview(preview),
+                    Err(e) => Outcome::Problem(server_failure("Couldn't read the link", &e)),
+                }
+            }
+            .boxed_local(),
+            DialogKind::Join(Some(preview)) => {
+                if join_step(preview, listed(&preview.conversation_id)) == JoinStep::Open {
+                    let id = preview.conversation_id.clone();
+                    self.dialog = None;
+                    return self.select(id, window, cx);
+                }
+                async move {
+                    match client.join_group(value).await {
+                        Ok(joined) => Outcome::Open(joined.conversation_id),
+                        Err(e) => Outcome::Problem(server_failure("Couldn't join the group", &e)),
+                    }
+                }
+                .boxed_local()
+            }
+        };
+        if let Some(d) = &mut self.dialog {
+            d.busy = true;
+            d.problem = None;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = Compat::new(work).await;
+            let _ = this.update_in(cx, |app, window, cx| app.dialog_done(asked, outcome, window, cx));
+        })
+        .detach();
+    }
+
+    fn dialog_done(&mut self, asked: String, outcome: Outcome, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = &mut self.dialog else { return };
+        d.busy = false;
+        // the text changed meanwhile: a preview or a problem isn't about what it says now
+        let same = d.field.read(cx).value().trim() == asked;
+        match outcome {
+            Outcome::Open(id) => {
+                self.dialog = None;
+                self.select(id, window, cx);
+                self.refresh_chats(cx);
+            }
+            Outcome::Preview(p) if same => {
+                if let DialogKind::Join(preview) = &mut d.kind {
+                    *preview = Some(p);
+                }
+            }
+            Outcome::Problem(why) if same => d.problem = Some(why),
+            Outcome::Preview(_) | Outcome::Problem(_) => {}
+        }
+        cx.notify();
+    }
+
+    /// Withdraws our request to join the group, then deletes its chat; a failure is said (the
+    /// chat then stays).
+    fn cancel_join_request(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        if self.cancelling {
+            return;
+        }
+        self.cancelling = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cancelled = Compat::new(client.cancel_join_request(id.clone())).await;
+            let _ = this.update(cx, |app, cx| {
+                app.cancelling = false;
+                match cancelled {
+                    Ok(()) => app.delete_chat(id, cx),
+                    Err(e) => app.error = Some(server_failure("Couldn't cancel the request", &e)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Deletes the chat's messages here (a person's on the phone too); it closes
+    /// (`AppStore.deleteChat`). A failure is said.
+    fn delete_chat(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        if self.selected.as_ref() == Some(&id) {
+            self.selected = None;
+            self.generation += 1;
+            self.messages.clear();
+            self.timeline.update(cx, |t, cx| t.reset(0, cx));
+        }
+        self.drafts.remove(&id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let Err(e) = Compat::new(client.delete_chat(id)).await else {
+                return;
+            };
+            let _ = this.update(cx, |app, cx| {
+                app.error = Some(format!("Couldn't delete the chat: {}", describe(&e)));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// After a failed history transfer: picks it up where it stopped.
     fn retry_history(&mut self, cx: &mut Context<Self>) {
         let Some(client) = &self.client else { return };
@@ -675,6 +940,61 @@ impl Hush {
     }
 }
 
+/// Who a new group can have: the people with a chat here, but strangers, blocked ones and us; by
+/// name (`AppStore.addableContacts`).
+fn addable(all: &[Conversation], own_aci: Option<&str>) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = all
+        .iter()
+        .filter(|c| c.kind == ConversationKind::Direct && !c.blocked && !c.message_request)
+        .filter_map(|c| {
+            let aci =
+                c.id.strip_prefix("c:")
+                    .filter(|a| !a.starts_with("PNI:") && Some(*a) != own_aci)?;
+            Some((aci.to_owned(), text::title(c, own_aci)))
+        })
+        .collect();
+    found.sort_by_key(|(_, name)| name.to_lowercase());
+    found
+}
+
+/// The people (ACI, name) whose name has `filter` in it, in any case (`PeoplePicker`).
+fn matching<'a>(people: &'a [(String, String)], filter: &str) -> impl Iterator<Item = &'a (String, String)> {
+    let filter = filter.trim().to_lowercase();
+    people
+        .iter()
+        .filter(move |(_, name)| name.to_lowercase().contains(&filter))
+}
+
+fn join_step(p: &GroupPreview, listed: bool) -> JoinStep {
+    // no chat here (in it with no messages yet, or asked from another device): joining or asking
+    // again lists it; the Mac app's Open Chat would open nothing
+    if listed && (p.member || p.requested) {
+        JoinStep::Open
+    } else if p.approval {
+        JoinStep::AskToJoin
+    } else {
+        JoinStep::Join
+    }
+}
+
+/// A failure as the Mac app says it (`AppStore.describe`).
+fn describe(e: &CoreError) -> String {
+    match e {
+        CoreError::Storage { message } => format!("Hush couldn't open its data: {message}"),
+        CoreError::InvalidInput { message } => message.clone(),
+        CoreError::Network { message } => format!("The server couldn't be reached: {message}"),
+        e => e.to_string(),
+    }
+}
+
+/// A server's refusal, after what was tried (`AppStore.serverFailure`).
+fn server_failure(what: &str, e: &CoreError) -> String {
+    match e {
+        CoreError::Network { message } => format!("{what}: {message}"),
+        e => format!("{what}: {}", describe(e)),
+    }
+}
+
 /// The rows that changed between two lists of keys: `old[range]` became `count` rows of `new`
 /// (what both share at the start and at the end stays).
 fn changed_rows<K: PartialEq>(old: &[K], new: &[K]) -> (Range<usize>, usize) {
@@ -714,6 +1034,127 @@ fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
 
 #[cfg(test)]
 mod tests {
+    use super::{addable, changed_rows, describe, join_step, matching, JoinStep};
+    use sig_core::projection::{Conversation, ConversationKind, MessageKind, MessageStatus};
+    use sig_core::{CoreError, GroupPreview};
+
+    fn chat(id: &str, title: &str) -> Conversation {
+        Conversation {
+            id: id.into(),
+            title: title.into(),
+            kind: if id.starts_with("g:") {
+                ConversationKind::Group
+            } else {
+                ConversationKind::Direct
+            },
+            last_message_at: 0,
+            last_message_preview: String::new(),
+            last_message_ranges: vec![],
+            unread_count: 0,
+            last_message_author: String::new(),
+            last_message_outgoing: false,
+            last_message_status: MessageStatus::Read,
+            last_message_deleted: false,
+            last_message_file: None,
+            expire_timer: 0,
+            last_message_kind: MessageKind::Normal,
+            last_message_undecryptable: false,
+            archived: false,
+            pinned_order: None,
+            mute_until: 0,
+            marked_unread: false,
+            blocked: false,
+            whitelisted: true,
+            message_request: false,
+            group_invitation: false,
+            group_join_requested: false,
+            avatar: None,
+            username: None,
+            note: None,
+            chat_color: None,
+            wallpaper: None,
+        }
+    }
+
+    #[test]
+    fn a_new_group_can_have_the_people_with_a_chat_here() {
+        let blocked = Conversation {
+            blocked: true,
+            ..chat("c:b", "Blocked")
+        };
+        let stranger = Conversation {
+            message_request: true,
+            ..chat("c:s", "Stranger")
+        };
+        let all = [
+            chat("c:z", "zoë"),
+            chat("g:1", "A group"),
+            chat("c:me", "Me"),
+            chat("c:PNI:p", "By number"),
+            blocked,
+            stranger,
+            chat("c:a", "Ana"),
+        ];
+        let names: Vec<_> = addable(&all, Some("me")).into_iter().map(|(aci, _)| aci).collect();
+        assert_eq!(names, ["a", "z"]);
+    }
+
+    #[test]
+    fn the_join_button_opens_joins_or_asks() {
+        let group = GroupPreview {
+            conversation_id: "g:1".into(),
+            title: "Hikers".into(),
+            description: String::new(),
+            member_count: 3,
+            approval: false,
+            requested: false,
+            member: false,
+        };
+        assert_eq!(join_step(&group, false), JoinStep::Join);
+        let approval = GroupPreview {
+            approval: true,
+            ..group.clone()
+        };
+        assert_eq!(join_step(&approval, false), JoinStep::AskToJoin);
+        let member = GroupPreview {
+            member: true,
+            ..group.clone()
+        };
+        assert_eq!(join_step(&member, true), JoinStep::Open);
+        // in it, but its chat isn't listed here (no messages yet): joining lists it
+        assert_eq!(join_step(&member, false), JoinStep::Join);
+        // asked here: its chat opens; asked elsewhere: asking again lists it
+        let requested = GroupPreview {
+            requested: true,
+            ..approval
+        };
+        assert_eq!(join_step(&requested, true), JoinStep::Open);
+        assert_eq!(join_step(&requested, false), JoinStep::AskToJoin);
+    }
+
+    #[test]
+    fn the_people_search_finds_names_in_any_case() {
+        let people: Vec<(String, String)> = [("a", "Ana Pop"), ("b", "Bogdan"), ("c", "Ioana")]
+            .map(|(aci, name)| (aci.to_owned(), name.to_owned()))
+            .into();
+        let found = |filter: &str| -> Vec<&str> { matching(&people, filter).map(|(aci, _)| aci.as_str()).collect() };
+        assert_eq!(found(""), ["a", "b", "c"]);
+        assert_eq!(found(" ANA "), ["a", "c"]);
+        assert_eq!(found("pop"), ["a"]);
+        assert!(found("zoë").is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_said_as_the_mac_app_says_it() {
+        let storage = CoreError::Storage {
+            message: "disk full".into(),
+        };
+        assert_eq!(describe(&storage), "Hush couldn't open its data: disk full");
+        let network = CoreError::Network {
+            message: "timed out".into(),
+        };
+        assert_eq!(describe(&network), "The server couldn't be reached: timed out");
+    }
 
     #[test]
     fn a_pictures_format_is_told_by_its_first_bytes() {
@@ -730,7 +1171,6 @@ mod tests {
         assert_eq!(image_format(b"HUSHFIL1"), None, "still encrypted: nothing to show");
         assert_eq!(image_format(b""), None);
     }
-    use super::changed_rows;
 
     #[test]
     fn only_the_rows_that_came_or_went_change() {

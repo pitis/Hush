@@ -4,16 +4,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{h_flex, v_flex, Icon, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, FocusTrapElement, Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind, MessageStatus};
 use sig_core::{ConnectionState, HistoryStage};
 
-use super::{Hush, Screen};
+use super::{join_step, matching, Dialog, DialogKind, Hush, JoinStep, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -170,7 +172,7 @@ impl Hush {
     }
 
     fn render_sidebar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        let shown: Vec<&Conversation> = self.chats.iter().filter(|c| self.matches(c)).collect();
+        let shown: Vec<&Conversation> = self.inbox().filter(|c| self.matches(c)).collect();
         let pinned = self.query.is_empty() && shown.iter().any(|c| c.pinned_order.is_some());
         let mut list = v_flex().pb(px(8.));
         for (ix, c) in shown.iter().enumerate() {
@@ -212,22 +214,30 @@ impl Hush {
                 )
             })
             .child(
-                div().px(px(10.)).pb(px(8.)).pt(px(8.)).flex_none().child(
-                    h_flex()
-                        .h(px(30.))
-                        .px(px(8.))
-                        .gap(px(6.))
-                        .rounded(px(8.))
-                        .bg(p.fill)
-                        .child(icon("search", 14., p.secondary))
-                        .child(
-                            Input::new(&self.search)
-                                .appearance(false)
-                                .aria_label("Search")
-                                .text_size(px(13.))
-                                .flex_1(),
-                        ),
-                ),
+                h_flex()
+                    .px(px(10.))
+                    .pb(px(8.))
+                    .pt(px(8.))
+                    .gap(px(6.))
+                    .flex_none()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .h(px(30.))
+                            .px(px(8.))
+                            .gap(px(6.))
+                            .rounded(px(8.))
+                            .bg(p.fill)
+                            .child(icon("search", 14., p.secondary))
+                            .child(
+                                Input::new(&self.search)
+                                    .appearance(false)
+                                    .aria_label("Search")
+                                    .text_size(px(13.))
+                                    .flex_1(),
+                            ),
+                    )
+                    .child(self.render_new_chat(p, cx)),
             )
             .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
             .child(
@@ -241,6 +251,215 @@ impl Hush {
                     .child(list),
             )
             .children(self.render_connection(p, cx))
+    }
+
+    /// The Mac app's New Chat menu (`SidebarView.swift`).
+    fn render_new_chat(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        Button::new("new-chat")
+            .ghost()
+            .icon(icon("square-pen", 15., p.secondary))
+            .accessibility_label("New Chat")
+            .tooltip("New chat")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let item = |label: &'static str, kind: fn() -> DialogKind| {
+                    let this = this.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let _ = this.update(cx, |app, cx| app.open_dialog(kind(), window, cx));
+                    })
+                };
+                menu.item(item("New Chat by Username…", || DialogKind::Username))
+                    .item(item("New Group…", || DialogKind::Group(Default::default())))
+                    .item(item("Join Group by Link…", || DialogKind::Join(None)))
+            })
+    }
+
+    /// The open New Chat dialog over the window (the Mac app's sheets).
+    fn render_dialog(&self, d: &Dialog, p: Palette, cx: &mut Context<Self>) -> Div {
+        let asked = !d.field.read(cx).value().trim().is_empty();
+        let (title, detail) = match &d.kind {
+            DialogKind::Username => ("New chat", Some("Enter their username, as it shows in their profile.")),
+            DialogKind::Group(_) => ("New group", None),
+            DialogKind::Join(_) => ("Join a group", None),
+        };
+        let primary = match &d.kind {
+            DialogKind::Username => "Find",
+            DialogKind::Group(_) => "Create",
+            DialogKind::Join(None) => "Show Group",
+            DialogKind::Join(Some(g)) => match join_step(g, self.chats.iter().any(|c| c.id == g.conversation_id)) {
+                JoinStep::Open => "Open Chat",
+                JoinStep::Join => "Join",
+                JoinStep::AskToJoin => "Ask to Join",
+            },
+        };
+        let body = match &d.kind {
+            DialogKind::Group(chosen) => {
+                let filter = d.search.as_ref().map(|s| s.read(cx).value().to_string());
+                // shortcut: names only; the Mac app's picker shows each one's picture too, add
+                // it when the checkbox takes more than a label
+                let people: Vec<_> = matching(&self.contacts, filter.as_deref().unwrap_or_default())
+                    .enumerate()
+                    .map(|(ix, (aci, name))| {
+                        let aci = aci.clone();
+                        let this = cx.entity().downgrade();
+                        Checkbox::new(("member", ix))
+                            .label(name.clone())
+                            .checked(chosen.contains(&aci))
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |app, cx| app.toggle_member(aci.clone(), cx));
+                            })
+                    })
+                    .collect();
+                let list = if people.is_empty() {
+                    let no_one = if self.contacts.is_empty() {
+                        "No one to add yet; members can be added later."
+                    } else {
+                        "No one matches."
+                    };
+                    label("no-one", Role::Label, no_one)
+                        .text_size(px(12.))
+                        .text_color(p.secondary)
+                } else {
+                    v_flex()
+                        .id("members")
+                        .role(Role::List)
+                        .aria_label("Members")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .gap(px(6.))
+                        .children(people)
+                };
+                Some(
+                    v_flex()
+                        .gap(px(12.))
+                        .children(
+                            d.search
+                                .as_ref()
+                                .map(|s| field(Input::new(s).appearance(false).aria_label("Search").w_full(), p)),
+                        )
+                        .child(list)
+                        .into_any_element(),
+                )
+            }
+            DialogKind::Join(Some(g)) => {
+                let members = match g.member_count {
+                    1 => "1 member".to_string(),
+                    n => format!("{n} members"),
+                };
+                let standing = match () {
+                    _ if g.member => "You're in this group.",
+                    _ if g.requested => "You asked to join: an admin has to let you in.",
+                    _ if g.approval => "An admin has to approve you.",
+                    _ => "",
+                };
+                Some(
+                    v_flex()
+                        .gap(px(4.))
+                        .child(
+                            label(
+                                "group-title",
+                                Role::Label,
+                                if g.title.is_empty() {
+                                    "Unnamed group".into()
+                                } else {
+                                    g.title.clone()
+                                },
+                            )
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .when(!g.description.is_empty(), |this| {
+                            this.child(
+                                label("group-description", Role::Label, g.description.clone())
+                                    .text_size(px(12.))
+                                    .text_color(p.secondary),
+                            )
+                        })
+                        .child(label("group-members", Role::Label, members).text_size(px(12.)))
+                        .when(!standing.is_empty(), |this| {
+                            this.child(
+                                label("group-standing", Role::Label, standing)
+                                    .text_size(px(12.))
+                                    .text_color(p.secondary),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        };
+        // the chats behind don't take clicks while it's open
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(black().opacity(0.35))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .id("dialog")
+                    .role(Role::Dialog)
+                    .aria_label(title)
+                    .w(px(380.))
+                    .p(px(20.))
+                    .gap(px(12.))
+                    .rounded(px(12.))
+                    .bg(p.window)
+                    .border_1()
+                    .border_color(p.separator)
+                    .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                        if e.keystroke.key == "escape" {
+                            this.close_dialog(cx);
+                        }
+                    }))
+                    .child(
+                        label("dialog-title", Role::Heading, title)
+                            .aria_level(1)
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .children(detail.map(|d| {
+                        label("dialog-detail", Role::Label, d)
+                            .text_size(px(12.))
+                            .text_color(p.secondary)
+                    }))
+                    .child(field(
+                        Input::new(&d.field)
+                            .appearance(false)
+                            .aria_label(title)
+                            .disabled(d.busy)
+                            .w_full(),
+                        p,
+                    ))
+                    .children(body)
+                    .children(d.problem.clone().map(|why| {
+                        label("dialog-problem", Role::Alert, why)
+                            .text_size(px(12.))
+                            .text_color(p.danger)
+                    }))
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .when(d.busy, |this| this.child(Spinner::new().xsmall()))
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("dialog-cancel")
+                                    .label("Cancel")
+                                    .disabled(d.busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+                            )
+                            .child(
+                                Button::new("dialog-primary")
+                                    .primary()
+                                    .label(primary)
+                                    .disabled(d.busy || !asked)
+                                    .on_click(cx.listener(|this, _, window, cx| this.submit_dialog(window, cx))),
+                            ),
+                    )
+                    .focus_trap("dialog", &d.focus),
+            )
     }
 
     fn matches(&self, c: &Conversation) -> bool {
@@ -440,7 +659,7 @@ impl Hush {
             .as_ref()
             .and_then(|id| self.chats.iter().find(|c| &c.id == id));
         let Some(c) = open else {
-            let (title, detail) = match (self.chats.is_empty(), &self.connection) {
+            let (title, detail) = match (self.inbox().next().is_none(), &self.connection) {
                 (false, _) => ("Select a chat", ""),
                 (true, ConnectionState::Online) => (
                     "Connected — no messages yet",
@@ -471,11 +690,14 @@ impl Hush {
                 _ => String::new(),
             },
         };
-        // shortcut: requests, invitations, join requests and blocked chats are answered on the
-        // phone; the Mac app offers Accept, Block and the others here
+        // shortcut: message requests, invitations and blocked chats are answered on the phone,
+        // and a join request's Delete and Cancel Request don't ask first; the Mac app offers
+        // Accept, Block and the others here, and asks: add them with a confirmation dialog
         let answer_first = c.message_request || c.group_invitation || c.group_join_requested || c.blocked;
         let answer_where = if c.blocked {
             "This chat is blocked. Unblock it on your phone to write here."
+        } else if c.group_join_requested {
+            "You asked to join this group. An admin has to let you in."
         } else {
             "Answer this chat on your phone to write here."
         };
@@ -517,11 +739,42 @@ impl Hush {
                 .min_h_0(),
             )
             .child(if answer_first {
-                div().flex_none().px(px(18.)).py(px(14.)).child(
-                    label("answer-first", Role::Label, answer_where)
-                        .text_center()
-                        .text_color(p.secondary),
-                )
+                let id = c.id.clone();
+                v_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(18.))
+                    .py(px(14.))
+                    .child(
+                        label("answer-first", Role::Label, answer_where)
+                            .text_center()
+                            .text_color(p.secondary),
+                    )
+                    .when(c.group_join_requested && !c.blocked, |this| {
+                        let delete = id.clone();
+                        this.child(
+                            h_flex()
+                                .gap(px(10.))
+                                // here only, should cancelling fail for good (the request stays)
+                                .child(
+                                    Button::new("delete-chat")
+                                        .label("Delete")
+                                        .disabled(self.cancelling)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| this.delete_chat(delete.clone(), cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("cancel-request")
+                                        .label("Cancel Request")
+                                        .disabled(self.cancelling)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| this.cancel_join_request(id.clone(), cx)),
+                                        ),
+                                ),
+                        )
+                    })
             } else {
                 self.render_composer(p, cx)
             })
@@ -820,6 +1073,20 @@ fn icon(name: &str, size: f32, color: Hsla) -> Icon {
         .text_color(color)
 }
 
+/// A dialog's text field, in its box.
+fn field(input: Input, p: Palette) -> Div {
+    div()
+        .h(px(28.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(6.))
+        .bg(p.field)
+        .border_1()
+        .border_color(p.separator)
+        .child(input)
+}
+
 fn section(title: &'static str, p: Palette) -> Div {
     div()
         .px(px(20.))
@@ -897,6 +1164,10 @@ impl Render for Hush {
             Screen::Chats => self.history.map(|h| self.render_history(h, p, cx)),
             _ => None,
         };
+        let dialog = match self.screen {
+            Screen::Chats => self.dialog.as_ref().map(|d| self.render_dialog(d, p, cx)),
+            _ => None,
+        };
         div()
             .relative()
             .size_full()
@@ -905,5 +1176,6 @@ impl Render for Hush {
             .text_size(px(13.))
             .child(screen)
             .children(history)
+            .children(dialog)
     }
 }
