@@ -60,8 +60,8 @@ pub enum Command {
     },
     Start,
     Send(Job),
-    /// Download one attachment (the user asked for it).
-    Download(i64),
+    /// Download one attachment (the user asked for it), or what downloads by itself.
+    Download(Download),
     /// The user is typing in a conversation (`started`), or stopped.
     Typing {
         conversation_id: String,
@@ -364,6 +364,7 @@ async fn run(
         projection.clone(),
         listener.clone(),
         send_tx.clone(),
+        download_tx.clone(),
         storage_rx,
     );
     // Downloads cut off by the previous run start over.
@@ -823,8 +824,8 @@ async fn run(
                 // the thread ends; the Client deletes presage's store and the app relinks
                 return;
             }
-            Command::Download(id) => {
-                let _ = download_tx.send(Download::One(id));
+            Command::Download(what) => {
+                let _ = download_tx.send(what);
             }
             Command::Typing {
                 conversation_id,
@@ -1440,6 +1441,7 @@ fn spawn_storage_sync(
     db: ProjectionDb,
     listener: Arc<dyn EventListener>,
     send_tx: mpsc::UnboundedSender<Job>,
+    download_tx: mpsc::UnboundedSender<Download>,
     mut rx: mpsc::UnboundedReceiver<storage::Trigger>,
 ) {
     let l = listener.clone();
@@ -1465,6 +1467,10 @@ fn spawn_storage_sync(
                 Err(e) => tracing::warn!(?trigger, error = %e, "storage sync failed"),
             }
             let (events, wrote) = storage::effects(&result);
+            // a chat the phone accepted (made a contact, say) lets its held-back media come
+            if events.contains(&CoreEvent::ConversationsChanged) {
+                let _ = download_tx.send(Download::Auto);
+            }
             for event in events {
                 listener.on_event(event);
             }
@@ -1520,6 +1526,7 @@ fn spawn_call_router(
     {
         let ensure_engine = ensure_engine.clone();
         let (store, listener, registration) = (store.clone(), listener.clone(), registration.clone());
+        let db = db.clone();
         tokio::task::spawn_local(async move {
             use presage::libsignal_service::protocol::{IdentityKeyStore, ProtocolAddress};
             while let Some(envelope) = incoming_rx.recv().await {
@@ -1531,6 +1538,9 @@ fn spawn_call_router(
                 let calls = crate::calls::wire::from_proto(&envelope.message, our_device_id);
                 if calls.is_empty() {
                     continue; // not for this device, or nothing we handle: no audio stack for it
+                }
+                if hold_back_unaccepted_call(&db, listener.as_ref(), &sender_aci, &calls).await {
+                    continue;
                 }
                 let Some(engine) = ensure_engine() else {
                     tracing::warn!("a call message arrived while unlinked");
@@ -2141,7 +2151,7 @@ async fn handle(
                 // now that the new setting is stored, so they can't go out under the old one
                 let _ = queues.sends.send(Job::Receipts);
             }
-            if outcome.attachments_added {
+            if outcome.attachments_added || outcome.requests_answered {
                 let _ = queues.downloads.send(Download::Auto);
             }
         }
@@ -2225,6 +2235,50 @@ struct Queues {
 struct Outcome {
     settings_changed: bool,
     attachments_added: bool,
+    requests_answered: bool,
+}
+
+/// As on Signal, a call from a chat we haven't accepted (a message request, a stranger with no
+/// chat yet, or a blocked chat) doesn't ring: none of its messages reach the call engine, so no
+/// connection is set up and the caller can't learn our IP. Its offer (not a blocked chat's) is
+/// recorded as a missed call and lists the chat: a stranger's first contact may be this call.
+/// Nothing is answered: the caller hears no answer, as receipts to requests wait too. True if it
+/// was held back, which it also is when the check fails.
+async fn hold_back_unaccepted_call(
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    sender_aci: &str,
+    calls: &[crate::calls::wire::IncomingCall],
+) -> bool {
+    let id = format!("c:{sender_aci}");
+    let held = async {
+        if !db.is_unaccepted(&id).await? {
+            return Ok(false);
+        }
+        tracing::info!(sender = %sender_aci, "a call from a chat not accepted didn't ring");
+        let offer = calls
+            .iter()
+            .any(|c| matches!(c.message, ringrtc::core::signaling::Message::Offer(_)));
+        // a blocked sender's (past a failed `drop_blocked` lookup) leaves nothing, as it should
+        if offer && !db.is_blocked(&id).await? {
+            let at = chrono::Utc::now().timestamp_millis();
+            db.add_chat_event(&id, at, ChatEventKind::MissedCall, sender_aci, None)
+                .await?;
+            db.list_chat(&id, at).await?;
+            l.on_event(CoreEvent::ChatEventAdded {
+                conversation_id: id.clone(),
+            });
+            l.on_event(CoreEvent::ConversationsChanged);
+        }
+        Ok::<_, sqlx::Error>(true)
+    };
+    held.await.unwrap_or_else(|e| {
+        // held back anyway: a call that rings by mistake gives our IP away
+        l.on_event(CoreEvent::Error {
+            message: format!("a call was held back: checking or recording it failed: {e}"),
+        });
+        true
+    })
 }
 
 /// Applies the ops of one received content and, when `live` (not catching up), announces what
@@ -2243,6 +2297,8 @@ async fn apply_received(
             Ok(applied) => {
                 outcome.settings_changed |= matches!(op, Op::Settings { .. });
                 outcome.attachments_added |= matches!(op, Op::AddAttachments { .. }) && !applied.is_empty();
+                // a block list or request answer changed chats: an accepted one's media may come
+                outcome.requests_answered |= applied.contains(&crate::projection::db::Applied::ConversationsChanged);
                 let new = if live { alert(op, &applied, me) } else { None };
                 applied.into_iter().for_each(|a| l.on_event(from_applied(a)));
                 if let Some(e) = new {
@@ -2865,6 +2921,171 @@ mod tests {
         db.block(&chat).await.unwrap();
         super::decryption_failed(&db, &sink, alice, Some(&broken)).await;
         assert_eq!(db.chat_events(&chat, 0).await.unwrap().len(), 2);
+    }
+
+    async fn phone_state_known(db: &ProjectionDb) {
+        db.set_storage_state(&crate::projection::StorageState {
+            version: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A call from a message request, or a stranger's first contact, doesn't ring: nothing of it
+    /// reaches the call engine (so no connection gives our IP away), and its offer shows as a
+    /// missed call in the request, which is listed for it.
+    #[tokio::test]
+    async fn a_call_from_a_message_request_is_held_back_as_missed() {
+        use crate::calls::wire::IncomingCall;
+        use crate::projection::ChatEventKind;
+        use ringrtc::common::{CallId, CallMediaType};
+        use ringrtc::core::signaling::{Hangup, Ice, Message, Offer};
+        const STRANGER: &str = "22222222-2222-2222-2222-222222222222";
+        const BOB: &str = "33333333-3333-3333-3333-333333333333";
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        phone_state_known(&db).await;
+        db.set_phone_contact(&format!("c:{BOB}"), true).await.unwrap();
+        let sink = Sink(Default::default());
+        let call = |message| IncomingCall {
+            call_id: CallId::new(7),
+            message,
+        };
+        let offer = || call(Message::Offer(Offer::new(CallMediaType::Audio, vec![]).unwrap()));
+        let ice = || call(Message::Ice(Ice { candidates: vec![] }));
+        let held = |sender: &'static str, calls: Vec<IncomingCall>| {
+            let (db, sink) = (&db, &sink);
+            async move { super::hold_back_unaccepted_call(db, sink, sender, &calls).await }
+        };
+        let chat = format!("c:{STRANGER}");
+        let missed = || {
+            let (db, chat) = (&db, &chat);
+            async move {
+                db.chat_events(chat, 0)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.kind == ChatEventKind::MissedCall && e.author == STRANGER)
+                    .count()
+            }
+        };
+        assert!(held(STRANGER, vec![offer(), ice()]).await);
+        assert_eq!(missed().await, 1);
+        let listed = db.conversations().await.unwrap();
+        assert!(
+            listed.iter().any(|c| c.id == chat && c.message_request),
+            "the call alone makes the request"
+        );
+        assert!(sink.0.lock().unwrap().contains(&CoreEvent::ChatEventAdded {
+            conversation_id: chat.clone()
+        }));
+        assert!(held(STRANGER, vec![ice()]).await, "its ICE stays out too");
+        assert!(
+            held(STRANGER, vec![call(Message::Hangup(Hangup::Normal))]).await,
+            "and its hangup"
+        );
+        assert_eq!(missed().await, 1, "one missed call per offer");
+        assert!(!held(BOB, vec![offer()]).await, "an accepted chat's call rings");
+        assert!(db.chat_events(&format!("c:{BOB}"), 0).await.unwrap().is_empty());
+        db.block(&format!("c:{BOB}")).await.unwrap();
+        assert!(held(BOB, vec![offer()]).await, "nor does a blocked one's");
+        assert!(
+            db.chat_events(&format!("c:{BOB}"), 0).await.unwrap().is_empty(),
+            "a blocked sender leaves nothing"
+        );
+    }
+
+    /// A call that can't be checked is held back too (ringing by mistake gives our IP away), and
+    /// says why once.
+    #[tokio::test]
+    async fn a_call_that_cant_be_checked_doesnt_ring() {
+        use crate::calls::wire::IncomingCall;
+        use ringrtc::common::{CallId, CallMediaType};
+        use ringrtc::core::signaling::{Message, Offer};
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        db.close().await;
+        let sink = Sink(Default::default());
+        let offer = IncomingCall {
+            call_id: CallId::new(7),
+            message: Message::Offer(Offer::new(CallMediaType::Audio, vec![]).unwrap()),
+        };
+        assert!(super::hold_back_unaccepted_call(&db, &sink, "22222222-2222-2222-2222-222222222222", &[offer]).await);
+        let events = sink.0.lock().unwrap();
+        assert!(matches!(&events[..], [CoreEvent::Error { .. }]), "{events:?}");
+    }
+
+    /// The phone accepting a request, or unblocking a chat in its block list, lets the chat's
+    /// held-back media download.
+    #[tokio::test]
+    async fn a_request_accepted_on_the_phone_lets_its_media_download() {
+        use crate::projection::{MessageKey, NewAttachment, RequestResponse, RequestThread};
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        phone_state_known(&db).await;
+        let from = |author: &str| crate::projection::Message {
+            conversation_id: format!("c:{author}"),
+            author: author.into(),
+            sent_at: 1,
+            received_at: 1,
+            ranges: vec![],
+            body: None,
+            is_outgoing: false,
+            status: crate::projection::MessageStatus::Delivered,
+            edited: false,
+            deleted: false,
+            quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
+        };
+        let image = |author: &str| Op::AddAttachments {
+            message: MessageKey {
+                author: author.into(),
+                sent_at: 1,
+            },
+            attachments: vec![NewAttachment {
+                pointer: vec![1],
+                content_type: "image/jpeg".into(),
+                file_name: None,
+                size: 3,
+                width: None,
+                height: None,
+                is_voice_note: false,
+            }],
+            preview: None,
+        };
+        for who in ["alice", "bob"] {
+            db.insert_message(&from(who)).await.unwrap();
+            db.apply(&image(who)).await.unwrap();
+        }
+        db.block("c:bob").await.unwrap();
+        db.clear_dirty(&db.dirty_chats().await.unwrap()).await.unwrap(); // the phone has the block
+        assert!(db.auto_downloads().await.unwrap().is_empty());
+        let accept = Op::RequestResponse {
+            thread: RequestThread::Aci("alice".into()),
+            response: RequestResponse::Accept,
+        };
+        let answered = |op: Op| {
+            let db = &db;
+            async move {
+                super::apply_received(db, &Quiet, &[op], "me", "me", true)
+                    .await
+                    .requests_answered
+            }
+        };
+        assert!(answered(accept.clone()).await);
+        let key = MessageKey {
+            author: "alice".into(),
+            sent_at: 1,
+        };
+        let alice = db.attachments(&key).await.unwrap()[0].id;
+        assert_eq!(db.auto_downloads().await.unwrap(), [alice]);
+        assert!(!answered(accept).await, "already accepted: nothing new to fetch");
+        let unblock = Op::BlockedList {
+            acis: vec![],
+            groups: vec![],
+        };
+        assert!(answered(unblock).await, "bob is off the phone's block list");
+        assert_eq!(db.auto_downloads().await.unwrap().len(), 2);
     }
 
     /// The receipts flush is queued after this returns, so the new setting must already be stored.
