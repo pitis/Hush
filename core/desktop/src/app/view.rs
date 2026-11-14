@@ -764,7 +764,7 @@ impl Hush {
                         if app.is_some_and(|app| app.read(cx).files.wants_pictures()) {
                             let this = this.clone();
                             cx.defer(move |cx| {
-                                let _ = this.update(cx, |app, cx| app.load_media(cx));
+                                let _ = this.update(cx, |app, cx| app.decode_pictures(cx));
                             });
                         }
                         match row {
@@ -1206,6 +1206,7 @@ pub(super) fn label(id: impl Into<ElementId>, role: Role, text: impl Into<Shared
 
 impl Render for Hush {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.files.new_frame();
         let p = style::palette(cx);
         let screen = match &self.screen {
             Screen::Opening => div().size_full().flex().items_center().justify_center().child(
