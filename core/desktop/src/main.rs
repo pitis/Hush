@@ -68,6 +68,8 @@ pub enum Demo {
     Chat,
     /// The chat, with the New Group dialog over it.
     NewGroup,
+    /// The chat, replying to a message whose buttons and reaction picker show.
+    Reply,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -85,6 +87,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("empty", Demo::Empty),
                 ("chat", Demo::Chat),
                 ("new-group", Demo::NewGroup),
+                ("reply", Demo::Reply),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
