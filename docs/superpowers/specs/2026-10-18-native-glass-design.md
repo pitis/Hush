@@ -116,7 +116,7 @@ handling (`onKeyPress`) if it does.
 - **Reset in progress** is the store's (`resettingSessions`): cleared when the reset is recorded
   or anything fails, so a failed reset is offered again.
 - **The Core Log window** no longer lists decryption failures: the chat shows them, and the
-  unified log keeps the sender id.
+  unified log keeps the chat's opaque id (never the sender's ACI).
 - **The Rust core** is still built for macOS 15 (`scripts/build-core.sh`): objects built for an
   older target link into the macOS 26 app without warnings, and a rebuild of the C dependencies
   isn't worth it.

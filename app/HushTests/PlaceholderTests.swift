@@ -197,12 +197,13 @@ final class AppStoreExpiryTests: XCTestCase {
         XCTAssertEqual(store.messages.map(\.sentAt), [2])
         // one prefix covers the message's notification and those of reactions to it, even ones
         // shown before the app started
-        // (boot also clears stale call rings, "call|"; that is not this message's doing)
-        XCTAssertEqual(notifier.removedPrefixes.filter { $0 != "call|" }, ["c:a|a|1|"])
-        XCTAssertTrue(Notifications.id("c:a", key, reactor: nil, emoji: nil).hasPrefix("c:a|a|1|"))
-        XCTAssertTrue(Notifications.id("c:a", key, reactor: "b", emoji: "👍").hasPrefix("c:a|a|1|"))
-        XCTAssertNotEqual(
-            Notifications.id("c:a", key, reactor: "b", emoji: "👍"),
-            Notifications.id("c:a", key, reactor: nil, emoji: nil))
+        // (boot also clears stale notifications; that is not this message's doing)
+        let prefix = Notifications.idPrefix(author: fake.opaqueId(id: "a"), sentAt: 1)
+        XCTAssertEqual(notifier.removedPrefixes.filter { !Notifications.stalePrefixes.contains($0) }, [prefix])
+        let own = Notifications.id(author: fake.opaqueId(id: "a"), sentAt: 1, reactor: nil, emoji: nil)
+        let reaction = Notifications.id(author: fake.opaqueId(id: "a"), sentAt: 1, reactor: "b", emoji: "👍")
+        XCTAssertTrue(own.hasPrefix(prefix))
+        XCTAssertTrue(reaction.hasPrefix(prefix))
+        XCTAssertNotEqual(own, reaction)
     }
 }

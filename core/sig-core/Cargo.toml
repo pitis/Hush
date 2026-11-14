@@ -58,6 +58,8 @@ thiserror = "2"
 tracing = "0.1"
 # RingRTC and WebRTC log through `log`; without this bridge a failed call leaves no trace
 tracing-log = "0.2"
+# blanks ids out of log lines (already in the tree through phonenumber)
+regex = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 # the unified log on Apple platforms; tracing-oslog builds elsewhere but logs nothing

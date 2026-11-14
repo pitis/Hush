@@ -106,16 +106,109 @@ final class ComposerTests: XCTestCase {
         XCTAssertTrue(Composer.canSend(" hi "))
     }
 
-    func testDraftsAreKeptPerConversation() {
-        let defaults = UserDefaults(suiteName: "hush.tests.\(UUID())")!
-        Composer.defaults = defaults
-        defer { Composer.defaults = .standard }
-        Composer.saveDraft("for a", for: "c:a")
-        Composer.saveDraft("for b", for: "c:b")
-        XCTAssertEqual(Composer.draft(for: "c:a"), "for a")
-        XCTAssertEqual(Composer.draft(for: "c:b"), "for b")
-        Composer.saveDraft("  ", for: "c:a")
-        XCTAssertEqual(Composer.draft(for: "c:a"), "")
+    @MainActor func testDraftsAreKeptPerConversationByTheCore() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        store.saveDraft("for a", for: "c:a")
+        store.saveDraft("for b", for: "c:b")
+        XCTAssertEqual(store.draft("c:a"), "for a")
+        XCTAssertEqual(store.draft("c:b"), "for b")
+        store.saveDraft("for a, more", for: "c:a")
+        store.saveDraft("  ", for: "c:b")
+        XCTAssertEqual(store.draft("c:b"), "")
+        await eventually { fake.draftStore == ["c:a": "for a, more"] }
+        // a draft still on its way when the chat goes doesn't bring it back
+        fake.draftDelay = .milliseconds(50)
+        store.saveDraft("for a, last", for: "c:a")
+        store.deleteChat("c:a")
+        await eventually { fake.flagCalls.contains("delete c:a") }
+        await eventually { store.draft("c:a") == "" }  // it goes with the chat, once it's gone
+        try? await Task.sleep(for: .milliseconds(100))  // past the write's delay
+        XCTAssertEqual(fake.draftStore, [:])
+    }
+
+    @MainActor func testAFailedDraftWriteIsShownAndTheNextChangeTriesAgain() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        fake.draftError = TestError(description: "disk full")
+        store.saveDraft("for a", for: "c:a")
+        await eventually { store.lastError?.contains("Couldn't keep the draft") == true }
+        fake.draftError = nil
+        store.saveDraft("for a", for: "c:a")
+        await eventually { fake.draftStore == ["c:a": "for a"] }
+    }
+
+    @MainActor func testDraftsThatCouldntBeReadAreNotOverwritten() async {
+        let fake = FakeClient(linked: true)
+        fake.draftStore = ["c:a": "kept"]
+        fake.draftsError = TestError(description: "unreadable")
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        XCTAssertEqual(store.lastError?.contains("Couldn't read your drafts"), true)
+        store.saveDraft("new", for: "c:a")
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(fake.draftStore, ["c:a": "kept"])
+    }
+
+    @MainActor func testADraftGoneWithItsChatOnThePhoneLeavesTheApp() async {
+        let fake = FakeClient(linked: true)
+        fake.draftStore = ["c:a": "unsent", "c:b": "stays"]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        XCTAssertEqual(store.draft("c:a"), "unsent")
+        fake.draftStore["c:a"] = nil  // the core deleted the chat for the phone
+        store.handle(.conversationsChanged)
+        await eventually { store.draft("c:a") == "" }
+        XCTAssertEqual(store.draft("c:b"), "stays")
+    }
+
+    @MainActor func testADraftStaysWhenItsChatCouldntBeDeleted() async {
+        let fake = FakeClient(linked: true)
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        store.saveDraft("for a", for: "c:a")
+        fake.changeError = TestError(description: "closed")
+        store.deleteChat("c:a")
+        await eventually { store.lastError?.contains("Couldn't delete the chat") == true }
+        XCTAssertEqual(store.draft("c:a"), "for a")
+    }
+
+    @MainActor func testDraftsKeptInThePreferencesMoveIntoTheCoreAndLeaveThem() async {
+        let suite = "hush.tests.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("unsent", forKey: "draft.c:a")
+        defaults.set("in the group", forKey: "draft.g:00")
+        defaults.set("older", forKey: "draft.c:b")
+        defaults.set("for a chat that's gone", forKey: "draft.c:gone")
+        defaults.set("dark", forKey: "appearance")
+        let fake = FakeClient(linked: true)
+        fake.draftStore = ["c:b": "already moved"]
+        fake.conversationAnswers = [.success([conversation("c:a"), conversation("c:b"), conversation("g:00")])]
+        let store = AppStore(open: { _ in fake }, legacyDrafts: defaults)
+        await store.boot()
+        XCTAssertEqual(fake.draftStore, ["c:a": "unsent", "g:00": "in the group", "c:b": "already moved"])
+        XCTAssertEqual(store.draft("c:a"), "unsent")
+        XCTAssertEqual(store.draft("c:b"), "already moved", "the core's wins")
+        XCTAssertEqual(store.draft("c:gone"), "")
+        for key in ["draft.c:a", "draft.g:00", "draft.c:b", "draft.c:gone"] {
+            XCTAssertNil(defaults.object(forKey: key))
+        }
+        XCTAssertEqual(defaults.string(forKey: "appearance"), "dark", "other settings stay")
+    }
+
+    @MainActor func testADraftTheCoreCouldntTakeStaysInThePreferences() async {
+        let suite = "hush.tests.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("unsent", forKey: "draft.c:a")
+        let fake = FakeClient(linked: true)
+        fake.conversationAnswers = [.success([conversation("c:a")])]
+        fake.draftError = TestError(description: "closed")
+        await AppStore(open: { _ in fake }, legacyDrafts: defaults).boot()
+        XCTAssertEqual(defaults.string(forKey: "draft.c:a"), "unsent", "moved on a later launch")
     }
 
     func testDisplayTitleFallsBackToAShortId() {
