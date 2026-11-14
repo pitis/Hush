@@ -153,6 +153,14 @@ final class AppStoreResilienceTests: XCTestCase {
         XCTAssertEqual(store.errors.last?.text, "e\(AppStore.logLimit + 4)")
     }
 
+    /// Quitting stops the core, so it handles what it has already received first.
+    func testQuittingStopsTheCore() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        await store.stop()
+        XCTAssertEqual(fake.stops, 1)
+    }
+
     func testRetryReconnectsAndUndecryptableMessagesShowWithAReset() async {
         let fake = FakeClient(linked: true)
         fake.messageAnswers["c:a"] = [message("c:a", "a", 10)]
