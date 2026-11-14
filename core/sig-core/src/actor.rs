@@ -60,8 +60,8 @@ pub enum Command {
     },
     Start,
     Send(Job),
-    /// Download one attachment (the user asked for it).
-    Download(i64),
+    /// Download one attachment (the user asked for it), or what downloads by itself.
+    Download(Download),
     /// The user is typing in a conversation (`started`), or stopped.
     Typing {
         conversation_id: String,
@@ -96,6 +96,11 @@ pub enum Command {
     StopUnlinked {
         done: oneshot::Sender<bool>,
     },
+    /// Stops the core for good, as the app quits: receiving ends once what the open connection
+    /// has read is handled (the server counts it as delivered), within `STOPPING`.
+    Stop {
+        done: oneshot::Sender<()>,
+    },
     /// A chat setting changed here (or Storage Service writes were turned on): sync soon.
     StorageSync,
     /// Who has `username` ("name.42"): their ACI, None if no one, an error if it can't be asked.
@@ -124,6 +129,11 @@ pub enum Command {
     GroupInfo {
         key: [u8; 32],
         done: oneshot::Sender<Result<Option<crate::groups::GroupInfo>, String>>,
+    },
+    /// Our safety number with a contact (their ACI): None before any session with them.
+    SafetyNumber {
+        aci: presage::libsignal_service::prelude::Uuid,
+        done: oneshot::Sender<Result<Option<crate::safety::SafetyNumber>, String>>,
     },
     /// Changes a group (its members are told), then stores it in its chat.
     ChangeGroup {
@@ -192,6 +202,16 @@ pub fn spawn(
     own_aci: Arc<Mutex<Option<String>>>,
 ) -> Result<Handles, CoreError> {
     std::fs::create_dir_all(&data_dir).map_err(|e| CoreError::Storage { message: e.to_string() })?;
+    // Ours alone, so other users can't reach the files inside, whatever their own modes (a home
+    // folder is often 0755 on Linux). On Windows the per-user app data folder's ACL already does.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)) {
+            // a file system without modes: refusing to open wouldn't make the folder private
+            tracing::warn!(error = %e, "the data folder couldn't be made private");
+        }
+    }
     // Two cores on one presage store would fight over the websocket and corrupt sessions.
     let lock = File::create(data_dir.join(".lock")).map_err(|e| CoreError::Storage { message: e.to_string() })?;
     lock.try_lock().map_err(|_| CoreError::AlreadyOpen)?;
@@ -287,10 +307,24 @@ async fn run(
         let projection = ProjectionDb::open(&format!("sqlite://{}", dir.join("projection.db").display()), Some(&key))
             .await?
             .with_files(dir.join("attachments"));
-        match projection.reroot_avatars().await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(n, "chat pictures now point into the moved data folder"),
-            Err(e) => tracing::warn!(error = %e, "re-pointing chat pictures after a folder move failed"),
+        match projection.rename_avatars().await {
+            Ok((0, 0)) => {}
+            Ok((moved, missing)) => {
+                tracing::info!(moved, missing, "chat pictures renamed or moved into the data folder")
+            }
+            Err(e) => tracing::warn!(error = %e, "renaming chat pictures failed"),
+        }
+        // files from before they were encrypted, once (it holds up the open: nothing may read
+        // or write them meanwhile)
+        match projection.encrypt_files().await {
+            Ok(c) if c == Default::default() => {}
+            Ok(c) => tracing::info!(
+                encrypted = c.encrypted,
+                failed = c.failed,
+                missing = c.missing,
+                "files from before were encrypted"
+            ),
+            Err(e) => tracing::warn!(error = %e, "encrypting the files from before failed"),
         }
         let store =
             SqliteStore::open_with_options(sqlite_options(&dir.join("presage.db"), &key)?, OnNewIdentity::Trust)
@@ -364,6 +398,7 @@ async fn run(
         projection.clone(),
         listener.clone(),
         send_tx.clone(),
+        download_tx.clone(),
         storage_rx,
     );
     // Downloads cut off by the previous run start over.
@@ -392,7 +427,9 @@ async fn run(
     // Disappearing messages go once their timer runs out, connected or not.
     tokio::task::spawn_local(expire(store.clone(), projection.clone(), listener.clone()));
     let receiving = Rc::new(Cell::new(false));
-    let wake = Rc::new(tokio::sync::Notify::new());
+    // the receive loop's supervisor, while one runs
+    let mut receiver = None;
+    let wake = Rc::new(Wake::default());
     // The history import between linking and receiving, if the phone offered one.
     let history_running = Rc::new(Cell::new(false));
     let history_cancel: Rc<RefCell<watch::Sender<bool>>> = Rc::new(RefCell::new(watch::channel(false).0));
@@ -489,6 +526,9 @@ async fn run(
                             continue;
                         }
                     }
+                    // before any message, so a key never noted yet is the one a change is told against
+                    let me = m.registration_data().service_ids.aci.to_string();
+                    crate::safety::notice_known(m.store(), &projection, listener.as_ref(), &me).await;
                     receiving.set(true);
                     if !sending {
                         sending = true;
@@ -521,7 +561,7 @@ async fn run(
                     )));
                     let (receiving, l) = (receiving.clone(), listener.clone());
                     // Supervise: a panic in the loop must be reported and allow a restart.
-                    tokio::task::spawn_local(async move {
+                    receiver = Some(tokio::task::spawn_local(async move {
                         if let Err(e) = task.await {
                             l.on_event(CoreEvent::Error {
                                 message: format!("receiving stopped: {e}"),
@@ -531,7 +571,7 @@ async fn run(
                             });
                         }
                         receiving.set(false);
-                    });
+                    }));
                 }
                 None => listener.on_event(CoreEvent::Connection {
                     state: ConnectionState::Unlinked,
@@ -551,8 +591,7 @@ async fn run(
                     }
                 }
             }
-            // wakes only what waits now: a stored request would later drop a fresh connection
-            Command::Reconnect => wake.notify_waiters(),
+            Command::Reconnect => wake.reconnect(),
             Command::StorageSync => {
                 let _ = storage_tx.send(storage::Trigger::Local);
             }
@@ -564,15 +603,24 @@ async fn run(
                         let at = chrono::Utc::now().timestamp_millis();
                         if let Err(e) = Box::pin(m.send_session_reset(&to, at as u64)).await {
                             return l.on_event(CoreEvent::Error {
-                                message: format!("resetting the session with {conversation_id} failed: {e}"),
+                                message: format!(
+                                    "resetting the session in chat {} failed: {e}",
+                                    db.opaque_id(&conversation_id)
+                                ),
                             });
                         }
+                        // the reset fetched their keys anew
+                        let me = m.registration_data().service_ids.aci.to_string();
+                        crate::safety::notice_chat(m.store(), &db, l.as_ref(), &me, &conversation_id, at - 1).await;
                         let author = to.raw_uuid().to_string();
                         match db
                             .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author, None)
                             .await
                         {
-                            Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+                            Ok(()) => l.on_event(CoreEvent::ChatEventAdded {
+                                conversation_id,
+                                kind: ChatEventKind::SessionReset,
+                            }),
                             Err(e) => l.on_event(CoreEvent::Error {
                                 message: format!("recording a session reset failed: {e}"),
                             }),
@@ -580,7 +628,10 @@ async fn run(
                     });
                 }
                 _ => listener.on_event(CoreEvent::Error {
-                    message: format!("a session can't be reset with {conversation_id}"),
+                    message: format!(
+                        "a session can't be reset in chat {}",
+                        projection.opaque_id(&conversation_id)
+                    ),
                 }),
             },
             Command::Unlink { tell_server, done } => {
@@ -640,7 +691,7 @@ async fn run(
             }
             Command::StickerPacks { done } => match &manager {
                 Some(m) => {
-                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join("stickers"));
+                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join(crate::files::STICKERS));
                     tokio::task::spawn_local(async move {
                         let packs = installed_packs(&store, &db, dir).await;
                         if let Err(e) = &packs {
@@ -659,7 +710,7 @@ async fn run(
                 done,
             } => match &manager {
                 Some(m) => {
-                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join("stickers"));
+                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join(crate::files::STICKERS));
                     tokio::task::spawn_local(async move {
                         let _ = done.send(chosen_sticker(&store, &db, dir, pack_id, sticker_id).await);
                     });
@@ -707,6 +758,13 @@ async fn run(
                     None => Err("not linked yet".into()),
                 };
                 let _ = done.send(info);
+            }
+            Command::SafetyNumber { aci, done } => {
+                let number = match &manager {
+                    Some(m) => crate::safety::ours_with(m.store(), m.registration_data().service_ids.aci, aci).await,
+                    None => Err("not linked yet".into()),
+                };
+                let _ = done.send(number);
             }
             Command::ChangeGroup { key, edit, done } => match &manager {
                 Some(m) => {
@@ -803,6 +861,22 @@ async fn run(
                 let _ = done.send(true);
                 return;
             }
+            Command::Stop { done } => {
+                let until = tokio::time::Instant::now() + STOPPING;
+                wake.stop(until);
+                if let Some(receiver) = receiver.take() {
+                    // the message in hand when reading stops gets a moment to finish
+                    if tokio::time::timeout_at(until + FINISHING + DRAIN / 2, receiver)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("receiving didn't stop in time: a message being handled may have been cut off");
+                    }
+                }
+                tracing::info!("the core stopped");
+                let _ = done.send(());
+                return;
+            }
             Command::Relink { done } => {
                 if let Some(m) = &manager {
                     // Best effort: the new link works either way, but each failure leaves a
@@ -823,8 +897,8 @@ async fn run(
                 // the thread ends; the Client deletes presage's store and the app relinks
                 return;
             }
-            Command::Download(id) => {
-                let _ = download_tx.send(Download::One(id));
+            Command::Download(what) => {
+                let _ = download_tx.send(what);
             }
             Command::Typing {
                 conversation_id,
@@ -960,7 +1034,7 @@ async fn installed_packs(
             kept.push(pack);
         } else if let Err(e) = db.forget_sticker_pack(&pack.id).await {
             // removed on the phone, or presage's store was replaced (relinking, a restore)
-            tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a removed sticker pack couldn't be forgotten");
+            tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(&pack.id), "a removed sticker pack couldn't be forgotten");
         }
     }
     let images = dir.clone();
@@ -978,18 +1052,19 @@ async fn installed_packs(
             Ok(None) => continue,
             Err(e) => {
                 // one unreadable pack doesn't hide the others
-                tracing::warn!(error = %e, pack = %hex::encode(id), "a sticker pack couldn't be read");
+                tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(id), "a sticker pack couldn't be read");
                 continue;
             }
         };
-        let images = dir.clone();
-        let (pack, whole) = tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images))
-            .await
-            .map_err(|e| e.to_string())?;
+        let (images, keys) = (dir.clone(), db.clone());
+        let (pack, whole) =
+            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images, |p| keys.derived_key(p)))
+                .await
+                .map_err(|e| e.to_string())?;
         // one that isn't kept is read again next time, and sending from it reads presage's copy
         if whole {
             if let Err(e) = db.keep_sticker_pack(&pack).await {
-                tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a sticker pack couldn't be kept");
+                tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(&pack.id), "a sticker pack couldn't be kept");
             }
         }
         packs.push(pack);
@@ -1022,8 +1097,8 @@ async fn chosen_sticker(
             let Some(pack) = store.sticker_pack(&pack_id).await.map_err(|e| e.to_string())? else {
                 return Ok(None);
             };
-            let images = dir.clone();
-            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images).0)
+            let (images, keys) = (dir.clone(), db.clone());
+            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images, |p| keys.derived_key(p)).0)
                 .await
                 .map_err(|e| e.to_string())?
         }
@@ -1440,6 +1515,7 @@ fn spawn_storage_sync(
     db: ProjectionDb,
     listener: Arc<dyn EventListener>,
     send_tx: mpsc::UnboundedSender<Job>,
+    download_tx: mpsc::UnboundedSender<Download>,
     mut rx: mpsc::UnboundedReceiver<storage::Trigger>,
 ) {
     let l = listener.clone();
@@ -1465,6 +1541,10 @@ fn spawn_storage_sync(
                 Err(e) => tracing::warn!(?trigger, error = %e, "storage sync failed"),
             }
             let (events, wrote) = storage::effects(&result);
+            // a chat the phone accepted (made a contact, say) lets its held-back media come
+            if events.contains(&CoreEvent::ConversationsChanged) {
+                let _ = download_tx.send(Download::Auto);
+            }
             for event in events {
                 listener.on_event(event);
             }
@@ -1520,6 +1600,7 @@ fn spawn_call_router(
     {
         let ensure_engine = ensure_engine.clone();
         let (store, listener, registration) = (store.clone(), listener.clone(), registration.clone());
+        let db = db.clone();
         tokio::task::spawn_local(async move {
             use presage::libsignal_service::protocol::{IdentityKeyStore, ProtocolAddress};
             while let Some(envelope) = incoming_rx.recv().await {
@@ -1531,6 +1612,9 @@ fn spawn_call_router(
                 let calls = crate::calls::wire::from_proto(&envelope.message, our_device_id);
                 if calls.is_empty() {
                     continue; // not for this device, or nothing we handle: no audio stack for it
+                }
+                if hold_back_unaccepted_call(&db, listener.as_ref(), &sender_aci, &calls).await {
+                    continue;
                 }
                 let Some(engine) = ensure_engine() else {
                     tracing::warn!("a call message arrived while unlinked");
@@ -1559,7 +1643,7 @@ fn spawn_call_router(
                     Ok(Some(identity)) => identity.public_key().public_key_bytes().to_vec(),
                     Ok(None) => {
                         // no session with this device: a call can't be verified, so it can't ring
-                        tracing::warn!(sender = %sender_aci, "a call from an unknown device was ignored");
+                        tracing::warn!("a call from an unknown device was ignored");
                         continue;
                     }
                     Err(e) => {
@@ -1644,7 +1728,7 @@ fn spawn_call_router(
                         let at = chrono::Utc::now().timestamp_millis();
                         match db.add_chat_event(&conversation_id, at, kind, &peer_aci, value).await {
                             Ok(()) => {
-                                listener.on_event(CoreEvent::ChatEventAdded { conversation_id });
+                                listener.on_event(CoreEvent::ChatEventAdded { conversation_id, kind });
                                 listener.on_event(CoreEvent::ConversationsChanged);
                             }
                             Err(e) => listener.on_event(CoreEvent::Error {
@@ -1673,7 +1757,7 @@ enum Raced<T> {
 }
 
 /// Waits for `linking`, meanwhile answering the commands that stop an unlinked core (to restore
-/// a backup, relink or unlink) and queuing the rest for after the link.
+/// a backup, relink, unlink or quit) and queuing the rest for after the link.
 async fn race_link<T>(
     mut linking: std::pin::Pin<Box<impl std::future::Future<Output = T>>>,
     rx: &mut mpsc::UnboundedReceiver<Command>,
@@ -1693,6 +1777,10 @@ async fn race_link<T>(
                 }
                 Some(Command::Unlink { done, .. }) => {
                     let _ = done.send(Ok(()));
+                    return Raced::Stopped;
+                }
+                Some(Command::Stop { done }) => {
+                    let _ = done.send(());
                     return Raced::Stopped;
                 }
                 Some(cmd) => queued.push_back(cmd),
@@ -1914,14 +2002,14 @@ async fn supervise_downloader(
     }
 }
 
-/// Receives forever, reconnecting with exponential backoff (1 s → 60 s).
+/// Receives until stopped, reconnecting with exponential backoff (1 s → 60 s).
 async fn receive_loop(
     mut m: Manager<SqliteStore, Registered>,
     db: ProjectionDb,
     l: Arc<dyn EventListener>,
     caught_up: Rc<watch::Sender<bool>>,
     queues: Queues,
-    wake: Rc<tokio::sync::Notify>,
+    wake: Rc<Wake>,
     linked: Arc<AtomicBool>,
 ) {
     let me = m.registration_data().service_ids.aci.to_string();
@@ -1929,7 +2017,13 @@ async fn receive_loop(
     let mut progress = Progress::default();
     // a pass fetching chats' pictures is under way
     let fetching_avatars = std::rc::Rc::new(std::cell::Cell::new(false));
+    // messages handled since quitting began
+    let mut handled_quitting = 0;
     loop {
+        if !wake.connect() {
+            tracing::info!(handled = handled_quitting, "receiving stopped");
+            return;
+        }
         l.on_event(CoreEvent::Connection {
             state: ConnectionState::Connecting,
         });
@@ -1937,7 +2031,7 @@ async fn receive_loop(
         // nothing has been read yet, so nothing is lost
         let connecting = tokio::select! {
             connected = Box::pin(m.receive_messages()) => Some(connected),
-            _ = wake.notified() => None,
+            _ = wake.notify.notified() => None,
         };
         let Some(connecting) = connecting else {
             backoff = Duration::from_secs(1);
@@ -1955,15 +2049,15 @@ async fn receive_loop(
                 loop {
                     let received = tokio::select! {
                         received = stream.next() => received,
-                        // asked to reconnect: this connection may be dead with the old network
-                        _ = wake.notified() => {
+                        // asked to reconnect (this connection may be dead with the old network) or to stop
+                        _ = wake.notify.notified() => {
                             woken = true;
                             None
                         }
                     };
                     let Some(received) = received else { break };
                     let pictures = matches!(received, Received::QueueEmpty | Received::Contacts);
-                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
+                    handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues, &wake).await;
                     caught_up.send_if_modified(|ready| {
                         let first = !*ready && progress.titles_synced;
                         *ready |= progress.titles_synced;
@@ -1983,8 +2077,9 @@ async fn receive_loop(
                     // The server already counts what this connection read as delivered: handle
                     // all of it before dropping the connection (it ends once nothing comes for
                     // a moment; a dead one has nothing more).
-                    while let Ok(Some(received)) = tokio::time::timeout(DRAIN, stream.next()).await {
-                        handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues).await;
+                    while let Some(received) = drained(&mut stream, wake.until()).await {
+                        handle(received, &m, &db, &me, &mut progress, l.as_ref(), &queues, &wake).await;
+                        handled_quitting += usize::from(wake.until().is_some());
                     }
                     backoff = Duration::from_secs(1);
                     continue;
@@ -2020,14 +2115,82 @@ async fn receive_loop(
     }
 }
 
-/// On a reconnect request, the old connection is read until it is quiet this long.
+/// On a reconnect request or quitting, the old connection is read until it is quiet this long.
 const DRAIN: Duration = Duration::from_secs(1);
 
+/// Quitting: the open connection is read (`DRAIN`) for at most this long, so quitting never hangs.
+const STOPPING: Duration = Duration::from_secs(2);
+
+/// Quitting: a message still being handled when reading stops gets this long for a group fetch
+/// (`sync_group`), and then half a `DRAIN` for the rest.
+const FINISHING: Duration = Duration::from_secs(1);
+
+/// While a connection is drained: its next message, or None once it is quiet for `DRAIN` or
+/// `until` (quitting) has passed.
+async fn drained<S: futures::Stream + Unpin>(stream: &mut S, until: Option<tokio::time::Instant>) -> Option<S::Item> {
+    let quiet = tokio::time::Instant::now() + DRAIN;
+    let by = match until {
+        // checked first: a timeout lets a message that is ready through, however late
+        Some(until) if until <= tokio::time::Instant::now() => return None,
+        Some(until) => until.min(quiet),
+        None => quiet,
+    };
+    tokio::time::timeout_at(by, stream.next()).await.ok().flatten()
+}
+
+/// How the receive loop is asked to reconnect now, or to stop.
+#[derive(Default)]
+struct Wake {
+    notify: tokio::sync::Notify,
+    /// Quitting: reading ends by then.
+    stop: watch::Sender<Option<tokio::time::Instant>>,
+}
+
+impl Wake {
+    /// Kept until the loop next waits for it: it may be handling a message now.
+    fn reconnect(&self) {
+        self.notify.notify_one();
+    }
+
+    fn stop(&self, until: tokio::time::Instant) {
+        self.stop.send_replace(Some(until));
+        self.notify.notify_one();
+    }
+
+    /// When reading ends, once quitting.
+    fn until(&self) -> Option<tokio::time::Instant> {
+        *self.stop.borrow()
+    }
+
+    /// Once quitting: when reading ends.
+    async fn stopping(&self) -> tokio::time::Instant {
+        // the sender lives in `self`, so the wait ends only once quitting
+        let until = self
+            .stop
+            .subscribe()
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|u| *u);
+        until.unwrap_or_else(tokio::time::Instant::now)
+    }
+
+    /// At each connect: false once quitting; otherwise a request made before is dropped (this
+    /// connect answers it, so it mustn't cut it short).
+    fn connect(&self) -> bool {
+        if self.until().is_some() {
+            return false;
+        }
+        let _ = futures::FutureExt::now_or_never(self.notify.notified());
+        true
+    }
+}
+
 /// Waits `backoff` before reconnecting, or less if woken. True if woken.
-async fn pause(backoff: Duration, wake: &tokio::sync::Notify) -> bool {
+async fn pause(backoff: Duration, wake: &Wake) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(backoff) => false,
-        _ = wake.notified() => true,
+        _ = wake.notify.notified() => true,
     }
 }
 
@@ -2053,7 +2216,7 @@ struct Progress {
     titles_synced: bool,
     /// This connection has drained the server queue: what arrives now is new.
     live: bool,
-    /// Groups fetched again for messages claiming a newer revision (`sync_group`).
+    /// Groups fetched again for messages claiming a newer revision or from a non-member (`sync_group`).
     refetches: Refetches,
 }
 
@@ -2070,6 +2233,7 @@ impl Progress {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     received: Received,
     m: &Manager<SqliteStore, Registered>,
@@ -2078,16 +2242,17 @@ async fn handle(
     progress: &mut Progress,
     l: &dyn EventListener,
     queues: &Queues,
+    wake: &Wake,
 ) {
     // Kinds, counts and ids only: never message content.
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
         Received::DecryptionError { sender, error } => {
-            tracing::warn!(sender = %sender.service_id_string(), %error, "a message couldn't be decrypted")
+            tracing::warn!(chat = %db.opaque_id(&direct_id(sender)), %error, "a message couldn't be decrypted")
         }
         Received::RetryReceipt { sender, .. } => {
-            tracing::info!(sender = %sender.service_id_string(), "a message of ours couldn't be decrypted there")
+            tracing::info!(chat = %db.opaque_id(&direct_id(sender)), "a message of ours couldn't be decrypted there")
         }
         Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
     }
@@ -2104,12 +2269,16 @@ async fn handle(
         // their device asks us to resend or restart the session; Hush doesn't, so a reset is offered
         Received::RetryReceipt { sender, .. } => decryption_failed(db, l, sender, None).await,
         Received::Content(content) => {
-            sync_group(m, db, l, &mut progress.refetches, &content).await;
-            match drop_blocked(db, &content, me).await {
-                Ok(true) => {
-                    tracing::info!(kind = content_kind(&content.body), "dropped: blocked or not a member");
-                    return;
-                }
+            if let Some(check) = key_check(&content.metadata, chrono::Utc::now().timestamp_millis()) {
+                let store = match check.to_pni {
+                    true => m.store().pni_protocol_store(),
+                    false => m.store().aci_protocol_store(),
+                };
+                crate::safety::notice(&store, db, l, me, vec![check.aci], check.at).await;
+            }
+            let unconfirmed = sync_group(m, db, l, &mut progress.refetches, wake, &content).await;
+            match drop_blocked(db, &content, me, unconfirmed).await {
+                Ok(true) => return,
                 Ok(false) => {}
                 // shown rather than dropped: losing a message is worse than showing a blocked one
                 Err(e) => l.on_event(CoreEvent::Error {
@@ -2141,7 +2310,7 @@ async fn handle(
                 // now that the new setting is stored, so they can't go out under the old one
                 let _ = queues.sends.send(Job::Receipts);
             }
-            if outcome.attachments_added {
+            if outcome.attachments_added || outcome.requests_answered {
                 let _ = queues.downloads.send(Download::Auto);
             }
         }
@@ -2151,8 +2320,9 @@ async fn handle(
 /// Whether content comes from a blocked person, or belongs to a blocked group or to a group
 /// the sender isn't a member of (messages, edits, typing, stories), so nothing should see it.
 /// A dropped message's copy in presage's store (saved before we see it) is queued for the
-/// sweep to delete. Our own devices are never blocked.
-async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<bool, sqlx::Error> {
+/// sweep to delete. Our own devices are never blocked, and a sender whose membership a failed
+/// fetch left `unconfirmed` (`sync_group`) isn't judged a non-member.
+async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str, unconfirmed: bool) -> Result<bool, sqlx::Error> {
     use presage::libsignal_service::content::ContentBody;
     let sender = &content.metadata.sender;
     if sender.raw_uuid().to_string() == me {
@@ -2168,11 +2338,23 @@ async fn drop_blocked(db: &ProjectionDb, content: &Content, me: &str) -> Result<
         ContentBody::StoryMessage(sm) => group_chat(sm.group.as_ref()),
         _ => None,
     };
+    let kind = content_kind(&content.body);
     let blocked = db.is_blocked(&direct_id(sender)).await?
         || match &group {
-            Some(g) => db.is_blocked(g).await? || outsider(db, g, sender).await?,
+            Some(g) => db.is_blocked(g).await?,
             None => false,
         };
+    // shown rather than dropped: losing a message is worse than showing a non-member's
+    let outsider = match &group {
+        Some(g) if !blocked && !unconfirmed => outsider(db, g, sender).await?,
+        _ => false,
+    };
+    if blocked {
+        tracing::info!(kind, "dropped: blocked");
+    } else if outsider {
+        tracing::warn!(kind, "dropped: its sender isn't a member of the group");
+    }
+    let blocked = blocked || outsider;
     if blocked && matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
         // still dropped if this fails: the copy only stays in presage's store
         let queued = match Thread::try_from(content) {
@@ -2225,6 +2407,51 @@ struct Queues {
 struct Outcome {
     settings_changed: bool,
     attachments_added: bool,
+    requests_answered: bool,
+}
+
+/// As on Signal, a call from a chat we haven't accepted (a message request, a stranger with no
+/// chat yet, or a blocked chat) doesn't ring: none of its messages reach the call engine, so no
+/// connection is set up and the caller can't learn our IP. Its offer (not a blocked chat's) is
+/// recorded as a missed call and lists the chat: a stranger's first contact may be this call.
+/// Nothing is answered: the caller hears no answer, as receipts to requests wait too. True if it
+/// was held back, which it also is when the check fails.
+async fn hold_back_unaccepted_call(
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    sender_aci: &str,
+    calls: &[crate::calls::wire::IncomingCall],
+) -> bool {
+    let id = format!("c:{sender_aci}");
+    let held = async {
+        if !db.is_unaccepted(&id).await? {
+            return Ok(false);
+        }
+        tracing::info!(chat = %db.opaque_id(&id), "a call from a chat not accepted didn't ring");
+        let offer = calls
+            .iter()
+            .any(|c| matches!(c.message, ringrtc::core::signaling::Message::Offer(_)));
+        // a blocked sender's (past a failed `drop_blocked` lookup) leaves nothing, as it should
+        if offer && !db.is_blocked(&id).await? {
+            let at = chrono::Utc::now().timestamp_millis();
+            db.add_chat_event(&id, at, ChatEventKind::MissedCall, sender_aci, None)
+                .await?;
+            db.list_chat(&id, at).await?;
+            l.on_event(CoreEvent::ChatEventAdded {
+                conversation_id: id.clone(),
+                kind: ChatEventKind::MissedCall,
+            });
+            l.on_event(CoreEvent::ConversationsChanged);
+        }
+        Ok::<_, sqlx::Error>(true)
+    };
+    held.await.unwrap_or_else(|e| {
+        // held back anyway: a call that rings by mistake gives our IP away
+        l.on_event(CoreEvent::Error {
+            message: format!("a call was held back: checking or recording it failed: {e}"),
+        });
+        true
+    })
 }
 
 /// Applies the ops of one received content and, when `live` (not catching up), announces what
@@ -2243,6 +2470,8 @@ async fn apply_received(
             Ok(applied) => {
                 outcome.settings_changed |= matches!(op, Op::Settings { .. });
                 outcome.attachments_added |= matches!(op, Op::AddAttachments { .. }) && !applied.is_empty();
+                // a block list or request answer changed chats: an accepted one's media may come
+                outcome.requests_answered |= applied.contains(&crate::projection::db::Applied::ConversationsChanged);
                 let new = if live { alert(op, &applied, me) } else { None };
                 applied.into_iter().for_each(|a| l.on_event(from_applied(a)));
                 if let Some(e) = new {
@@ -2250,11 +2479,38 @@ async fn apply_received(
                 }
             }
             Err(e) => l.on_event(CoreEvent::Error {
-                message: format!("storing a message from {sender} failed: {e}"),
+                message: format!(
+                    "storing a message in chat {} failed: {e}",
+                    db.opaque_id(&format!("c:{sender}"))
+                ),
             }),
         }
     }
     outcome
+}
+
+/// The safety-number check after content from someone (`safety::notice`).
+#[derive(Debug, PartialEq)]
+struct KeyCheck {
+    /// Whose key: an ACI's (a PNI sender has no safety number).
+    aci: String,
+    /// Where a change goes in the chat: just before the message, but within the last minute of
+    /// our clock, as its time is the sender's to choose.
+    at: i64,
+    /// In our PNI's store: presage decrypts what was sent to our PNI with it, and keeps the key
+    /// the message brought there.
+    to_pni: bool,
+}
+
+fn key_check(metadata: &presage::libsignal_service::content::Metadata, now: i64) -> Option<KeyCheck> {
+    let ServiceId::Aci(aci) = metadata.sender else {
+        return None;
+    };
+    Some(KeyCheck {
+        aci: aci.service_id_string(),
+        at: metadata.client_timestamp.timestamp_millis().clamp(now - 60_000, now) - 1,
+        to_pni: matches!(metadata.destination, ServiceId::Pni(_)),
+    })
 }
 
 /// A message between us and `sender` that couldn't be decrypted, here (`error`) or on their
@@ -2268,11 +2524,11 @@ async fn decryption_failed(
     sender: ServiceId,
     error: Option<&SignalProtocolError>,
 ) {
+    let conversation_id = direct_id(&sender);
     if matches!(error, Some(SignalProtocolError::DuplicatedMessage(..))) {
-        tracing::info!(sender = %sender.service_id_string(), "dropped a message delivered again");
+        tracing::info!(chat = %db.opaque_id(&conversation_id), "dropped a message delivered again");
         return;
     }
-    let conversation_id = direct_id(&sender);
     // shown rather than dropped if the lookup fails, as messages are
     if matches!(db.is_blocked(&conversation_id).await, Ok(true)) {
         return;
@@ -2283,7 +2539,10 @@ async fn decryption_failed(
         .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author, None)
         .await
     {
-        Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+        Ok(()) => l.on_event(CoreEvent::ChatEventAdded {
+            conversation_id,
+            kind: ChatEventKind::DecryptionFailed,
+        }),
         Err(e) => l.on_event(CoreEvent::Error {
             message: format!("recording an undecryptable message failed: {e}"),
         }),
@@ -2355,14 +2614,14 @@ async fn fetch_avatars(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, 
         let stored = match fetched {
             Ok(bytes) => db.store_avatar(&id, bytes.as_deref(), now).await,
             Err(e) => {
-                // ids only; tried again in a day
-                tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be fetched");
+                // opaque ids only; tried again in a day
+                tracing::warn!(chat = %db.opaque_id(&id), error = %e, "a chat's picture couldn't be fetched");
                 db.set_avatar_checked(&id, now).await.map(|_| false)
             }
         };
         match stored {
             Ok(c) => changed |= c,
-            Err(e) => tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be kept"),
+            Err(e) => tracing::warn!(chat = %db.opaque_id(&id), error = %e, "a chat's picture couldn't be kept"),
         }
     }
     if changed {
@@ -2420,42 +2679,54 @@ async fn list_invitation(
 
 /// Brings a group message's chat up to presage's group, so its sender is checked against
 /// current members. presage refreshes the group before handing us a message sent at a newer
-/// revision; if that refresh failed, a group presage knows is fetched once more, though not
-/// for a blocked sender or group and at most every five minutes (`Refetches`): the revision
-/// is whatever the sender wrote.
+/// revision; if that refresh failed, or the sender isn't among its members, a group presage
+/// knows is fetched once more (`refetched`), though not for a blocked sender or group: the
+/// revision is whatever the sender wrote. True if the sender isn't among the members and a
+/// failed fetch left that unconfirmed: their message is shown then (`drop_blocked`).
 async fn sync_group(
     m: &Manager<SqliteStore, Registered>,
     db: &ProjectionDb,
     l: &dyn EventListener,
     refetches: &mut Refetches,
+    wake: &Wake,
     content: &Content,
-) {
+) -> bool {
     let Ok(Thread::Group(key)) = Thread::try_from(content) else {
-        return;
+        return false;
     };
     let sent_at = sent_revision(&content.body);
+    let sender = &content.metadata.sender;
+    let own = &m.registration_data().service_ids;
+    let mut unconfirmed = false;
     let group = match m.store().group(key).await {
-        Ok(Some(g)) if sent_at.is_none_or(|r| r <= g.revision) => Ok(g),
         Ok(Some(g)) => {
-            let blocked = db
-                .is_blocked(&direct_id(&content.metadata.sender))
-                .await
-                .unwrap_or(true)
-                || db.is_blocked(&group_id(&key)).await.unwrap_or(true);
-            if blocked || !refetches.allow(key, std::time::Instant::now()) {
-                Ok(g)
-            } else {
-                match tokio::time::timeout(Duration::from_secs(10), m.clone().fetch_group(&key)).await {
-                    Ok(fetched) => fetched.map_err(|e| e.to_string()),
-                    Err(_) => Err("fetching it timed out".into()),
+            let why = match refetch_key(&g, key, sent_at, sender, own) {
+                Some(why) if !blocked_group_message(db, sender, &key).await => Some(why),
+                _ => None,
+            };
+            let fetch = async {
+                let mut m = m.clone();
+                tokio::select! {
+                    fetched = tokio::time::timeout(Duration::from_secs(10), m.fetch_group(&key)) => {
+                        match fetched {
+                            Ok(fetched) => fetched.map_err(|e| e.to_string()),
+                            Err(_) => Err("fetching it timed out".into()),
+                        }
+                    }
+                    // quitting: the rest of this message needs a moment too before the core ends
+                    _ = async { tokio::time::sleep_until(wake.stopping().await + FINISHING).await } => {
+                        Err("quitting cut fetching it short".into())
+                    }
                 }
-            }
+            };
+            let (group, unsure) = refetched(g, why, refetches, std::time::Instant::now(), fetch).await;
+            unconfirmed = unsure;
+            group
         }
         // presage couldn't fetch it as the message came: not ours to try again
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(e) => Err(e.to_string()),
     };
-    let own = &m.registration_data().service_ids;
     let stored = match group {
         Ok(g) => match store_group(db, &key, &g, own).await {
             Ok(stored) => list_invitation(db, &key, &g, own).await.map(|listed| stored || listed),
@@ -2471,26 +2742,96 @@ async fn sync_group(
             message: format!("syncing a group failed: {e}"),
         }),
     }
+    unconfirmed
 }
 
-/// When each group was last fetched again by `sync_group`.
+/// Whether a group message's sender or its group is blocked; a failed check counts as blocked.
+async fn blocked_group_message(db: &ProjectionDb, sender: &ServiceId, key: &[u8; 32]) -> bool {
+    for id in [direct_id(sender), group_id(key)] {
+        match db.is_blocked(&id).await {
+            Ok(false) => {}
+            Ok(true) => return true,
+            Err(e) => {
+                tracing::warn!(error = %e, "checking whether a group message is blocked failed");
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// presage's group `g` for a message, fetched again (`fetch`) if `refetch_key` asks for it
+/// (`why`) and `Refetches` allows. Also whether the sender, missing from the group, may be a
+/// member all the same: a failed fetch couldn't confirm it.
+async fn refetched(
+    g: presage::model::groups::Group,
+    why: Option<RefetchKey>,
+    refetches: &mut Refetches,
+    now: std::time::Instant,
+    fetch: impl std::future::Future<Output = Result<presage::model::groups::Group, String>>,
+) -> (Result<presage::model::groups::Group, String>, bool) {
+    let Some(why) = why else { return (Ok(g), false) };
+    let stranger = why.1.is_some();
+    if !refetches.allow(why, now) {
+        return (Ok(g), stranger && refetches.failed_last(&why));
+    }
+    match fetch.await {
+        Ok(fresh) => (Ok(fresh), false),
+        Err(e) => {
+            refetches.failed(why, now);
+            (Err(e), stranger)
+        }
+    }
+}
+
+/// Why a group message calls for fetching its group (`g`, as presage has it) again, as the
+/// `Refetches` key it counts against; None if it doesn't. Its sender, not us, isn't a member
+/// (added since?): that sender's in the group, or the message would be dropped unseen
+/// (`outsider`). It claims a newer revision: the group's.
+fn refetch_key(
+    g: &presage::model::groups::Group,
+    key: [u8; 32],
+    sent_at: Option<u32>,
+    sender: &ServiceId,
+    own: &ServiceIds,
+) -> Option<RefetchKey> {
+    let sender = sender.raw_uuid();
+    if sender != own.aci && !g.members.iter().any(|m| ServiceId::from(m.aci).raw_uuid() == sender) {
+        return Some((key, Some(sender)));
+    }
+    sent_at.is_some_and(|r| r > g.revision).then_some((key, None))
+}
+
+/// A group, or a sender in it.
+type RefetchKey = ([u8; 32], Option<presage::libsignal_service::prelude::Uuid>);
+
+/// When each group (or a sender in it) may next be fetched again by `sync_group`, and whether
+/// its last fetch failed.
 #[derive(Default)]
-struct Refetches(std::collections::HashMap<[u8; 32], std::time::Instant>);
+struct Refetches(std::collections::HashMap<RefetchKey, (std::time::Instant, bool)>);
 
 impl Refetches {
     const EVERY: Duration = Duration::from_secs(5 * 60);
+    /// After a failed fetch.
+    const RETRY: Duration = Duration::from_secs(30);
 
-    /// Whether the group may be fetched again at `now`; if so, counts it as fetched.
-    fn allow(&mut self, key: [u8; 32], now: std::time::Instant) -> bool {
-        if self
-            .0
-            .get(&key)
-            .is_some_and(|last| now.duration_since(*last) < Self::EVERY)
-        {
+    /// Whether the group may be fetched again at `now` for `key`; if so, counts it as fetched.
+    fn allow(&mut self, key: RefetchKey, now: std::time::Instant) -> bool {
+        if self.0.get(&key).is_some_and(|(next, _)| now < *next) {
             return false;
         }
-        self.0.insert(key, now);
+        self.0.insert(key, (now + Self::EVERY, false));
         true
+    }
+
+    /// The fetch `allow` let through failed: it may be tried again after `RETRY`.
+    fn failed(&mut self, key: RefetchKey, now: std::time::Instant) {
+        self.0.insert(key, (now + Self::RETRY, true));
+    }
+
+    /// Whether the last fetch for `key` failed.
+    fn failed_last(&self, key: &RefetchKey) -> bool {
+        self.0.get(key).is_some_and(|(_, failed)| *failed)
     }
 }
 
@@ -2589,7 +2930,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let db = ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap()
+            .with_files(dir.join("attachments"));
+        let read = |path: &str| {
+            crate::files::Kept {
+                path: path.into(),
+                key: db.derived_key(std::path::Path::new(path)),
+            }
+            .read()
+            .unwrap()
+        };
         let pack = |title: &str| StickerPack {
             id: vec![1; 16],
             key: vec![2; 32],
@@ -2605,7 +2957,7 @@ mod tests {
                 }],
             },
         };
-        let stickers = dir.join("stickers");
+        let stickers = dir.join(crate::files::STICKERS);
         store.add_sticker_pack(&pack("Foxes")).await.unwrap();
 
         // an image that can't be written (a file where the pack's folder goes): not kept
@@ -2621,7 +2973,8 @@ mod tests {
 
         let listed = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(listed.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), ["Foxes"]);
-        assert_eq!(std::fs::read(&listed[0].stickers[0].path).unwrap(), b"fox");
+        assert_eq!(read(&listed[0].stickers[0].path), b"fox");
+        assert_ne!(std::fs::read(&listed[0].stickers[0].path).unwrap(), b"fox", "encrypted");
         // listed again from what Hush kept, not from presage's copy
         store.add_sticker_pack(&pack("Renamed")).await.unwrap();
         let again = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
@@ -2638,7 +2991,7 @@ mod tests {
         std::fs::remove_file(&listed[0].stickers[0].path).unwrap();
         let reread = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(reread[0].title, "Renamed");
-        assert_eq!(std::fs::read(&reread[0].stickers[0].path).unwrap(), b"fox");
+        assert_eq!(read(&reread[0].stickers[0].path), b"fox");
         // a pack removed on the phone is gone
         store.remove_sticker_pack(&[1; 16]).await.unwrap();
         assert!(super::installed_packs(&store, &db, stickers.clone())
@@ -2666,7 +3019,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let db = ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap()
+            .with_files(dir.join("attachments"));
         let sticker = |id, bytes: Option<&[u8]>| Sticker {
             id,
             emoji: None,
@@ -2687,7 +3043,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let stickers = dir.join("stickers");
+        let stickers = dir.join(crate::files::STICKERS);
 
         let listed = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(listed[0].stickers.iter().map(|s| s.id).collect::<Vec<_>>(), [0]);
@@ -2756,7 +3112,7 @@ mod tests {
     /// "Retry now" and the network coming back cut the wait before reconnecting short.
     #[tokio::test(start_paused = true)]
     async fn a_reconnect_request_ends_the_wait_at_once() {
-        let wake = tokio::sync::Notify::new();
+        let wake = super::Wake::default();
         let started = tokio::time::Instant::now();
         assert!(
             !super::pause(std::time::Duration::from_secs(30), &wake).await,
@@ -2766,21 +3122,90 @@ mod tests {
         let started = tokio::time::Instant::now();
         let (woken, ()) = tokio::join!(super::pause(std::time::Duration::from_secs(30), &wake), async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            wake.notify_waiters();
+            wake.reconnect();
         });
         assert!(woken);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
-    /// A request while nothing waits (connecting, handling a message) isn't kept: it would
-    /// later drop a fresh connection, and with it messages the server counts as delivered.
+    /// A request while the loop doesn't wait for one (it is handling a message) is kept for when
+    /// it next waits; one from before a connect is answered by that connect, so it is dropped
+    /// there and can't cut the fresh connection short.
     #[tokio::test(start_paused = true)]
-    async fn a_reconnect_request_is_never_kept_for_later() {
-        let wake = tokio::sync::Notify::new();
-        wake.notify_waiters();
+    async fn a_reconnect_request_while_busy_is_kept_until_the_next_connect() {
+        let wake = super::Wake::default();
+        wake.reconnect();
         let started = tokio::time::Instant::now();
-        assert!(!super::pause(std::time::Duration::from_secs(5), &wake).await);
+        assert!(super::pause(std::time::Duration::from_secs(5), &wake).await, "kept");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        wake.reconnect();
+        assert!(wake.connect());
+        assert!(
+            !super::pause(std::time::Duration::from_secs(5), &wake).await,
+            "dropped at a connect"
+        );
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+    }
+
+    /// Quitting ends a wait at once, and no connect follows, however often the loop asks.
+    #[tokio::test(start_paused = true)]
+    async fn quitting_ends_the_wait_and_no_connect_follows() {
+        let wake = super::Wake::default();
+        let started = tokio::time::Instant::now();
+        wake.stop(started + super::STOPPING);
+        assert!(super::pause(std::time::Duration::from_secs(30), &wake).await);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!wake.connect());
+        assert!(!wake.connect(), "still quitting");
+        assert_eq!(wake.stopping().await, started + super::STOPPING);
+    }
+
+    /// Stop is answered (not just dropped with the thread), and the core thread ends, while the
+    /// commands channel is still open.
+    #[test]
+    fn stop_is_answered_and_ends_the_core_thread() {
+        let dir = std::env::temp_dir().join(format!("sig-core-stop-{}", std::process::id()));
+        let h = super::spawn(
+            dir.clone(),
+            "ab".repeat(32),
+            std::sync::Arc::new(Sink(std::sync::Mutex::new(vec![]))),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let (done, stopped) = oneshot::channel();
+        h.commands.send(Command::Stop { done }).unwrap();
+        assert!(stopped.blocking_recv().is_ok(), "answered");
+        h.thread.join().unwrap();
+        assert!(h.commands.send(Command::Start).is_err(), "nothing listens any more");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quitting reads what the connection has already got (the server counts it as delivered)
+    /// until it is quiet, but a server still sending can't hold quitting up past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn quitting_drains_the_connection_by_a_deadline() {
+        use futures::StreamExt;
+        use std::time::Duration;
+        use tokio::time::Instant;
+        let started = Instant::now();
+        let mut read = futures::stream::iter([1, 2, 3]).chain(futures::stream::pending());
+        let mut handled = vec![];
+        while let Some(n) = super::drained(&mut read, Some(started + super::STOPPING)).await {
+            handled.push(n);
+        }
+        assert_eq!(handled, [1, 2, 3]);
+        assert_eq!(started.elapsed(), super::DRAIN, "ended once quiet");
+
+        // a message always ready: only the deadline ends the drain
+        let until = Instant::now() + super::STOPPING;
+        let mut ready = futures::stream::repeat(());
+        let mut handled = 0;
+        while handled < 1000 && super::drained(&mut ready, Some(until)).await.is_some() {
+            handled += 1;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        assert_eq!(handled, 20, "read for two seconds");
     }
 
     /// Each connection starts by catching up; it is live only once the server queue is drained.
@@ -2817,6 +3242,7 @@ mod tests {
                 kind: crate::projection::MessageKind::Normal,
                 expires_in: 0,
                 expires_at: None,
+                story: None,
             })
         };
         let sink = Sink(Default::default());
@@ -2832,6 +3258,58 @@ mod tests {
         assert_eq!(announced(&sink), 0);
         super::apply_received(&db, &sink, &[msg(2)], "alice", "me", true).await;
         assert_eq!(announced(&sink), 1);
+    }
+
+    /// An ACI's key is checked, in the store of the identity the message was sent to, and a
+    /// change goes just before the message, within the last minute of our clock.
+    #[test]
+    fn content_is_checked_for_its_senders_key() {
+        use presage::libsignal_service::content::Metadata;
+        use presage::libsignal_service::protocol::{Aci, DeviceId, Pni, ServiceId};
+        let (alice, our_aci, our_pni) = (
+            ServiceId::from(Aci::from_uuid_bytes([2; 16])),
+            ServiceId::from(Aci::from_uuid_bytes([1; 16])),
+            ServiceId::from(Pni::from_uuid_bytes([1; 16])),
+        );
+        let metadata = |sender: ServiceId, destination: ServiceId, ms: i64| Metadata {
+            sender,
+            destination,
+            sender_device: DeviceId::new(1).unwrap(),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(ms).unwrap(),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(ms).unwrap(),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+        };
+        let now = 1_700_000_000_000;
+        let check = |aci: &ServiceId, at, to_pni| {
+            Some(super::KeyCheck {
+                aci: aci.service_id_string(),
+                at,
+                to_pni,
+            })
+        };
+        assert_eq!(
+            super::key_check(&metadata(alice, our_aci, now - 5_000), now),
+            check(&alice, now - 5_001, false)
+        );
+        assert_eq!(
+            super::key_check(&metadata(alice, our_pni, now - 5_000), now),
+            check(&alice, now - 5_001, true)
+        );
+        // a sender's clock far off (or lying) doesn't put it out of sight
+        assert_eq!(
+            super::key_check(&metadata(alice, our_aci, 1), now),
+            check(&alice, now - 60_001, false)
+        );
+        assert_eq!(
+            super::key_check(&metadata(alice, our_aci, now + 3_600_000), now),
+            check(&alice, now - 1, false)
+        );
+        let pni_sender = ServiceId::from(Pni::from_uuid_bytes([2; 16]));
+        assert_eq!(super::key_check(&metadata(pni_sender, our_pni, now), now), None);
     }
 
     /// A duplicate is dropped like Signal's clients do (no chat event, nothing to reset), and so
@@ -2859,12 +3337,179 @@ mod tests {
             .all(|e| e.kind == ChatEventKind::DecryptionFailed && e.author == alice.raw_uuid().to_string()));
         assert!(matches!(
             &sink.0.lock().unwrap()[..],
-            [CoreEvent::ChatEventAdded { conversation_id: a }, CoreEvent::ChatEventAdded { conversation_id: b }]
+            [CoreEvent::ChatEventAdded { conversation_id: a, .. }, CoreEvent::ChatEventAdded { conversation_id: b, .. }]
                 if *a == chat && *b == chat
         ));
         db.block(&chat).await.unwrap();
         super::decryption_failed(&db, &sink, alice, Some(&broken)).await;
         assert_eq!(db.chat_events(&chat, 0).await.unwrap().len(), 2);
+    }
+
+    async fn phone_state_known(db: &ProjectionDb) {
+        db.set_storage_state(&crate::projection::StorageState {
+            version: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A call from a message request, or a stranger's first contact, doesn't ring: nothing of it
+    /// reaches the call engine (so no connection gives our IP away), and its offer shows as a
+    /// missed call in the request, which is listed for it.
+    #[tokio::test]
+    async fn a_call_from_a_message_request_is_held_back_as_missed() {
+        use crate::calls::wire::IncomingCall;
+        use crate::projection::ChatEventKind;
+        use ringrtc::common::{CallId, CallMediaType};
+        use ringrtc::core::signaling::{Hangup, Ice, Message, Offer};
+        const STRANGER: &str = "22222222-2222-2222-2222-222222222222";
+        const BOB: &str = "33333333-3333-3333-3333-333333333333";
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        phone_state_known(&db).await;
+        db.set_phone_contact(&format!("c:{BOB}"), true).await.unwrap();
+        let sink = Sink(Default::default());
+        let call = |message| IncomingCall {
+            call_id: CallId::new(7),
+            message,
+        };
+        let offer = || call(Message::Offer(Offer::new(CallMediaType::Audio, vec![]).unwrap()));
+        let ice = || call(Message::Ice(Ice { candidates: vec![] }));
+        let held = |sender: &'static str, calls: Vec<IncomingCall>| {
+            let (db, sink) = (&db, &sink);
+            async move { super::hold_back_unaccepted_call(db, sink, sender, &calls).await }
+        };
+        let chat = format!("c:{STRANGER}");
+        let missed = || {
+            let (db, chat) = (&db, &chat);
+            async move {
+                db.chat_events(chat, 0)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.kind == ChatEventKind::MissedCall && e.author == STRANGER)
+                    .count()
+            }
+        };
+        assert!(held(STRANGER, vec![offer(), ice()]).await);
+        assert_eq!(missed().await, 1);
+        let listed = db.conversations().await.unwrap();
+        assert!(
+            listed.iter().any(|c| c.id == chat && c.message_request),
+            "the call alone makes the request"
+        );
+        assert!(sink.0.lock().unwrap().contains(&CoreEvent::ChatEventAdded {
+            conversation_id: chat.clone(),
+            kind: ChatEventKind::MissedCall,
+        }));
+        assert!(held(STRANGER, vec![ice()]).await, "its ICE stays out too");
+        assert!(
+            held(STRANGER, vec![call(Message::Hangup(Hangup::Normal))]).await,
+            "and its hangup"
+        );
+        assert_eq!(missed().await, 1, "one missed call per offer");
+        assert!(!held(BOB, vec![offer()]).await, "an accepted chat's call rings");
+        assert!(db.chat_events(&format!("c:{BOB}"), 0).await.unwrap().is_empty());
+        db.block(&format!("c:{BOB}")).await.unwrap();
+        assert!(held(BOB, vec![offer()]).await, "nor does a blocked one's");
+        assert!(
+            db.chat_events(&format!("c:{BOB}"), 0).await.unwrap().is_empty(),
+            "a blocked sender leaves nothing"
+        );
+    }
+
+    /// A call that can't be checked is held back too (ringing by mistake gives our IP away), and
+    /// says why once.
+    #[tokio::test]
+    async fn a_call_that_cant_be_checked_doesnt_ring() {
+        use crate::calls::wire::IncomingCall;
+        use ringrtc::common::{CallId, CallMediaType};
+        use ringrtc::core::signaling::{Message, Offer};
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        db.close().await;
+        let sink = Sink(Default::default());
+        let offer = IncomingCall {
+            call_id: CallId::new(7),
+            message: Message::Offer(Offer::new(CallMediaType::Audio, vec![]).unwrap()),
+        };
+        assert!(super::hold_back_unaccepted_call(&db, &sink, "22222222-2222-2222-2222-222222222222", &[offer]).await);
+        let events = sink.0.lock().unwrap();
+        assert!(matches!(&events[..], [CoreEvent::Error { .. }]), "{events:?}");
+    }
+
+    /// The phone accepting a request, or unblocking a chat in its block list, lets the chat's
+    /// held-back media download.
+    #[tokio::test]
+    async fn a_request_accepted_on_the_phone_lets_its_media_download() {
+        use crate::projection::{MessageKey, NewAttachment, RequestResponse, RequestThread};
+        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        phone_state_known(&db).await;
+        let from = |author: &str| crate::projection::Message {
+            conversation_id: format!("c:{author}"),
+            author: author.into(),
+            sent_at: 1,
+            received_at: 1,
+            ranges: vec![],
+            body: None,
+            is_outgoing: false,
+            status: crate::projection::MessageStatus::Delivered,
+            edited: false,
+            deleted: false,
+            quote: None,
+            kind: crate::projection::MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
+            story: None,
+        };
+        let image = |author: &str| Op::AddAttachments {
+            message: MessageKey {
+                author: author.into(),
+                sent_at: 1,
+            },
+            attachments: vec![NewAttachment {
+                pointer: vec![1],
+                content_type: "image/jpeg".into(),
+                file_name: None,
+                size: 3,
+                width: None,
+                height: None,
+                is_voice_note: false,
+            }],
+            preview: None,
+        };
+        for who in ["alice", "bob"] {
+            db.insert_message(&from(who)).await.unwrap();
+            db.apply(&image(who)).await.unwrap();
+        }
+        db.block("c:bob").await.unwrap();
+        db.clear_dirty(&db.dirty_chats().await.unwrap()).await.unwrap(); // the phone has the block
+        assert!(db.auto_downloads().await.unwrap().is_empty());
+        let accept = Op::RequestResponse {
+            thread: RequestThread::Aci("alice".into()),
+            response: RequestResponse::Accept,
+        };
+        let answered = |op: Op| {
+            let db = &db;
+            async move {
+                super::apply_received(db, &Quiet, &[op], "me", "me", true)
+                    .await
+                    .requests_answered
+            }
+        };
+        assert!(answered(accept.clone()).await);
+        let key = MessageKey {
+            author: "alice".into(),
+            sent_at: 1,
+        };
+        let alice = db.attachments(&key).await.unwrap()[0].id;
+        assert_eq!(db.auto_downloads().await.unwrap(), [alice]);
+        assert!(!answered(accept).await, "already accepted: nothing new to fetch");
+        let unblock = Op::BlockedList {
+            acis: vec![],
+            groups: vec![],
+        };
+        assert!(answered(unblock).await, "bob is off the phone's block list");
+        assert_eq!(db.auto_downloads().await.unwrap().len(), 2);
     }
 
     /// The receipts flush is queued after this returns, so the new setting must already be stored.
@@ -2984,6 +3629,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 1,
             expires_at: Some(1),
+            story: None,
         };
         db.insert_message(&expired(format!("c:{ALICE}"), 100)).await.unwrap();
         // a copy presage can't be asked to delete (a bad id) stays queued and fails the sweep
@@ -3067,7 +3713,7 @@ mod tests {
         }
         let dropped = |c| {
             let db = &db;
-            async move { super::drop_blocked(db, &c, ME).await.unwrap() }
+            async move { super::drop_blocked(db, &c, ME, false).await.unwrap() }
         };
         assert!(dropped(content_from(ALICE, 100, text(100, None))).await);
         assert!(dropped(content_from(ALICE, 2, typing(None))).await);
@@ -3157,7 +3803,7 @@ mod tests {
         };
         let dropped = |c| {
             let db = &db;
-            async move { super::drop_blocked(db, &c, ME).await.unwrap() }
+            async move { super::drop_blocked(db, &c, ME, false).await.unwrap() }
         };
         assert!(dropped(content_from(MALLORY, 100, text(100, known))).await);
         let edit = ContentBody::EditMessage(presage::proto::EditMessage {
@@ -3199,6 +3845,11 @@ mod tests {
             dropped(content_from(MALLORY, 500, newer)).await,
             "a revision the sender claims doesn't turn the check off"
         );
+        let unconfirmed = content_from(MALLORY, 600, text(600, known));
+        assert!(
+            !super::drop_blocked(&db, &unconfirmed, ME, true).await.unwrap(),
+            "a failed fetch couldn't confirm it: shown"
+        );
         assert_eq!(
             db.presage_forget_queue().await.unwrap(),
             vec![(group.clone(), 100), (group.clone(), 101), (group, 500)],
@@ -3212,10 +3863,73 @@ mod tests {
         use std::time::{Duration, Instant};
         let mut refetches = super::Refetches::default();
         let t = Instant::now();
-        assert!(refetches.allow([1; 32], t));
-        assert!(!refetches.allow([1; 32], t + Duration::from_secs(60)));
-        assert!(refetches.allow([2; 32], t + Duration::from_secs(60)), "another group");
-        assert!(refetches.allow([1; 32], t + Duration::from_secs(301)));
+        assert!(refetches.allow(([1; 32], None), t));
+        assert!(!refetches.allow(([1; 32], None), t + Duration::from_secs(60)));
+        assert!(
+            refetches.allow(([2; 32], None), t + Duration::from_secs(60)),
+            "another group"
+        );
+        assert!(refetches.allow(([1; 32], None), t + Duration::from_secs(301)));
+    }
+
+    /// A fetch that fails (offline, a server error, cut short by quitting) doesn't confirm that a
+    /// sender missing from a group isn't a member: their message is shown, and the group is
+    /// tried again after half a minute, not five; a fetch that works settles it.
+    #[tokio::test]
+    async fn a_failed_fetch_leaves_a_missing_sender_unconfirmed() {
+        use presage::libsignal_service::prelude::Uuid;
+        use std::time::{Duration, Instant};
+        let key = [7; 32];
+        let bob = (key, Some(Uuid::from_u128(0xb0b)));
+        let mut refetches = super::Refetches::default();
+        let t = Instant::now();
+        let failing = || async { Err("offline".to_string()) };
+        let working = || async { Ok(hikers(4)) };
+        let at = |secs| t + Duration::from_secs(secs);
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, t, failing()).await;
+        assert!(g.is_err() && unsure, "failed: unconfirmed");
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, at(10), working()).await;
+        assert_eq!(g.unwrap().revision, 3, "not fetched again at once");
+        assert!(unsure, "still unconfirmed");
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, at(31), working()).await;
+        assert_eq!(g.unwrap().revision, 4, "tried again");
+        assert!(!unsure);
+        let (g, unsure) = super::refetched(hikers(3), Some(bob), &mut refetches, at(60), failing()).await;
+        assert_eq!(g.unwrap().revision, 3, "not fetched again for five minutes");
+        assert!(!unsure, "confirmed by the last fetch");
+        let newer = (key, None);
+        let (g, unsure) = super::refetched(hikers(3), Some(newer), &mut refetches, t, failing()).await;
+        assert!(g.is_err() && !unsure, "a member's newer revision: nothing to confirm");
+    }
+
+    /// A sender the group doesn't list (added since presage last fetched it?) has it fetched
+    /// again before their message is judged, on its own budget: once per sender in the group
+    /// every five minutes, so a removed member can't make Hush fetch on every message, and the
+    /// group's own refetches (a newer revision claimed) don't hold a new member back.
+    #[test]
+    fn a_sender_missing_from_the_members_has_the_group_fetched_again() {
+        use super::{Aci, ServiceId};
+        use presage::libsignal_service::prelude::Uuid;
+        use std::time::{Duration, Instant};
+        let (g, key) = (hikers(3), [7; 32]);
+        let alice = ServiceId::Aci(Aci::from(Uuid::parse_str(ALICE).unwrap()));
+        let bob = Uuid::from_u128(0xb0b);
+        let why = |sent_at, sender: Uuid| super::refetch_key(&g, key, sent_at, &Aci::from(sender).into(), &own());
+        assert_eq!(super::refetch_key(&g, key, Some(3), &alice, &own()), None, "a member");
+        assert_eq!(super::refetch_key(&g, key, Some(4), &alice, &own()), Some((key, None)));
+        assert_eq!(why(Some(3), bob), Some((key, Some(bob))));
+        assert_eq!(why(None, bob), Some((key, Some(bob))));
+        assert_eq!(why(Some(4), bob), Some((key, Some(bob))), "a newer revision too");
+        assert_eq!(why(Some(3), own().aci), None, "our own devices");
+        let mut refetches = super::Refetches::default();
+        let t = Instant::now();
+        assert!(refetches.allow((key, None), t));
+        assert!(refetches.allow((key, Some(bob)), t), "the group's fetch doesn't count");
+        assert!(!refetches.allow((key, Some(bob)), t + Duration::from_secs(60)));
+        assert!(
+            refetches.allow((key, Some(Uuid::from_u128(0xca7))), t),
+            "another sender"
+        );
     }
 
     const ALICE: &str = "22222222-2222-2222-2222-222222222222";
@@ -3512,7 +4226,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relinking_or_unlinking_stop_a_code_too() {
+    async fn relinking_unlinking_or_quitting_stop_a_code_too() {
+        let (done, stopped) = oneshot::channel();
+        let (raced, _) = race_pending(|tx| tx.send(Command::Stop { done }).unwrap()).await;
+        assert_eq!(raced, Raced::Stopped);
+        stopped.await.unwrap();
         let (done, relinked) = oneshot::channel();
         let (raced, _) = race_pending(|tx| tx.send(Command::Relink { done }).unwrap()).await;
         assert_eq!(raced, Raced::Stopped);

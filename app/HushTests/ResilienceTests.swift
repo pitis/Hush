@@ -153,6 +153,14 @@ final class AppStoreResilienceTests: XCTestCase {
         XCTAssertEqual(store.errors.last?.text, "e\(AppStore.logLimit + 4)")
     }
 
+    /// Quitting stops the core, so it handles what it has already received first.
+    func testQuittingStopsTheCore() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        await store.stop()
+        XCTAssertEqual(fake.stops, 1)
+    }
+
     func testRetryReconnectsAndUndecryptableMessagesShowWithAReset() async {
         let fake = FakeClient(linked: true)
         fake.messageAnswers["c:a"] = [message("c:a", "a", 10)]
@@ -164,7 +172,7 @@ final class AppStoreResilienceTests: XCTestCase {
         fake.eventAnswers["c:a"] = [
             ChatEvent(id: 1, conversationId: "c:a", at: 20, kind: .decryptionFailed, author: "a", value: nil)
         ]
-        store.handle(.chatEventAdded(conversationId: "c:a"))
+        store.handle(.chatEventAdded(conversationId: "c:a", kind: .decryptionFailed))
         await eventually { store.events.count == 1 }
         XCTAssertTrue(store.timelineItems.contains { $0.id == "event-1" })
         store.resetSession("c:a")
@@ -176,7 +184,9 @@ final class AppStoreResilienceTests: XCTestCase {
         let store = await store(fake)
         store.resetSession("c:a")
         XCTAssertTrue(store.resettingSessions.contains("c:a"))
-        store.handle(.chatEventAdded(conversationId: "c:a"))  // the reset, recorded
+        store.handle(.chatEventAdded(conversationId: "c:a", kind: .safetyNumberChanged))
+        XCTAssertTrue(store.resettingSessions.contains("c:a"), "another event isn't the reset")
+        store.handle(.chatEventAdded(conversationId: "c:a", kind: .sessionReset))  // the reset, recorded
         XCTAssertFalse(store.resettingSessions.contains("c:a"))
         store.resetSession("c:a")
         store.handle(.error(message: "resetting the session failed: offline"))

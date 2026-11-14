@@ -83,7 +83,7 @@ struct ImageAttachmentView: View {
             .task(id: path) {
                 guard let path else { return }
                 image = await Thumbnails.load(path)
-                undecodable = image == nil
+                undecodable = image == nil && Thumbnails.isUndecodable(path)
             }
         }
     }
@@ -121,6 +121,8 @@ struct AudioAttachmentView: View {
     let download: () -> Void
     @State private var player: AVPlayer?
     @State private var opened: URL?
+    /// Its decrypted copy is being made: another click waits for it.
+    @State private var opening: Task<Void, Never>?
     @State private var playing = false
     @State private var unplayable = false
     @State private var elapsed: Double = 0
@@ -151,22 +153,40 @@ struct AudioAttachmentView: View {
         .accessibilityLabel(attachment.isVoiceNote ? "Voice message" : (attachment.fileName ?? "Audio"))
         .onDisappear { stop() }
         .task(id: attachment.state) {
-            // the length shows before playing, as in Desktop (read from the stored file: no link)
-            guard attachment.state == .ready, let path = attachment.path else { return }
-            let asset = AVURLAsset(
-                url: URL(fileURLWithPath: path), options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
-            if let length = try? await asset.load(.duration).seconds, length.isFinite { duration = length }
+            if let length = await Self.length(of: attachment) { duration = length }
         }
     }
 
+    /// Recordings' lengths, by attachment.
+    private static var lengths: [Int64: Double] = [:]
+    /// A larger recording isn't read whole just for its length: it shows once played.
+    static let lengthReadLimit: UInt64 = 20 << 20
+
+    /// A recording's length before it plays, as in Desktop: remembered, or read from its bytes in
+    /// memory (never a decrypted copy on disk) for one up to `lengthReadLimit`.
+    static func length(of a: Attachment) async -> Double? {
+        if let known = lengths[a.id] { return known }
+        guard a.state == .ready, let path = a.path, a.size <= lengthReadLimit,
+            let data = try? await Files.bytes(path)
+        else { return nil }
+        let type = UTType(mimeType: a.contentType)?.identifier
+        let length = await Task.detached(priority: .utility) {
+            (try? AVAudioPlayer(data: data, fileTypeHint: type)).map(\.duration).flatMap { $0 > 0 ? $0 : nil }
+        }.value
+        if let length { lengths[a.id] = length }
+        return length
+    }
+
     private func toggle() {
-        if player == nil { prepare() }
-        guard let player else { return }
-        if playing { player.pause() } else { player.play() }
-        playing.toggle()
-        guard playing else { return }
-        // a format AVFoundation can't play fails after starting: say so instead of a stuck Pause
-        Task {
+        guard opening == nil else { return }
+        opening = Task {
+            if player == nil { await prepare() }
+            opening = nil
+            guard let player, !Task.isCancelled else { return }
+            if playing { player.pause() } else { player.play() }
+            playing.toggle()
+            guard playing else { return }
+            // a format AVFoundation can't play fails after starting: say so instead of a stuck Pause
             try? await Task.sleep(for: .milliseconds(500))
             if player.currentItem?.status == .failed {
                 stop()
@@ -175,11 +195,13 @@ struct AudioAttachmentView: View {
         }
     }
 
-    private func prepare() {
-        guard let url = try? Files.openable(attachment) else {
+    private func prepare() async {
+        guard let url = try? await Files.openable(attachment) else {
             unplayable = true
             return
         }
+        // gone meanwhile: its copy goes with it
+        if Task.isCancelled { return Files.close(url) }
         opened = url
         let asset = AVURLAsset(url: url, options: [AVURLAssetOverrideMIMETypeKey: attachment.contentType])
         let item = AVPlayerItem(asset: asset)
@@ -189,7 +211,10 @@ struct AudioAttachmentView: View {
             MainActor.assumeIsolated {
                 elapsed = time.seconds
                 let total = item.duration.seconds
-                if total.isFinite { duration = total }
+                if total.isFinite {
+                    duration = total
+                    Self.lengths[attachment.id] = total
+                }
                 if total.isFinite, time.seconds >= total {
                     // played to the end: back to the start, ready to play again
                     playing = false
@@ -202,6 +227,8 @@ struct AudioAttachmentView: View {
     }
 
     private func stop() {
+        opening?.cancel()
+        opening = nil
         player?.pause()
         if let observer { player?.removeTimeObserver(observer) }
         observer = nil
@@ -311,7 +338,16 @@ enum Thumbnails {
     static func load(_ path: String, filling side: CGFloat? = nil) async -> CGImage? {
         if let hit = cached(path, filling: side) { return hit }
         if undecodable.contains(path) { return nil }
-        let image = await Task.detached(priority: .userInitiated) { decode(path, side) }.value
+        // decrypted in memory only
+        let data: Data
+        do {
+            data = try await Files.bytes(path)
+        } catch {
+            // not remembered: one that didn't read now (the core starting over, say) may later
+            AppStore.logger.error("a picture didn't read: \(error, privacy: .public)")
+            return nil
+        }
+        let image = await Task.detached(priority: .userInitiated) { decode(data, side) }.value
         if let image {
             cache.setObject(image, forKey: key(path, side), cost: image.bytesPerRow * image.height)
         } else {
@@ -320,12 +356,15 @@ enum Thumbnails {
         return image
     }
 
+    /// Whether the file at `path` was read but isn't a picture that decodes.
+    static func isUndecodable(_ path: String) -> Bool { undecodable.contains(path) }
+
     private static func key(_ path: String, _ side: CGFloat?) -> NSString {
         "\(Int(side ?? 0)) \(path)" as NSString
     }
 
-    nonisolated private static func decode(_ path: String, _ side: CGFloat?) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+    nonisolated private static func decode(_ data: Data, _ side: CGFloat?) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         var longest = maxPixels
         if let side {
             // its shorter side spans the square and the longer one is cropped (never more than a bubble's)

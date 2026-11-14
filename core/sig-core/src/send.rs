@@ -568,6 +568,7 @@ pub async fn sender(
         // the RefCell borrow is never held across the send itself
         let next = std::future::poll_fn(|cx| jobs.borrow_mut().poll_recv(cx)).await;
         let Some(job) = next else { return };
+        let sent_to = job.sent_to();
         match job {
             Job::Text(job) => send_text(&mut m, &db, l.as_ref(), job).await,
             Job::Mutation {
@@ -588,10 +589,13 @@ pub async fn sender(
             } => {
                 let sent = send_to(&mut m, &conversation_id, *body, at).await;
                 if let Err(e) = &sent {
-                    // ids only; the call engine ends the call, this says why
-                    tracing::warn!(conversation = %conversation_id, error = %e, "a call message wasn't sent");
+                    // opaque ids only; the call engine ends the call, this says why
+                    tracing::warn!(chat = %db.opaque_id(&conversation_id), error = %e, "a call message wasn't sent");
                     l.on_event(CoreEvent::Error {
-                        message: format!("a call message to {conversation_id} wasn't sent: {e}"),
+                        message: format!(
+                            "a call message in chat {} wasn't sent: {e}",
+                            db.opaque_id(&conversation_id)
+                        ),
                     });
                 }
                 let _ = done.send(sent.is_ok());
@@ -611,12 +615,7 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
-                    // a group's id is its key: not for the log
-                    let what = match conversation_id.starts_with("g:") {
-                        true => "telling the phone about a group's request".to_string(),
-                        false => format!("telling the phone about the request from {conversation_id}"),
-                    };
-                    report(l.as_ref(), &what, &e);
+                    report(l.as_ref(), "telling the phone about a message request", &e);
                 }
             }
             Job::ViewOnceOpen { key } => {
@@ -637,8 +636,7 @@ pub async fn sender(
                 let at = now_ms();
                 // not retried: every message we send carries the key too
                 if let Err(e) = send_to(&mut m, &conversation_id, profile_key_update(at).into(), at).await {
-                    let what = format!("sharing your profile with {conversation_id} (it goes with your next message)");
-                    report(l.as_ref(), &what, &e);
+                    report(l.as_ref(), "sharing your profile (it goes with your next message)", &e);
                 }
             }
             Job::Typing {
@@ -659,9 +657,35 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = send_to(&mut m, &conversation_id, tm.into(), at).await {
-                    tracing::warn!(conversation = %conversation_id, error = %e, "typing not sent");
+                    tracing::warn!(chat = %db.opaque_id(&conversation_id), error = %e, "typing not sent");
                 }
             }
+        }
+        if let Some((conversation_id, at)) = sent_to {
+            let me = me.service_id_string();
+            crate::safety::notice_chat(m.store(), &db, l.as_ref(), &me, &conversation_id, at - 1).await;
+        }
+    }
+}
+
+impl Job {
+    /// The chat a message, change, call or our profile key went to, and when: its people's keys
+    /// are checked after it (`safety::notice_chat`). Typing goes often and the message after it
+    /// checks; the rest goes to our own devices.
+    fn sent_to(&self) -> Option<(String, i64)> {
+        match self {
+            Job::Text(job) => Some((job.conversation_id.clone(), job.key.sent_at)),
+            Job::ProfileKey { conversation_id } => Some((conversation_id.clone(), now_ms() as i64)),
+            Job::Mutation {
+                conversation_id, at, ..
+            }
+            | Job::Timer {
+                conversation_id, at, ..
+            }
+            | Job::Call {
+                conversation_id, at, ..
+            } => Some((conversation_id.clone(), *at as i64)),
+            _ => None,
         }
     }
 }
@@ -734,7 +758,10 @@ async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, 
         // presage also fails a send whose message was delivered but whose sync transcript or
         // local copy failed; a delivery receipt then lifts the row out of Failed.
         l.on_event(CoreEvent::Error {
-            message: format!("a message to {} may not have been sent: {e}", job.conversation_id),
+            message: format!(
+                "a message in chat {} may not have been sent: {e}",
+                db.opaque_id(&job.conversation_id)
+            ),
         });
     }
     if let Err(e) = stored {
@@ -775,7 +802,10 @@ async fn set_timer(
     at: u64,
 ) {
     let fail = |why: String| CoreEvent::Error {
-        message: format!("the disappearing timer of {conversation_id} wasn't changed: {why}"),
+        message: format!(
+            "the disappearing timer of chat {} wasn't changed: {why}",
+            db.opaque_id(conversation_id)
+        ),
     };
     let Some(Recipient::Direct(sid)) = recipient(conversation_id) else {
         return;
@@ -825,14 +855,20 @@ async fn record_mutation(
 ) {
     if let Err(e) = sent {
         l.on_event(CoreEvent::Error {
-            message: format!("a reaction, edit or delete in {conversation_id} may not have reached everyone: {e}"),
+            message: format!(
+                "a reaction, edit or delete in chat {} may not have reached everyone: {e}",
+                db.opaque_id(conversation_id)
+            ),
         });
     }
     for op in own_ops(me, conversation_id, body) {
         match db.apply(&op).await {
             Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
             Err(e) => l.on_event(CoreEvent::Error {
-                message: format!("recording a change in {conversation_id} failed: {e}"),
+                message: format!(
+                    "recording a change in chat {} failed: {e}",
+                    db.opaque_id(conversation_id)
+                ),
             }),
         }
     }
@@ -895,7 +931,7 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
         match sent {
             Ok(()) => done.extend(targets.iter().filter(|t| t.author == author).cloned()),
             Err(e) => {
-                tracing::warn!(to = %author, error = %e, "read receipt not sent");
+                tracing::warn!(chat = %db.opaque_id(&format!("c:{author}")), error = %e, "read receipt not sent");
                 failed += 1;
             }
         }
@@ -926,16 +962,7 @@ async fn upload(
 ) -> Result<Vec<AttachmentPointer>, String> {
     let mut pointers = vec![];
     for &id in ids {
-        let a = db
-            .attachment(id)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("a file of the message is gone")?;
-        let path = a.path.ok_or("a file of the message is missing")?;
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+        let (a, bytes) = db.attachment_bytes(id).await?;
         let spec = AttachmentSpec {
             content_type: a.content_type,
             length: bytes.len(),
@@ -988,6 +1015,53 @@ mod tests {
 
     const U: &str = "22222222-2222-2222-2222-222222222222";
     const ME: &str = "11111111-1111-1111-1111-111111111111";
+
+    #[test]
+    fn the_chat_a_job_went_to_is_checked_after_it() {
+        let chat = format!("c:{U}");
+        let text = Job::Text(SendJob {
+            key: key(ME, 7),
+            conversation_id: chat.clone(),
+            body: Some("hi".into()),
+            ranges: vec![],
+            quote: None,
+            attachments: vec![],
+            preview: None,
+            sticker: None,
+        });
+        assert_eq!(text.sent_to(), Some((chat.clone(), 7)));
+        let mutation = Job::Mutation {
+            conversation_id: chat.clone(),
+            body: Box::new(ContentBody::DataMessage(Default::default())),
+            at: 8,
+        };
+        assert_eq!(mutation.sent_to(), Some((chat.clone(), 8)));
+        let timer = Job::Timer {
+            conversation_id: chat.clone(),
+            seconds: 60,
+            at: 9,
+        };
+        assert_eq!(timer.sent_to(), Some((chat.clone(), 9)));
+        let call = Job::Call {
+            conversation_id: chat.clone(),
+            body: Box::new(ContentBody::DataMessage(Default::default())),
+            at: 10,
+            done: tokio::sync::oneshot::channel().0,
+        };
+        assert_eq!(call.sent_to(), Some((chat.clone(), 10)));
+        let before = now_ms() as i64;
+        let profile = Job::ProfileKey {
+            conversation_id: chat.clone(),
+        };
+        assert!(matches!(profile.sent_to(), Some((c, at)) if c == chat && at >= before));
+        let typing = Job::Typing {
+            conversation_id: chat,
+            started: true,
+            queued: Instant::now(),
+        };
+        assert_eq!(typing.sent_to(), None, "the message after it checks");
+        assert_eq!(Job::Receipts.sent_to(), None);
+    }
 
     #[test]
     fn the_storage_changed_sync_asks_the_other_devices_for_the_manifest() {
@@ -1337,6 +1411,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         }
     }
 

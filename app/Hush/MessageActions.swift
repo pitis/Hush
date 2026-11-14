@@ -16,10 +16,11 @@ enum MessageActions {
     }
 
     /// As `canDelete`, and it has text to edit whose mentions the composer can hold (one
-    /// placeholder each, inside the text): an edit would lose any other.
+    /// placeholder each, inside the text): an edit would lose any other. Not a reply to a story:
+    /// an edit goes without the story it answers.
     static func canEdit(_ m: Message, me: String?, now: Date = .now) -> Bool {
         let length = (m.body ?? "").utf16.count
-        return canDelete(m, me: me, now: now) && length > 0
+        return canDelete(m, me: me, now: now) && length > 0 && m.story == nil
             && m.ranges.allSatisfy {
                 guard case .mention = $0.style else { return true }
                 return $0.length == 1 && Int($0.start) < length

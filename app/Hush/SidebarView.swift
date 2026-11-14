@@ -231,7 +231,7 @@ struct SidebarView: View {
         ConversationRow(
             conversation: c, title: store.title(c),
             line: ChatList.line(
-                c, selected: c.id == store.selectedId, typing: store.isTyping(c.id), draft: Composer.draft(for: c.id),
+                c, selected: c.id == store.selectedId, typing: store.isTyping(c.id), draft: store.draft(c.id),
                 authorName: store.senderName(c.lastMessageAuthor), name: store.mentionName)
         )
         .tag(c.id)

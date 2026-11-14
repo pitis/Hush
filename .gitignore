@@ -3,6 +3,7 @@ app/Generated/
 app/Frameworks/
 app/Hush.xcodeproj/
 app/Hush/Info.plist
+app/Hush/Hush.entitlements
 build/
 worktrees/
 .DS_Store

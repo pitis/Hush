@@ -7,8 +7,10 @@ use tokio::sync::mpsc;
 
 use crate::actor::{self, Command};
 use crate::backup;
+use crate::download::Download;
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
+use crate::files::Kept;
 use crate::groups::{GroupChange, GroupInfo, GroupJoined, GroupPreview};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
@@ -16,10 +18,13 @@ use crate::projection::{
     MessageKind, MessageStatus, OutgoingFile, PreviewDraft, ProjectionDb, Quote, RequestResponse, SearchHit,
     StickerPackInfo,
 };
+use crate::safety::SafetyNumber;
 use crate::send::{self, Job, SendJob};
 
 /// Signal's limit for attachments in one message.
 const MAX_ATTACHMENTS: usize = 32;
+/// Quitting never waits on the core longer (its own drain ends within about 3.5 s).
+const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The app's handle on the core. Cheap to call from any thread; Signal work happens on the core
 /// thread and reports back through the `EventListener`.
@@ -117,6 +122,7 @@ impl Client {
             },
             expires_in,
             expires_at: None,
+            story: None,
         };
         let was_archived = self.is_archived(&conversation_id).await?;
         // as in send_text: a timestamp collision takes the next one
@@ -180,7 +186,7 @@ impl Client {
 
     /// Where fetched preview images wait until sent.
     fn previews_dir(&self) -> PathBuf {
-        self.data_dir.join("previews")
+        self.data_dir.join(crate::files::PREVIEWS)
     }
 
     /// The stored link preview of our message `key`, for the send job.
@@ -206,7 +212,7 @@ impl Client {
         check_conversation(id)?;
         if !self.db.has_conversation(id).await? {
             return Err(CoreError::InvalidInput {
-                message: format!("no such chat: {id}"),
+                message: format!("no such chat: {}", self.db.opaque_id(id)),
             });
         }
         Ok(())
@@ -264,6 +270,13 @@ impl Client {
         }
     }
 
+    /// Queues a download (if the core is closing it is lost: the next start's pass picks it up).
+    fn download(&self, what: Download) -> Result<(), CoreError> {
+        #[cfg(test)]
+        self.sent_jobs.lock().unwrap().push(format!("{what:?}"));
+        self.send(Command::Download(what))
+    }
+
     /// A chat that can be blocked or deleted: known, and not Note to Self.
     async fn other_chat(&self, id: &str) -> Result<(), CoreError> {
         let me = self.own_aci().ok_or(CoreError::NotLinked)?;
@@ -293,7 +306,7 @@ fn write_export(
     folder: &std::path::Path,
     title: &str,
     messages: &[Message],
-    files: &[Vec<crate::projection::Attachment>],
+    files: &[Vec<(crate::projection::Attachment, Option<Kept>)>],
     names: &std::collections::HashMap<String, String>,
 ) -> Result<String, CoreError> {
     let base = crate::export::file_name(title);
@@ -329,7 +342,7 @@ fn fill_export(
     dir: &std::path::Path,
     title: &str,
     messages: &[Message],
-    files: &[Vec<crate::projection::Attachment>],
+    files: &[Vec<(crate::projection::Attachment, Option<Kept>)>],
     names: &std::collections::HashMap<String, String>,
 ) -> Result<(), CoreError> {
     std::fs::create_dir_all(dir.join("files")).map_err(storage("can't make the export folder"))?;
@@ -337,16 +350,17 @@ fn fill_export(
     let mut exported = vec![];
     for (m, attachments) in messages.iter().zip(files) {
         let mut out = vec![];
-        for a in attachments {
+        for (a, kept) in attachments {
             let shown = a.file_name.clone().unwrap_or_else(|| format!("file {}", a.id));
             let (mut path, mut missing) = (None, false);
-            if let Some(source) = &a.path {
+            if let Some(source) = kept {
                 let to = format!("files/{}-{}", a.id, crate::export::file_name(&shown));
-                match std::fs::copy(source, dir.join(&to)) {
+                // decrypted: the export is for reading anywhere
+                match source.copy_to(&dir.join(&to)) {
                     Ok(_) => path = Some(to),
-                    // gone from disk since: the page says so, and the rest still exports
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        tracing::warn!(attachment = a.id, "an exported file is missing");
+                    // gone from disk since, or damaged: the page says so, and the rest still exports
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData) => {
+                        tracing::warn!(attachment = a.id, error = %e, "an exported file is missing or damaged");
                         missing = true;
                     }
                     Err(e) => return Err(storage(&format!("can't copy file {}", a.id))(e)),
@@ -384,6 +398,14 @@ impl From<backup::BackupError> for CoreError {
             e => Self::InvalidInput { message: e.to_string() },
         }
     }
+}
+
+/// A path's file name, for the log (names are ids, never what a file holds or who sent it).
+fn logged_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn storage(what: &str) -> impl Fn(std::io::Error) -> CoreError + '_ {
@@ -545,7 +567,7 @@ impl Client {
             remove(&self.data_dir.join(format!("presage.db{suffix}")), false).map_err(&removing)?;
         }
         // presage's packs go with its store: so do our copies of their images
-        remove(&self.data_dir.join("stickers"), true).map_err(&removing)?;
+        remove(&self.data_dir.join(crate::files::STICKERS), true).map_err(&removing)?;
         remove(&self.data_dir.join("history.tmp"), false).map_err(&removing)
     }
 
@@ -590,13 +612,16 @@ impl Client {
         let linked = Arc::new(AtomicBool::new(false));
         let own_aci = Arc::new(Mutex::new(None));
         let data_dir = PathBuf::from(data_dir);
-        // preview images of drafts from before (never sent) don't stay, nor a backup's leftovers;
-        // a restore stopped while it swapped finishes
+        // preview images of drafts from before (never sent) don't stay, nor a backup's leftovers,
+        // nor sticker images from before they were encrypted (copies of presage's, written again
+        // encrypted); a restore stopped while it swapped finishes
         if data_dir.join(RESTORING).join(READY).exists() {
             swap_in_restore(&data_dir).map_err(storage("can't finish restoring the backup"))?;
         }
-        for left in ["previews", BACKING_UP, RESTORING] {
-            let _ = std::fs::remove_dir_all(data_dir.join(left));
+        for left in [crate::files::PREVIEWS, "stickers", BACKING_UP, RESTORING] {
+            if let Err(e) = remove(&data_dir.join(left), true) {
+                tracing::warn!(folder = left, error = %e, "a folder left from before couldn't be removed");
+            }
         }
         let h = actor::spawn(
             data_dir.clone(),
@@ -632,6 +657,12 @@ impl Client {
         self.linked.load(Ordering::SeqCst)
     }
 
+    /// A chat's id (or anyone's) as notifications and logs may show it: its keyed hash, the
+    /// same for as long as this Mac stays linked, naming no one to whoever reads it.
+    pub fn opaque_id(&self, id: String) -> String {
+        self.db.opaque_id(&id)
+    }
+
     /// Starts linking as a secondary device: emits `LinkUrl`, then `Linked`, or `Error` and
     /// `Connection(Unlinked)` (the code expires after 5 minutes). Call `start` after `Linked`.
     pub fn link(&self, device_name: String) -> Result<(), CoreError> {
@@ -655,7 +686,10 @@ impl Client {
         let aci = |id: &str| id.strip_prefix("c:").is_some_and(|rest| !rest.starts_with("PNI:"));
         if !matches!(send::recipient(&conversation_id), Some(send::Recipient::Direct(_))) || !aci(&conversation_id) {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+                message: format!(
+                    "not a 1:1 chat with a known contact: {}",
+                    self.db.opaque_id(&conversation_id)
+                ),
             });
         }
         self.send(Command::ResetSession { conversation_id })
@@ -672,7 +706,10 @@ impl Client {
             .filter(|rest| !rest.starts_with("PNI:") && !rest.is_empty());
         let Some(peer_aci) = aci else {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+                message: format!(
+                    "not a 1:1 chat with a known contact: {}",
+                    self.db.opaque_id(&conversation_id)
+                ),
             });
         };
         self.send(Command::Call(crate::calls::actor::CallCommand::Start {
@@ -722,7 +759,7 @@ impl Client {
         if !self.is_linked() {
             return Err(CoreError::NotLinked);
         }
-        self.send(Command::Download(id))
+        self.download(Download::One(id))
     }
 
     /// The user is typing in a conversation (`started`), or stopped (sent, cleared the field, left
@@ -823,6 +860,7 @@ impl Client {
             kind: MessageKind::Normal,
             expires_in,
             expires_at: None,
+            story: None,
         };
         let was_archived = self.is_archived(&conversation_id).await?;
         // (author, sent_at) is the identity: on a collision (a phone-sent message in the same ms,
@@ -889,7 +927,12 @@ impl Client {
                 let _ = std::fs::remove_dir_all(&dir);
                 // named by a timestamp nothing else takes (the one a message would get)
                 let path = dir.join(self.next_sent_at().to_string());
-                let saved = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes));
+                let key = self.db.derived_key(&path).ok_or_else(|| CoreError::Storage {
+                    message: "no folder for preview images".into(),
+                })?;
+                let saved = std::fs::create_dir_all(&dir)
+                    .and_then(|_| crate::files::seal(bytes.as_slice(), &path, &key))
+                    .inspect_err(|e| tracing::warn!(error = %e, "a link preview's image couldn't be kept"));
                 // without the image the preview still says what the link is
                 saved.ok().map(|_| OutgoingFile {
                     path: path.to_string_lossy().into_owned(),
@@ -1054,7 +1097,7 @@ impl Client {
             }
         }
         // sticker images are copies out of presage's store
-        for dir in ["attachments", "stickers"] {
+        for dir in ["attachments", crate::files::STICKERS] {
             match std::fs::remove_dir_all(self.data_dir.join(dir)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
                 _ => {}
@@ -1094,6 +1137,23 @@ impl Client {
         self.db.clear_history_state().await?;
         self.db.close().await;
         self.drop_presage()
+    }
+
+    /// Stops the core as the app quits, within `STOP_WITHIN`: what the open connection has read
+    /// is handled first (the server counts it as delivered, so it never comes again). Nothing
+    /// works after.
+    pub async fn stop(&self) {
+        let stopping = async {
+            let (done, stopped) = tokio::sync::oneshot::channel();
+            if self.send(Command::Stop { done }).is_ok() {
+                let _ = stopped.await;
+            }
+            self.join_core("stopping").await;
+        };
+        // the core may be busy with a long command first (an unlink waits up to 15 s)
+        if tokio::time::timeout(STOP_WITHIN, stopping).await.is_err() {
+            tracing::error!("the core didn't stop in time: quitting anyway");
+        }
     }
 
     /// Writes a backup of every chat and file here to `path` (replaced), encrypted with
@@ -1203,11 +1263,17 @@ impl Client {
             }
             // a deleted message's files are gone; view-once media is never kept
             let kept = !m.deleted && !matches!(m.kind, crate::projection::MessageKind::ViewOnce { .. });
-            files.push(if kept {
-                self.db.attachments(&m.key()).await?
-            } else {
-                vec![]
-            });
+            let mut with_files = vec![];
+            if kept {
+                for a in self.db.attachments(&m.key()).await? {
+                    let file = match &a.path {
+                        Some(path) => Some(self.db.kept(std::path::Path::new(path)).await?),
+                        None => None,
+                    };
+                    with_files.push((a, file));
+                }
+            }
+            files.push(with_files);
         }
         let mut names = std::collections::HashMap::new();
         for aci in named {
@@ -1242,6 +1308,36 @@ impl Client {
 
     pub async fn attachment(&self, id: i64) -> Result<Option<Attachment>, CoreError> {
         Ok(self.db.attachment(id).await?)
+    }
+
+    /// A file Hush keeps (an attachment, a chat's picture, a sticker, a draft's preview image),
+    /// decrypted in memory: they are encrypted on disk. Any other file as it is.
+    pub async fn file_bytes(&self, path: String) -> Result<Vec<u8>, CoreError> {
+        let read = async {
+            let kept = self.db.kept(std::path::Path::new(&path)).await?;
+            tokio::task::spawn_blocking(move || kept.read())
+                .await
+                .map_err(|e| CoreError::Storage { message: e.to_string() })?
+                .map_err(storage("can't read the file"))
+        };
+        read.await
+            .inspect_err(|e| tracing::warn!(file = %logged_name(&path), error = %e, "a file didn't read"))
+    }
+
+    /// Copies a file Hush keeps, decrypted, to a new file at `to` (one there is an error), as
+    /// `file_bytes` reads it: for Quick Look, opening and playing it.
+    pub async fn copy_file(&self, path: String, to: String) -> Result<(), CoreError> {
+        let copied = async {
+            let kept = self.db.kept(std::path::Path::new(&path)).await?;
+            tokio::task::spawn_blocking(move || kept.copy_to(std::path::Path::new(&to)))
+                .await
+                .map_err(|e| CoreError::Storage { message: e.to_string() })?
+                .map(|_| ())
+                .map_err(storage("can't copy the file"))
+        };
+        copied
+            .await
+            .inspect_err(|e| tracing::warn!(file = %logged_name(&path), error = %e, "a file didn't copy out"))
     }
 
     /// Reacts to a message with `emoji`, or takes back our reaction `emoji` (`remove`). It shows
@@ -1290,7 +1386,7 @@ impl Client {
             Some(crate::send::Recipient::Direct(_))
         ) {
             return Err(CoreError::InvalidInput {
-                message: format!("the timer can be set here in direct chats only, not {conversation_id}"),
+                message: "the timer can be set here in direct chats only".into(),
             });
         }
         let at = self.next_sent_at() as u64;
@@ -1506,6 +1602,8 @@ impl Client {
             self.queue(Job::ProfileKey { conversation_id });
         }
         self.queue(Job::Receipts);
+        // its pictures and voice notes waited while it was a request
+        let _ = self.download(Download::Auto);
         Ok(())
     }
 
@@ -1543,6 +1641,16 @@ impl Client {
     /// notification, so a mute set a moment ago counts even before the app's list caught up.
     pub async fn is_muted(&self, conversation_id: String) -> Result<bool, CoreError> {
         Ok(self.db.is_muted(&conversation_id, now_ms()).await?)
+    }
+
+    /// What was typed in a chat and not sent; blank text clears it. It goes with the chat.
+    pub async fn set_draft(&self, conversation_id: String, text: String) -> Result<(), CoreError> {
+        Ok(self.db.set_draft(&conversation_id, &text).await?)
+    }
+
+    /// Every chat's draft, by chat id.
+    pub async fn drafts(&self) -> Result<std::collections::HashMap<String, String>, CoreError> {
+        Ok(self.db.drafts().await?)
     }
 
     /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).
@@ -1597,6 +1705,21 @@ impl Client {
         self.own_aci().ok_or(CoreError::NotLinked)?;
         let (done, answer) = tokio::sync::oneshot::channel();
         self.send(Command::GroupInfo { key, done })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::Storage { message })
+    }
+
+    /// Our safety number with a contact (their ACI), to compare with theirs; None before any
+    /// session with them (no key of theirs yet).
+    pub async fn safety_number(&self, aci: String) -> Result<Option<SafetyNumber>, CoreError> {
+        let aci = presage::libsignal_service::prelude::Uuid::parse_str(&aci).map_err(|_| CoreError::InvalidInput {
+            message: "not an ACI".into(),
+        })?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::SafetyNumber { aci, done })?;
         answer
             .await
             .map_err(|_| CoreError::Closed)?
@@ -1907,8 +2030,18 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            std::fs::create_dir_all(from.0.join("attachments")).unwrap();
-            std::fs::write(from.0.join("attachments").join("1"), b"photo").unwrap();
+            // a file of ours, encrypted: its key travels in the database
+            let photo = file_in(&from.0.join("src"), "beach.heic", b"photo");
+            client
+                .send_attachments(
+                    format!("c:{ALICE}"),
+                    vec![outgoing(photo, "image/heic")],
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
             std::fs::write(from.0.join("attachments").join("2.part"), b"half").unwrap();
             client
                 .back_up(file.to_string_lossy().into(), "correct horse".into())
@@ -1929,13 +2062,123 @@ mod tests {
         });
         drop(fresh);
         assert!(!to.0.join(RESTORING).exists() && !to.0.join("presage.db").exists());
-        assert_eq!(std::fs::read(to.0.join("attachments").join("1")).unwrap(), b"photo");
+        let restored = to.0.join("attachments").join("1");
+        assert_ne!(std::fs::read(&restored).unwrap(), b"photo", "as it was: encrypted");
         assert!(!to.0.join("attachments").join("2.part").exists());
         let reopened = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
         rt.block_on(async {
             assert_eq!(reopened.conversations().await.unwrap().len(), 1);
             assert!(!reopened.history_pending().await.unwrap());
+            let path = reopened.attachment(1).await.unwrap().unwrap().path.unwrap();
+            assert_eq!(path, restored.to_string_lossy());
+            assert_eq!(reopened.file_bytes(path).await.unwrap(), b"photo");
         });
+    }
+
+    /// A backup from before files were encrypted: plain files, rows without keys, a plain chat
+    /// picture. Restored on another Mac, they are encrypted at its next open.
+    #[test]
+    fn files_of_a_backup_from_before_are_encrypted_once_restored() {
+        let (from, _sink, client, rt) = as_me("client-backup-plain-from");
+        let file = from.0.join("backup.hushbackup");
+        let conv = format!("c:{ALICE}");
+        let picture = format!("avatar-{}-1", client.db.opaque_id(&conv));
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            let files = from.0.join("attachments");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join("1"), b"a photo from before").unwrap();
+            std::fs::write(files.join(&picture), b"alice's face").unwrap();
+            sqlx::query(
+                "INSERT INTO attachments(id, message_author, message_sent_at, position, content_type, size, state, file)
+                 VALUES (1, ?1, 1, 0, 'image/jpeg', 19, ?2, '1')",
+            )
+            .bind(ALICE)
+            .bind(AttachmentState::Ready.to_i64())
+            .execute(client.db.pool())
+            .await
+            .unwrap();
+            sqlx::query("UPDATE conversations SET avatar = ?2 WHERE id = ?1")
+                .bind(&conv)
+                .bind(files.join(&picture).to_string_lossy().into_owned())
+                .execute(client.db.pool())
+                .await
+                .unwrap();
+            client
+                .back_up(file.to_string_lossy().into(), "correct horse".into())
+                .await
+                .unwrap();
+        });
+        let to = temp_dir("client-backup-plain-to");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let fresh = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink.clone()).unwrap();
+        rt.block_on(async {
+            fresh
+                .restore_backup(file.to_string_lossy().into(), "correct horse".into())
+                .await
+                .unwrap();
+        });
+        drop(fresh);
+        let reopened = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
+        let files = to.0.join("attachments");
+        rt.block_on(async {
+            let path = reopened.attachment(1).await.unwrap().unwrap().path.unwrap();
+            assert_eq!(path, files.join("1.enc").to_string_lossy());
+            assert_eq!(reopened.file_bytes(path.clone()).await.unwrap(), b"a photo from before");
+            assert_ne!(std::fs::read(&path).unwrap(), b"a photo from before");
+            let avatar = reopened.conversations().await.unwrap()[0].avatar.clone().unwrap();
+            assert_eq!(
+                avatar,
+                files.join(format!("{picture}.enc")).to_string_lossy(),
+                "moved in, then encrypted"
+            );
+            assert_eq!(reopened.file_bytes(avatar).await.unwrap(), b"alice's face");
+        });
+        assert!(
+            !files.join("1").exists() && !files.join(&picture).exists(),
+            "no plain copy stays"
+        );
+    }
+
+    #[test]
+    fn a_stored_file_copies_out_decrypted_and_never_over_another() {
+        let (dir, _sink, client, rt) = as_me("client-copy-file");
+        let photo = file_in(&dir.0.join("src"), "beach.heic", b"heic");
+        rt.block_on(async {
+            client.db.insert_message(&stored(ALICE, 1)).await.unwrap();
+            let key = client
+                .send_attachments(
+                    format!("c:{ALICE}"),
+                    vec![outgoing(photo, "image/heic")],
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            let stored = client.attachments(key).await.unwrap()[0].path.clone().unwrap();
+            let out = dir.0.join("out.heic");
+            client
+                .copy_file(stored.clone(), out.to_string_lossy().into())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), b"heic");
+            assert!(client.copy_file(stored, out.to_string_lossy().into()).await.is_err());
+            assert_eq!(std::fs::read(&out).unwrap(), b"heic", "the one there stays");
+        });
+    }
+
+    #[test]
+    fn sticker_images_from_before_go_at_open() {
+        let dir = temp_dir("client-old-stickers");
+        std::fs::create_dir_all(dir.0.join("stickers").join("ab")).unwrap();
+        std::fs::write(dir.0.join("stickers").join("ab").join("1"), b"fox").unwrap();
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let _client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
+        assert!(
+            !dir.0.join("stickers").exists(),
+            "plain copies of presage's, written again encrypted"
+        );
     }
 
     #[test]
@@ -2064,12 +2307,19 @@ mod tests {
             here.db.insert_message(&other).await.unwrap(); // in the live journal, not checkpointed
             std::fs::create_dir_all(to.0.join("attachments")).unwrap();
             std::fs::write(to.0.join("attachments").join("old"), b"old").unwrap();
+            // sealed under this Mac's install key, which the restored database doesn't have
+            std::fs::create_dir_all(to.0.join(crate::files::STICKERS).join("ab")).unwrap();
+            std::fs::write(to.0.join(crate::files::STICKERS).join("ab").join("1"), b"fox").unwrap();
             here.restore_backup(file.to_string_lossy().into(), "correct horse".into())
                 .await
                 .unwrap();
         });
         drop(here);
         assert!(!to.0.join("attachments").join("old").exists());
+        assert!(
+            !to.0.join(crate::files::STICKERS).exists(),
+            "sticker images go with presage's store"
+        );
         let reopened = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
         rt.block_on(async {
             let ids: Vec<_> = reopened
@@ -2230,6 +2480,28 @@ mod tests {
         assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
     }
 
+    /// Quitting stops the core: its thread ends and the data folder is free, even while the app
+    /// still holds the client.
+    #[test]
+    fn stopping_ends_the_core() {
+        let dir = temp_dir("client-stop");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink.clone()).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(client.stop());
+        let again = std::time::Instant::now();
+        rt.block_on(client.stop());
+        assert!(
+            again.elapsed() < Duration::from_secs(1),
+            "a second stop returns at once"
+        );
+        assert!(matches!(client.start(), Err(CoreError::Closed)));
+        assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
+    }
+
     #[test]
     fn a_second_client_on_the_same_data_is_refused() {
         let dir = temp_dir("client-lock");
@@ -2239,6 +2511,22 @@ mod tests {
         assert!(matches!(second, Err(CoreError::AlreadyOpen)));
         drop(first);
         assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
+    }
+
+    /// Other users of the computer can't read the chats: the data folder is ours alone, made so
+    /// and tightened when an older one is opened.
+    #[cfg(unix)]
+    #[test]
+    fn the_data_folder_is_ours_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("client-mode");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let mode = || std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+        drop(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink.clone()).unwrap());
+        assert_eq!(mode(), 0o700, "made so");
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap());
+        assert_eq!(mode(), 0o700, "tightened");
     }
 
     #[test]
@@ -2404,6 +2692,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         }
     }
 
@@ -2689,13 +2978,19 @@ mod tests {
             assert!(!c.blocked && c.whitelisted);
             assert_eq!(
                 jobs(&client),
-                ["RequestResponse(Accept)", "BlockedList", "ProfileKey", "Receipts"],
-                "unblocking is accepting; the block list changed too"
+                [
+                    "RequestResponse(Accept)",
+                    "BlockedList",
+                    "ProfileKey",
+                    "Receipts",
+                    "Auto"
+                ],
+                "unblocking is accepting; the block list changed too; held-back media comes now"
             );
             client.accept_request(conv.clone()).await.unwrap();
             assert_eq!(
                 jobs(&client),
-                ["RequestResponse(Accept)", "ProfileKey", "Receipts"],
+                ["RequestResponse(Accept)", "ProfileKey", "Receipts", "Auto"],
                 "the block list didn't change"
             );
             client.delete_chat(conv.clone()).await.unwrap();
@@ -2733,7 +3028,7 @@ mod tests {
                 .await
                 .unwrap();
             client.accept_request(group.clone()).await.unwrap();
-            assert_eq!(jobs(&client), ["RequestResponse(Accept)", "Receipts"]);
+            assert_eq!(jobs(&client), ["RequestResponse(Accept)", "Receipts", "Auto"]);
             client.block(group.clone()).await.unwrap();
             assert_eq!(jobs(&client), ["RequestResponse(Block)", "BlockedList"]);
         });
@@ -3098,7 +3393,7 @@ mod tests {
             let copy = files[0].path.clone().unwrap();
             assert_ne!(copy, photo);
             std::fs::remove_file(&photo).unwrap();
-            assert_eq!(std::fs::read(&copy).unwrap(), b"heic");
+            assert_eq!(client.db.plain(&copy).await, b"heic");
             // no caption is fine too
             let key = client
                 .send_attachments(
@@ -3157,14 +3452,15 @@ mod tests {
         let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
         std::fs::create_dir_all(dir.0.join("attachments")).unwrap();
         std::fs::write(dir.0.join("attachments").join("1"), b"photo").unwrap();
-        std::fs::create_dir_all(dir.0.join("stickers").join("ab")).unwrap();
-        std::fs::write(dir.0.join("stickers").join("ab").join("1"), b"fox").unwrap();
+        let stickers = dir.0.join(crate::files::STICKERS);
+        std::fs::create_dir_all(stickers.join("ab")).unwrap();
+        std::fs::write(stickers.join("ab").join("1"), b"fox").unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async { client.unlink(false).await.unwrap() });
-        for gone in ["presage.db", "projection.db", "attachments", "stickers"] {
+        for gone in ["presage.db", "projection.db", "attachments", crate::files::STICKERS] {
             assert!(!dir.0.join(gone).exists(), "{gone} is still there");
         }
         assert!(matches!(client.start(), Err(CoreError::Closed)));
@@ -3275,7 +3571,12 @@ mod tests {
             // the fetched image is the message's own copy once sent: the fetched file goes
             let fetched = client.data_dir.join("previews").join("1");
             std::fs::create_dir_all(fetched.parent().unwrap()).unwrap();
-            std::fs::write(&fetched, b"jpg").unwrap();
+            // as `link_preview_for` writes it
+            crate::files::seal(&b"jpg"[..], &fetched, &client.db.derived_key(&fetched).unwrap()).unwrap();
+            assert_eq!(
+                client.file_bytes(fetched.to_string_lossy().into()).await.unwrap(),
+                b"jpg"
+            );
             let with_image = PreviewDraft {
                 image: Some(OutgoingFile {
                     path: fetched.to_string_lossy().into_owned(),
@@ -3303,7 +3604,7 @@ mod tests {
                 .unwrap()
                 .image
                 .unwrap();
-            assert_eq!(std::fs::read(image.path.unwrap()).unwrap(), b"jpg");
+            assert_eq!(client.db.plain(image.path.unwrap()).await, b"jpg");
             // no page is fetched while the phone hasn't allowed link previews
             assert_eq!(
                 client

@@ -29,10 +29,10 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
-            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
             cx.set_menus([Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)])]);
-            cx.on_window_closed(|cx, _| cx.quit()).detach();
+            cx.on_window_closed(|cx, _| app::quit(cx)).detach();
             gpui_kit::open_window(window_options(cx), cx, |window, cx| {
                 cx.new(|cx| app::Hush::new(window, cx))
             })

@@ -5,15 +5,23 @@ struct ConversationView: View {
     let store: AppStore
     let conversation: Conversation
     @State private var quickLook: URL?
+    /// On screen: an open that ends after it went drops its copy.
+    @State private var visible = false
     @State private var dropTargeted = false
 
     var body: some View {
         TimelineList(store: store, conversation: conversation) { a in
             do {
-                quickLook = try Files.openable(a)
+                let url = try await Files.openable(a)
+                guard visible else {
+                    Files.close(url)
+                    return false
+                }
+                quickLook = url
                 return true
             } catch {
-                store.showError("Couldn't open \(a.fileName ?? "the file"): \(error.localizedDescription)")
+                Files.logger.error("opening a file failed: \(error, privacy: .public)")
+                store.showError("Couldn't open \(a.fileName ?? "the file"): \(Files.whyNot(error))")
                 return false
             }
         }
@@ -30,9 +38,13 @@ struct ConversationView: View {
         }
         .modifier(ConversationChrome(store: store, conversation: conversation))
         .quickLookPreview($quickLook)
-        // the preview closed: its link goes
+        // the preview closed: its copy goes
         .onChange(of: quickLook) { old, _ in if let old { Files.close(old) } }
-        .onDisappear { if let quickLook { Files.close(quickLook) } }
+        .onAppear { visible = true }
+        .onDisappear {
+            visible = false
+            if let quickLook { Files.close(quickLook) }
+        }
         // files dropped anywhere on the chat wait in the composer's tray
         .dropDestination(for: URL.self) { urls, _ in
             guard !RequestBar.replacesComposer(conversation) else { return false }
@@ -191,6 +203,14 @@ struct ConversationChrome: ViewModifier {
             && !conversation.id.hasPrefix("c:PNI:")
     }
 
+    /// A contact's ACI: not a phone number's chat, nor Note to Self.
+    private var contactAci: String? {
+        guard conversation.kind == .direct, !conversation.id.hasPrefix("c:PNI:"),
+            conversation.id != store.ownAci.map({ "c:\($0)" })
+        else { return nil }
+        return String(conversation.id.dropFirst(2))
+    }
+
     private var canCall: Bool {
         conversation.kind == .direct && !conversation.blocked && !conversation.messageRequest
             && !conversation.id.hasPrefix("c:PNI:")
@@ -213,6 +233,14 @@ struct ConversationChrome: ViewModifier {
                 }
             }
             .sheet(isPresented: $showingGroupInfo) { GroupInfoView(store: store, conversation: conversation) }
+            .sheet(
+                isPresented: Binding(
+                    get: { store.safetyNumberWith != nil }, set: { if !$0 { store.safetyNumberWith = nil } })
+            ) {
+                if let with = store.safetyNumberWith {
+                    SafetyNumberView(store: store, aci: with.aci, name: with.name)
+                }
+            }
     }
 
     private var callButton: some View {
@@ -245,6 +273,9 @@ struct ConversationChrome: ViewModifier {
             Button("Chat Colour and Wallpaper…") { choosingColor = true }
             Button("Search in Chat") { store.searchInChat() }
             if conversation.kind == .group { Button("Group Info…") { showingGroupInfo = true } }
+            if let aci = contactAci {
+                Button("View Safety Number…") { store.safetyNumberWith = (aci, store.title(conversation)) }
+            }
             // the note written about them on the phone
             if let note = conversation.note {
                 Divider()
@@ -282,7 +313,7 @@ struct TimelineList: View {
     let store: AppStore
     let conversation: Conversation
     /// Shows a file; false if it couldn't be.
-    let open: (Attachment) -> Bool
+    let open: (Attachment) async -> Bool
     @State private var atBottom = true
     @State private var nearTop = false
     @State private var unseenNew = false
@@ -309,7 +340,9 @@ struct TimelineList: View {
                             .wallpaperBacked()
                             .padding(.vertical, 10)
                     case .event(let e):
-                        ChatEventRow(event: e, name: name(e), me: store.ownAci)
+                        ChatEventRow(event: e, name: name(e), me: store.ownAci) {
+                            store.safetyNumberWith = (e.author, name(e))
+                        }
                     case .failures(let e, let count, let reset):
                         // presage resets sessions by ACI only
                         let direct = e.conversationId.hasPrefix("c:") && !e.conversationId.hasPrefix("c:PNI:")
@@ -325,6 +358,7 @@ struct TimelineList: View {
                             reactions: store.reactions[key] ?? [],
                             files: store.attachments[key] ?? [], preview: store.previews[key],
                             poll: store.polls[key],
+                            story: store.story(for: m),
                             highlighted: store.highlighted == key,
                             reply: { store.reply(to: m) },
                             retry: { Task { await store.retry(key) } },
@@ -485,13 +519,15 @@ struct MessageRow: View {
     let files: [Attachment]
     let preview: LinkPreview?
     var poll: Poll?
+    /// The story it replies or reacts to, while Hush still has it (a day).
+    var story: Story?
     /// Just opened from search: outlined for a moment.
     var highlighted = false
     let reply: () -> Void
     let retry: () -> Void
     let download: (Int64) -> Void
     /// Shows a file; false if it couldn't be.
-    let open: (Attachment) -> Bool
+    let open: (Attachment) async -> Bool
     var actions = Actions()
     @Environment(\.chatColor) private var chatColor
     @Environment(\.colorScheme) private var colorScheme
@@ -669,24 +705,30 @@ struct MessageRow: View {
         let filesOnly = !files.isEmpty && (message.body ?? "").isEmpty && !message.deleted
         return VStack(alignment: filesOnly ? .trailing : .leading, spacing: 4) {
             if let q = message.quote, !message.deleted {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(q.author == message.author ? "Reply" : "Quoted").font(.system(size: 11, weight: .semibold))
-                    Group {
-                        if let text = q.text {
-                            MessageText.text(
-                                MessageText.attributed(text, ranges: q.ranges, name: mentionName), size: 12)
-                        } else {
-                            Text("Attachment")
+                quoteBox(q.author == message.author ? "Reply" : "Quoted") {
+                    if let text = q.text {
+                        MessageText.text(MessageText.attributed(text, ranges: q.ranges, name: mentionName), size: 12)
+                    } else {
+                        Text("Attachment")
+                    }
+                }
+            }
+            if let header = Placeholder.storyHeader(message), !message.deleted {
+                // the story while Hush has it; after its day, the header alone
+                quoteBox(header) {
+                    if let story {
+                        HStack(spacing: 6) {
+                            if let file = story.file, file.state == .ready, let path = file.path, Files.isImage(file) {
+                                ThumbnailImage(path: path, shownAt: 32).frame(width: 32, height: 32)
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                            }
+                            Text(Placeholder.storyText(story))
                         }
                     }
-                    .font(.system(size: 12)).lineLimit(2)
                 }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
             }
             if !message.deleted && !isViewOnce && !isSticker {
-                AttachmentList(files: files, download: download, open: { _ = open($0) })
+                AttachmentList(files: files, download: download, open: { a in Task { _ = await open(a) } })
                 if let preview { LinkPreviewCard(preview: preview) }
             }
             HStack(alignment: .lastTextBaseline, spacing: 8) {
@@ -702,6 +744,9 @@ struct MessageRow: View {
                         PollCard(
                             question: question, poll: poll, me: actions.me, mine: message.author == actions.me,
                             vote: actions.vote, end: actions.endPoll)
+                    } else if case .storyReaction = message.kind {
+                        // its emoji is in the story's header
+                        EmptyView()
                     } else if let placeholder = Placeholder.text(message.kind) {
                         // something we can't show yet (sticker, contact, payment, poll, gift badge)
                         HStack(spacing: 6) {
@@ -746,6 +791,17 @@ struct MessageRow: View {
         }
     }
 
+    /// A quote's box above the bubble's text: what it answers, under a small header.
+    private func quoteBox(_ header: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(header).font(.system(size: 11, weight: .semibold))
+            content().font(.system(size: 12)).lineLimit(2)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private var isSticker: Bool {
         if case .sticker = message.kind { return true }
         return false
@@ -766,13 +822,14 @@ struct MessageRow: View {
         switch state {
         case .open(let file):
             Button {
-                // linked for the viewer first: the core drops the file next
-                viewOnceOpening = ViewOnce.open(file, with: open, then: actions.viewOnce)
+                // copied out for the viewer first: the core drops the file next
+                viewOnceOpening = true
+                Task { viewOnceOpening = await ViewOnce.open(file, with: open, then: actions.viewOnce) }
             } label: {
                 label
             }
             .buttonStyle(.bordered)
-            .disabled(viewOnceOpening)  // one look: a second click would relink what's showing
+            .disabled(viewOnceOpening)  // one look: a second click would copy out what's showing
         case .download(let id):
             Button {
                 download(id)
@@ -864,7 +921,7 @@ extension MessageRow: @MainActor Equatable {
     static func == (a: MessageRow, b: MessageRow) -> Bool {
         a.message == b.message && a.first == b.first && a.last == b.last && a.isGroup == b.isGroup
             && a.senderName == b.senderName && a.reactions == b.reactions && a.files == b.files
-            && a.preview == b.preview && a.poll == b.poll && a.highlighted == b.highlighted
+            && a.preview == b.preview && a.poll == b.poll && a.story == b.story && a.highlighted == b.highlighted
             && a.actions.me == b.actions.me && a.actions.mine == b.actions.mine
             && a.actions.canEdit == b.actions.canEdit && a.actions.canDelete == b.actions.canDelete
     }
@@ -894,6 +951,8 @@ struct ChatEventRow: View {
     let name: String
     /// Our ACI, to word our own changes ("You set…").
     var me: String?
+    /// Opens the safety number sheet with the event's author.
+    var viewSafetyNumber: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 6) {
@@ -926,6 +985,12 @@ struct ChatEventRow: View {
                 Label("Missed voice call", systemImage: "phone.down")
                     .font(.system(size: 12))
                     .foregroundStyle(.red.opacity(0.9))
+            case .safetyNumberChanged:
+                Label("Your safety number with \(name) changed", systemImage: "checkmark.shield")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondaryText)
+                Button("View Safety Number", action: viewSafetyNumber)
+                    .buttonStyle(.link).font(.system(size: 12))
             }
         }
         .wallpaperBacked()

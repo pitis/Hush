@@ -20,6 +20,7 @@ This covers the backup; the export is its own PR.
   reordered, cut-off or extended file fails. Inside: named entries, `manifest.json` first
   (format, creation time, the copied database's key; kept in memory on restore, never written
   out), `projection.db`, `attachments/<name>`. Restore writes only those names (no path escapes).
+  The files go in as they are on disk, encrypted (#167): their keys are in `projection.db`.
 - A backup is written to `<path>.part` and moved over `path` when done: a failure keeps the
   backup it was replacing.
 - The projection is copied with `sqlcipher_export` into a SQLCipher file under a fresh random

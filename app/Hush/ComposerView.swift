@@ -55,7 +55,7 @@ struct ComposerView: View {
         .padding(.bottom, 12)
         .onChange(of: store.attachRequest) { _, _ in chooseFiles() }
         .onAppear {
-            text = Self.plain(Composer.draft(for: conversationId))
+            text = Self.plain(store.draft(conversationId))
             takeFocusIfAsked()
         }
         .task(id: conversationId) {
@@ -65,11 +65,11 @@ struct ComposerView: View {
         .onChange(of: conversationId) { _, new in
             // an edit doesn't follow to another chat, nor does the draft it put aside
             draftBeforeEdit = nil
-            text = Self.plain(Composer.draft(for: new))
+            text = Self.plain(store.draft(new))
         }
         .onChange(of: text) { _, new in
             // drafts keep the words, not their styles
-            if store.editing == nil { Composer.saveDraft(new.string, for: conversationId) }
+            if store.editing == nil { store.saveDraft(new.string, for: conversationId) }
             previewWait?.cancel()
             previewWait = Task {
                 try? await Task.sleep(for: .milliseconds(700))
@@ -146,7 +146,7 @@ struct ComposerView: View {
                     icon: "arrowshape.turn.up.left",
                     title: reply.isOutgoing ? "Replying to yourself" : "Replying to \(store.senderName(reply.author))",
                     detail: reply.body.map { MessageText.plain($0, ranges: reply.ranges, name: store.mentionName) }
-                        ?? "Attachment",
+                        ?? Placeholder.text(reply.kind) ?? "Attachment",
                     close: "Cancel reply", cancelsWithEsc: !mentions.isOpen
                 ) { store.replyTo = nil }
             }
@@ -220,7 +220,7 @@ enum Composer {
         guard let image = NSImage(pasteboard: board), let tiff = image.tiffRepresentation,
             let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
         else { throw PasteError() }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("Hush-paste", isDirectory: true)
+        let dir = Files.pasteRoot
         let url = dir.appendingPathComponent("Pasted image \(UUID().uuidString.prefix(8)).png")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try png.write(to: url)
@@ -229,20 +229,6 @@ enum Composer {
 
     static func canSend(_ text: String) -> Bool {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    nonisolated(unsafe) static var defaults: UserDefaults = .standard  // swapped only by tests
-
-    static func draft(for conversationId: String) -> String {
-        defaults.string(forKey: "draft.\(conversationId)") ?? ""
-    }
-
-    static func saveDraft(_ text: String, for conversationId: String) {
-        if canSend(text) {
-            defaults.set(text, forKey: "draft.\(conversationId)")
-        } else {
-            defaults.removeObject(forKey: "draft.\(conversationId)")
-        }
     }
 }
 

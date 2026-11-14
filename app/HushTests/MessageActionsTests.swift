@@ -83,6 +83,16 @@ final class MessageActionsTests: XCTestCase {
             MessageActions.lastEditable([older, failed, theirs], me: "me", now: now)?.sentAt, older.sentAt)
         XCTAssertNil(MessageActions.lastEditable([theirs], me: "me", now: now))
     }
+
+    func testARepliedStoryCantBeEdited() {
+        // an edit would go without the story it answers
+        var reply = mine(3_600_000)
+        reply.story = MessageKey(author: "alice", sentAt: 1)
+        XCTAssertTrue(MessageActions.canDelete(reply, me: "me", now: now))
+        XCTAssertFalse(MessageActions.canEdit(reply, me: "me", now: now))
+        let older = mine(2 * 3_600_000)
+        XCTAssertEqual(MessageActions.lastEditable([older, reply], me: "me", now: now)?.sentAt, older.sentAt)
+    }
 }
 
 @MainActor

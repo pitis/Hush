@@ -279,6 +279,10 @@ pub enum MessageKind {
     ViewOnce {
         viewed: bool,
     },
+    /// A reaction to a story (`Message::story`): a message of its own, as Signal's apps show it.
+    StoryReaction {
+        emoji: String,
+    },
 }
 
 impl MessageKind {
@@ -292,6 +296,7 @@ impl MessageKind {
             Self::Poll { question } => (4, question.as_deref()),
             Self::GiftBadge => (5, None),
             Self::ViewOnce { viewed } => (6, viewed.then_some("viewed")),
+            Self::StoryReaction { emoji } => (7, Some(emoji.as_str())),
         }
     }
 
@@ -304,6 +309,9 @@ impl MessageKind {
             4 => Self::Poll { question: text },
             5 => Self::GiftBadge,
             6 => Self::ViewOnce { viewed: text.is_some() },
+            7 => Self::StoryReaction {
+                emoji: text.unwrap_or_default(),
+            },
             _ => return None,
         })
     }
@@ -393,6 +401,8 @@ pub struct Message {
     pub expires_in: u32,
     /// When it disappears (ms), once its timer started: when read, or when we sent it.
     pub expires_at: Option<i64>,
+    /// The story this replies or reacts to (`MessageKind::StoryReaction`), in a 1:1 chat.
+    pub story: Option<MessageKey>,
 }
 
 impl Message {
@@ -420,16 +430,20 @@ pub enum ChatEventKind {
     IncomingCall,
     /// `author` called us and we never connected (unanswered or declined).
     MissedCall,
+    /// `author`'s identity key changed (a new phone, or someone else): our safety number with
+    /// them is a new one.
+    SafetyNumberChanged,
 }
 
 impl ChatEventKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DecryptionFailed,
         Self::SessionReset,
         Self::TimerChanged,
         Self::OutgoingCall,
         Self::IncomingCall,
         Self::MissedCall,
+        Self::SafetyNumberChanged,
     ];
 
     pub fn to_i64(self) -> i64 {
@@ -440,6 +454,7 @@ impl ChatEventKind {
             Self::OutgoingCall => 3,
             Self::IncomingCall => 4,
             Self::MissedCall => 5,
+            Self::SafetyNumberChanged => 6,
         }
     }
 
@@ -644,6 +659,7 @@ mod tests {
             (ChatEventKind::OutgoingCall, 3),
             (ChatEventKind::IncomingCall, 4),
             (ChatEventKind::MissedCall, 5),
+            (ChatEventKind::SafetyNumberChanged, 6),
         ] {
             assert_eq!(kind.to_i64(), n);
             assert_eq!(ChatEventKind::from_i64(n), Some(kind));

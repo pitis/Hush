@@ -4,8 +4,35 @@ import UserNotifications
 
 /// Closing the window keeps Hush running (notifications, the menu bar item), as Signal
 /// Desktop does; ⌘Q quits.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    var store: AppStore?
+    /// Quitting was answered: by the core stopping, or by the backstop.
+    private var replied = false
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quits once the core has stopped (`AppStore.stop`, 5 s at most), or after 6 s should even
+    /// that hang.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let store else { return .terminateNow }
+        Task {
+            await store.stop()
+            reply(sender)
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(6))
+            if !replied { AppStore.logger.error("the core didn't answer quitting in time: quitting anyway") }
+            reply(sender)
+        }
+        return .terminateLater
+    }
+
+    private func reply(_ sender: NSApplication) {
+        guard !replied else { return }
+        replied = true
+        sender.reply(toApplicationShouldTerminate: true)
+    }
 }
 
 @main
@@ -27,8 +54,8 @@ struct HushApp: App {
     init() {
         let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         if !isTestHost { Legacy.adoptSettings() }  // before any setting is read
-        let core = AppStore(notifier: isTestHost ? nil : SystemNotifier())
-        if !isTestHost { Files.clearOpened() }
+        let core = AppStore(
+            notifier: isTestHost ? nil : SystemNotifier(), legacyDrafts: isTestHost ? nil : .standard)
         self.isTestHost = isTestHost
         _core = State(initialValue: core)
         // set before launch finishes, so a click on a notification that launched the app arrives
@@ -36,6 +63,7 @@ struct HushApp: App {
         if let notificationDelegate { UNUserNotificationCenter.current().delegate = notificationDelegate }
         networkWatch = isTestHost ? nil : NetworkWatch { core.networkReturned() }
         menuBar = isTestHost ? nil : MenuBarItem(store: core)
+        appDelegate.store = core
     }
 
     var body: some Scene {

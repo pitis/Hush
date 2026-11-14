@@ -28,10 +28,12 @@ enum NotificationContent: String, CaseIterable, Identifiable {
     }
 }
 
-/// One notification to show.
+/// One notification to show. Its id and `chat` are made of opaque ids (the core's `opaqueId`):
+/// Notification Center keeps them, and a chat's id can be a group's key or a person's ACI.
 struct NotificationRequest: Equatable {
     let id: String
-    let conversationId: String
+    /// The chat's opaque id: its notifications' thread, and what a click names.
+    let chat: String
     let title: String
     let body: String
     /// Reply and Mark as Read (only when the content is shown).
@@ -47,29 +49,33 @@ enum Notifications {
     static let callCategory = "call"
     static let acceptCallAction = "accept-call"
     static let declineCallAction = "decline-call"
+    /// The `userInfo` key of the chat a notification is about (its opaque id).
+    static let chatKey = "chat"
 
-    /// The one ringing notification of a conversation's incoming call.
-    static func callId(_ conversationId: String) -> String { "call|\(conversationId)" }
+    /// Removed when the app starts: a ring from a previous run can't be answered, and the
+    /// notifications of older versions were named by chat id and ACI.
+    static let stalePrefixes = ["call|", "c:", "g:", "call-missed|c:", "reply-failed-"]
+
+    /// The one ringing notification of a chat's incoming call (`chat`: its opaque id).
+    static func callId(_ chat: String) -> String { "call|\(chat)" }
 
     /// Rings until answered, declined, or the caller gives up. Nil when notifications are off;
     /// the caller's name only when the setting shows names.
-    static func incomingCall(setting: NotificationContent, conversationId: String, title: String)
-        -> NotificationRequest?
-    {
+    static func incomingCall(setting: NotificationContent, chat: String, title: String) -> NotificationRequest? {
         guard let title = callTitle(setting, title) else { return nil }
         return NotificationRequest(
-            id: callId(conversationId), conversationId: conversationId, title: title,
-            body: "Incoming voice call", hasActions: false, category: callCategory)
+            id: callId(chat), chat: chat, title: title, body: "Incoming voice call", hasActions: false,
+            category: callCategory)
     }
 
     /// Posted when an incoming call ends without ever connecting (same privacy rules).
-    static func missedCall(setting: NotificationContent, conversationId: String, title: String, at: Date)
+    static func missedCall(setting: NotificationContent, chat: String, title: String, at: Date)
         -> NotificationRequest?
     {
         guard let title = callTitle(setting, title) else { return nil }
         return NotificationRequest(
-            id: "call-missed|\(conversationId)|\(Int(at.timeIntervalSince1970))", conversationId: conversationId,
-            title: title, body: "Missed voice call", hasActions: false)
+            id: "call-missed|\(chat)|\(Int(at.timeIntervalSince1970))", chat: chat, title: title,
+            body: "Missed voice call", hasActions: false)
     }
 
     private static func callTitle(_ setting: NotificationContent, _ name: String) -> String? {
@@ -80,20 +86,19 @@ enum Notifications {
         }
     }
 
-    /// The id of a notification about a message: the message itself (`reactor` nil) or a reaction
-    /// to it. All of a message's notifications share `idPrefix`, to remove them together.
-    static func id(_ conversationId: String, _ key: MessageKey, reactor: String?, emoji: String?) -> String {
-        idPrefix(conversationId, key) + (reactor.map { "\($0)|\(emoji ?? "")" } ?? "")
+    /// The id of a notification about a message (its author's opaque id and sent time): the
+    /// message itself (`reactor` nil) or a reaction to it (the reactor's opaque id). All of a
+    /// message's notifications share `idPrefix`, to remove them together.
+    static func id(author: String, sentAt: Int64, reactor: String?, emoji: String?) -> String {
+        idPrefix(author: author, sentAt: sentAt) + (reactor.map { "\($0)|\(emoji ?? "")" } ?? "")
     }
 
-    static func idPrefix(_ conversationId: String, _ key: MessageKey) -> String {
-        "\(conversationId)|\(key.author)|\(key.sentAt)|"
-    }
+    static func idPrefix(author: String, sentAt: Int64) -> String { "\(author)|\(sentAt)|" }
 
     /// The notification for a message (or a reaction to ours, `reaction` = its emoji) worded like
     /// Signal Desktop's, or nil when notifications are off.
     static func request(
-        setting: NotificationContent, conversationId: String, id: String, sender: String, groupTitle: String?,
+        setting: NotificationContent, chat: String, id: String, sender: String, groupTitle: String?,
         text: String?, reaction: String?
     ) -> NotificationRequest? {
         let title: String
@@ -116,8 +121,7 @@ enum Notifications {
             }
         }
         return NotificationRequest(
-            id: id, conversationId: conversationId, title: title, body: body,
-            hasActions: setting == .nameAndMessage)
+            id: id, chat: chat, title: title, body: body, hasActions: setting == .nameAndMessage)
     }
 }
 
@@ -125,7 +129,8 @@ enum Notifications {
 protocol Notifier: AnyObject {
     func authorize()
     func post(_ request: NotificationRequest)
-    func remove(conversationId: String)
+    /// Removes a chat's delivered notifications (`chat`: its opaque id).
+    func remove(chat: String)
     func remove(ids: [String])
     /// Removes the delivered notifications whose ids start with `idPrefix`, including ones shown
     /// before the app last started.
@@ -137,7 +142,7 @@ protocol Notifier: AnyObject {
 final class SystemNotifier: Notifier {
     private var center: UNUserNotificationCenter { .current() }
     /// Ids and errors only, never what a notification says.
-    private static let logger = Logger(subsystem: "dev.pitis.hush", category: "notifications")
+    static let logger = Logger(subsystem: "dev.pitis.hush", category: "notifications")
 
     func authorize() {
         let reply = UNTextInputNotificationAction(
@@ -168,8 +173,8 @@ final class SystemNotifier: Notifier {
         content.title = request.title
         content.body = request.body
         content.sound = .default
-        content.threadIdentifier = request.conversationId
-        content.userInfo = ["conversationId": request.conversationId]
+        content.threadIdentifier = request.chat
+        content.userInfo = [Notifications.chatKey: request.chat]
         if let category = request.category {
             content.categoryIdentifier = category
         } else if request.hasActions {
@@ -180,9 +185,9 @@ final class SystemNotifier: Notifier {
         }
     }
 
-    func remove(conversationId: String) {
+    func remove(chat: String) {
         center.getDeliveredNotifications { delivered in
-            let ids = delivered.filter { $0.request.content.threadIdentifier == conversationId }
+            let ids = delivered.filter { $0.request.content.threadIdentifier == chat }
                 .map(\.request.identifier)
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ids)
         }
@@ -207,19 +212,22 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     init(store: AppStore) { self.store = store }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let id = response.notification.request.content.userInfo["conversationId"] as? String else { return }
+        guard let chat = response.notification.request.content.userInfo[Notifications.chatKey] as? String else {
+            // an older version's, removed at the next launch
+            return SystemNotifier.logger.error("a notification that names no chat was used")
+        }
         let text = (response as? UNTextInputNotificationResponse)?.userText
         switch response.actionIdentifier {
         case Notifications.replyAction:
-            if let text { await store.replyFromNotification(conversationId: id, text: text) }
+            if let text { await store.replyFromNotification(chat: chat, text: text) }
         case Notifications.markReadAction:
-            await store.markReadFromNotification(conversationId: id)
+            await store.markReadFromNotification(chat: chat)
         case Notifications.acceptCallAction:
             await store.acceptCall()
         case Notifications.declineCallAction:
             await store.hangupCall()
         default:
-            await store.openFromNotification(conversationId: id)
+            await store.openFromNotification(chat: chat)
         }
     }
 
