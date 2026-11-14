@@ -117,6 +117,9 @@ pub enum Demo {
     SearchInChat,
     /// The chat scrolled back: an older page loading, a message come in unseen.
     History,
+    /// The chat with a received link preview and a group's invite link, writing a link with its
+    /// preview above the composer.
+    LinkPreview,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -140,6 +143,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("search", Demo::Search),
                 ("search-in-chat", Demo::SearchInChat),
                 ("history", Demo::History),
+                ("link-preview", Demo::LinkPreview),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

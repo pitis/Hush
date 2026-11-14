@@ -16,7 +16,7 @@ use sig_core::projection::{Conversation, ConversationKind, MessageStatus};
 use sig_core::{ConnectionState, HistoryStage};
 
 use super::actions::{self, view::ActionCx};
-use super::{files, join_step, matching, Dialog, DialogKind, Hush, JoinStep, Screen};
+use super::{files, join_step, matching, previews, Dialog, DialogKind, Hush, JoinStep, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -43,6 +43,8 @@ struct Row {
     note: bool,
     /// Above the text, which is empty without a caption.
     files: Vec<files::Shown>,
+    /// Under the files.
+    preview: Option<previews::Card>,
     edited: bool,
     time: String,
     status: Option<MessageStatus>,
@@ -107,6 +109,7 @@ impl Hush {
             label: format!("{name}: {spoken}. {time}{said}"),
             text: body,
             files,
+            preview: self.preview_card(m),
             runs,
             note: m.deleted,
             edited: m.edited && !m.deleted,
@@ -997,6 +1000,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         // files without a caption: the time sits under them on the right
         .when(row.text.is_empty(), |this| this.items_end())
         .children(files::render(&row.files, this, color, behind))
+        .children(previews::card(&row.preview, this, color))
         .child(line)
         // over the bubble, so its size doesn't change: the system's yellow, as on the Mac
         .when(row.found, |this| {

@@ -27,6 +27,7 @@ pub mod compose;
 mod files;
 pub mod navigate;
 mod paging;
+mod previews;
 pub mod search;
 mod view;
 
@@ -157,6 +158,7 @@ pub struct Hush {
     paging: paging::Paging,
     /// The composer's styles and mentions.
     compose: compose::Compose,
+    previews: previews::Previews,
 }
 
 /// The open core, for `quit`.
@@ -264,6 +266,7 @@ impl Hush {
                 InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
                 InputEvent::Change => {
                     this.composer_empty = composer.read(cx).value().trim().is_empty();
+                    this.composer_changed(cx);
                     cx.notify();
                 }
                 _ => {}
@@ -341,6 +344,7 @@ impl Hush {
             files: Default::default(),
             paging: Default::default(),
             compose: Default::default(),
+            previews: Default::default(),
         }
     }
 
@@ -364,7 +368,8 @@ impl Hush {
             | crate::Demo::Compose
             | crate::Demo::Search
             | crate::Demo::SearchInChat
-            | crate::Demo::History => {
+            | crate::Demo::History
+            | crate::Demo::LinkPreview => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -383,6 +388,9 @@ impl Hush {
                 }
                 if let crate::Demo::History = screen {
                     app.demo_paging(cx);
+                }
+                if let crate::Demo::LinkPreview = screen {
+                    app.demo_previews(window, cx);
                 }
             }
             crate::Demo::Files => {
@@ -500,10 +508,16 @@ impl Hush {
                 self.drop_copies_if_gone(&key, cx);
                 self.refresh_chats(cx);
                 if self.selected.as_deref() == Some(conversation_id.as_str()) {
+                    // its reactions, files or preview may have changed with it
+                    self.read_details([(key.author, key.sent_at)], cx);
                     self.reload_messages(cx);
                 }
             }
-            CoreEvent::AttachmentChanged { conversation_id, .. } => self.attachment_changed(&conversation_id, cx),
+            CoreEvent::AttachmentChanged {
+                conversation_id,
+                message,
+                ..
+            } => self.attachment_changed(&conversation_id, &message, cx),
             CoreEvent::Error { message } => self.error = Some(message),
             // not in this version: typing, calls, stories, notifications (a reaction shows with its
             // message's `MessageChanged`)
@@ -644,6 +658,9 @@ impl Hush {
         self.depth = PAGE;
         self.messages.clear();
         self.clear_files(cx);
+        self.clear_previews(cx);
+        // the draft's link, as if typed: putting text in the field says nothing
+        self.composer_changed(cx);
         self.clear_tray(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
@@ -703,6 +720,10 @@ impl Hush {
         let new: Vec<_> = page.iter().map(key).collect();
         self.messages = page;
         let changes = changed_rows(&old, &new);
+        let came = changes
+            .iter()
+            .flat_map(|(range, count)| &new[range.start..range.start + count]);
+        let came: Vec<_> = came.cloned().collect();
         // only rows that came or went are replaced, so a reader scrolled up stays put; with the
         // same messages, some changed (a tick, an edit) and their heights may have too
         self.timeline.update(cx, |t, cx| {
@@ -727,7 +748,7 @@ impl Hush {
                 .flat_map(|m| m.quote.iter().flat_map(|q| mentioned(&q.ranges))),
         );
         self.load_names(wanted, cx);
-        self.messages_loaded(cx);
+        self.messages_loaded(came, cx);
         self.reveal_found(cx);
     }
 
@@ -812,16 +833,18 @@ impl Hush {
         let Some(client) = self.client.clone() else { return };
         let reply = self.take_reply();
         let quote = reply.as_ref().map(actions::quote);
+        let preview = self.previews.take(&body);
         self.set_typed(compose::Typed::default(), window, cx);
         let files = self.take_tray();
         let worded = !body.is_empty();
         cx.spawn_in(window, async move |this, cx| {
             let sent = match plan {
+                // a preview goes with text only (`AppStore.send`)
                 attach::Plan::Files { caption } => {
                     let outgoing = files.iter().map(attach::Outgoing::file).collect();
                     Compat::new(client.send_attachments(id.clone(), outgoing, caption, ranges, quote)).await
                 }
-                _ => Compat::new(client.send_text(id.clone(), body, ranges, quote, None)).await,
+                _ => Compat::new(client.send_text(id.clone(), body, ranges, quote, preview.clone())).await,
             };
             let had_files = !files.is_empty();
             let _ = this.update(cx, |app, cx| app.tray_back(&id, files, sent.is_ok(), cx));
@@ -836,6 +859,7 @@ impl Hush {
                     app.error = Some(e);
                     app.set_typed(typed, window, cx);
                     app.restore_reply(reply);
+                    app.previews.put_back(preview);
                 } else {
                     // the files went back to the tray only if their chat is still open
                     let lost_files = had_files && !open;
@@ -1034,6 +1058,7 @@ impl Hush {
             self.generation += 1;
             self.messages.clear();
             self.clear_files(cx);
+            self.clear_previews(cx);
             self.clear_tray(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }

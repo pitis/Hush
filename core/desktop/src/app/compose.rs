@@ -271,7 +271,7 @@ pub(super) fn load(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> Stri
 
 /// The runs of like styles (`styles` of each byte), the mentions' bytes marked: what the preview
 /// draws.
-fn runs(styles: &[u8], tokens: &[Range<usize>]) -> text::Runs {
+pub(in crate::app) fn runs(styles: &[u8], tokens: &[Range<usize>]) -> text::Runs {
     let mut runs: text::Runs = vec![];
     for (i, &s) in styles.iter().enumerate() {
         let s = if tokens.iter().any(|t| t.contains(&i)) {

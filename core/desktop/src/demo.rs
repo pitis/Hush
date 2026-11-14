@@ -1,12 +1,13 @@
 //! Made-up chats for `--snapshot`: the screens render without a core or anyone's real messages.
 
 use sig_core::projection::{
-    Attachment, AttachmentState, BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKey,
-    MessageKind, MessageStatus, Quote, Reaction, SearchHit, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
+    Attachment, AttachmentState, BodyRange, Conversation, ConversationKind, FileSummary, LinkPreview, Message,
+    MessageKey, MessageKind, MessageStatus, OutgoingFile, PreviewDraft, Quote, Reaction, SearchHit, TextStyle,
+    HIGHLIGHT_END, HIGHLIGHT_START,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
-const ANA: &str = "11111111-1111-4111-8111-111111111111";
+pub const ANA: &str = "11111111-1111-4111-8111-111111111111";
 pub const BOGDAN: &str = "22222222-2222-4222-8222-222222222222";
 const HOUR: i64 = 3_600_000;
 
@@ -261,6 +262,54 @@ pub fn history(n: usize) -> Vec<Message> {
     (0..n)
         .map(|i| message(authors[i % 3], 3 * 24 * 60 + (n - i) as i64 * 7, SAID[i % SAID.len()]))
         .collect()
+}
+
+/// Newer than `messages`: Ana's link with its preview (the picture made up below), then Bogdan's
+/// group invite link.
+pub fn link_messages() -> (Vec<Message>, LinkPreview) {
+    let url = "https://dulce.example/menu";
+    let mut place = message(ANA, 0, &format!("This is the place, with the terrace: {url}"));
+    place.sent_at += 1_000;
+    let mut group = message(
+        BOGDAN,
+        0,
+        "Cousins, join here: https://signal.group/#CjQKIBXf3rEcaOEPjx",
+    );
+    group.sent_at += 2_000;
+    let preview = LinkPreview {
+        url: url.into(),
+        title: Some("Dulce — cakes, coffee and a garden terrace".into()),
+        description: None,
+        image: Some(Attachment {
+            id: 100,
+            message: place.key(),
+            content_type: "image/png".into(),
+            file_name: None,
+            size: 120_000,
+            width: None,
+            height: None,
+            is_voice_note: false,
+            path: Some("demo-preview".into()),
+            state: AttachmentState::Ready,
+        }),
+    };
+    (vec![place, group], preview)
+}
+
+/// The preview of the link being written.
+pub fn preview_draft() -> PreviewDraft {
+    PreviewDraft {
+        url: "https://maps.example/dulce".into(),
+        title: Some("Dulce · Strada Florilor 12".into()),
+        description: Some("Cakes and coffee, with a garden terrace. Open every day 8–22.".into()),
+        image: Some(OutgoingFile {
+            path: "demo-draft".into(),
+            content_type: "image/png".into(),
+            width: None,
+            height: None,
+            is_voice_note: false,
+        }),
+    }
 }
 
 /// Who sent the messages with files in Bogdan's chat, and how many minutes ago, oldest first.

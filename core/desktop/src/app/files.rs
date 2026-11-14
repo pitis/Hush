@@ -327,23 +327,28 @@ impl Files {
     }
 }
 
-/// The page's files from the core's details of its messages (`keys`); a message the core
-/// couldn't read isn't in them, and keeps what it showed.
-fn with_details(
-    shown: &HashMap<Key, Vec<Attachment>>,
-    keys: &[MessageKey],
-    details: &[MessageDetails],
-) -> HashMap<Key, Vec<Attachment>> {
-    let read: HashMap<Key, &Vec<Attachment>> = details
-        .iter()
-        .map(|d| ((d.key.author.clone(), d.key.sent_at), &d.attachments))
-        .collect();
-    let files = keys.iter().filter_map(|k| {
-        let k = (k.author.clone(), k.sent_at);
-        let files = read.get(&k).copied().or_else(|| shown.get(&k))?;
-        (!files.is_empty()).then(|| (k, files.clone()))
+/// The files after the core's details of some messages were read: theirs as read, the others'
+/// as they were (a message the core couldn't read isn't in them, and keeps what it showed).
+fn with_details(shown: &mut HashMap<Key, Vec<Attachment>>, details: &[MessageDetails]) {
+    for d in details {
+        let k = (d.key.author.clone(), d.key.sent_at);
+        if d.attachments.is_empty() {
+            shown.remove(&k);
+        } else {
+            shown.insert(k, d.attachments.clone());
+        }
+    }
+}
+
+/// Lets decoded pictures' memory go, once no window is being drawn, so each lets its copy go.
+fn drop_thumbs(thumbs: Vec<Thumb>, cx: &mut App) {
+    cx.defer(move |cx| {
+        for thumb in thumbs {
+            if let Thumb::Shown(thumb) = thumb {
+                cx.drop_image(thumb, None);
+            }
+        }
     });
-    files.collect()
 }
 
 /// Why a recording didn't start.
@@ -354,18 +359,32 @@ enum Unplayed {
 }
 
 impl Hush {
-    /// The open chat's messages' details were read (with their reactions, `load_reactions`).
-    pub(super) fn files_loaded(&mut self, keys: &[MessageKey], details: &[MessageDetails], cx: &mut Context<Self>) {
-        self.files.by_message = with_details(&self.files.by_message, keys, details);
+    /// Some of the open chat's messages' details were read (with their reactions, `read_details`).
+    pub(super) fn files_loaded(&mut self, details: &[MessageDetails], cx: &mut Context<Self>) {
+        with_details(&mut self.files.by_message, details);
         self.load_media(cx);
     }
 
-    /// A file was added or changed state (downloading, ready, failed): the page's details are
-    /// read again.
-    pub(super) fn attachment_changed(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+    /// A file of `message` was added or changed state (downloading, ready, failed): its details
+    /// are read again.
+    pub(super) fn attachment_changed(&mut self, conversation_id: &str, message: &MessageKey, cx: &mut Context<Self>) {
         if self.selected.as_deref() == Some(conversation_id) {
-            self.messages_loaded(cx);
+            self.read_details([(message.author.clone(), message.sent_at)], cx);
         }
+    }
+
+    /// Only the `loaded` messages' files stay, with what is shown of them: rows that went let
+    /// their pictures' memory go (one still decoding isn't).
+    pub(super) fn keep_files(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
+        let f = &mut self.files;
+        f.by_message.retain(|k, _| loaded.contains(k));
+        let files = f.by_message.values().flatten();
+        let ids: HashSet<i64> = files.clone().map(|a| a.id).collect();
+        let paths: HashSet<String> = files.filter_map(ready_path).collect();
+        let gone = f.thumbs.extract_if(|path, _| !paths.contains(path));
+        drop_thumbs(gone.map(|(_, thumb)| thumb).collect(), cx);
+        f.lengths.retain(|id, _| ids.contains(id));
+        f.unplayable.retain(|id| ids.contains(id));
     }
 
     /// Decodes the pictures and reads the recordings' lengths not asked for yet, one at a time,
@@ -458,15 +477,7 @@ impl Hush {
     /// play is tried again next time.
     pub(super) fn clear_files(&mut self, cx: &mut Context<Self>) {
         self.files.by_message.clear();
-        let shown: Vec<_> = self.files.thumbs.drain().collect();
-        // once no window is being drawn, so each lets their copy go
-        cx.defer(move |cx| {
-            for (_, thumb) in shown {
-                if let Thumb::Shown(thumb) = thumb {
-                    cx.drop_image(thumb, None);
-                }
-            }
-        });
+        drop_thumbs(self.files.thumbs.drain().map(|(_, thumb)| thumb).collect(), cx);
         self.files.lengths.clear();
         self.files.unplayable.clear();
         self.files.playing = None;
@@ -708,8 +719,15 @@ fn start(
     Ok((device, player, length))
 }
 
-/// Opens a copy in the system's app for its kind, off the main thread; a failure is said.
-fn launch(file: PathBuf, what: String, cx: &mut Context<Hush>) {
+/// Opens an https link in the system's browser, off the main thread; a failure is said. Not
+/// GPUI's `open_url`: that logs the link when it fails.
+pub(super) fn open_link(url: String, cx: &mut Context<Hush>) {
+    launch(url, "the link".into(), cx);
+}
+
+/// Opens a copy (or a link) in the system's app for its kind, off the main thread; a failure is
+/// said.
+fn launch(file: impl AsRef<std::ffi::OsStr> + Send + 'static, what: String, cx: &mut Context<Hush>) {
     cx.spawn(async move |this, cx| {
         let opened = cx.background_spawn(async move { open_with_system(&file) }).await;
         if let Err(e) = opened {
@@ -722,23 +740,33 @@ fn launch(file: PathBuf, what: String, cx: &mut Context<Hush>) {
     .detach();
 }
 
-/// Opens `file` in the system's app for its kind. Not GPUI's: that says nothing when no app opens
-/// it, and on Windows logs the file's path (a name the sender chose).
-fn open_with_system(file: &Path) -> Result<(), String> {
+/// Opens `file` (or an https link: `open` takes one after `--` too) in the system's app for its
+/// kind. Not GPUI's: that says nothing when no app opens it, and on Windows logs the file's path (a
+/// name the sender chose).
+fn open_with_system(file: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
     use std::process::{Command, Stdio};
     #[cfg(target_os = "macos")]
     let mut opener = {
         let mut open = Command::new("/usr/bin/open");
-        open.arg("--");
+        open.arg("--").arg(file);
         open
     };
     #[cfg(windows)]
-    let mut opener = Command::new("explorer.exe");
+    let mut opener = {
+        use std::os::windows::process::CommandExt as _;
+        let target = explorer_arg(file.as_ref()).ok_or("Explorer can't be given its name")?;
+        let mut explorer = Command::new("explorer.exe");
+        explorer.raw_arg(target);
+        explorer
+    };
     #[cfg(not(any(target_os = "macos", windows)))]
-    let mut opener = Command::new("xdg-open");
+    let mut opener = {
+        let mut open = Command::new("xdg-open");
+        open.arg(file);
+        open
+    };
     // what they print names the file
     let done = opener
-        .arg(file)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -748,8 +776,24 @@ fn open_with_system(file: &Path) -> Result<(), String> {
     if done.success() || cfg!(windows) {
         Ok(())
     } else {
-        Err("no app here opens this kind of file".into())
+        Err("no app here opens it".into())
     }
+}
+
+/// `target` as Explorer's whole command line: quoted, as Explorer splits it on `,` and `=` itself
+/// (a later `/root,<path>` would replace the target), and Rust quotes only around spaces. None
+/// with a `"` in it, or a final `\` (which would escape the closing quote): no file's path has
+/// either, and a link to open has neither (`previews::openable`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn explorer_arg(target: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let text = target.to_string_lossy();
+    if text.contains('"') || text.ends_with('\\') {
+        return None;
+    }
+    let mut quoted = std::ffi::OsString::from("\"");
+    quoted.push(target);
+    quoted.push("\"");
+    Some(quoted)
 }
 
 /// Copies a previous run left open, or this one: they go, at launch (once the core holds the
@@ -1452,12 +1496,13 @@ mod tests {
             (("a".into(), 2), vec![file("image/jpeg", None)]),
             (("a".into(), 9), vec![file("image/jpeg", None)]),
         ]);
-        // 1 lost its file, 2 wasn't read, 3 got one, 9 left the page
+        // 1 lost its file, 2 wasn't read, 3 got one, 9 wasn't asked about
         let found = vec![details(1, vec![]), details(3, vec![file("video/mp4", None)])];
-        let new = with_details(&old, &[key(1), key(2), key(3)], &found);
+        let mut new = old.clone();
+        with_details(&mut new, &found);
         let mut kept: Vec<i64> = new.keys().map(|k| k.1).collect();
         kept.sort();
-        assert_eq!(kept, [2, 3]);
+        assert_eq!(kept, [2, 3, 9]);
     }
 
     fn png_turned(width: u32, height: u32, orientation: u16) -> Vec<u8> {
@@ -1487,6 +1532,31 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn a_file_no_app_opens_is_said() {
         let missing = std::env::temp_dir().join(format!("hush-desktop-none-{}", std::process::id()));
-        assert!(super::open_with_system(&missing).is_err());
+        assert_eq!(super::open_with_system(&missing), Err("no app here opens it".into()));
+    }
+
+    #[test]
+    fn explorer_gets_one_quoted_target_whatever_its_commas_and_equals_signs() {
+        use super::explorer_arg;
+        use std::ffi::OsStr;
+        let arg = |s: &str| explorer_arg(OsStr::new(s)).map(|a| a.to_string_lossy().into_owned());
+        assert_eq!(
+            arg("https://news.example/a,/root,file:///C:/Windows/System32/calc.exe").as_deref(),
+            Some("\"https://news.example/a,/root,file:///C:/Windows/System32/calc.exe\"")
+        );
+        assert_eq!(
+            arg("https://maps.example/@44.4,26.1,15z?q=a=b").as_deref(),
+            Some("\"https://maps.example/@44.4,26.1,15z?q=a=b\"")
+        );
+        assert_eq!(
+            arg(r"C:\Users\me\Hush Desktop\open\ab\Menu, final=2.pdf").as_deref(),
+            Some(r#""C:\Users\me\Hush Desktop\open\ab\Menu, final=2.pdf""#)
+        );
+        assert_eq!(arg("a\"b"), None, "a quote would end it early");
+        assert_eq!(
+            arg(r"C:\dir\"),
+            None,
+            "a final backslash would escape the closing quote"
+        );
     }
 }

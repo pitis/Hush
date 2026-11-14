@@ -38,7 +38,9 @@ impl Hush {
         let near_top = t.logical_scroll_top().item_ix < NEAR_TOP;
         // fewer than asked for is the whole chat; fewer than wanted, a load still on its way
         let more = !self.messages.is_empty() && self.messages.len() as u32 >= self.depth;
-        if near_top && more {
+        // one on its way (back to the newest, say) would move the reader once in: it comes first
+        let loading = self.messages_loading == Some(self.generation);
+        if near_top && more && !loading {
             self.paging.older = Some(self.generation);
             self.depth += PAGE;
             self.reload_messages(cx);
@@ -67,20 +69,23 @@ impl Hush {
     }
 
     /// The timeline, with a spinner over its top while an older page loads, and its jump button
-    /// as the "New messages" pill while messages came in unseen.
+    /// only as the Mac app's "New messages" pill, bottom right, while messages came in unseen.
     pub(super) fn with_paging(&self, timeline: MessageScroller, p: Palette) -> Div {
         let unseen = self.paging.unseen == Some(self.generation);
         let loading = self.paging.older == Some(self.generation);
-        let timeline = timeline.when(unseen, |t| {
-            t.with_jump_button_label("New messages")
-                .with_jump_button_renderer(move |b| {
-                    b.primary()
-                        .label("New messages")
-                        .bg(p.accent)
-                        .text_color(p.on_accent)
-                        .border_color(p.accent)
-                })
-        });
+        let timeline = timeline
+            .jump_button(unseen)
+            .with_jump_button_label("New messages")
+            .with_jump_button_renderer(move |b| {
+                b.primary()
+                    .label("New messages")
+                    .bg(p.accent)
+                    .text_color(p.on_accent)
+                    .border_color(p.accent)
+                    // its row centres it
+                    .ml_auto()
+                    .mr(px(16.))
+            });
         div()
             .relative()
             .flex_1()

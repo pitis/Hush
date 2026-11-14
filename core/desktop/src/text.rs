@@ -53,6 +53,8 @@ pub const MONOSPACE: u8 = 8;
 pub const SPOILER: u8 = 16;
 /// Only in the composer: a mention, in the accent colour (a bubble's are bold).
 pub const MENTION: u8 = 32;
+/// A link a click opens (a group's invite link), underlined.
+pub const LINK: u8 = 64;
 
 /// Styled runs: byte ranges of a text, in order, with their styles.
 pub type Runs = Vec<(Range<usize>, u8)>;

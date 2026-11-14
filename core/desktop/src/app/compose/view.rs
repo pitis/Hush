@@ -92,6 +92,7 @@ impl Hush {
                 }
             }))
             .children(picker)
+            .children(self.render_link_draft(p, cx).map(|draft| panel(draft, p)))
             .children(preview)
             .child(composer)
     }
