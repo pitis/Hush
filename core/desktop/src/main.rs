@@ -161,6 +161,10 @@ pub enum Demo {
     BackUp,
     /// The link screen after a restore.
     Restored,
+    /// The chat with stickers received, sent and still to download.
+    Stickers,
+    /// The sticker picker open over it.
+    StickerPicker,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -200,6 +204,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("typing", Demo::Typing),
                 ("back-up", Demo::BackUp),
                 ("restored", Demo::Restored),
+                ("stickers", Demo::Stickers),
+                ("sticker-picker", Demo::StickerPicker),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

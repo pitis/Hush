@@ -37,6 +37,7 @@ mod polls;
 mod previews;
 pub mod search;
 pub mod settings;
+mod stickers;
 mod typing;
 mod view;
 mod view_once;
@@ -189,6 +190,7 @@ pub struct Hush {
     typing: typing::Typing,
     /// Back Up's or Restore's dialog, and the link screen's restore note.
     backup: backup::Backup,
+    stickers: stickers::Stickers,
 }
 
 /// This computer's data folder and keychain entry: set by `Hush::new` for the real window, and by
@@ -429,6 +431,7 @@ impl Hush {
             notifications: Default::default(),
             typing: Default::default(),
             backup: Default::default(),
+            stickers: Default::default(),
         }
     }
 
@@ -528,6 +531,12 @@ impl Hush {
                 if let crate::Demo::ViewOnce = screen {
                     app.demo_view_once(window, cx);
                 }
+            }
+            crate::Demo::Stickers | crate::Demo::StickerPicker => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.demo_stickers(matches!(screen, crate::Demo::StickerPicker), window, cx);
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;
