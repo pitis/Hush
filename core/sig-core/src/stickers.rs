@@ -78,7 +78,7 @@ pub(crate) fn keep(pack: &presage::store::StickerPack, dir: &Path) -> (KeptPack,
                     .map_or(Ok(()), std::fs::create_dir_all)
                     .and_then(|_| std::fs::write(&path, bytes));
                 if let Err(e) = written {
-                    tracing::warn!(error = %e, pack = %hex::encode(&pack.id), sticker = s.id, "a sticker's image couldn't be written");
+                    tracing::warn!(error = %e, pack = %pack_tag(&pack.id), sticker = s.id, "a sticker's image couldn't be written");
                     // a partial file would pass for the image next time
                     let _ = std::fs::remove_file(&path);
                     whole = false;
@@ -115,6 +115,12 @@ pub(crate) fn pack_info(pack: &KeptPack, dir: &Path) -> StickerPackInfo {
         author: pack.author.clone(),
         stickers: pack.stickers.iter().map(|s| sticker_info(pack, s, dir)).collect(),
     }
+}
+
+/// A pack as the log names it: its id's first bytes (an id isn't secret, its key is; a whole id
+/// would be blanked out as a key).
+pub(crate) fn pack_tag(id: &[u8]) -> String {
+    hex::encode(&id[..id.len().min(4)])
 }
 
 /// One sticker of a kept pack as `pack_info` shows it.

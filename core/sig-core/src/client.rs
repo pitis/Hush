@@ -210,7 +210,7 @@ impl Client {
         check_conversation(id)?;
         if !self.db.has_conversation(id).await? {
             return Err(CoreError::InvalidInput {
-                message: format!("no such chat: {id}"),
+                message: format!("no such chat: {}", self.db.opaque_id(id)),
             });
         }
         Ok(())
@@ -643,6 +643,12 @@ impl Client {
         self.linked.load(Ordering::SeqCst)
     }
 
+    /// A chat's id (or anyone's) as notifications and logs may show it: its keyed hash, the
+    /// same for as long as this Mac stays linked, naming no one to whoever reads it.
+    pub fn opaque_id(&self, id: String) -> String {
+        self.db.opaque_id(&id)
+    }
+
     /// Starts linking as a secondary device: emits `LinkUrl`, then `Linked`, or `Error` and
     /// `Connection(Unlinked)` (the code expires after 5 minutes). Call `start` after `Linked`.
     pub fn link(&self, device_name: String) -> Result<(), CoreError> {
@@ -666,7 +672,10 @@ impl Client {
         let aci = |id: &str| id.strip_prefix("c:").is_some_and(|rest| !rest.starts_with("PNI:"));
         if !matches!(send::recipient(&conversation_id), Some(send::Recipient::Direct(_))) || !aci(&conversation_id) {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+                message: format!(
+                    "not a 1:1 chat with a known contact: {}",
+                    self.db.opaque_id(&conversation_id)
+                ),
             });
         }
         self.send(Command::ResetSession { conversation_id })
@@ -683,7 +692,10 @@ impl Client {
             .filter(|rest| !rest.starts_with("PNI:") && !rest.is_empty());
         let Some(peer_aci) = aci else {
             return Err(CoreError::InvalidInput {
-                message: format!("not a 1:1 chat with a known contact: {conversation_id}"),
+                message: format!(
+                    "not a 1:1 chat with a known contact: {}",
+                    self.db.opaque_id(&conversation_id)
+                ),
             });
         };
         self.send(Command::Call(crate::calls::actor::CallCommand::Start {
@@ -1319,7 +1331,7 @@ impl Client {
             Some(crate::send::Recipient::Direct(_))
         ) {
             return Err(CoreError::InvalidInput {
-                message: format!("the timer can be set here in direct chats only, not {conversation_id}"),
+                message: "the timer can be set here in direct chats only".into(),
             });
         }
         let at = self.next_sent_at() as u64;
@@ -1574,6 +1586,16 @@ impl Client {
     /// notification, so a mute set a moment ago counts even before the app's list caught up.
     pub async fn is_muted(&self, conversation_id: String) -> Result<bool, CoreError> {
         Ok(self.db.is_muted(&conversation_id, now_ms()).await?)
+    }
+
+    /// What was typed in a chat and not sent; blank text clears it. It goes with the chat.
+    pub async fn set_draft(&self, conversation_id: String, text: String) -> Result<(), CoreError> {
+        Ok(self.db.set_draft(&conversation_id, &text).await?)
+    }
+
+    /// Every chat's draft, by chat id.
+    pub async fn drafts(&self) -> Result<std::collections::HashMap<String, String>, CoreError> {
+        Ok(self.db.drafts().await?)
     }
 
     /// The stored name of any conversation or contact (e.g. a group member's `c:<aci>`).

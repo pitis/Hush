@@ -302,10 +302,12 @@ async fn run(
         let projection = ProjectionDb::open(&format!("sqlite://{}", dir.join("projection.db").display()), Some(&key))
             .await?
             .with_files(dir.join("attachments"));
-        match projection.reroot_avatars().await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(n, "chat pictures now point into the moved data folder"),
-            Err(e) => tracing::warn!(error = %e, "re-pointing chat pictures after a folder move failed"),
+        match projection.rename_avatars().await {
+            Ok((0, 0)) => {}
+            Ok((moved, missing)) => {
+                tracing::info!(moved, missing, "chat pictures renamed or moved into the data folder")
+            }
+            Err(e) => tracing::warn!(error = %e, "renaming chat pictures failed"),
         }
         let store =
             SqliteStore::open_with_options(sqlite_options(&dir.join("presage.db"), &key)?, OnNewIdentity::Trust)
@@ -581,7 +583,10 @@ async fn run(
                         let at = chrono::Utc::now().timestamp_millis();
                         if let Err(e) = Box::pin(m.send_session_reset(&to, at as u64)).await {
                             return l.on_event(CoreEvent::Error {
-                                message: format!("resetting the session with {conversation_id} failed: {e}"),
+                                message: format!(
+                                    "resetting the session in chat {} failed: {e}",
+                                    db.opaque_id(&conversation_id)
+                                ),
                             });
                         }
                         let author = to.raw_uuid().to_string();
@@ -597,7 +602,10 @@ async fn run(
                     });
                 }
                 _ => listener.on_event(CoreEvent::Error {
-                    message: format!("a session can't be reset with {conversation_id}"),
+                    message: format!(
+                        "a session can't be reset in chat {}",
+                        projection.opaque_id(&conversation_id)
+                    ),
                 }),
             },
             Command::Unlink { tell_server, done } => {
@@ -993,7 +1001,7 @@ async fn installed_packs(
             kept.push(pack);
         } else if let Err(e) = db.forget_sticker_pack(&pack.id).await {
             // removed on the phone, or presage's store was replaced (relinking, a restore)
-            tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a removed sticker pack couldn't be forgotten");
+            tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(&pack.id), "a removed sticker pack couldn't be forgotten");
         }
     }
     let images = dir.clone();
@@ -1011,7 +1019,7 @@ async fn installed_packs(
             Ok(None) => continue,
             Err(e) => {
                 // one unreadable pack doesn't hide the others
-                tracing::warn!(error = %e, pack = %hex::encode(id), "a sticker pack couldn't be read");
+                tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(id), "a sticker pack couldn't be read");
                 continue;
             }
         };
@@ -1022,7 +1030,7 @@ async fn installed_packs(
         // one that isn't kept is read again next time, and sending from it reads presage's copy
         if whole {
             if let Err(e) = db.keep_sticker_pack(&pack).await {
-                tracing::warn!(error = %e, pack = %hex::encode(&pack.id), "a sticker pack couldn't be kept");
+                tracing::warn!(error = %e, pack = %crate::stickers::pack_tag(&pack.id), "a sticker pack couldn't be kept");
             }
         }
         packs.push(pack);
@@ -1601,7 +1609,7 @@ fn spawn_call_router(
                     Ok(Some(identity)) => identity.public_key().public_key_bytes().to_vec(),
                     Ok(None) => {
                         // no session with this device: a call can't be verified, so it can't ring
-                        tracing::warn!(sender = %sender_aci, "a call from an unknown device was ignored");
+                        tracing::warn!("a call from an unknown device was ignored");
                         continue;
                     }
                     Err(e) => {
@@ -2207,10 +2215,10 @@ async fn handle(
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
         Received::DecryptionError { sender, error } => {
-            tracing::warn!(sender = %sender.service_id_string(), %error, "a message couldn't be decrypted")
+            tracing::warn!(chat = %db.opaque_id(&direct_id(sender)), %error, "a message couldn't be decrypted")
         }
         Received::RetryReceipt { sender, .. } => {
-            tracing::info!(sender = %sender.service_id_string(), "a message of ours couldn't be decrypted there")
+            tracing::info!(chat = %db.opaque_id(&direct_id(sender)), "a message of ours couldn't be decrypted there")
         }
         Received::Content(c) => tracing::info!(kind = content_kind(&c.body), "received"),
     }
@@ -2378,7 +2386,7 @@ async fn hold_back_unaccepted_call(
         if !db.is_unaccepted(&id).await? {
             return Ok(false);
         }
-        tracing::info!(sender = %sender_aci, "a call from a chat not accepted didn't ring");
+        tracing::info!(chat = %db.opaque_id(&id), "a call from a chat not accepted didn't ring");
         let offer = calls
             .iter()
             .any(|c| matches!(c.message, ringrtc::core::signaling::Message::Offer(_)));
@@ -2429,7 +2437,10 @@ async fn apply_received(
                 }
             }
             Err(e) => l.on_event(CoreEvent::Error {
-                message: format!("storing a message from {sender} failed: {e}"),
+                message: format!(
+                    "storing a message in chat {} failed: {e}",
+                    db.opaque_id(&format!("c:{sender}"))
+                ),
             }),
         }
     }
@@ -2447,11 +2458,11 @@ async fn decryption_failed(
     sender: ServiceId,
     error: Option<&SignalProtocolError>,
 ) {
+    let conversation_id = direct_id(&sender);
     if matches!(error, Some(SignalProtocolError::DuplicatedMessage(..))) {
-        tracing::info!(sender = %sender.service_id_string(), "dropped a message delivered again");
+        tracing::info!(chat = %db.opaque_id(&conversation_id), "dropped a message delivered again");
         return;
     }
-    let conversation_id = direct_id(&sender);
     // shown rather than dropped if the lookup fails, as messages are
     if matches!(db.is_blocked(&conversation_id).await, Ok(true)) {
         return;
@@ -2534,14 +2545,14 @@ async fn fetch_avatars(m: &Manager<SqliteStore, Registered>, db: &ProjectionDb, 
         let stored = match fetched {
             Ok(bytes) => db.store_avatar(&id, bytes.as_deref(), now).await,
             Err(e) => {
-                // ids only; tried again in a day
-                tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be fetched");
+                // opaque ids only; tried again in a day
+                tracing::warn!(chat = %db.opaque_id(&id), error = %e, "a chat's picture couldn't be fetched");
                 db.set_avatar_checked(&id, now).await.map(|_| false)
             }
         };
         match stored {
             Ok(c) => changed |= c,
-            Err(e) => tracing::warn!(conversation = %id, error = %e, "a chat's picture couldn't be kept"),
+            Err(e) => tracing::warn!(chat = %db.opaque_id(&id), error = %e, "a chat's picture couldn't be kept"),
         }
     }
     if changed {

@@ -588,10 +588,13 @@ pub async fn sender(
             } => {
                 let sent = send_to(&mut m, &conversation_id, *body, at).await;
                 if let Err(e) = &sent {
-                    // ids only; the call engine ends the call, this says why
-                    tracing::warn!(conversation = %conversation_id, error = %e, "a call message wasn't sent");
+                    // opaque ids only; the call engine ends the call, this says why
+                    tracing::warn!(chat = %db.opaque_id(&conversation_id), error = %e, "a call message wasn't sent");
                     l.on_event(CoreEvent::Error {
-                        message: format!("a call message to {conversation_id} wasn't sent: {e}"),
+                        message: format!(
+                            "a call message in chat {} wasn't sent: {e}",
+                            db.opaque_id(&conversation_id)
+                        ),
                     });
                 }
                 let _ = done.send(sent.is_ok());
@@ -611,12 +614,7 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = timed(Box::pin(m.send_message(me, sm, now_ms()))).await {
-                    // a group's id is its key: not for the log
-                    let what = match conversation_id.starts_with("g:") {
-                        true => "telling the phone about a group's request".to_string(),
-                        false => format!("telling the phone about the request from {conversation_id}"),
-                    };
-                    report(l.as_ref(), &what, &e);
+                    report(l.as_ref(), "telling the phone about a message request", &e);
                 }
             }
             Job::ViewOnceOpen { key } => {
@@ -637,8 +635,7 @@ pub async fn sender(
                 let at = now_ms();
                 // not retried: every message we send carries the key too
                 if let Err(e) = send_to(&mut m, &conversation_id, profile_key_update(at).into(), at).await {
-                    let what = format!("sharing your profile with {conversation_id} (it goes with your next message)");
-                    report(l.as_ref(), &what, &e);
+                    report(l.as_ref(), "sharing your profile (it goes with your next message)", &e);
                 }
             }
             Job::Typing {
@@ -659,7 +656,7 @@ pub async fn sender(
                     continue;
                 };
                 if let Err(e) = send_to(&mut m, &conversation_id, tm.into(), at).await {
-                    tracing::warn!(conversation = %conversation_id, error = %e, "typing not sent");
+                    tracing::warn!(chat = %db.opaque_id(&conversation_id), error = %e, "typing not sent");
                 }
             }
         }
@@ -734,7 +731,10 @@ async fn send_text(m: &mut Manager<SqliteStore, Registered>, db: &ProjectionDb, 
         // presage also fails a send whose message was delivered but whose sync transcript or
         // local copy failed; a delivery receipt then lifts the row out of Failed.
         l.on_event(CoreEvent::Error {
-            message: format!("a message to {} may not have been sent: {e}", job.conversation_id),
+            message: format!(
+                "a message in chat {} may not have been sent: {e}",
+                db.opaque_id(&job.conversation_id)
+            ),
         });
     }
     if let Err(e) = stored {
@@ -775,7 +775,10 @@ async fn set_timer(
     at: u64,
 ) {
     let fail = |why: String| CoreEvent::Error {
-        message: format!("the disappearing timer of {conversation_id} wasn't changed: {why}"),
+        message: format!(
+            "the disappearing timer of chat {} wasn't changed: {why}",
+            db.opaque_id(conversation_id)
+        ),
     };
     let Some(Recipient::Direct(sid)) = recipient(conversation_id) else {
         return;
@@ -825,14 +828,20 @@ async fn record_mutation(
 ) {
     if let Err(e) = sent {
         l.on_event(CoreEvent::Error {
-            message: format!("a reaction, edit or delete in {conversation_id} may not have reached everyone: {e}"),
+            message: format!(
+                "a reaction, edit or delete in chat {} may not have reached everyone: {e}",
+                db.opaque_id(conversation_id)
+            ),
         });
     }
     for op in own_ops(me, conversation_id, body) {
         match db.apply(&op).await {
             Ok(applied) => applied.into_iter().for_each(|a| l.on_event(from_applied(a))),
             Err(e) => l.on_event(CoreEvent::Error {
-                message: format!("recording a change in {conversation_id} failed: {e}"),
+                message: format!(
+                    "recording a change in chat {} failed: {e}",
+                    db.opaque_id(conversation_id)
+                ),
             }),
         }
     }
@@ -895,7 +904,7 @@ async fn send_receipts(m: &mut Manager<SqliteStore, Registered>, db: &Projection
         match sent {
             Ok(()) => done.extend(targets.iter().filter(|t| t.author == author).cloned()),
             Err(e) => {
-                tracing::warn!(to = %author, error = %e, "read receipt not sent");
+                tracing::warn!(chat = %db.opaque_id(&format!("c:{author}")), error = %e, "read receipt not sent");
                 failed += 1;
             }
         }
