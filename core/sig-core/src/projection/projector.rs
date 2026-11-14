@@ -537,9 +537,15 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         }
         attachments.push(image);
     }
+    // as Signal's apps do: a card only for an https link the message shows, so it can't name one
+    // place and open another
+    let shown = |url: &String| {
+        url::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
+            && dm.body.as_ref().is_some_and(|b| b.contains(url.as_str()))
+    };
     let preview = dm.preview.first().and_then(|p| {
         Some(NewPreview {
-            url: p.url.clone()?,
+            url: p.url.clone().filter(shown)?,
             title: p.title.clone(),
             description: p.description.clone(),
             image: p.image.as_ref().map(new_attachment),
@@ -1628,7 +1634,7 @@ mod tests {
 
     #[test]
     fn attachments_and_previews_come_with_their_message() {
-        let mut dm = text(100, "look");
+        let mut dm = text(100, "look: https://example.org.");
         dm.attachments = vec![pointer("image/jpeg", 1000, 0), pointer("audio/aac", 50, 1)];
         dm.preview = vec![Preview {
             url: Some("https://example.org".into()),
@@ -1697,6 +1703,46 @@ mod tests {
         let mut dm = text(101, "hi");
         dm.preview = vec![Preview::default()];
         assert_eq!(project(&content(ALICE, 151, ContentBody::DataMessage(dm)), ME).len(), 1);
+    }
+
+    #[test]
+    fn a_preview_is_kept_only_if_its_https_link_is_in_the_message() {
+        let preview = |body: &str, url: &str| {
+            let mut dm = text(100, body);
+            dm.preview = vec![Preview {
+                url: Some(url.into()),
+                title: Some("Google Docs".into()),
+                ..Default::default()
+            }];
+            [
+                project(&content(ALICE, 150, ContentBody::DataMessage(dm.clone())), ME),
+                project(&content(ME, 150, sent_sync(ALICE, dm)), ME),
+            ]
+            .map(|ops| match ops.as_slice() {
+                [Op::InsertMessage(m), Op::AddAttachments { preview, .. }] if m.body.is_some() => {
+                    preview.as_ref().map(|p| p.url.clone())
+                }
+                [Op::InsertMessage(m)] if m.body.is_some() => None,
+                _ => panic!("{ops:?}"),
+            })
+        };
+        let kept = Some("https://docs.example/d/1".to_string());
+        assert_eq!(
+            preview("see https://docs.example/d/1", "https://docs.example/d/1"),
+            [kept.clone(), kept]
+        );
+        // a card for a link the message doesn't have: the message stays, the card goes
+        assert_eq!(
+            preview("see https://docs.example/d/1", "https://elsewhere.example"),
+            [None, None]
+        );
+        assert_eq!(preview("no link here", "https://docs.example/d/1"), [None, None]);
+        // only https links get a card
+        assert_eq!(
+            preview("see http://docs.example/d/1", "http://docs.example/d/1"),
+            [None, None]
+        );
+        assert_eq!(preview("see https://", "https://"), [None, None]);
     }
 
     fn placeholder(dm: DataMessage) -> MessageKind {
