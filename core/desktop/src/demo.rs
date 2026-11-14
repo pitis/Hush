@@ -107,13 +107,15 @@ pub fn chats() -> Vec<Conversation> {
         file_name: None,
         is_voice_note: false,
     });
-    let note = chat(
+    let mut note = chat(
         &format!("c:{ME}"),
         ConversationKind::Direct,
         "",
         30,
         "Passport number is in the drawer",
     );
+    // all of Note to Self's are ours
+    note.last_message_outgoing = true;
     let mut club = chat(
         "g:02",
         ConversationKind::Group,
