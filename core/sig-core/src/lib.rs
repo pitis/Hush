@@ -16,6 +16,7 @@ mod logging;
 mod net;
 mod profile;
 pub mod projection;
+mod safety;
 mod send;
 mod stickers;
 mod storage;

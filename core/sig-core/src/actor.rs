@@ -130,6 +130,11 @@ pub enum Command {
         key: [u8; 32],
         done: oneshot::Sender<Result<Option<crate::groups::GroupInfo>, String>>,
     },
+    /// Our safety number with a contact (their ACI): None before any session with them.
+    SafetyNumber {
+        aci: presage::libsignal_service::prelude::Uuid,
+        done: oneshot::Sender<Result<Option<crate::safety::SafetyNumber>, String>>,
+    },
     /// Changes a group (its members are told), then stores it in its chat.
     ChangeGroup {
         key: [u8; 32],
@@ -516,6 +521,9 @@ async fn run(
                             continue;
                         }
                     }
+                    // before any message, so a key never noted yet is the one a change is told against
+                    let me = m.registration_data().service_ids.aci.to_string();
+                    crate::safety::notice_known(m.store(), &projection, listener.as_ref(), &me).await;
                     receiving.set(true);
                     if !sending {
                         sending = true;
@@ -596,12 +604,18 @@ async fn run(
                                 ),
                             });
                         }
+                        // the reset fetched their keys anew
+                        let me = m.registration_data().service_ids.aci.to_string();
+                        crate::safety::notice_chat(m.store(), &db, l.as_ref(), &me, &conversation_id, at - 1).await;
                         let author = to.raw_uuid().to_string();
                         match db
                             .add_chat_event(&conversation_id, at, ChatEventKind::SessionReset, &author, None)
                             .await
                         {
-                            Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+                            Ok(()) => l.on_event(CoreEvent::ChatEventAdded {
+                                conversation_id,
+                                kind: ChatEventKind::SessionReset,
+                            }),
                             Err(e) => l.on_event(CoreEvent::Error {
                                 message: format!("recording a session reset failed: {e}"),
                             }),
@@ -739,6 +753,13 @@ async fn run(
                     None => Err("not linked yet".into()),
                 };
                 let _ = done.send(info);
+            }
+            Command::SafetyNumber { aci, done } => {
+                let number = match &manager {
+                    Some(m) => crate::safety::ours_with(m.store(), m.registration_data().service_ids.aci, aci).await,
+                    None => Err("not linked yet".into()),
+                };
+                let _ = done.send(number);
             }
             Command::ChangeGroup { key, edit, done } => match &manager {
                 Some(m) => {
@@ -1702,7 +1723,7 @@ fn spawn_call_router(
                         let at = chrono::Utc::now().timestamp_millis();
                         match db.add_chat_event(&conversation_id, at, kind, &peer_aci, value).await {
                             Ok(()) => {
-                                listener.on_event(CoreEvent::ChatEventAdded { conversation_id });
+                                listener.on_event(CoreEvent::ChatEventAdded { conversation_id, kind });
                                 listener.on_event(CoreEvent::ConversationsChanged);
                             }
                             Err(e) => listener.on_event(CoreEvent::Error {
@@ -2243,6 +2264,13 @@ async fn handle(
         // their device asks us to resend or restart the session; Hush doesn't, so a reset is offered
         Received::RetryReceipt { sender, .. } => decryption_failed(db, l, sender, None).await,
         Received::Content(content) => {
+            if let Some(check) = key_check(&content.metadata, chrono::Utc::now().timestamp_millis()) {
+                let store = match check.to_pni {
+                    true => m.store().pni_protocol_store(),
+                    false => m.store().aci_protocol_store(),
+                };
+                crate::safety::notice(&store, db, l, me, vec![check.aci], check.at).await;
+            }
             let unconfirmed = sync_group(m, db, l, &mut progress.refetches, wake, &content).await;
             match drop_blocked(db, &content, me, unconfirmed).await {
                 Ok(true) => return,
@@ -2406,6 +2434,7 @@ async fn hold_back_unaccepted_call(
             db.list_chat(&id, at).await?;
             l.on_event(CoreEvent::ChatEventAdded {
                 conversation_id: id.clone(),
+                kind: ChatEventKind::MissedCall,
             });
             l.on_event(CoreEvent::ConversationsChanged);
         }
@@ -2455,6 +2484,30 @@ async fn apply_received(
     outcome
 }
 
+/// The safety-number check after content from someone (`safety::notice`).
+#[derive(Debug, PartialEq)]
+struct KeyCheck {
+    /// Whose key: an ACI's (a PNI sender has no safety number).
+    aci: String,
+    /// Where a change goes in the chat: just before the message, but within the last minute of
+    /// our clock, as its time is the sender's to choose.
+    at: i64,
+    /// In our PNI's store: presage decrypts what was sent to our PNI with it, and keeps the key
+    /// the message brought there.
+    to_pni: bool,
+}
+
+fn key_check(metadata: &presage::libsignal_service::content::Metadata, now: i64) -> Option<KeyCheck> {
+    let ServiceId::Aci(aci) = metadata.sender else {
+        return None;
+    };
+    Some(KeyCheck {
+        aci: aci.service_id_string(),
+        at: metadata.client_timestamp.timestamp_millis().clamp(now - 60_000, now) - 1,
+        to_pni: matches!(metadata.destination, ServiceId::Pni(_)),
+    })
+}
+
 /// A message between us and `sender` that couldn't be decrypted, here (`error`) or on their
 /// device (a retry receipt): shown in their chat (not as an error banner), with a way to reset
 /// the session. A duplicate is skipped: its first copy was decrypted, then the server delivered it
@@ -2481,7 +2534,10 @@ async fn decryption_failed(
         .add_chat_event(&conversation_id, at, ChatEventKind::DecryptionFailed, &author, None)
         .await
     {
-        Ok(()) => l.on_event(CoreEvent::ChatEventAdded { conversation_id }),
+        Ok(()) => l.on_event(CoreEvent::ChatEventAdded {
+            conversation_id,
+            kind: ChatEventKind::DecryptionFailed,
+        }),
         Err(e) => l.on_event(CoreEvent::Error {
             message: format!("recording an undecryptable message failed: {e}"),
         }),
@@ -3199,6 +3255,58 @@ mod tests {
         assert_eq!(announced(&sink), 1);
     }
 
+    /// An ACI's key is checked, in the store of the identity the message was sent to, and a
+    /// change goes just before the message, within the last minute of our clock.
+    #[test]
+    fn content_is_checked_for_its_senders_key() {
+        use presage::libsignal_service::content::Metadata;
+        use presage::libsignal_service::protocol::{Aci, DeviceId, Pni, ServiceId};
+        let (alice, our_aci, our_pni) = (
+            ServiceId::from(Aci::from_uuid_bytes([2; 16])),
+            ServiceId::from(Aci::from_uuid_bytes([1; 16])),
+            ServiceId::from(Pni::from_uuid_bytes([1; 16])),
+        );
+        let metadata = |sender: ServiceId, destination: ServiceId, ms: i64| Metadata {
+            sender,
+            destination,
+            sender_device: DeviceId::new(1).unwrap(),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(ms).unwrap(),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(ms).unwrap(),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+        };
+        let now = 1_700_000_000_000;
+        let check = |aci: &ServiceId, at, to_pni| {
+            Some(super::KeyCheck {
+                aci: aci.service_id_string(),
+                at,
+                to_pni,
+            })
+        };
+        assert_eq!(
+            super::key_check(&metadata(alice, our_aci, now - 5_000), now),
+            check(&alice, now - 5_001, false)
+        );
+        assert_eq!(
+            super::key_check(&metadata(alice, our_pni, now - 5_000), now),
+            check(&alice, now - 5_001, true)
+        );
+        // a sender's clock far off (or lying) doesn't put it out of sight
+        assert_eq!(
+            super::key_check(&metadata(alice, our_aci, 1), now),
+            check(&alice, now - 60_001, false)
+        );
+        assert_eq!(
+            super::key_check(&metadata(alice, our_aci, now + 3_600_000), now),
+            check(&alice, now - 1, false)
+        );
+        let pni_sender = ServiceId::from(Pni::from_uuid_bytes([2; 16]));
+        assert_eq!(super::key_check(&metadata(pni_sender, our_pni, now), now), None);
+    }
+
     /// A duplicate is dropped like Signal's clients do (no chat event, nothing to reset), and so
     /// is a failure in a blocked chat; a real failure, ours or theirs, is shown.
     #[tokio::test]
@@ -3224,7 +3332,7 @@ mod tests {
             .all(|e| e.kind == ChatEventKind::DecryptionFailed && e.author == alice.raw_uuid().to_string()));
         assert!(matches!(
             &sink.0.lock().unwrap()[..],
-            [CoreEvent::ChatEventAdded { conversation_id: a }, CoreEvent::ChatEventAdded { conversation_id: b }]
+            [CoreEvent::ChatEventAdded { conversation_id: a, .. }, CoreEvent::ChatEventAdded { conversation_id: b, .. }]
                 if *a == chat && *b == chat
         ));
         db.block(&chat).await.unwrap();
@@ -3286,7 +3394,8 @@ mod tests {
             "the call alone makes the request"
         );
         assert!(sink.0.lock().unwrap().contains(&CoreEvent::ChatEventAdded {
-            conversation_id: chat.clone()
+            conversation_id: chat.clone(),
+            kind: ChatEventKind::MissedCall,
         }));
         assert!(held(STRANGER, vec![ice()]).await, "its ICE stays out too");
         assert!(
