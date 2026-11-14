@@ -122,6 +122,13 @@ impl Hush {
                     .disabled(working)
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_relink(window, cx))),
             ))
+            .child(row(
+                "Backup",
+                Button::new("back-up")
+                    .label("Back Up…")
+                    .disabled(working)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_backup(window, cx))),
+            ))
             .child(row("", sync))
             .child(row(
                 "Linked device",

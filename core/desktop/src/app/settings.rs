@@ -209,7 +209,11 @@ impl Hush {
     /// Settings…: the panel over the window (not over another one: the keys stay with that); our
     /// profile is read each time it opens (the phone changes it too), and the sync switch.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let over = self.dialog.is_some() || self.group.is_some() || self.view_once.showing() || self.stories.showing();
+        let over = self.dialog.is_some()
+            || self.group.is_some()
+            || self.view_once.showing()
+            || self.stories.showing()
+            || self.backup.showing();
         if self.settings.panel.is_some() || over {
             return;
         }
@@ -252,6 +256,13 @@ impl Hush {
     /// The panel is over the window: the chats' shortcuts wait.
     pub(super) fn settings_open(&self) -> bool {
         self.settings.panel.is_some()
+    }
+
+    /// Back to the panel's keys, from a dialog over it that closed.
+    pub(super) fn focus_settings(&self, window: &mut Window, cx: &mut App) {
+        if let Some(p) = &self.settings.panel {
+            p.focus.focus(window, cx);
+        }
     }
 
     /// Done or Esc: back to the open chat's composer. A save or an unlink on its way still lands.
@@ -560,8 +571,9 @@ impl Hush {
     }
 
     /// Starts over with a fresh core, all that showed forgotten (`AppStore.restart`); the key and
-    /// the notifications shown go with the data they belong to, unless relinking kept that.
-    fn restart(&mut self, forget_key: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// the notifications shown go with the data they belong to, unless relinking or a restore kept
+    /// that.
+    pub(super) fn restart(&mut self, forget_key: bool, window: &mut Window, cx: &mut Context<Self>) {
         // the old core is stopped: quitting has nothing of it to wait for
         if cx.has_global::<Core>() {
             cx.remove_global::<Core>();

@@ -157,6 +157,10 @@ pub enum Demo {
     ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
+    /// Back Up's dialog over Settings, its passphrase in the first field only.
+    BackUp,
+    /// The link screen after a restore.
+    Restored,
     /// The chat with stickers received, sent and still to download.
     Stickers,
     /// The sticker picker open over it.
@@ -200,6 +204,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("polls", Demo::Polls),
                 ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),
+                ("back-up", Demo::BackUp),
+                ("restored", Demo::Restored),
                 ("stickers", Demo::Stickers),
                 ("sticker-picker", Demo::StickerPicker),
                 ("stories", Demo::Stories(0)),
