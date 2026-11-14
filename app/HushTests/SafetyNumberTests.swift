@@ -9,6 +9,9 @@ final class SafetyNumberTests: XCTestCase {
         XCTAssertEqual(
             SafetyNumberView.formatted(digits),
             "30035 44776 92869 39689\n28698 76765 45825 75691\n62576 84344 09180 79131")
+        // read digit by digit, a pause between groups
+        XCTAssertEqual(
+            SafetyNumberView.spoken(String(digits.prefix(10))), "3 0 0 3 5, 4 4 7 7 6")
     }
 
     func testTheNumberComesFromTheCoreOrSaysWhyNot() async {

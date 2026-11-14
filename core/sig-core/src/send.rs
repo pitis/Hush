@@ -669,12 +669,13 @@ pub async fn sender(
 }
 
 impl Job {
-    /// The chat a message, change or call went to, and when: its people's keys are checked after
-    /// it (`safety::notice_chat`). Typing goes often and the message after it checks; the rest
-    /// goes to our own devices, or is rare.
+    /// The chat a message, change, call or our profile key went to, and when: its people's keys
+    /// are checked after it (`safety::notice_chat`). Typing goes often and the message after it
+    /// checks; the rest goes to our own devices.
     fn sent_to(&self) -> Option<(String, i64)> {
         match self {
             Job::Text(job) => Some((job.conversation_id.clone(), job.key.sent_at)),
+            Job::ProfileKey { conversation_id } => Some((conversation_id.clone(), now_ms() as i64)),
             Job::Mutation {
                 conversation_id, at, ..
             }
@@ -1023,6 +1024,53 @@ mod tests {
 
     const U: &str = "22222222-2222-2222-2222-222222222222";
     const ME: &str = "11111111-1111-1111-1111-111111111111";
+
+    #[test]
+    fn the_chat_a_job_went_to_is_checked_after_it() {
+        let chat = format!("c:{U}");
+        let text = Job::Text(SendJob {
+            key: key(ME, 7),
+            conversation_id: chat.clone(),
+            body: Some("hi".into()),
+            ranges: vec![],
+            quote: None,
+            attachments: vec![],
+            preview: None,
+            sticker: None,
+        });
+        assert_eq!(text.sent_to(), Some((chat.clone(), 7)));
+        let mutation = Job::Mutation {
+            conversation_id: chat.clone(),
+            body: Box::new(ContentBody::DataMessage(Default::default())),
+            at: 8,
+        };
+        assert_eq!(mutation.sent_to(), Some((chat.clone(), 8)));
+        let timer = Job::Timer {
+            conversation_id: chat.clone(),
+            seconds: 60,
+            at: 9,
+        };
+        assert_eq!(timer.sent_to(), Some((chat.clone(), 9)));
+        let call = Job::Call {
+            conversation_id: chat.clone(),
+            body: Box::new(ContentBody::DataMessage(Default::default())),
+            at: 10,
+            done: tokio::sync::oneshot::channel().0,
+        };
+        assert_eq!(call.sent_to(), Some((chat.clone(), 10)));
+        let before = now_ms() as i64;
+        let profile = Job::ProfileKey {
+            conversation_id: chat.clone(),
+        };
+        assert!(matches!(profile.sent_to(), Some((c, at)) if c == chat && at >= before));
+        let typing = Job::Typing {
+            conversation_id: chat,
+            started: true,
+            queued: Instant::now(),
+        };
+        assert_eq!(typing.sent_to(), None, "the message after it checks");
+        assert_eq!(Job::Receipts.sent_to(), None);
+    }
 
     #[test]
     fn the_storage_changed_sync_asks_the_other_devices_for_the_manifest() {

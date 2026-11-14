@@ -26,6 +26,7 @@ struct SafetyNumberView: View {
                     .lineSpacing(4)
                     .fixedSize()
                     .textSelection(.enabled)
+                    .accessibilityLabel(Self.spoken(number.digits))
                 Text(
                     "To check that your chat with \(name) is end-to-end encrypted, compare these numbers with "
                         + "the ones their phone shows, or let it scan this code."
@@ -43,6 +44,12 @@ struct SafetyNumberView: View {
         .padding(24)
         .frame(width: 360)
         .task { read = await store.safetyNumber(aci) }
+    }
+
+    /// For VoiceOver: digit by digit, a pause between groups.
+    nonisolated static func spoken(_ digits: String) -> String {
+        formatted(digits).split(whereSeparator: \.isWhitespace).map { $0.map(String.init).joined(separator: " ") }
+            .joined(separator: ", ")
     }
 
     /// As Signal's apps show it: 3 rows of 4 groups of 5 digits.

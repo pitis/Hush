@@ -659,6 +659,7 @@ mod tests {
             (ChatEventKind::OutgoingCall, 3),
             (ChatEventKind::IncomingCall, 4),
             (ChatEventKind::MissedCall, 5),
+            (ChatEventKind::SafetyNumberChanged, 6),
         ] {
             assert_eq!(kind.to_i64(), n);
             assert_eq!(ChatEventKind::from_i64(n), Some(kind));

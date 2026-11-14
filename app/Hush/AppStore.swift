@@ -362,8 +362,8 @@ final class AppStore {
             Task { await notify(conversationId, about: target, reaction: (reactor, emoji)) }
         case .typing(let conversationId, let who, let started):
             setTyping(conversationId, who: who, until: started ? now.addingTimeInterval(Self.typingTimeout) : nil)
-        case .chatEventAdded(let conversationId):
-            resettingSessions.remove(conversationId)
+        case .chatEventAdded(let conversationId, let kind):
+            if kind == .sessionReset { resettingSessions.remove(conversationId) }
             refreshConversations()
             if conversationId == selectedId { reloadEvents() }
         case .callChanged(let conversationId, let phase, let reason):

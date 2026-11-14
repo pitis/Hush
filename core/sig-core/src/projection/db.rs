@@ -29,6 +29,7 @@ pub enum Applied {
     /// Something was added to a chat's timeline that isn't a message.
     ChatEvent {
         conversation_id: String,
+        kind: ChatEventKind,
     },
     /// Chats' flags changed, or a chat went (blocks and request answers from our phone).
     ConversationsChanged,
@@ -1738,10 +1739,33 @@ impl ProjectionDb {
             .collect()
     }
 
+    /// The identity keys noted for `acis` (`note_identity_key`), by ACI.
+    pub async fn noted_identity_keys(
+        &self,
+        acis: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, sqlx::Error> {
+        let rows: Vec<(String, Vec<u8>)> =
+            sqlx::query_as("SELECT aci, key FROM identity_keys WHERE aci IN (SELECT value FROM json_each(?1))")
+                .bind(serde_json::to_string(acis).map_err(|e| sqlx::Error::Encode(e.into()))?)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Everyone Hush has a 1:1 chat with (by ACI) or shares a group with.
+    pub async fn known_acis(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT substr(id, 3) FROM conversations WHERE id LIKE 'c:%' AND id NOT LIKE 'c:PNI:%'
+             UNION SELECT aci FROM group_members ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Notes `aci`'s identity key as presage has it now. A key other than the one noted before
     /// adds a `SafetyNumberChanged` event at `at` to their 1:1 chat and to each group both they
-    /// and we (`me`) are in, and answers those chats; the first key noted (first contact) adds
-    /// none.
+    /// and we (`me`) are in, but blocked ones, and answers those chats; the first key noted
+    /// (first contact) adds none.
     pub async fn note_identity_key(
         &self,
         aci: &str,
@@ -1783,16 +1807,19 @@ impl ProjectionDb {
             .bind(kind_to_i64(ConversationKind::Direct))
             .execute(&mut *tx)
             .await?;
-        let groups: Vec<String> = sqlx::query_scalar(
-            "SELECT them.conversation_id FROM group_members them
-             JOIN group_members us ON us.conversation_id = them.conversation_id AND us.aci = ?2
-             WHERE them.aci = ?1 ORDER BY them.conversation_id",
+        let chats: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM conversations WHERE id = ?3 AND blocked = 0
+             UNION ALL
+             SELECT * FROM (SELECT them.conversation_id FROM group_members them
+               JOIN group_members us ON us.conversation_id = them.conversation_id AND us.aci = ?2
+               JOIN conversations c ON c.id = them.conversation_id AND c.blocked = 0
+               WHERE them.aci = ?1 ORDER BY them.conversation_id)",
         )
         .bind(aci)
         .bind(me)
+        .bind(&direct)
         .fetch_all(&mut *tx)
         .await?;
-        let chats: Vec<String> = std::iter::once(direct).chain(groups).collect();
         for chat in &chats {
             sqlx::query("INSERT INTO chat_events(conversation_id, at, kind, author) VALUES (?1, ?2, ?3, ?4)")
                 .bind(chat)
@@ -2297,6 +2324,7 @@ impl ProjectionDb {
                 tx.commit().await?;
                 Ok(vec![Applied::ChatEvent {
                     conversation_id: conversation_id.clone(),
+                    kind: ChatEventKind::TimerChanged,
                 }])
             }
         }
@@ -7298,6 +7326,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_change_seen_by_two_checks_at_once_is_told_once() {
+        let db = db().await;
+        db.note_identity_key("alice", b"key1", "me", 10).await.unwrap();
+        let (a, b) = tokio::join!(
+            db.note_identity_key("alice", b"key2", "me", 20),
+            db.note_identity_key("alice", b"key2", "me", 20)
+        );
+        assert_eq!(a.unwrap().len() + b.unwrap().len(), 1);
+        assert_eq!(db.chat_events("c:alice", 0).await.unwrap().len(), 1);
+    }
+
+    /// A blocked chat gets no note of it (the key is noted all the same).
+    #[tokio::test]
+    async fn a_changed_identity_key_isnt_told_in_blocked_chats() {
+        let db = db().await;
+        let group = format!("g:{}", "ab".repeat(32));
+        db.set_group(
+            &group,
+            1,
+            "Hikers",
+            &["alice".into(), "me".into()],
+            0,
+            GroupStanding::Other,
+        )
+        .await
+        .unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
+        db.block("c:alice").await.unwrap();
+        db.note_identity_key("alice", b"key1", "me", 10).await.unwrap();
+        assert_eq!(
+            db.note_identity_key("alice", b"key2", "me", 20).await.unwrap(),
+            vec![group.clone()]
+        );
+        assert!(db.chat_events("c:alice", 0).await.unwrap().is_empty());
+        db.block(&group).await.unwrap();
+        assert!(db
+            .note_identity_key("alice", b"key3", "me", 30)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.chat_events(&group, 0).await.unwrap().len(), 1);
+        assert_eq!(
+            db.noted_identity_keys(&["alice".into()]).await.unwrap()["alice"],
+            b"key3"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_known_people_and_their_noted_keys() {
+        let db = db().await;
+        db.set_group(
+            &format!("g:{}", "ab".repeat(32)),
+            1,
+            "Hikers",
+            &["bob".into(), "me".into()],
+            0,
+            GroupStanding::Other,
+        )
+        .await
+        .unwrap();
+        db.upsert_conversation_title("c:alice", "Alice").await.unwrap();
+        db.upsert_conversation_title("c:PNI:carol", "Carol").await.unwrap();
+        assert_eq!(db.known_acis().await.unwrap(), ["alice", "bob", "me"]);
+        db.note_identity_key("alice", b"key1", "me", 10).await.unwrap();
+        db.note_identity_key("bob", b"key2", "me", 10).await.unwrap();
+        let noted = db.noted_identity_keys(&["alice".into(), "dave".into()]).await.unwrap();
+        assert_eq!(noted.len(), 1);
+        assert_eq!(noted["alice"], b"key1");
+        assert!(db.noted_identity_keys(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_changed_identity_key_is_told_once_in_their_chat_and_the_groups_we_share() {
         let db = db().await;
         let (shared, left) = (format!("g:{}", "ab".repeat(32)), format!("g:{}", "cd".repeat(32)));
@@ -7315,6 +7415,18 @@ mod tests {
         db.set_group(&left, 1, "Old", &["alice".into()], 0, GroupStanding::Other)
             .await
             .unwrap();
+        // ours, without alice
+        let other = format!("g:{}", "ef".repeat(32));
+        db.set_group(
+            &other,
+            1,
+            "Climbers",
+            &["bob".into(), "me".into()],
+            0,
+            GroupStanding::Other,
+        )
+        .await
+        .unwrap();
         let changes = |chat: String| {
             let db = db.clone();
             async move {
@@ -7348,6 +7460,7 @@ mod tests {
         assert_eq!(changes("c:alice".into()).await, vec![(30, "alice".to_string())]);
         assert_eq!(changes(shared.clone()).await, vec![(30, "alice".to_string())]);
         assert!(changes(left.clone()).await.is_empty());
+        assert!(changes(other.clone()).await.is_empty());
         // seen again (another message from the new key): already told
         assert!(db
             .note_identity_key("alice", b"key2", "me", 40)
@@ -7552,7 +7665,8 @@ mod tests {
         assert_eq!(
             applied,
             vec![Applied::ChatEvent {
-                conversation_id: "c:alice".into()
+                conversation_id: "c:alice".into(),
+                kind: ChatEventKind::TimerChanged,
             }]
         );
         assert_eq!(db.expire_timer("c:alice").await.unwrap(), 604_800);
