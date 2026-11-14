@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::input::{Escape, Input, MoveDown, MoveUp, Textarea};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::spinner::Spinner;
@@ -49,6 +49,8 @@ struct Row {
     /// What assistive technology reads: who, what, when.
     label: String,
     actions: Rc<actions::RowActions>,
+    /// Just opened from the search: outlined for a moment.
+    found: bool,
 }
 
 /// The space beside incoming messages in a group: the sender's picture by the last of a run.
@@ -109,6 +111,7 @@ impl Hush {
                 time,
                 status,
                 actions: self.row_actions(m, now_ms),
+                found: self.is_found(&m.key()),
             }
         });
         rows.collect()
@@ -184,9 +187,21 @@ impl Hush {
     }
 
     fn render_sidebar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        let shown: Vec<&Conversation> = self.inbox().filter(|c| self.matches(c)).collect();
+        let shown = self.listed();
         let pinned = self.query.is_empty() && shown.iter().any(|c| c.pinned_order.is_some());
-        let mut list = v_flex().pb(px(8.));
+        let mut list = v_flex()
+            .id("chat-list")
+            .role(Role::List)
+            .aria_label("Chats")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.find.scroll)
+            .pb(px(8.))
+            .children(self.render_scope(p, cx));
+        if !self.query.is_empty() && !shown.is_empty() {
+            list = list.child(section("Chats", p));
+        }
         for (ix, c) in shown.iter().enumerate() {
             let first_unpinned = c.pinned_order.is_none() && ix > 0 && shown[ix - 1].pinned_order.is_some();
             if pinned && ix == 0 {
@@ -197,15 +212,7 @@ impl Hush {
             }
             list = list.child(self.render_chat_row(ix, c, p, cx));
         }
-        if shown.is_empty() && !self.query.is_empty() {
-            list = list.child(
-                label("no-results", Role::Label, "No chats found")
-                    .px(px(20.))
-                    .py(px(8.))
-                    .text_size(px(12.))
-                    .text_color(p.secondary),
-            );
-        }
+        let list = list.children(self.render_results(p, cx));
         // macOS 26's sidebar: a panel floating in the window, inset from its edges
         v_flex()
             .w(px(SIDEBAR))
@@ -240,6 +247,14 @@ impl Hush {
                             .gap(px(6.))
                             .rounded(px(8.))
                             .bg(p.fill)
+                            // while browsing the messages found, the arrows step through them
+                            .capture_action(
+                                cx.listener(|this, _: &MoveUp, window, cx| this.step_results(-1, window, cx)),
+                            )
+                            .capture_action(
+                                cx.listener(|this, _: &MoveDown, window, cx| this.step_results(1, window, cx)),
+                            )
+                            .capture_action(cx.listener(|this, _: &Escape, window, cx| this.escape_search(window, cx)))
                             .child(icon("search", 14., p.secondary))
                             .child(
                                 Input::new(&self.search)
@@ -252,16 +267,7 @@ impl Hush {
                     .child(self.render_new_chat(p, cx)),
             )
             .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
-            .child(
-                div()
-                    .id("chat-list")
-                    .role(Role::List)
-                    .aria_label("Chats")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(list),
-            )
+            .child(list)
             .children(self.render_connection(p, cx))
     }
 
@@ -472,13 +478,6 @@ impl Hush {
                     )
                     .focus_trap("dialog", &d.focus),
             )
-    }
-
-    fn matches(&self, c: &Conversation) -> bool {
-        let q = &self.query;
-        q.is_empty()
-            || text::title(c, self.own_aci.as_deref()).to_lowercase().contains(q)
-            || c.last_message_preview.to_lowercase().contains(q)
     }
 
     fn render_chat_row(&self, ix: usize, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -993,7 +992,18 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         // files without a caption: the time sits under them on the right
         .when(row.text.is_empty(), |this| this.items_end())
         .children(files::render(&row.files, this, color, behind))
-        .child(line);
+        .child(line)
+        // over the bubble, so its size doesn't change: the system's yellow, as on the Mac
+        .when(row.found, |this| {
+            this.relative().child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(18.))
+                    .border_3()
+                    .border_color(rgb(0xffcc00)),
+            )
+        });
     let gutter = match &row.gutter {
         Gutter::None => None,
         Gutter::Blank => Some(div().size(px(28.)).flex_none()),
@@ -1053,7 +1063,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
 }
 
 /// A person's or chat's picture, or their initials on their colour.
-fn avatar(id: &str, name: &str, picture: Option<Arc<Image>>, size: f32) -> Div {
+pub(super) fn avatar(id: &str, name: &str, picture: Option<Arc<Image>>, size: f32) -> Div {
     let base = style::avatar_color(id);
     let top = Hsla {
         l: (base.l + 0.08).min(1.),
@@ -1128,7 +1138,7 @@ fn field(input: Input, p: Palette) -> Div {
         .child(input)
 }
 
-fn section(title: &'static str, p: Palette) -> Div {
+pub(super) fn section(title: &'static str, p: Palette) -> Div {
     div()
         .px(px(20.))
         .pt(px(10.))
@@ -1166,7 +1176,7 @@ fn empty_state(symbol: &str, title: &'static str, detail: impl Into<SharedString
 
 /// Text that assistive technology reads too: GPUI shows it only elements with an id and a role;
 /// the label is what it reads.
-fn label(id: impl Into<ElementId>, role: Role, text: impl Into<SharedString>) -> Stateful<Div> {
+pub(super) fn label(id: impl Into<ElementId>, role: Role, text: impl Into<SharedString>) -> Stateful<Div> {
     let text = text.into();
     div().id(id).role(role).aria_label(text.clone()).child(text)
 }
