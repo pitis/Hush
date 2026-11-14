@@ -1047,7 +1047,7 @@ fn clock(seconds: f64) -> String {
 /// The name a file's copy gets: the sender's, only its last part, without what a name can't hold
 /// on Windows or what would turn it around on screen, at most `NAME_LIMIT` bytes; or "file" with
 /// its type's extension, unless that would make it a program.
-pub(super) fn file_name(a: &Attachment) -> String {
+fn file_name(a: &Attachment) -> String {
     let given = a.file_name.as_deref().and_then(|n| n.rsplit(['/', '\\']).next());
     let given = given.map(|n| {
         let n: String = n

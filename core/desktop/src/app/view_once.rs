@@ -98,6 +98,21 @@ pub(super) fn label(state: &State) -> &'static str {
     }
 }
 
+/// The name of a view-once video's copy for the system's player: from its type, never the
+/// sender's name (which could make it a program or a script); none for any other type, which
+/// isn't opened.
+fn video_name(a: &Attachment) -> Option<String> {
+    let ext = match a.content_type.split(';').next().unwrap_or_default().trim() {
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/x-m4v" => "m4v",
+        "video/webm" => "webm",
+        "video/3gpp" => "3gp",
+        _ => return None,
+    };
+    Some(format!("video.{ext}"))
+}
+
 fn is_video(a: &Attachment) -> bool {
     a.content_type.starts_with("video/")
 }
@@ -125,15 +140,20 @@ impl Hush {
         let (Some(client), Some(path)) = (self.client.clone(), files::ready_path(a)) else {
             return;
         };
+        let video = is_video(a);
+        let name = video_name(a);
+        if video && name.is_none() {
+            self.error = Some("Couldn't open the video: it isn't a kind of video Hush plays".into());
+            return cx.notify();
+        }
         let key = a.message.clone();
         self.view_once.opening = Some((key.author.clone(), key.sent_at));
         let generation = self.generation;
-        let video = is_video(a);
         let dir = self
             .data_dir
             .join(files::OPEN_FOLDER)
             .join(hex::encode(rand::random::<[u8; 8]>()));
-        let file = dir.join(files::file_name(a));
+        let file = dir.join(name.unwrap_or_default());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let look = if video {
@@ -256,7 +276,7 @@ impl Hush {
 mod tests {
     use sig_core::projection::{Attachment, AttachmentState, Message, MessageKey, MessageKind, MessageStatus};
 
-    use super::{label, state, State};
+    use super::{label, state, video_name, State};
     use crate::app::actions::{menu, Item};
 
     fn message(kind: MessageKind) -> Message {
@@ -343,6 +363,31 @@ mod tests {
             label(&State::Download(file(AttachmentState::Pending, "image/jpeg"))),
             "Download view-once media"
         );
+    }
+
+    #[test]
+    fn a_videos_copy_is_named_by_its_type_never_by_its_sender() {
+        let named = |content_type: &str, name: &str| Attachment {
+            file_name: Some(name.into()),
+            ..file(AttachmentState::Ready, content_type)
+        };
+        // a sender's name could make the player's click run a program or a script
+        assert_eq!(
+            video_name(&named("video/mp4", "clip.command")).as_deref(),
+            Some("video.mp4")
+        );
+        assert_eq!(video_name(&named("video/mp4", "x.app")).as_deref(), Some("video.mp4"));
+        assert_eq!(
+            video_name(&named("video/quicktime", "a.exe")).as_deref(),
+            Some("video.mov")
+        );
+        assert_eq!(
+            video_name(&named("video/webm; codecs=vp9", "a.sh")).as_deref(),
+            Some("video.webm")
+        );
+        // a type that isn't a video this hands to a player: not opened at all
+        assert_eq!(video_name(&named("video/x-msdownload", "a.mp4")), None);
+        assert_eq!(video_name(&named("application/x-sh", "a.mp4")), None);
     }
 
     #[test]
@@ -492,6 +537,23 @@ mod window_tests {
         assert!(hush.read_with(cx, |app, _| app.view_once.viewer.is_none()));
         // another try
         assert_eq!(state(&hush, cx), Some(State::Open(file.clone())));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[gpui::test]
+    fn a_video_of_a_kind_no_player_should_open_is_never_copied_or_opened(cx: &mut TestAppContext) {
+        let (window, hush, data, file) = open("refused", cx);
+        let file = Attachment {
+            content_type: "video/x-msdownload".into(),
+            file_name: Some("run.command".into()),
+            ..file
+        };
+        act(window, &hush, cx, |app, window, cx| app.view_once(&file, window, cx));
+        let error = hush.update(cx, |app, _| app.error.take()).unwrap_or_default();
+        assert_eq!(error, "Couldn't open the video: it isn't a kind of video Hush plays");
+        assert_eq!(copies(&data), 0, "nothing copied out");
+        assert!(hush.read_with(cx, |app, _| app.view_once.opening.is_none()
+            && app.view_once.viewer.is_none()));
         let _ = std::fs::remove_dir_all(&data);
     }
 
