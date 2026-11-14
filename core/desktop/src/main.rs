@@ -161,6 +161,8 @@ pub enum Demo {
     Stickers,
     /// The sticker picker open over it.
     StickerPicker,
+    /// The stories window over the chats, this many stories on from the first.
+    Stories(usize),
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -200,6 +202,11 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("typing", Demo::Typing),
                 ("stickers", Demo::Stickers),
                 ("sticker-picker", Demo::StickerPicker),
+                ("stories", Demo::Stories(0)),
+                ("story-text", Demo::Stories(1)),
+                ("story-photo", Demo::Stories(2)),
+                ("story-group", Demo::Stories(3)),
+                ("story-video", Demo::Stories(4)),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
