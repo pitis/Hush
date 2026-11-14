@@ -22,6 +22,7 @@ use crate::{key, text};
 
 mod actions;
 pub mod attach;
+pub mod backup;
 mod chats;
 pub mod compose;
 mod drafts;
@@ -193,6 +194,8 @@ pub struct Hush {
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
+    /// Back Up's or Restore's dialog, and the link screen's restore note.
+    backup: backup::Backup,
     stickers: stickers::Stickers,
     systray: systray::Systray,
 }
@@ -435,6 +438,7 @@ impl Hush {
             stories: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
+            backup: Default::default(),
             stickers: Default::default(),
             systray: Default::default(),
         }
@@ -449,9 +453,12 @@ impl Hush {
         app.names.extend(crate::demo::names());
         app.connection = ConnectionState::Online;
         match screen {
-            crate::Demo::Link => {
+            crate::Demo::Link | crate::Demo::Restored => {
                 app.screen = Screen::Link {
                     url: Some("sgnl://linkdevice?uuid=demo&pub_key=demo".into()),
+                };
+                if let crate::Demo::Restored = screen {
+                    app.demo_backup(true, window, cx);
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
@@ -466,7 +473,8 @@ impl Hush {
             | crate::Demo::GroupInfo
             | crate::Demo::EditGroup
             | crate::Demo::AddMembers
-            | crate::Demo::Typing => {
+            | crate::Demo::Typing
+            | crate::Demo::BackUp => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -493,6 +501,9 @@ impl Hush {
                 }
                 if let crate::Demo::Typing = screen {
                     app.demo_typing(cx);
+                }
+                if let crate::Demo::BackUp = screen {
+                    app.demo_backup(false, window, cx);
                 }
                 match screen {
                     crate::Demo::GroupInfo => app.demo_group(None, window, cx),
