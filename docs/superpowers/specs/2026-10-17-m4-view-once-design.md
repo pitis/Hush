@@ -20,9 +20,9 @@ with the phone (`SyncMessage.ViewOnceOpen{senderAci, senderAciBinary, timestamp}
   marks it viewed and deletes its attachments and files. Only an unviewed view-once message.
 - `Client.view_once_opened(key)` applies it and queues `Job::ViewOnceOpen`, which sends
   `view_once_open_sync` to our devices.
-- App: the bubble hides the attachment list for view-once media; the button links the file for
-  Quick Look (`Files.openable`) before telling the core, so the viewer keeps it after the core
-  deletes the original; the link goes when the preview closes.
+- App: the bubble hides the attachment list for view-once media; the button copies the file out,
+  decrypted, for Quick Look (`Files.openable`) before telling the core, so the viewer keeps it
+  after the core deletes the original; the copy goes when the preview closes.
 
 ## Not done
 - Expiring unopened view-once media after a while (Desktop drops them after 30 days).

@@ -962,16 +962,7 @@ async fn upload(
 ) -> Result<Vec<AttachmentPointer>, String> {
     let mut pointers = vec![];
     for &id in ids {
-        let a = db
-            .attachment(id)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("a file of the message is gone")?;
-        let path = a.path.ok_or("a file of the message is missing")?;
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+        let (a, bytes) = db.attachment_bytes(id).await?;
         let spec = AttachmentSpec {
             content_type: a.content_type,
             length: bytes.len(),

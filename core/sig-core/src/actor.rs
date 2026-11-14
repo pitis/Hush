@@ -314,6 +314,18 @@ async fn run(
             }
             Err(e) => tracing::warn!(error = %e, "renaming chat pictures failed"),
         }
+        // files from before they were encrypted, once (it holds up the open: nothing may read
+        // or write them meanwhile)
+        match projection.encrypt_files().await {
+            Ok(c) if c == Default::default() => {}
+            Ok(c) => tracing::info!(
+                encrypted = c.encrypted,
+                failed = c.failed,
+                missing = c.missing,
+                "files from before were encrypted"
+            ),
+            Err(e) => tracing::warn!(error = %e, "encrypting the files from before failed"),
+        }
         let store =
             SqliteStore::open_with_options(sqlite_options(&dir.join("presage.db"), &key)?, OnNewIdentity::Trust)
                 .await
@@ -679,7 +691,7 @@ async fn run(
             }
             Command::StickerPacks { done } => match &manager {
                 Some(m) => {
-                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join("stickers"));
+                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join(crate::files::STICKERS));
                     tokio::task::spawn_local(async move {
                         let packs = installed_packs(&store, &db, dir).await;
                         if let Err(e) = &packs {
@@ -698,7 +710,7 @@ async fn run(
                 done,
             } => match &manager {
                 Some(m) => {
-                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join("stickers"));
+                    let (store, db, dir) = (m.store().clone(), projection.clone(), dir.join(crate::files::STICKERS));
                     tokio::task::spawn_local(async move {
                         let _ = done.send(chosen_sticker(&store, &db, dir, pack_id, sticker_id).await);
                     });
@@ -1044,10 +1056,11 @@ async fn installed_packs(
                 continue;
             }
         };
-        let images = dir.clone();
-        let (pack, whole) = tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images))
-            .await
-            .map_err(|e| e.to_string())?;
+        let (images, keys) = (dir.clone(), db.clone());
+        let (pack, whole) =
+            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images, |p| keys.derived_key(p)))
+                .await
+                .map_err(|e| e.to_string())?;
         // one that isn't kept is read again next time, and sending from it reads presage's copy
         if whole {
             if let Err(e) = db.keep_sticker_pack(&pack).await {
@@ -1084,8 +1097,8 @@ async fn chosen_sticker(
             let Some(pack) = store.sticker_pack(&pack_id).await.map_err(|e| e.to_string())? else {
                 return Ok(None);
             };
-            let images = dir.clone();
-            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images).0)
+            let (images, keys) = (dir.clone(), db.clone());
+            tokio::task::spawn_blocking(move || crate::stickers::keep(&pack, &images, |p| keys.derived_key(p)).0)
                 .await
                 .map_err(|e| e.to_string())?
         }
@@ -2917,7 +2930,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let db = ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap()
+            .with_files(dir.join("attachments"));
+        let read = |path: &str| {
+            crate::files::Kept {
+                path: path.into(),
+                key: db.derived_key(std::path::Path::new(path)),
+            }
+            .read()
+            .unwrap()
+        };
         let pack = |title: &str| StickerPack {
             id: vec![1; 16],
             key: vec![2; 32],
@@ -2933,7 +2957,7 @@ mod tests {
                 }],
             },
         };
-        let stickers = dir.join("stickers");
+        let stickers = dir.join(crate::files::STICKERS);
         store.add_sticker_pack(&pack("Foxes")).await.unwrap();
 
         // an image that can't be written (a file where the pack's folder goes): not kept
@@ -2949,7 +2973,8 @@ mod tests {
 
         let listed = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(listed.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), ["Foxes"]);
-        assert_eq!(std::fs::read(&listed[0].stickers[0].path).unwrap(), b"fox");
+        assert_eq!(read(&listed[0].stickers[0].path), b"fox");
+        assert_ne!(std::fs::read(&listed[0].stickers[0].path).unwrap(), b"fox", "encrypted");
         // listed again from what Hush kept, not from presage's copy
         store.add_sticker_pack(&pack("Renamed")).await.unwrap();
         let again = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
@@ -2966,7 +2991,7 @@ mod tests {
         std::fs::remove_file(&listed[0].stickers[0].path).unwrap();
         let reread = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(reread[0].title, "Renamed");
-        assert_eq!(std::fs::read(&reread[0].stickers[0].path).unwrap(), b"fox");
+        assert_eq!(read(&reread[0].stickers[0].path), b"fox");
         // a pack removed on the phone is gone
         store.remove_sticker_pack(&[1; 16]).await.unwrap();
         assert!(super::installed_packs(&store, &db, stickers.clone())
@@ -2994,7 +3019,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let db = ProjectionDb::open("sqlite::memory:", None).await.unwrap();
+        let db = ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap()
+            .with_files(dir.join("attachments"));
         let sticker = |id, bytes: Option<&[u8]>| Sticker {
             id,
             emoji: None,
@@ -3015,7 +3043,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let stickers = dir.join("stickers");
+        let stickers = dir.join(crate::files::STICKERS);
 
         let listed = super::installed_packs(&store, &db, stickers.clone()).await.unwrap();
         assert_eq!(listed[0].stickers.iter().map(|s| s.id).collect::<Vec<_>>(), [0]);

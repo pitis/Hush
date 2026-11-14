@@ -66,6 +66,9 @@ pub struct Hush {
     names: HashMap<String, String>,
     /// ACIs whose name was asked for (asked again only after a failed lookup).
     asked: HashSet<String>,
+    /// Chats' pictures by their file, decrypted by the core (they are encrypted on disk); None
+    /// while asked for, or one that isn't a picture. One that didn't read is asked for again.
+    pictures: HashMap<String, Option<Arc<Image>>>,
     /// Unsent text of the chats that aren't open.
     /// shortcut: kept only while the app runs, and not shown in the chat list; the Mac app keeps
     /// them and shows "Draft: …".
@@ -217,6 +220,7 @@ impl Hush {
             messages_again: false,
             names: HashMap::new(),
             asked: HashSet::new(),
+            pictures: HashMap::new(),
             drafts: HashMap::new(),
             marking_read: None,
             window_active: window.is_window_active(),
@@ -399,7 +403,53 @@ impl Hush {
         let mut wanted: Vec<String> = authors.map(|c| c.last_message_author.clone()).collect();
         wanted.extend(self.chats.iter().flat_map(|c| mentioned(&c.last_message_ranges)));
         self.load_names(wanted, cx);
+        self.load_pictures(cx);
         self.mark_read(false, cx);
+    }
+
+    /// The chat list's pictures not asked for yet (a new picture is a new file).
+    fn load_pictures(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        let wanted: Vec<String> = self
+            .chats
+            .iter()
+            .filter_map(|c| c.avatar.clone())
+            .filter(|path| {
+                let new = !self.pictures.contains_key(path);
+                if new {
+                    self.pictures.insert(path.clone(), None);
+                }
+                new
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            for path in wanted {
+                let bytes = Compat::new(client.file_bytes(path.clone())).await;
+                let shown = this.update(cx, |app, cx| match bytes {
+                    Ok(b) => {
+                        let image = image_format(&b).map(|f| Arc::new(Image::from_bytes(f, b)));
+                        app.pictures.insert(path, image);
+                        cx.notify();
+                    }
+                    // the core logs why; the next refresh asks again
+                    Err(_) => {
+                        app.pictures.remove(&path);
+                    }
+                });
+                if shown.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The decrypted picture of a chat whose picture is `path`, once read.
+    pub(crate) fn picture(&self, path: &str) -> Option<Arc<Image>> {
+        self.pictures.get(path).cloned().flatten()
     }
 
     fn select(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -646,8 +696,40 @@ fn mentioned(ranges: &[sig_core::projection::BodyRange]) -> impl Iterator<Item =
     })
 }
 
+/// A picture's format from its first bytes, of those GPUI decodes from memory (as `img` of a
+/// file guessed them; chat pictures are JPEG, PNG, GIF or WebP).
+fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    match bytes {
+        [0xFF, 0xD8, 0xFF, ..] => Some(ImageFormat::Jpeg),
+        [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
+        [b'G', b'I', b'F', b'8', ..] => Some(ImageFormat::Gif),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some(ImageFormat::Webp),
+        [b'B', b'M', ..] => Some(ImageFormat::Bmp),
+        [b'I', b'I', 42, 0, ..] | [b'M', b'M', 0, 42, ..] => Some(ImageFormat::Tiff),
+        [0, 0, 1, 0, ..] => Some(ImageFormat::Ico),
+        [b'P', b'1'..=b'7', ..] => Some(ImageFormat::Pnm),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_pictures_format_is_told_by_its_first_bytes() {
+        use super::{image_format, ImageFormat};
+        assert_eq!(image_format(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(ImageFormat::Jpeg));
+        assert_eq!(image_format(b"\x89PNG\r\n"), Some(ImageFormat::Png));
+        assert_eq!(image_format(b"GIF89a"), Some(ImageFormat::Gif));
+        assert_eq!(image_format(b"RIFF\0\0\0\0WEBPVP8 "), Some(ImageFormat::Webp));
+        assert_eq!(image_format(b"BM6\0"), Some(ImageFormat::Bmp));
+        assert_eq!(image_format(b"II*\0"), Some(ImageFormat::Tiff));
+        assert_eq!(image_format(b"MM\0*"), Some(ImageFormat::Tiff));
+        assert_eq!(image_format(&[0, 0, 1, 0, 1, 0]), Some(ImageFormat::Ico));
+        assert_eq!(image_format(b"P6\n"), Some(ImageFormat::Pnm));
+        assert_eq!(image_format(b"HUSHFIL1"), None, "still encrypted: nothing to show");
+        assert_eq!(image_format(b""), None);
+    }
     use super::changed_rows;
 
     #[test]

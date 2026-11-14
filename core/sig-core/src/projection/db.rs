@@ -7,6 +7,7 @@ use sqlx::{ConnectOptions, Row};
 
 use super::model::*;
 use super::projector::Op;
+use crate::files::{self, FileKey, Kept};
 use crate::stickers::{KeptPack, KeptSticker};
 
 /// What applying an `Op` changed, for the UI.
@@ -68,7 +69,8 @@ pub enum GroupStanding {
 /// it holds a transaction: multi-step work goes through `&mut SqliteConnection` helpers.
 ///
 /// It also owns the attachments folder (`with_files`): files are written and removed together
-/// with their rows, so a message deleted for everyone leaves nothing behind.
+/// with their rows, so a message deleted for everyone leaves nothing behind. Each file is
+/// encrypted under its own key, kept in its row (`files`, `kept`).
 #[derive(Clone)]
 pub struct ProjectionDb {
     pool: SqlitePool,
@@ -82,6 +84,18 @@ pub struct ProjectionDb {
 
 /// Signal's limit for one attachment: larger ones are neither sent nor downloaded.
 pub const MAX_ATTACHMENT: u64 = 100 * 1024 * 1024;
+
+/// What `encrypt_files` did: files encrypted, files that couldn't be (tried again at the next
+/// start), and rows whose file was gone (marked to be fetched again).
+#[derive(Debug, Default, PartialEq)]
+pub struct Encrypted {
+    pub encrypted: u64,
+    pub failed: u64,
+    pub missing: u64,
+}
+
+/// Files encrypted between two writes out to the drive (`encrypt_files`).
+const ENCRYPT_BATCH: usize = 64;
 
 /// A message whose disappearing timer ran out (see `delete_expired`).
 #[derive(Debug, Clone, PartialEq)]
@@ -220,6 +234,14 @@ impl ProjectionDb {
             .collect())
     }
 
+    /// A kept file's plaintext, for tests; it must be encrypted on disk.
+    #[cfg(test)]
+    pub(crate) async fn plain(&self, path: impl AsRef<str>) -> Vec<u8> {
+        let kept = self.kept(std::path::Path::new(path.as_ref())).await.unwrap();
+        assert!(kept.key.is_some(), "{} is encrypted", path.as_ref());
+        kept.read().unwrap()
+    }
+
     /// For tests that set up rows no public call makes.
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &sqlx::SqlitePool {
@@ -272,7 +294,9 @@ impl ProjectionDb {
         let names: Vec<(String,)> = sqlx::query_as("SELECT file FROM attachments WHERE file IS NOT NULL")
             .fetch_all(&self.pool)
             .await?;
-        if !names.iter().all(|(n,)| plain(n)) {
+        // a file of two rows would be one key's and read with another's
+        let mut seen = std::collections::HashSet::new();
+        if !names.iter().all(|(n,)| plain(n) && seen.insert(n.clone())) {
             return Ok(false);
         }
         let avatars: Vec<(String, String)> =
@@ -281,20 +305,141 @@ impl ProjectionDb {
                 .await?;
         for (id, avatar) in avatars {
             let name = std::path::Path::new(&avatar).file_name().and_then(|n| n.to_str());
-            if !name.is_some_and(|n| plain(n) && files.join(n).is_file()) {
-                sqlx::query("UPDATE conversations SET avatar = NULL, avatar_checked_at = 0 WHERE id = ?1")
-                    .bind(&id)
-                    .execute(&self.pool)
-                    .await?;
+            if !name.is_some_and(|n| plain(n) && files.join(n).is_file() && seen.insert(n.to_owned())) {
+                sqlx::query(
+                    "UPDATE conversations SET avatar = NULL, avatar_key = NULL, avatar_checked_at = 0 WHERE id = ?1",
+                )
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
             }
         }
         Ok(true)
     }
 
-    /// Keeps attachment files in `dir` (created when the first one is written).
+    /// Keeps attachment files in `dir` (created when the first one is written), a folder of the
+    /// data folder: sticker images and preview images are beside it (`files::STICKERS`, `PREVIEWS`).
     pub fn with_files(mut self, dir: PathBuf) -> Self {
         self.files = Some(dir);
         self
+    }
+
+    /// The file at `path` and its key, to read it: an attachment's or a chat picture's own (none
+    /// for one from before files were encrypted), a sticker image's or a preview image's derived
+    /// (`derived_key`). A path outside those folders is a file of the user's, plain. Errors if
+    /// no attachment or chat has the file (deleted since).
+    pub(crate) async fn kept(&self, path: &std::path::Path) -> Result<Kept, sqlx::Error> {
+        let kept = |key| Kept {
+            path: path.to_path_buf(),
+            key,
+        };
+        let name = self.files.as_ref().and_then(|dir| path.strip_prefix(dir).ok());
+        let Some(name) = name else {
+            return Ok(kept(self.derived_key(path)));
+        };
+        let key: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+            "SELECT file_key FROM attachments WHERE file = ?1
+             UNION ALL SELECT avatar_key FROM conversations WHERE avatar = ?2 LIMIT 1",
+        )
+        .bind(name.to_string_lossy())
+        .bind(path.to_string_lossy())
+        .fetch_optional(&self.pool)
+        .await?;
+        let key = key.ok_or(sqlx::Error::RowNotFound)?;
+        Ok(kept(key.map(file_key).transpose()?))
+    }
+
+    /// The key of a sticker image or a draft's preview image (`files::STICKERS`, `PREVIEWS`):
+    /// this install's key's hash of its place there, as they are copies of presage's or live only
+    /// until sent, so no row keeps them (a sticker's image never changes; the salt makes each
+    /// write's key new anyway). None for a path elsewhere.
+    pub(crate) fn derived_key(&self, path: &std::path::Path) -> Option<FileKey> {
+        use hmac::{Hmac, KeyInit, Mac};
+        let root = self.files.as_ref()?.parent()?;
+        let (folder, rest) = [files::STICKERS, files::PREVIEWS]
+            .into_iter()
+            .find_map(|f| path.strip_prefix(root.join(f)).ok().map(|rest| (f, rest)))?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.id_key).expect("HMAC takes any key length");
+        // its own label: never another use's hash of the same key (`opaque_id`)
+        mac.update(b"hush file key\0");
+        mac.update(format!("{folder}/{}", rest.to_string_lossy()).as_bytes());
+        Some(mac.finalize().into_bytes().into())
+    }
+
+    /// Encrypts the attachments and chat pictures written before files were, each under its own
+    /// new key and a new name (`files::ENCRYPTED` added): the copy is checked against the plain
+    /// file and written out to the disk, its row takes the new name and key (a batch's rows in
+    /// one transaction, its commit written out to the drive too), and only then the plain file
+    /// goes. At open, before anything reads or writes them. Safe to interrupt: an encrypted copy no
+    /// row names (cut short) goes, to be made again, and a plain file whose row names its copy
+    /// goes. One that can't be encrypted stays plain, and readable, until the next start; one
+    /// whose file is gone is marked to be fetched again.
+    pub async fn encrypt_files(&self) -> Result<Encrypted, sqlx::Error> {
+        let Some(dir) = self.files.clone() else {
+            return Ok(Encrypted::default());
+        };
+        let attachments: Vec<(i64, String, bool)> =
+            sqlx::query_as("SELECT id, file, file_key IS NOT NULL FROM attachments WHERE file IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        let avatars: Vec<(String, String, bool)> =
+            sqlx::query_as("SELECT id, avatar, avatar_key IS NOT NULL FROM conversations WHERE avatar IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        let name_of = |path: &str| {
+            let name = std::path::Path::new(path).file_name()?.to_str()?;
+            Some(name.to_owned())
+        };
+        // every name a row has, wherever the file is (a picture not moved in yet is still its)
+        let named: std::collections::HashSet<String> = attachments
+            .iter()
+            .map(|(_, f, _)| f.clone())
+            .chain(avatars.iter().filter_map(|(_, p, _)| name_of(p)))
+            .collect();
+        let folder = dir.clone();
+        tokio::task::spawn_blocking(move || remove_encryption_leftovers(&folder, &named))
+            .await
+            .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))?;
+        let mut seen = std::collections::HashSet::new();
+        let todo: Vec<(Owner, String)> = attachments
+            .into_iter()
+            .filter(|(_, _, sealed)| !sealed)
+            .map(|(id, file, _)| (Owner::Attachment(id), file))
+            .chain(
+                avatars
+                    .into_iter()
+                    // pictures in the folder only: one left elsewhere (not moved in yet) waits
+                    .filter(|(_, path, sealed)| !sealed && std::path::Path::new(path).parent() == Some(dir.as_path()))
+                    .filter_map(|(id, path, _)| Some((name_of(&path)?, Owner::Chat(id, path))))
+                    .map(|(name, owner)| (owner, name)),
+            )
+            // a file two rows name (only a crafted backup could): encrypted for the first
+            .filter(|(_, name)| seen.insert(name.clone()))
+            .collect();
+        let mut counts = Encrypted::default();
+        for batch in todo.chunks(ENCRYPT_BATCH) {
+            let (folder, names) = (dir.clone(), batch.iter().map(|(_, n)| n.clone()).collect());
+            let copies =
+                tokio::task::spawn_blocking(move || encrypted_copies(&folder, names, |p| files::sync(p, true)))
+                    .await
+                    .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))?;
+            let mut conn = self.pool.acquire().await?;
+            // the commit out to the drive (F_FULLFSYNC on Apple platforms) before a plain file goes
+            sqlx::query("PRAGMA fullfsync = ON").execute(&mut *conn).await?;
+            let took = take_copies(&mut conn, &dir, batch, &copies).await;
+            sqlx::query("PRAGMA fullfsync = OFF").execute(&mut *conn).await?;
+            let took = took?;
+            drop(conn);
+            for (((_, plain), copied), took) in batch.iter().zip(copies).zip(took) {
+                let new = format!("{plain}{}", files::ENCRYPTED);
+                match copied {
+                    Copied::Key(_) => counts.encrypted += finish_encrypting(&dir, plain, &new, took),
+                    Copied::Missing => counts.missing += took,
+                    Copied::Failed => counts.failed += 1,
+                }
+            }
+        }
+        Ok(counts)
     }
 
     /// Stores a group as presage has it at `revision`: its title (an empty one never replaces a
@@ -687,7 +832,17 @@ impl ProjectionDb {
             .await?
             .flatten();
         let same = match (&old, bytes) {
-            (Some(path), Some(bytes)) => std::fs::read(path).is_ok_and(|b| b == bytes),
+            (Some(path), Some(bytes)) => match self.kept(std::path::Path::new(path)).await.map(|k| k.read()) {
+                Ok(Ok(old)) => old == bytes,
+                Ok(Err(e)) => {
+                    tracing::warn!(chat = %self.opaque_id(id), error = %e, "a chat picture didn't read; it is written again");
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(chat = %self.opaque_id(id), error = %e, "a chat picture's key didn't read; it is written again");
+                    false
+                }
+            },
             (None, None) => true,
             _ => false,
         };
@@ -695,16 +850,17 @@ impl ProjectionDb {
             self.set_avatar_checked(id, now_ms).await?;
             return Ok(false);
         }
+        let key = files::new_key();
         let path = match bytes {
             Some(bytes) => {
                 std::fs::create_dir_all(&dir)?;
                 let path = dir.join(self.avatar_name(id, now_ms));
-                std::fs::write(&path, bytes)?;
+                files::seal(bytes, &path, &key)?;
                 Some(path.to_string_lossy().into_owned())
             }
             None => None,
         };
-        self.set_avatar(id, path.as_deref(), now_ms).await?;
+        self.set_avatar(id, path.as_deref().map(|p| (p, &key)), now_ms).await?;
         if let Some(old) = old {
             let _ = std::fs::remove_file(old);
         }
@@ -791,16 +947,24 @@ impl ProjectionDb {
         Ok(())
     }
 
-    /// Stores a chat's picture (None: it has none) as looked for at `now_ms`. True if the
-    /// picture changed.
-    pub async fn set_avatar(&self, id: &str, path: Option<&str>, now_ms: i64) -> Result<bool, sqlx::Error> {
-        let changed = sqlx::query("UPDATE conversations SET avatar = ?2 WHERE id = ?1 AND avatar IS NOT ?2")
-            .bind(id)
-            .bind(path)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-            == 1;
+    /// Stores a chat's picture, its file and that file's key (None: it has none), as looked for
+    /// at `now_ms`. True if the picture changed.
+    pub(crate) async fn set_avatar(
+        &self,
+        id: &str,
+        file: Option<(&str, &FileKey)>,
+        now_ms: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let (path, key) = file.unzip();
+        let changed =
+            sqlx::query("UPDATE conversations SET avatar = ?2, avatar_key = ?3 WHERE id = ?1 AND avatar IS NOT ?2")
+                .bind(id)
+                .bind(path)
+                .bind(key.map(|k| k.as_slice()))
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                == 1;
         sqlx::query("UPDATE conversations SET avatar_checked_at = ?2 WHERE id = ?1")
             .bind(id)
             .bind(now_ms)
@@ -1464,12 +1628,15 @@ impl ProjectionDb {
         // off the async threads, so the one database connection isn't held meanwhile.
         // the preview's image is copied last, as position -1 (a preview image's place)
         let preview_image = preview.and_then(|p| p.image.as_ref());
-        let sources: Vec<String> = files.iter().chain(preview_image).map(|f| f.path.clone()).collect();
+        let mut sources = vec![];
+        for f in files.iter().chain(preview_image) {
+            sources.push(self.kept(std::path::Path::new(&f.path)).await?);
+        }
         let (copy_dir, sent_at) = (dir.clone(), m.sent_at);
         let staged = tokio::task::spawn_blocking(move || stage_copies(&copy_dir, sent_at, &sources))
             .await
             .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))??;
-        let mut names: Vec<String> = staged.iter().map(|(name, _)| name.clone()).collect();
+        let mut names: Vec<String> = staged.iter().map(|(name, _, _)| name.clone()).collect();
         let mut tx = self.pool.begin().await?;
         let result = async {
             if !insert_message_in(&mut tx, m).await? {
@@ -1481,9 +1648,10 @@ impl ProjectionDb {
                 let file = id.to_string();
                 std::fs::rename(dir.join(&names[i]), dir.join(&file))?;
                 names[i] = file.clone();
-                sqlx::query("UPDATE attachments SET file = ?2 WHERE id = ?1")
+                sqlx::query("UPDATE attachments SET file = ?2, file_key = ?3 WHERE id = ?1")
                     .bind(id)
                     .bind(&file)
+                    .bind(staged[i].2.as_slice())
                     .execute(&mut *tx)
                     .await?;
             }
@@ -2657,6 +2825,26 @@ impl ProjectionDb {
         rows.iter().map(|r| self.row_to_attachment(r)).collect()
     }
 
+    /// An attachment and its file's plaintext, to upload it (the upload encrypts it for the
+    /// recipients itself); an error says why it can't be.
+    pub(crate) async fn attachment_bytes(&self, id: i64) -> Result<(Attachment, Vec<u8>), String> {
+        let a = self
+            .attachment(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("a file of the message is gone")?;
+        let path = a.path.clone().ok_or("a file of the message is missing")?;
+        let kept = self
+            .kept(std::path::Path::new(&path))
+            .await
+            .map_err(|e| e.to_string())?;
+        let bytes = tokio::task::spawn_blocking(move || kept.read())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        Ok((a, bytes))
+    }
+
     pub async fn attachment(&self, id: i64) -> Result<Option<Attachment>, sqlx::Error> {
         let row = sqlx::query("SELECT * FROM attachments WHERE id = ?1")
             .bind(id)
@@ -2743,13 +2931,14 @@ impl ProjectionDb {
         data: Result<Vec<u8>, String>,
     ) -> Result<Option<(String, MessageKey)>, sqlx::Error> {
         let file = id.to_string();
+        let key = files::new_key();
         // the file is named by the id, which is never reused (AUTOINCREMENT): it is this
         // attachment's own, even if its message was deleted meanwhile
         let written = match (data, self.files.clone()) {
             (Ok(bytes), Some(dir)) => {
                 let path = dir.join(&file);
                 let wrote = tokio::task::spawn_blocking(move || {
-                    std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(path, bytes))
+                    std::fs::create_dir_all(&dir).and_then(|_| files::seal(bytes.as_slice(), &path, &key).map(|_| ()))
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -2768,13 +2957,14 @@ impl ProjectionDb {
         };
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, i64)> = sqlx::query_as(
-            "UPDATE attachments SET state = ?2, file = ?3 WHERE id = ?1 AND state = ?4
+            "UPDATE attachments SET state = ?2, file = ?3, file_key = ?5 WHERE id = ?1 AND state = ?4
              RETURNING message_author, message_sent_at",
         )
         .bind(id)
         .bind(state.to_i64())
         .bind(&file)
         .bind(AttachmentState::Downloading.to_i64())
+        .bind(file.as_ref().map(|_| key.as_slice()))
         .fetch_optional(&mut *tx)
         .await?;
         let Some((author, sent_at)) = row else {
@@ -3522,17 +3712,19 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     Ok(inserted)
 }
 
-/// Copies files into `dir` under temporary names; all or none. Returns each name and size.
-fn stage_copies(dir: &std::path::Path, sent_at: i64, sources: &[String]) -> std::io::Result<Vec<(String, u64)>> {
+/// Copies files into `dir` under temporary names, each encrypted under a new key; all or none.
+/// Returns each name, size and key.
+fn stage_copies(dir: &std::path::Path, sent_at: i64, sources: &[Kept]) -> std::io::Result<Vec<(String, u64, FileKey)>> {
     std::fs::create_dir_all(dir)?;
     let mut staged = vec![];
     for (i, source) in sources.iter().enumerate() {
         let name = format!("{sent_at}-{i}.part");
-        match std::fs::copy(source, dir.join(&name)) {
-            Ok(size) => staged.push((name, size)),
+        let key = files::new_key();
+        match source.reader().and_then(|r| files::seal(r, &dir.join(&name), &key)) {
+            Ok(size) => staged.push((name, size, key)),
             Err(e) => {
                 let _ = std::fs::remove_file(dir.join(&name));
-                for (n, _) in &staged {
+                for (n, _, _) in &staged {
                     let _ = std::fs::remove_file(dir.join(n));
                 }
                 return Err(e);
@@ -3540,6 +3732,196 @@ fn stage_copies(dir: &std::path::Path, sent_at: i64, sources: &[String]) -> std:
         }
     }
     Ok(staged)
+}
+
+/// A key as a row keeps it.
+fn file_key(bytes: Vec<u8>) -> Result<FileKey, sqlx::Error> {
+    bytes.try_into().map_err(|_| decode_err("file key".into()))
+}
+
+/// What an encryption run cut short left in `dir`, whose files rows name (`named`): an
+/// encrypted copy no row names yet goes, and so does a plain file once its row names its copy.
+fn remove_encryption_leftovers(dir: &std::path::Path, named: &std::collections::HashSet<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, "the files' folder couldn't be listed for what encrypting left");
+            }
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(plain) = name.strip_suffix(files::ENCRYPTED) else {
+            continue;
+        };
+        let gone = if !named.contains(&name) {
+            entry.path()
+        } else if !named.contains(plain) {
+            dir.join(plain)
+        } else {
+            continue;
+        };
+        match std::fs::remove_file(&gone) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(error = %e, "a file left by encrypting couldn't be removed")
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A file from before encryption: whose it is (a chat picture's by its path).
+enum Owner {
+    Attachment(i64),
+    Chat(String, String),
+}
+
+/// How encrypting a plain file went (`encrypted_copies`).
+enum Copied {
+    /// Its copy is written, checked and on the disk, under this key.
+    Key(FileKey),
+    /// It is gone.
+    Missing,
+    /// It stays as it is, for the next start.
+    Failed,
+}
+
+/// Writes each plain file's encrypted copy in `dir` (its name and `files::ENCRYPTED`), checked
+/// against it, all out to the disk for good (`flush`, given the last copy, writes the drive's
+/// cache out): no row may name a copy a power cut could still take. A file that fails has no copy.
+/// Blocking.
+fn encrypted_copies(
+    dir: &std::path::Path,
+    names: Vec<String>,
+    flush: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> Vec<Copied> {
+    let copy = |name: &String| {
+        let (plain, new) = (dir.join(name), dir.join(format!("{name}{}", files::ENCRYPTED)));
+        let source = match std::fs::File::open(&plain) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Copied::Missing,
+            Err(e) => {
+                tracing::warn!(file = %name, error = %e, "a file couldn't be read to encrypt; it stays as it was");
+                return Copied::Failed;
+            }
+        };
+        let key = files::new_key();
+        let copied = files::seal(source, &new, &key)
+            .and_then(|_| files::sync(&new, false))
+            .and_then(
+                |()| match files::same(std::fs::File::open(&plain)?, files::open(&new, &key)?)? {
+                    true => Ok(()),
+                    false => Err(std::io::Error::other("its encrypted copy reads differently")),
+                },
+            );
+        match copied {
+            Ok(()) => Copied::Key(key),
+            Err(e) => {
+                tracing::warn!(file = %name, error = %e, "a file couldn't be encrypted; it stays as it was");
+                remove_copy(&new);
+                Copied::Failed
+            }
+        }
+    };
+    let mut copies: Vec<Copied> = names.iter().map(copy).collect();
+    let last = names
+        .iter()
+        .zip(&copies)
+        .rev()
+        .find(|(_, c)| matches!(c, Copied::Key(_)));
+    if let Some((name, _)) = last {
+        // the folder's new names too, where a folder can be written out
+        #[cfg(unix)]
+        let flushed = files::sync(dir, false).and_then(|()| flush(&dir.join(format!("{name}{}", files::ENCRYPTED))));
+        #[cfg(not(unix))]
+        let flushed = flush(&dir.join(format!("{name}{}", files::ENCRYPTED)));
+        if let Err(e) = flushed {
+            tracing::warn!(error = %e, "encrypted files couldn't be written out; they wait for the next start");
+            for (name, copied) in names.iter().zip(&mut copies) {
+                if matches!(copied, Copied::Key(_)) {
+                    remove_copy(&dir.join(format!("{name}{}", files::ENCRYPTED)));
+                    *copied = Copied::Failed;
+                }
+            }
+        }
+    }
+    copies
+}
+
+/// Removes an encrypted copy no row will name.
+fn remove_copy(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            // next start's `remove_encryption_leftovers` tries again
+            tracing::warn!(error = %e, "an encrypted copy couldn't be removed")
+        }
+        _ => {}
+    }
+}
+
+/// The rows of a batch take their encrypted copies (a row whose file was gone is marked to be
+/// fetched again), in one transaction. Whether each one did (1) or had changed meanwhile (0).
+async fn take_copies(
+    conn: &mut SqliteConnection,
+    dir: &std::path::Path,
+    batch: &[(Owner, String)],
+    copies: &[Copied],
+) -> Result<Vec<u64>, sqlx::Error> {
+    use sqlx::Connection;
+    let mut tx = conn.begin().await?;
+    let mut took = vec![];
+    for ((owner, plain), copied) in batch.iter().zip(copies) {
+        let new = format!("{plain}{}", files::ENCRYPTED);
+        let query = match (owner, copied) {
+            (_, Copied::Failed) => {
+                took.push(0);
+                continue;
+            }
+            (Owner::Attachment(id), Copied::Key(key)) => sqlx::query(
+                "UPDATE attachments SET file = ?3, file_key = ?4 WHERE id = ?1 AND file = ?2 AND file_key IS NULL",
+            )
+            .bind(id)
+            .bind(plain)
+            .bind(new)
+            .bind(key.to_vec()),
+            (Owner::Chat(id, path), Copied::Key(key)) => sqlx::query(
+                "UPDATE conversations SET avatar = ?3, avatar_key = ?4 WHERE id = ?1 AND avatar = ?2 AND avatar_key IS NULL",
+            )
+            .bind(id)
+            .bind(path)
+            .bind(dir.join(&new).to_string_lossy().into_owned())
+            .bind(key.to_vec()),
+            // its file gone: Failed, to be downloaded again (if it can be)
+            (Owner::Attachment(id), Copied::Missing) => sqlx::query(
+                "UPDATE attachments SET file = NULL, state = ?3 WHERE id = ?1 AND file = ?2 AND file_key IS NULL",
+            )
+            .bind(id)
+            .bind(plain)
+            .bind(AttachmentState::Failed.to_i64()),
+            // looked for again, as `rename_avatars` does
+            (Owner::Chat(id, path), Copied::Missing) => sqlx::query(
+                "UPDATE conversations SET avatar = NULL, avatar_checked_at = 0 WHERE id = ?1 AND avatar = ?2 AND avatar_key IS NULL",
+            )
+            .bind(id)
+            .bind(path),
+        };
+        took.push(query.execute(&mut *tx).await?.rows_affected());
+    }
+    tx.commit().await?;
+    Ok(took)
+}
+
+/// After a row took (`took` 1) or didn't take (gone meanwhile) the encrypted copy `new` of
+/// `plain`: the file it doesn't name goes. 1 if it took.
+fn finish_encrypting(dir: &std::path::Path, plain: &str, new: &str, took: u64) -> u64 {
+    let gone = dir.join(if took == 1 { plain } else { new });
+    if let Err(e) = std::fs::remove_file(gone) {
+        // next start's `remove_encryption_leftovers` tries again
+        tracing::warn!(error = %e, "a file left by encrypting couldn't be removed");
+    }
+    took
 }
 
 /// The row of one of our files (Ready, its copy named by the returned id once renamed).
@@ -5836,7 +6218,10 @@ mod tests {
             vec!["g:00", "c:alice"],
             "newest first"
         );
-        assert!(db.set_avatar("c:alice", Some("/data/avatars/a"), day).await.unwrap());
+        assert!(db
+            .set_avatar("c:alice", Some(("/data/avatars/a", &[1; 32])), day)
+            .await
+            .unwrap());
         db.set_avatar("g:00", None, day).await.unwrap(); // none set
         assert_eq!(conv(&db, "c:alice").await.avatar.as_deref(), Some("/data/avatars/a"));
         assert_eq!(conv(&db, "g:00").await.avatar, None);
@@ -5851,7 +6236,7 @@ mod tests {
         );
         // unchanged: no announcement needed
         assert!(!db
-            .set_avatar("c:alice", Some("/data/avatars/a"), 2 * day)
+            .set_avatar("c:alice", Some(("/data/avatars/a", &[1; 32])), 2 * day)
             .await
             .unwrap());
     }
@@ -5863,7 +6248,7 @@ mod tests {
         db.insert_message(&msg("alice", 1, "hi")).await.unwrap();
         assert!(db.store_avatar("c:alice", Some(b"jpeg"), 1).await.unwrap());
         let path = conv(&db, "c:alice").await.avatar.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"jpeg");
+        assert_eq!(db.plain(&path).await, b"jpeg");
         assert!(
             !db.store_avatar("c:alice", Some(b"jpeg"), 2).await.unwrap(),
             "the same picture"
@@ -6878,7 +7263,7 @@ mod tests {
         let a = db.attachment(a.id).await.unwrap().unwrap();
         assert_eq!(a.state, AttachmentState::Ready);
         let path = a.path.clone().unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"jpg");
+        assert_eq!(db.plain(&path).await, b"jpg");
         assert!(db.start_download(a.id).await.unwrap().is_none(), "already there");
         // a corrupt download fails; it can be tried again
         db.start_download(b.id).await.unwrap().unwrap();
@@ -6902,6 +7287,370 @@ mod tests {
         db.apply(&Op::Delete { target: k("alice", 1) }).await.unwrap();
         assert!(db.attachments(&k("alice", 1)).await.unwrap().is_empty());
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    /// As an older Hush left them: alice's message 1 with a downloaded photo, and her chat's
+    /// picture, both plain. Returns the photo's id and the picture's path.
+    async fn files_from_before(db: &ProjectionDb, dir: &std::path::Path) -> (i64, String) {
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
+        db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        let id = db.attachments(&k("alice", 1)).await.unwrap()[0].id;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(id.to_string()), PHOTO).unwrap();
+        sqlx::query("UPDATE attachments SET state = ?2, file = ?3 WHERE id = ?1")
+            .bind(id)
+            .bind(AttachmentState::Ready.to_i64())
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let avatar = dir.join(db.avatar_name("c:alice", 1)).to_string_lossy().into_owned();
+        std::fs::write(&avatar, FACE).unwrap();
+        sqlx::query("UPDATE conversations SET avatar = ?1 WHERE id = 'c:alice'")
+            .bind(&avatar)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        (id, avatar)
+    }
+
+    fn done(encrypted: u64, failed: u64, missing: u64) -> Encrypted {
+        Encrypted {
+            encrypted,
+            failed,
+            missing,
+        }
+    }
+
+    const PHOTO: &[u8] = b"a photo of the beach";
+    const FACE: &[u8] = b"alice's face";
+
+    #[tokio::test]
+    async fn files_from_before_are_encrypted_once_under_new_names_and_read_as_they_are_until_then() {
+        let files = TempFiles::new("encrypt");
+        let db = db().await.with_files(files.0.clone());
+        let (id, avatar) = files_from_before(&db, &files.0).await;
+        let old = db.attachment(id).await.unwrap().unwrap().path.unwrap();
+        let before = db.kept(std::path::Path::new(&old)).await.unwrap();
+        assert!(before.key.is_none());
+        assert_eq!(before.read().unwrap(), PHOTO);
+        assert_eq!(
+            db.kept(std::path::Path::new(&avatar)).await.unwrap().read().unwrap(),
+            FACE
+        );
+        assert!(db.kept(&files.0.join("nobody's")).await.is_err(), "no row has it");
+
+        assert_eq!(db.encrypt_files().await.unwrap(), done(2, 0, 0));
+        let path = db.attachment(id).await.unwrap().unwrap().path.unwrap();
+        assert_eq!(path, format!("{old}.enc"));
+        assert_eq!(db.plain(&path).await, PHOTO);
+        let picture = conv(&db, "c:alice").await.avatar.unwrap();
+        assert_eq!(picture, format!("{avatar}.enc"));
+        assert_eq!(db.plain(&picture).await, FACE);
+        let mut left: Vec<_> = std::fs::read_dir(&files.0)
+            .unwrap()
+            .map(|e| e.unwrap().path().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [path.clone(), picture.clone()], "the plain files went");
+        for f in &left {
+            let bytes = std::fs::read(f).unwrap();
+            assert!(!bytes.windows(8).any(|w| w == &PHOTO[..8] || w == &FACE[..8]), "{f}");
+        }
+        assert_eq!(db.encrypt_files().await.unwrap(), done(0, 0, 0), "once");
+        assert_eq!(db.plain(&path).await, PHOTO);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_encryption_is_finished_by_the_next_start() {
+        let files = TempFiles::new("encrypt-cut");
+        let db = db().await.with_files(files.0.clone());
+        let (id, avatar) = files_from_before(&db, &files.0).await;
+        let (plain, copy) = (files.0.join(id.to_string()), files.0.join(format!("{id}.enc")));
+        // cut short while the copy was written, and after it was but before its row took it
+        std::fs::write(&copy, b"HUSHFIL1 cut").unwrap();
+        crate::files::seal(FACE, std::path::Path::new(&format!("{avatar}.enc")), &[9; 32]).unwrap();
+        // a copy whose message went before the next start
+        std::fs::write(files.0.join("99.enc"), b"HUSHFIL1").unwrap();
+
+        assert_eq!(db.encrypt_files().await.unwrap(), done(2, 0, 0));
+        assert_eq!(db.plain(copy.to_string_lossy()).await, PHOTO);
+        assert_eq!(db.plain(format!("{avatar}.enc")).await, FACE);
+        assert!(!files.0.join("99.enc").exists());
+
+        // cut short after the rows took the copies, before the plain files went
+        std::fs::write(&plain, PHOTO).unwrap();
+        std::fs::write(&avatar, FACE).unwrap();
+        assert_eq!(db.encrypt_files().await.unwrap(), done(0, 0, 0));
+        assert!(!plain.exists() && !std::path::Path::new(&avatar).exists());
+        assert_eq!(db.plain(copy.to_string_lossy()).await, PHOTO, "the copy stays");
+        assert_eq!(db.plain(format!("{avatar}.enc")).await, FACE);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cant_be_encrypted_stays_readable_and_is_tried_again() {
+        let files = TempFiles::new("encrypt-fail");
+        let db = db().await.with_files(files.0.clone());
+        let (id, _) = files_from_before(&db, &files.0).await;
+        // something in the way of its copy
+        let blocker = files.0.join(format!("{id}.enc"));
+        std::fs::create_dir(&blocker).unwrap();
+        assert_eq!(db.encrypt_files().await.unwrap(), done(1, 1, 0), "the picture still is");
+        let path = db.attachment(id).await.unwrap().unwrap().path.unwrap();
+        assert_eq!(path, files.0.join(id.to_string()).to_string_lossy());
+        let kept = db.kept(std::path::Path::new(&path)).await.unwrap();
+        assert!(kept.key.is_none());
+        assert_eq!(kept.read().unwrap(), PHOTO);
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(db.encrypt_files().await.unwrap(), done(1, 0, 0), "the next start");
+        assert_eq!(db.plain(format!("{path}.enc")).await, PHOTO);
+    }
+
+    /// alice's message 2 with `n` downloaded files from before, plain; their ids.
+    async fn many_from_before(db: &ProjectionDb, dir: &std::path::Path, n: usize) -> Vec<i64> {
+        db.insert_message(&msg("alice", 2, "x")).await.unwrap();
+        let all = (0..n).map(|_| new_attachment("image/jpeg", 3, false)).collect();
+        db.apply(&add(k("alice", 2), all, None)).await.unwrap();
+        let ids: Vec<i64> = db
+            .attachments(&k("alice", 2))
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        std::fs::create_dir_all(dir).unwrap();
+        for id in &ids {
+            std::fs::write(dir.join(id.to_string()), format!("photo {id}")).unwrap();
+            sqlx::query("UPDATE attachments SET state = ?2, file = ?3 WHERE id = ?1")
+                .bind(id)
+                .bind(AttachmentState::Ready.to_i64())
+                .bind(id.to_string())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        ids
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn files_across_batches_are_encrypted_but_those_in_the_way_and_gone_ones_are_marked() {
+        let files = TempFiles::new("encrypt-batches");
+        let db = db().await.with_files(files.0.clone());
+        let ids = many_from_before(&db, &files.0, 130).await;
+        // in the way mid-batch; unreadable, the last of the first batch (so no copy of it is
+        // there to write the batch out to the drive with)
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(files.0.join(format!("{}.enc", ids[10]))).unwrap();
+        let last = files.0.join(ids[ENCRYPT_BATCH - 1].to_string());
+        std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // gone before it could be encrypted
+        std::fs::remove_file(files.0.join(ids[100].to_string())).unwrap();
+
+        assert_eq!(db.encrypt_files().await.unwrap(), done(127, 2, 1));
+        for (i, id) in ids.iter().enumerate() {
+            let a = db.attachment(*id).await.unwrap().unwrap();
+            match i {
+                10 | 63 => {
+                    std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o600)).unwrap();
+                    let kept = db.kept(std::path::Path::new(a.path.as_ref().unwrap())).await.unwrap();
+                    assert!(kept.key.is_none(), "{i} stays plain");
+                    assert_eq!(kept.read().unwrap(), format!("photo {id}").as_bytes());
+                }
+                100 => assert_eq!((a.state, a.path), (AttachmentState::Failed, None), "to fetch again"),
+                _ => assert_eq!(db.plain(a.path.unwrap()).await, format!("photo {id}").as_bytes(), "{i}"),
+            }
+        }
+        // each under a key of its own
+        let keys: std::collections::HashSet<Vec<u8>> =
+            sqlx::query_scalar("SELECT file_key FROM attachments WHERE file_key IS NOT NULL")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        assert_eq!(keys.len(), 127);
+        std::fs::remove_dir(files.0.join(format!("{}.enc", ids[10]))).unwrap();
+        assert_eq!(db.encrypt_files().await.unwrap(), done(2, 0, 0), "the next start");
+    }
+
+    #[test]
+    fn a_batch_that_cant_be_written_out_to_the_drive_leaves_its_files_as_they_were() {
+        let files = TempFiles::new("encrypt-flush");
+        std::fs::create_dir_all(&files.0).unwrap();
+        for name in ["1", "2"] {
+            std::fs::write(files.0.join(name), PHOTO).unwrap();
+        }
+        let names = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        let copies = encrypted_copies(&files.0, names, |_| Err(std::io::Error::other("the disk")));
+        assert!(matches!(copies[..], [Copied::Failed, Copied::Failed, Copied::Missing]));
+        let mut left: Vec<_> = std::fs::read_dir(&files.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["1", "2"], "no copy stays");
+        assert_eq!(std::fs::read(files.0.join("1")).unwrap(), PHOTO);
+    }
+
+    #[tokio::test]
+    async fn every_file_gets_a_key_of_its_own() {
+        let files = TempFiles::new("keys");
+        let db = db().await.with_files(files.0.clone());
+        let (from_before, _) = files_from_before(&db, &files.0).await;
+        db.insert_message(&msg("alice", 3, "x")).await.unwrap();
+        let two = vec![
+            new_attachment("image/jpeg", 3, false),
+            new_attachment("image/jpeg", 3, false),
+        ];
+        db.apply(&add(k("alice", 3), two, None)).await.unwrap();
+        for a in db.attachments(&k("alice", 3)).await.unwrap() {
+            db.start_download(a.id).await.unwrap().unwrap();
+            db.finish_download(a.id, Ok(PHOTO.to_vec())).await.unwrap();
+        }
+        let theirs = TempFiles::new("keys-mine");
+        std::fs::create_dir_all(&theirs.0).unwrap();
+        let source = theirs.0.join("mine.jpg");
+        std::fs::write(&source, PHOTO).unwrap();
+        let mut mine = msg("me", 4, "x");
+        mine.is_outgoing = true;
+        let file = OutgoingFile {
+            path: source.to_string_lossy().into_owned(),
+            content_type: "image/jpeg".into(),
+            width: None,
+            height: None,
+            is_voice_note: false,
+        };
+        assert!(db.insert_outgoing(&mine, &[file], None, None).await.unwrap());
+        db.insert_message(&in_conv("c:bob", msg("bob", 5, "x"))).await.unwrap();
+        assert!(db.store_avatar("c:bob", Some(FACE), 2).await.unwrap());
+        assert_eq!(
+            db.encrypt_files().await.unwrap(),
+            done(2, 0, 0),
+            "alice's photo and picture"
+        );
+        let keys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT file_key FROM attachments WHERE file_key IS NOT NULL
+             UNION ALL SELECT avatar_key FROM conversations WHERE avatar_key IS NOT NULL",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 6, "two downloads, our copy, a picture, two from before");
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), 6);
+        assert_eq!(db.attachment_bytes(from_before).await.unwrap().1, PHOTO);
+    }
+
+    #[tokio::test]
+    async fn an_upload_reads_each_kind_of_file_as_its_plaintext() {
+        let files = TempFiles::new("upload");
+        let db = db().await.with_files(files.0.clone());
+        // a file from before (no key)
+        let (plain, _) = files_from_before(&db, &files.0).await;
+        assert_eq!(db.attachment_bytes(plain).await.unwrap().1, PHOTO);
+        // a download
+        db.insert_message(&msg("alice", 3, "x")).await.unwrap();
+        db.apply(&add(k("alice", 3), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        let downloaded = db.attachments(&k("alice", 3)).await.unwrap()[0].id;
+        db.start_download(downloaded).await.unwrap().unwrap();
+        db.finish_download(downloaded, Ok(FACE.to_vec())).await.unwrap();
+        assert_eq!(db.attachment_bytes(downloaded).await.unwrap().1, FACE);
+        // our own copy
+        let theirs = TempFiles::new("upload-mine");
+        std::fs::create_dir_all(&theirs.0).unwrap();
+        let source = theirs.0.join("mine.jpg");
+        std::fs::write(&source, b"ours").unwrap();
+        let mut mine = msg("me", 4, "x");
+        mine.is_outgoing = true;
+        let file = OutgoingFile {
+            path: source.to_string_lossy().into_owned(),
+            content_type: "image/jpeg".into(),
+            width: None,
+            height: None,
+            is_voice_note: false,
+        };
+        assert!(db.insert_outgoing(&mine, &[file], None, None).await.unwrap());
+        let ours = db.attachments(&k("me", 4)).await.unwrap()[0].id;
+        assert_eq!(db.attachment_bytes(ours).await.unwrap().1, b"ours");
+        assert!(db.attachment_bytes(9999).await.is_err(), "gone");
+    }
+
+    #[tokio::test]
+    async fn a_picture_left_elsewhere_isnt_taken_for_a_leftover() {
+        let files = TempFiles::new("encrypt-elsewhere");
+        let db = db().await.with_files(files.0.clone());
+        db.insert_message(&msg("alice", 1, "x")).await.unwrap();
+        assert!(db.store_avatar("c:alice", Some(FACE), 1).await.unwrap());
+        // its row still names the folder's old place, the file came along
+        let here = conv(&db, "c:alice").await.avatar.unwrap();
+        let name = std::path::Path::new(&here)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let moved = format!("{name}{}", crate::files::ENCRYPTED);
+        std::fs::rename(&here, files.0.join(&moved)).unwrap();
+        sqlx::query("UPDATE conversations SET avatar = ?1 WHERE id = 'c:alice'")
+            .bind(format!("/old/Semaphore/attachments/{moved}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.encrypt_files().await.unwrap(), done(0, 0, 0));
+        assert!(files.0.join(&moved).exists(), "a row names it");
+    }
+
+    #[tokio::test]
+    async fn a_restored_database_naming_a_file_twice_is_refused() {
+        let files = TempFiles::new("restore-twice");
+        let db = db().await.with_files(files.0.clone());
+        let (id, _) = files_from_before(&db, &files.0).await;
+        assert!(db.restored_files_are_plain(&files.0).await.unwrap());
+        db.insert_message(&msg("alice", 2, "x")).await.unwrap();
+        db.apply(&add(k("alice", 2), vec![new_attachment("image/jpeg", 3, false)], None))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE attachments SET file = ?1 WHERE message_sent_at = 2")
+            .bind(id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(!db.restored_files_are_plain(&files.0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sticker_and_preview_images_have_keys_of_their_own_and_other_files_none() {
+        let files = TempFiles::new("derived");
+        let db = db().await.with_files(files.0.join("attachments"));
+        let at = |folder: &str, name: &str| files.0.join(folder).join(name);
+        let a = db.derived_key(&at(crate::files::STICKERS, "ab/1")).unwrap();
+        let b = db.derived_key(&at(crate::files::STICKERS, "ab/2")).unwrap();
+        let c = db.derived_key(&at(crate::files::PREVIEWS, "1")).unwrap();
+        assert!(a != b && b != c && a != c);
+        assert_eq!(
+            db.derived_key(&at(crate::files::STICKERS, "ab/1")),
+            Some(a),
+            "the same each time"
+        );
+        assert_ne!(
+            ProjectionDb::open("sqlite::memory:", None)
+                .await
+                .unwrap()
+                .with_files(files.0.join("attachments"))
+                .derived_key(&at(crate::files::STICKERS, "ab/1")),
+            Some(a),
+            "another install's are others"
+        );
+        // a file of the user's, to send, is read as it is
+        std::fs::create_dir_all(&files.0).unwrap();
+        let mine = files.0.join("mine.jpg");
+        std::fs::write(&mine, PHOTO).unwrap();
+        assert_eq!(db.derived_key(&mine), None);
+        assert_eq!(db.kept(&mine).await.unwrap().read().unwrap(), PHOTO);
     }
 
     #[tokio::test]
@@ -6994,7 +7743,7 @@ mod tests {
         assert!(db.insert_outgoing(&mine, &[file(&first)], None, None).await.unwrap());
         let stored = db.attachments(&k("me", 5)).await.unwrap();
         assert_eq!((stored.len(), stored[0].size), (1, 1));
-        assert_eq!(std::fs::read(stored[0].path.as_ref().unwrap()).unwrap(), b"1");
+        assert_eq!(db.plain(stored[0].path.as_ref().unwrap()).await, b"1");
     }
 
     #[tokio::test]
@@ -7088,7 +7837,7 @@ mod tests {
             (img.state, img.content_type.as_str()),
             (AttachmentState::Ready, "image/jpeg")
         );
-        assert_eq!(std::fs::read(img.path.unwrap()).unwrap(), b"jpg");
+        assert_eq!(db.plain(img.path.unwrap()).await, b"jpg");
     }
 
     #[tokio::test]

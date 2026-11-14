@@ -8432,6 +8432,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "http",
+ "libc",
  "libsignal-message-backup",
  "libsqlite3-sys",
  "presage",

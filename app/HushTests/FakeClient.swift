@@ -314,6 +314,20 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     }
     func linkPreview(key: MessageKey) async throws -> LinkPreview? { lock.withLock { previewAnswers[key] } }
 
+    /// What the core decrypts a stored file to, by path; any other file is read as it is.
+    var decrypted: [String: Data] = [:]
+    func fileBytes(path: String) async throws -> Data {
+        if let plain = lock.withLock({ decrypted[path] }) { return plain }
+        return try Data(contentsOf: URL(fileURLWithPath: path))
+    }
+    func copyFile(path: String, to: String) async throws {
+        if let plain = lock.withLock({ decrypted[path] }) {
+            try plain.write(to: URL(fileURLWithPath: to), options: .withoutOverwriting)
+        } else {
+            try FileManager.default.copyItem(atPath: path, toPath: to)
+        }
+    }
+
     private(set) var titleCalls = 0
     var reactionAnswers: [MessageKey: [Reaction]] = [:]
     private(set) var reactionCalls = 0

@@ -65,6 +65,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 # the unified log on Apple platforms; tracing-oslog builds elsewhere but logs nothing
 [target.'cfg(target_vendor = "apple")'.dependencies]
 tracing-oslog = "0.3"
+# a file's plain fsync, as std's is the drive-flushing F_FULLFSYNC there (already in the tree)
+libc = "0.2"
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
