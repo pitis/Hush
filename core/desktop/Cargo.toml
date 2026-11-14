@@ -36,6 +36,12 @@ url = "2"
 # only for `snapshot`: GPUI's offscreen rendering is test support (gpui-kit's own test-support
 # would also pull in a second GPUI)
 gpui-pre-platform = { version = "=0.3.11", optional = true }
+# the tray icon and its menu (GPUI has none): the menu bar's status item on macOS, the notification
+# area on Windows, and on Linux a StatusNotifierItem over D-Bus (ksni, on the zbus already here)
+# rather than libappindicator's GTK
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+# the tray's picture, drawn from a Lucide icon; already GPUI's
+resvg = { version = "0.46", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # the quarantine mark on files from chats, as the Mac app sets it
@@ -44,9 +50,18 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# the network monitor's handler (Network.framework takes a block); already GPUI's
+block2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# Hush in the Run key, to open at login; already GPUI's
+windows-registry = "0.6"
+# the network's connectivity changes; already GPUI's
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
-# the launcher's unread count over D-Bus (GPUI has none); already the keyring's Secret Service
+# the launcher's unread count and NetworkManager's state over D-Bus (GPUI has none); already the
+# keyring's Secret Service
 zbus = "5"
 
 [features]

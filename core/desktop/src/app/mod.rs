@@ -29,13 +29,16 @@ mod drafts;
 mod events;
 mod files;
 mod group;
+mod login;
 pub mod navigate;
+pub mod network;
 pub mod notifications;
 mod options;
 mod paging;
 mod polls;
 mod previews;
 pub mod search;
+pub mod systray;
 mod typing;
 mod view;
 mod view_once;
@@ -182,6 +185,7 @@ pub struct Hush {
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
+    systray: systray::Systray,
 }
 
 /// The open core and the draft writes on their way, for `quit`.
@@ -381,6 +385,7 @@ impl Hush {
             view_once: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
+            systray: Default::default(),
         }
     }
 

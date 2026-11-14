@@ -46,6 +46,8 @@ fn main() {
             app::attach::shortcut(window, hush.downgrade(), cx);
             app::navigate::shortcuts(window, hush.downgrade(), cx);
             app::notifications::responses(window, hush.downgrade(), cx);
+            app::systray::start(window, hush.downgrade(), cx);
+            app::network::watch(hush.downgrade(), cx);
             cx.activate(true);
         });
 }

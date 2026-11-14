@@ -38,8 +38,8 @@ struct Shown {
 #[derive(Default)]
 pub(super) struct Notifications {
     shown: Vec<Shown>,
-    /// What the Dock or launcher shows.
-    badge: u32,
+    /// What the Dock or launcher shows (and the tray).
+    pub(super) badge: u32,
     /// Counts again when the next timed mute ends (then): nothing else says so.
     mute_ends: Option<(i64, Task<()>)>,
 }
@@ -290,6 +290,7 @@ impl Hush {
             self.notifications.badge = count;
             show_badge(count);
         }
+        self.systray_changed(now);
         // a timer dropped stays queued with the system until it's due: one per mute end
         let next = next_mute_end(&self.chats, now);
         if next == self.notifications.mute_ends.as_ref().map(|(end, _)| *end) {
