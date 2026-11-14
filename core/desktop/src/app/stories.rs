@@ -44,7 +44,8 @@ pub(super) struct Viewer {
     /// The chat whose stories show, and which of them.
     chat: Option<String>,
     index: usize,
-    /// The story shown last: another one in its place is new to see.
+    /// The story last shown: a reload that keeps it there doesn't mark or fetch it again; another
+    /// one in its place is new to see.
     shown: Option<Key>,
     /// The keys go to it; Tab stays inside.
     focus: FocusHandle,
@@ -75,8 +76,8 @@ fn key(s: &Story) -> Key {
     (s.author.clone(), s.sent_at)
 }
 
-/// One group per chat, oldest story first: ours first, then chats with unseen stories, newest
-/// first within each (`StoryList.groups`).
+/// One group per chat, its stories oldest first; the chats ours first, then those with unseen
+/// stories, then by newest story (`StoryList.groups`).
 fn groups<'a>(stories: &'a [Story], me: Option<&str>) -> Vec<Group<'a>> {
     let mut groups: Vec<Group> = vec![];
     for s in stories {
@@ -120,7 +121,8 @@ fn step(groups: &[Group], chat: Option<&str>, index: usize, by: isize) -> Option
 }
 
 /// Where in `chat` the viewer is once the list changed: on the story `shown` before, wherever it
-/// is now; if it went (it expired), on the one in its place, else its chat's last.
+/// is now; if it went, on the one in its place, else its chat's last. A chat with none left keeps
+/// the index, and nothing shows (as on the Mac).
 fn kept(groups: &[Group], chat: Option<&str>, index: usize, shown: Option<&Key>) -> usize {
     let Some(g) = groups.iter().find(|g| Some(g.chat) == chat) else {
         return index;
@@ -129,7 +131,7 @@ fn kept(groups: &[Group], chat: Option<&str>, index: usize, shown: Option<&Key>)
     now.unwrap_or(index.min(g.stories.len() - 1))
 }
 
-/// The stories of `before` that `after` hasn't (expired, or their chat blocked).
+/// The stories of `before` that `after` hasn't (expired, deleted, or their chat blocked or deleted).
 fn left(before: &[Story], after: &[Story]) -> HashSet<Key> {
     let still: HashSet<Key> = after.iter().map(key).collect();
     before.iter().map(key).filter(|k| !still.contains(k)).collect()
@@ -197,7 +199,8 @@ impl Hush {
 
     /// The Stories button: the window over the chats, on the first chat's first story.
     pub(super) fn open_stories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dialog.is_some() || self.group.is_some() || self.settings_open() || self.stories.list.is_empty() {
+        let over = self.dialog.is_some() || self.group.is_some() || self.settings_open() || self.view_once.showing();
+        if over || self.stories.list.is_empty() {
             return;
         }
         let order: Vec<String> = groups(&self.stories.list, self.own_aci.as_deref())
@@ -218,17 +221,20 @@ impl Hush {
         cx.notify();
     }
 
-    /// Esc or Close: back to the chat's composer.
+    /// Esc or Close: back to the open chat's composer, if one is open.
     pub(super) fn close_stories(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.stories.viewer.take().is_some() {
-            self.composer.update(cx, |input, cx| input.focus(window, cx));
+            match self.selected {
+                Some(_) => self.composer.update(cx, |input, cx| input.focus(window, cx)),
+                None => window.blur(cx),
+            }
             cx.notify();
         }
     }
 
-    /// A chat picked in the list: its first story.
+    /// Another chat picked in the list: its first story (the one shown stays where it is).
     fn show_story_chat(&mut self, chat: String, cx: &mut Context<Self>) {
-        if let Some(v) = &mut self.stories.viewer {
+        if let Some(v) = self.stories.viewer.as_mut().filter(|v| v.chat.as_ref() != Some(&chat)) {
             v.chat = Some(chat);
             v.index = 0;
         }
@@ -236,7 +242,7 @@ impl Hush {
         cx.notify();
     }
 
-    /// ←/→ and the arrows: the next or previous story, on into the next or previous chat's.
+    /// ←/→ and the chevron buttons: the next or previous story, on into the next or previous chat's.
     fn step_story(&mut self, by: isize, cx: &mut Context<Self>) {
         let Some(v) = &self.stories.viewer else { return };
         let Some((chat, index)) = step(&self.story_groups(), v.chat.as_deref(), v.index, by) else {
@@ -265,8 +271,8 @@ impl Hush {
         chat.stories.get(v.index).copied()
     }
 
-    /// Another story shows (opened, stepped to, or in the place of one that went): it is marked
-    /// seen, and its file fetched if it waits (only now: not every story is looked at).
+    /// Another story shows (opened, picked, stepped to, or in the place of one that went): it is
+    /// marked seen, and its file fetched if it waits (only now: not every story is looked at).
     fn story_shown(&mut self, cx: &mut Context<Self>) {
         let Some(story) = self.current_story().cloned() else {
             return;
@@ -313,7 +319,6 @@ impl Hush {
     pub(super) fn demo_stories(&mut self, steps: usize, window: &mut Window, cx: &mut Context<Self>) {
         let (list, photo) = crate::demo::stories();
         self.stories.list = list;
-        // the photo's picture is drawn here, not read
         self.files = super::files::Files::demo(vec![photo]);
         self.open_stories(window, cx);
         for _ in 0..steps {
@@ -368,6 +373,11 @@ mod tests {
         let all = day();
         let by_chat = groups(&all, Some(ME));
         assert_eq!(chats(&by_chat), ["c:me", "c:ana", "g:family", "c:bogdan"]);
+        // a chat seen goes after those unseen, however new
+        let mut later = all.clone();
+        later.push(story("c:dan", "dan", 50, true));
+        let by_chat_later = chats(&groups(&later, Some(ME)));
+        assert_eq!(by_chat_later, ["c:me", "c:ana", "g:family", "c:dan", "c:bogdan"]);
         let ana: Vec<i64> = by_chat[1].stories.iter().map(|s| s.sent_at).collect();
         assert_eq!(ana, [15, 30], "oldest first");
         assert!(by_chat[1].unseen() && !by_chat[3].unseen());
@@ -389,7 +399,7 @@ mod tests {
     fn the_order_stays_as_the_window_opened_new_chats_last() {
         let mut all = day();
         let order = chats(&groups(&all, Some(ME)));
-        // Ana's seen now, and a new chat came: neither moves the others
+        // all seen now, and a new chat came: neither moves the others
         all.iter_mut().for_each(|s| s.viewed = true);
         all.push(story("c:zoe", "zoe", 40, false));
         let now = ordered(groups(&all, Some(ME)), &order);
@@ -421,6 +431,11 @@ mod tests {
         let now = groups(&after, Some(ME));
         let shown = ("ana".to_string(), 30);
         assert_eq!(kept(&now, Some("c:ana"), 1, Some(&shown)), 0, "the same story");
+        // a later one shows as the oldest expires: it stays, not the one after it
+        let mut three = before.clone();
+        three.push(story("c:ana", "ana", 45, false));
+        let after_three: Vec<_> = three.into_iter().filter(|s| s.sent_at != 15).collect();
+        assert_eq!(kept(&groups(&after_three, Some(ME)), Some("c:ana"), 1, Some(&shown)), 0);
         // the one shown went: the one in its place, else the chat's last
         let gone = ("ana".to_string(), 15);
         assert_eq!(kept(&now, Some("c:ana"), 0, Some(&gone)), 0);
@@ -441,8 +456,9 @@ mod window_tests {
     use super::super::attach::window_tests::with_core;
     use super::super::{files, navigate, settings, Hush};
     use super::{key, Key};
-    use crate::demo::ANA;
+    use crate::demo::{ANA, BOGDAN};
     use crate::Demo;
+    use sig_core::projection::{Attachment, AttachmentState};
 
     fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>) {
         let opened = cx.update(|cx| {
@@ -548,7 +564,7 @@ mod window_tests {
         };
         until(&hush, cx, decoded);
 
-        // a message comes in the chat behind: its rows reload, the photo shown stays
+        // the chat behind reloads its rows (one fewer here): the photo shown stays
         hush.update(cx, |app, cx| {
             let fewer = app.messages[1..].to_vec();
             app.set_messages(fewer, cx);
@@ -559,8 +575,147 @@ mod window_tests {
         until(&hush, cx, |app| {
             app.stories.list.iter().filter(|s| s.author == ANA).all(|s| s.viewed)
         });
+
+        // Ana's all seen, which sorts Family's unseen one before hers: the arrows keep the order
+        // the window opened with, so it isn't skipped
+        cx.simulate_keystrokes(window, "right");
+        let family = hush.read_with(cx, |app, _| app.current_story().map(|s| s.conversation_id.clone()));
+        assert_eq!(family.as_deref(), Some("g:01"));
+        until(&hush, cx, |app| app.current_story().is_some_and(|s| s.viewed));
         hush.update(cx, |app, _| app.client = None);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Bogdan's video story, the last one, as `change` makes it.
+    fn video(hush: &Entity<Hush>, cx: &mut TestAppContext, change: impl FnOnce(&mut Attachment)) -> Attachment {
+        hush.update(cx, |app, cx| {
+            let mut list = app.stories.list.clone();
+            let file = list
+                .iter_mut()
+                .find_map(|s| s.file.as_mut().filter(|f| f.content_type == "video/mp4"));
+            let file = file.expect("the demo has one");
+            change(file);
+            let changed = file.clone();
+            app.set_stories(list, cx);
+            changed
+        })
+    }
+
+    #[gpui::test]
+    fn a_story_file_waiting_is_fetched_once_shown_and_never_before(cx: &mut TestAppContext) {
+        let (window, hush) = open(cx);
+        let data = std::env::temp_dir().join(format!("hush-desktop-story-fetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        // unlinked: the core refuses the download, which says it was asked
+        with_core(&hush, &data, cx);
+        cx.executor().allow_parking();
+        video(&hush, cx, |f| {
+            f.state = AttachmentState::Pending;
+            f.path = None;
+        });
+        let error = |hush: &Entity<Hush>, cx: &mut TestAppContext| hush.read_with(cx, |app, _| app.error.clone());
+        assert_eq!(error(&hush, cx), None, "not before it shows");
+        // ours, Ana's two, Family's, then Bogdan's video
+        cx.simulate_keystrokes(window, "right right right right");
+        let said = error(&hush, cx).unwrap_or_default();
+        assert!(said.starts_with("Couldn't download"), "{said}");
+        // nothing is left asking the core as the test ends
+        until(&hush, cx, |app| app.stories.list.iter().all(|s| s.viewed));
+        hush.update(cx, |app, _| app.client = None);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[gpui::test]
+    fn a_video_story_named_as_a_program_is_only_saved_never_opened(cx: &mut TestAppContext) {
+        let (_, hush) = open(cx);
+        let data = std::env::temp_dir().join(format!("hush-desktop-story-program-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let clip = data.join("clip");
+        std::fs::write(&clip, b"#!/bin/sh").unwrap();
+        with_core(&hush, &data, cx);
+        hush.update(cx, |app, _| app.data_dir = data.clone());
+        let file = video(&hush, cx, |f| {
+            f.file_name = Some("clip.command".into());
+            f.path = Some(clip.to_str().unwrap().into());
+        });
+        let chat = format!("c:{BOGDAN}");
+        hush.update(cx, |app, cx| app.open_file_of(chat, &file, cx));
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path(), "saved where the user picks");
+        assert!(!data.join(files::OPEN_FOLDER).exists(), "no copy to open");
+        cx.simulate_new_path_selection(|_| None);
+        cx.run_until_parked();
+        hush.update(cx, |app, _| app.client = None);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[gpui::test]
+    fn a_story_that_leaves_the_list_takes_its_opened_copy(cx: &mut TestAppContext) {
+        let (_, hush) = open(cx);
+        let data = std::env::temp_dir().join(format!("hush-desktop-story-copies-{}", std::process::id()));
+        let (beach, photo) = (data.join("beach"), data.join("photo"));
+        for dir in [&beach, &photo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        hush.update(cx, |app, cx| {
+            let opened = app
+                .stories
+                .list
+                .iter()
+                .filter_map(|s| s.file.clone())
+                .collect::<Vec<_>>();
+            for (f, dir) in opened.iter().zip([&beach, &photo]) {
+                let message = (f.message.author.clone(), f.message.sent_at);
+                app.files.opened_copy(f.id, "c:any", message, dir.to_path_buf());
+            }
+            // a reload with the same stories takes none
+            let same = app.stories.list.clone();
+            app.set_stories(same, cx);
+            assert!(beach.exists() && photo.exists());
+            // Bogdan's video expired
+            let expired = app
+                .stories
+                .list
+                .iter()
+                .filter(|s| s.author != BOGDAN)
+                .cloned()
+                .collect();
+            app.set_stories(expired, cx);
+        });
+        assert!(!beach.exists(), "its copy went with it");
+        assert!(photo.exists(), "a story still listed keeps its copy");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[gpui::test]
+    fn a_chat_opened_from_under_the_window_closes_it(cx: &mut TestAppContext) {
+        let (window, hush) = open(cx);
+        // a notification's click
+        let ana = format!("c:{ANA}");
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| app.select(ana, window, cx))
+            })
+            .unwrap();
+        assert!(!hush.read_with(cx, |app, _| app.stories.showing()));
+
+        // with no chat open, closing it leaves the keys nowhere hidden
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| {
+                    app.switch(None, window, cx);
+                    app.open_stories(window, cx);
+                    app.close_stories(window, cx);
+                })
+            })
+            .unwrap();
+        let composer = window
+            .update(cx, |_, window, cx| {
+                hush.read(cx).composer.focus_handle(cx).is_focused(window)
+            })
+            .unwrap();
+        assert!(!composer);
     }
 
     #[gpui::test]

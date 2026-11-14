@@ -60,6 +60,8 @@ impl Hush {
             .children(rows);
         let story = self.current_story();
         let can = |by| step(&groups, v.chat.as_deref(), v.index, by).is_some();
+        // the icon's own colour overrides a disabled button's
+        let arrow = |by| if can(by) { p.text } else { p.secondary.opacity(0.4) };
         let close = Button::new("stories-close")
             .ghost()
             .icon(icon("x", 14., p.secondary))
@@ -83,7 +85,7 @@ impl Hush {
                 .child(
                     Button::new("story-previous")
                         .ghost()
-                        .icon(icon("chevron-left", 14., p.text))
+                        .icon(icon("chevron-left", 14., arrow(-1)))
                         .accessibility_label("Previous story")
                         .disabled(!can(-1))
                         .on_click(cx.listener(|this, _, _, cx| this.step_story(-1, cx))),
@@ -91,7 +93,7 @@ impl Hush {
                 .child(
                     Button::new("story-next")
                         .ghost()
-                        .icon(icon("chevron-right", 14., p.text))
+                        .icon(icon("chevron-right", 14., arrow(1)))
                         .accessibility_label("Next story")
                         .disabled(!can(1))
                         .on_click(cx.listener(|this, _, _, cx| this.step_story(1, cx))),
@@ -111,6 +113,8 @@ impl Hush {
             .p(px(16.))
             .gap(px(10.))
             .child(header.child(close))
+            // what went wrong with a file or a link here, where it's seen
+            .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
             .child(
                 div()
                     .flex_1()
@@ -324,7 +328,9 @@ impl Hush {
         shown
     }
 
-    /// A video story: GPUI plays none, so it opens in the system's player, as a chat's videos do.
+    /// A video story opens in the system's player, as a chat's videos do.
+    /// shortcut: the Mac plays it in the window (`StoryVideo`), GPUI plays no video; play it here
+    /// once gpui-kit can.
     fn render_story_video(&self, a: &Attachment, chat: &str, cx: &mut Context<Self>) -> AnyElement {
         let (file, chat) = (a.clone(), chat.to_owned());
         card()
@@ -347,7 +353,7 @@ impl Hush {
     }
 }
 
-/// A story's frame: 9:16, as tall as it can be, its corners round.
+/// A text or video story's frame: 9:16, as tall as it can be, its corners round.
 fn card() -> Div {
     div()
         .h_full()
@@ -390,8 +396,9 @@ fn background(t: &StoryText) -> Background {
 
 /// A text story's font: its family (None: the system's), size and weight (`StoryCard.font`;
 /// Signal's TextAttachment.Style).
-/// shortcut: condensed (5) is only semibold, GPUI picks no font width; and Linux has no script
-/// font everywhere, so it gets the system's.
+/// shortcut: condensed (5) is only semibold, GPUI picks no font width; serif is Georgia (the Mac's
+/// is New York, not reachable by name) and DejaVu Serif, which not every Linux has; and Linux has
+/// no script font everywhere, so it gets the system's. A missing family falls back to GPUI's.
 fn font(style: u32) -> (Option<&'static str>, f32, FontWeight) {
     match style {
         2 => (None, 28., FontWeight::BOLD),
@@ -419,7 +426,7 @@ mod tests {
     use gpui_kit::{rgba, FontWeight, Hsla};
 
     #[test]
-    fn colours_are_argb_and_fonts_as_the_mac_draws_them() {
+    fn colours_are_argb_and_fonts_take_the_macs_sizes_and_weights() {
         let red: Hsla = rgba(0xff000080).into();
         assert_eq!(argb(0x80ff0000), red, "alpha first");
         assert_eq!(font(2), (None, 28., FontWeight::BOLD));

@@ -399,6 +399,21 @@ impl Files {
             .collect()
     }
 
+    /// An opened file's copy in folder `dir`, for tests that can't launch a player.
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn opened_copy(&mut self, id: i64, chat: &str, message: Key, dir: PathBuf) {
+        let chat = chat.to_owned();
+        self.copies.insert(
+            id,
+            Copy {
+                chat,
+                message,
+                dir,
+                ready: true,
+            },
+        );
+    }
+
     /// Made-up files for `--snapshot`: their pictures are drawn here, not read.
     #[cfg(feature = "snapshot")]
     pub(super) fn demo(files: Vec<Attachment>) -> Self {
@@ -472,10 +487,10 @@ impl Hush {
         }
     }
 
-    /// Only the `loaded` messages' files stay, with what is shown of them: rows that went let
-    /// their pictures' memory go (one still decoding isn't).
+    /// Only the `loaded` messages' files stay, and the picture of the story shown over the chat
+    /// (its window outlives a reload of the rows behind), with what is shown of them: rows that
+    /// went let their pictures' memory go (one still decoding isn't).
     pub(super) fn keep_files(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
-        // and the story shown over the chat
         let story = self.current_story().and_then(|s| s.file.as_ref()).and_then(ready_path);
         let f = &mut self.files;
         f.by_message.retain(|k, _| loaded.contains(k));
@@ -611,7 +626,8 @@ impl Hush {
         }
     }
 
-    /// `open_file`, for a file of chat `chat` (whose deletion takes its copy).
+    /// `open_file`, for a file of chat `chat`: the chat's deletion takes its copy (a story's
+    /// leaving the list does too).
     pub(super) fn open_file_of(&mut self, chat: String, a: &Attachment, cx: &mut Context<Self>) {
         if !openable(a) {
             return self.save_file(a, cx);
@@ -657,14 +673,12 @@ impl Hush {
                         copy.ready = true;
                         launch(file, what, cx);
                     }
-                    // its message went meanwhile, and its copy with it
-                    (Ok(()), None) => {
+                    // its message (or story) went meanwhile, and its copy with it: nothing to say
+                    (_, None) => {
                         remove_copies([dir]);
                     }
-                    (Err(e), copy) => {
-                        if copy.is_some() {
-                            app.files.copies.remove(&id);
-                        }
+                    (Err(e), Some(_)) => {
+                        app.files.copies.remove(&id);
                         remove_copies([dir]);
                         app.error = Some(format!("Couldn't open {what}: {e}"));
                         cx.notify();

@@ -836,6 +836,8 @@ impl Hush {
         self.clear_files(cx);
         self.clear_previews(cx);
         self.end_view_once(cx);
+        // a notification's click opens a chat from under the stories window: the keys go to it
+        self.stories.close();
         // the draft's link, as if typed: putting text in the field says nothing
         self.composer_changed(cx);
         self.clear_tray(cx);
