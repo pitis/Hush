@@ -145,6 +145,8 @@ pub enum Demo {
     Polls,
     /// A view-once photo shown over that chat.
     ViewOnce,
+    /// The chat with someone typing in it, and in another chat.
+    Typing,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -179,6 +181,7 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("add-members", Demo::AddMembers),
                 ("polls", Demo::Polls),
                 ("view-once", Demo::ViewOnce),
+                ("typing", Demo::Typing),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
