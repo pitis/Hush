@@ -97,13 +97,14 @@ final class MessageActionsTests: XCTestCase {
 
 @MainActor
 final class AppStoreMessageActionsTests: XCTestCase {
-    private func store(_ fake: FakeClient) async -> AppStore {
+    private func store(_ fake: FakeClient, messages: [Message]? = nil) async -> AppStore {
         fake.aci = "me"
-        fake.messageAnswers["c:a"] = [message("c:a", "alice", 1), message("c:a", "me", 2, "typo", outgoing: true)]
+        let messages = messages ?? [message("c:a", "alice", 1), message("c:a", "me", 2, "typo", outgoing: true)]
+        fake.messageAnswers["c:a"] = messages
         let store = AppStore(open: { _ in fake })
         await store.boot()
         store.select("c:a")
-        await eventually { store.messages.count == 2 }
+        await eventually { store.messages.count == min(messages.count, 100) }
         return store
     }
 
@@ -200,5 +201,110 @@ final class AppStoreMessageActionsTests: XCTestCase {
         fake.messageAnswers["c:a"] = [message("c:a", "alice", 1), gone]
         store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "me", sentAt: 2)))
         await eventually { store.editing == nil }
+        XCTAssertEqual(
+            store.lastError, "The message you were editing was deleted or disappeared, so the edit wasn't sent.")
+    }
+
+    /// What Remove in the who-reacted list sends (the button itself, `unreact`, isn't tested here).
+    func testSendingARemovalNeverAddsEvenAfterATakeBack() async {
+        let fake = FakeClient(linked: true)
+        let target = MessageKey(author: "alice", sentAt: 1)
+        fake.reactionAnswers[target] = [Reaction(reactor: "me", emoji: "❤️")]
+        let store = await store(fake)
+        await eventually { store.reactions[target] != nil }
+        await store.react(to: store.messages[0], with: "❤️")  // taken back in the picker, not reloaded yet
+        // the who-reacted list still shows "You ❤️": a removal from there must not send it again
+        await store.sendReaction(to: store.messages[0], emoji: "❤️", remove: true)
+        XCTAssertEqual(fake.reacted.map(\.remove), [true, true])
+        XCTAssertNil(store.myReaction(to: store.messages[0]))
+    }
+
+    func testAReplyToAMessageDeletedForEveryoneEnds() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.reply(to: store.messages[0])
+        var gone = message("c:a", "alice", 1)
+        gone.deleted = true
+        gone.body = nil
+        fake.messageAnswers["c:a"] = [gone, message("c:a", "me", 2, "typo", outgoing: true)]
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "alice", sentAt: 1)))
+        await eventually { store.replyTo == nil }
+        XCTAssertNil(store.lastError, "a reply ends without a word")
+    }
+
+    func testAReplyOrEditStaysWhenAnotherMessageWasDeleted() async {
+        let fake = FakeClient(linked: true)
+        var tombstone = message("c:a", "alice", 0)
+        tombstone.deleted = true
+        tombstone.body = nil
+        let store = await store(
+            fake, messages: [tombstone, message("c:a", "alice", 1), message("c:a", "me", 2, "typo", outgoing: true)])
+        store.reply(to: store.messages.first { $0.sentAt == 1 }!)
+        fake.messageAnswers["c:a"]?.append(message("c:a", "alice", 3))
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "alice", sentAt: 3)))
+        await eventually { store.messages.count == 4 }
+        XCTAssertEqual(store.replyTo?.sentAt, 1)
+
+        store.startEditing(store.messages.first { $0.sentAt == 2 }!)
+        fake.messageAnswers["c:a"]?.append(message("c:a", "alice", 4))
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "alice", sentAt: 4)))
+        await eventually { store.messages.count == 5 }
+        XCTAssertEqual(store.editing?.sentAt, 2)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testAReplyToAnOlderMessageDeletedForEveryoneEnds() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake, messages: (1...150).map { message("c:a", "a", Int64($0)) })
+        await store.loadOlder()
+        store.reply(to: store.messages.first { $0.sentAt == 5 }!)
+        fake.messageAnswers["c:a"]?[4].deleted = true
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "a", sentAt: 5)))
+        await eventually { store.replyTo == nil }
+    }
+
+    func testAReplyToAMessageThatLeftTheLoadedWindowEndsWhenItIsDeleted() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake, messages: (1...150).map { message("c:a", "a", Int64($0)) })
+        await store.loadOlder()
+        store.reply(to: store.messages.first { $0.sentAt == 5 }!)
+        // a burst of new messages restarts the window at the newest page, without the one replied to
+        fake.messageAnswers["c:a"] = (1...300).map { message("c:a", "a", Int64($0)) }
+        fake.messageAnswers["c:a"]?[4].deleted = true
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "a", sentAt: 5)))
+        await eventually { store.replyTo == nil }
+        XCTAssertFalse(store.messages.contains { $0.sentAt == 5 })
+    }
+
+    func testDeletingTheMessageBeingEditedEndsTheEditQuietly() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.startEditing(store.messages[1])
+        await store.deleteForEveryone(store.messages[1])
+        XCTAssertNil(store.editing)
+        var gone = message("c:a", "me", 2, "typo", outgoing: true)
+        gone.deleted = true
+        fake.messageAnswers["c:a"] = [message("c:a", "alice", 1), gone]
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "me", sentAt: 2)))
+        await eventually { store.messages.last?.deleted == true }
+        XCTAssertNil(store.lastError)
+    }
+
+    func testAnExpiredMessageEndsTheReplyToItAndTheEditOfIt() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        let (theirs, ours) = (store.messages[0], store.messages[1])
+        store.reply(to: theirs)
+        store.handle(.messageExpired(conversationId: "c:a", key: MessageKey(author: "bob", sentAt: 1)))
+        XCTAssertNotNil(store.replyTo, "another message expired")
+        store.handle(.messageExpired(conversationId: "c:a", key: MessageKey(author: "alice", sentAt: 1)))
+        XCTAssertNil(store.replyTo)
+        XCTAssertNil(store.lastError, "a reply ends without a word")
+
+        store.startEditing(ours)
+        store.handle(.messageExpired(conversationId: "c:a", key: MessageKey(author: "me", sentAt: 2)))
+        XCTAssertNil(store.editing)
+        XCTAssertEqual(
+            store.lastError, "The message you were editing was deleted or disappeared, so the edit wasn't sent.")
     }
 }
