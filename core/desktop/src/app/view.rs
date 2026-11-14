@@ -758,7 +758,15 @@ impl Hush {
             .child(
                 self.with_paging(
                     MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
-                        let row = this.upgrade().and_then(|app| app.read(cx).row(group, ix, now));
+                        let app = this.upgrade();
+                        let row = app.as_ref().and_then(|app| app.read(cx).row(group, ix, now));
+                        // a picture drawn with none decoded (new, or let go past the budget) is decoded
+                        if app.is_some_and(|app| app.read(cx).files.wants_pictures()) {
+                            let this = this.clone();
+                            cx.defer(move |cx| {
+                                let _ = this.update(cx, |app, cx| app.decode_pictures(cx));
+                            });
+                        }
                         match row {
                             Some(row) => render_row(&row, &out_fill, &act, &this, style::palette(cx)),
                             None => div().id(("row", ix)),
@@ -1198,6 +1206,7 @@ pub(super) fn label(id: impl Into<ElementId>, role: Role, text: impl Into<Shared
 
 impl Render for Hush {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.files.new_frame();
         let p = style::palette(cx);
         let screen = match &self.screen {
             Screen::Opening => div().size_full().flex().items_center().justify_center().child(

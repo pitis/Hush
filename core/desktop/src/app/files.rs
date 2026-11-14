@@ -3,6 +3,7 @@
 //! `AttachmentViews.swift`, `Files.swift`). Files are encrypted on disk: the core decrypts them, in
 //! memory (`file_bytes`) or into a copy (`copy_file`); they are never read here directly.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,10 @@ pub(super) use view::render;
 const IMAGE_BOX: f64 = 320.;
 /// Pictures are decoded at most this many pixels either way: the box at 2× (`Thumbnails.maxPixels`).
 const MAX_PIXELS: u32 = 640;
+
+/// Decoded pictures are kept up to this many bytes (20 photos), least recently drawn going first,
+/// as the Mac app's `Thumbnails` does: a chat with hundreds of photos holds no more.
+const PICTURE_BUDGET: usize = 32 * 1024 * 1024;
 /// A larger picture isn't decoded (its pixels alone would take 256 MB): it opens as a file.
 const MAX_DECODED_PIXELS: u64 = 64_000_000;
 /// A larger recording isn't read whole just for its length: it shows once played
@@ -132,11 +137,17 @@ type Key = (String, i64);
 pub(super) struct Files {
     /// The open chat's messages' files, by message (author, sent at).
     by_message: HashMap<Key, Vec<Attachment>>,
-    /// Pictures by their file, decoded small.
-    /// shortcut: every picture of the open chat's page is kept, up to 1.6 MB each (160 MB for
-    /// 100 photos), until another chat opens; the Mac app keeps 32 MB, least recently shown going
-    /// first. Upgrade (with GPUI's `image_cache`) if photo-heavy chats use too much.
+    /// Pictures by their file, decoded small once their rows are drawn, up to `PICTURE_BUDGET`.
     thumbs: HashMap<String, Thumb>,
+    /// The frame each picture's row was last drawn in: past the budget the least recent go,
+    /// never one drawn in the last frame (on screen).
+    drawn: RefCell<HashMap<String, u64>>,
+    /// Frames drawn (`new_frame`).
+    frame: Cell<u64>,
+    /// Pictures whose rows were drawn with none decoded (or it was let go): decoded next.
+    wanted: RefCell<Vec<(i64, String)>>,
+    /// A picture is being decoded: one at a time (a full photo is decoded before it's shrunk).
+    decoding: bool,
     /// Recordings' lengths by file; None: unknown until played.
     lengths: HashMap<i64, Option<Duration>>,
     unplayable: HashSet<i64>,
@@ -277,7 +288,12 @@ impl Files {
 
     fn look(&self, a: &Attachment) -> Look {
         if is_image(a) {
-            return match ready_path(a).and_then(|path| self.thumbs.get(&path)) {
+            let path = ready_path(a);
+            let thumb = path.as_ref().and_then(|path| self.thumbs.get(path));
+            if let Some(path) = path {
+                self.drew(a.id, path, thumb.is_none());
+            }
+            return match thumb {
                 // one that didn't read or says it is a picture but isn't: still there to open
                 Some(Thumb::Failed) => Look::File,
                 Some(Thumb::Shown(thumb)) => Look::Picture(Some(thumb.clone())),
@@ -297,6 +313,68 @@ impl Files {
             });
         }
         Look::File
+    }
+
+    /// A frame is being drawn: rows drawn from now on are in it.
+    pub(super) fn new_frame(&self) {
+        self.frame.set(self.frame.get() + 1);
+    }
+
+    /// A picture's row is drawn in this frame, and its picture is decoded if it isn't.
+    fn drew(&self, id: i64, path: String, missing: bool) {
+        if missing {
+            self.wanted.borrow_mut().push((id, path.clone()));
+        }
+        self.drawn.borrow_mut().insert(path, self.frame.get());
+    }
+
+    /// Pictures drawn wait to be decoded, and none is being decoded.
+    pub(super) fn wants_pictures(&self) -> bool {
+        !self.decoding && !self.wanted.borrow().is_empty()
+    }
+
+    /// The next drawn picture to decode, the last drawn first: it's loading from now. One whose
+    /// row wasn't drawn in the last frame (scrolled past) is skipped; drawn again, it's asked for
+    /// again.
+    fn next_wanted(&mut self) -> Option<(i64, String)> {
+        let frame = self.frame.get();
+        while let Some((id, path)) = self.wanted.get_mut().pop() {
+            let on_screen = self.drawn.get_mut().get(&path) == Some(&frame);
+            if on_screen && !self.thumbs.contains_key(&path) {
+                self.thumbs.insert(path.clone(), Thumb::Loading);
+                return Some((id, path));
+            }
+        }
+        None
+    }
+
+    /// A picture was decoded (or wasn't): it shows, and past `PICTURE_BUDGET` the least recently
+    /// drawn go, but none drawn in the last frame: a row holding more than the budget (an album)
+    /// keeps all its pictures while it shows. Returns those let go, whose memory is to be dropped.
+    fn decoded(&mut self, path: String, thumb: Thumb) -> Vec<Thumb> {
+        let frame = self.frame.get();
+        self.thumbs.insert(path, thumb);
+        let drawn = self.drawn.get_mut();
+        let mut held: Vec<(u64, String, usize)> = self
+            .thumbs
+            .iter()
+            .filter_map(|(path, t)| match t {
+                Thumb::Shown(p) => Some((drawn.get(path).copied().unwrap_or(0), path.clone(), picture_bytes(p))),
+                _ => None,
+            })
+            .collect();
+        let mut total: usize = held.iter().map(|(_, _, bytes)| bytes).sum();
+        held.sort_unstable();
+        let mut gone = vec![];
+        for (at, path, bytes) in held {
+            if total <= PICTURE_BUDGET || at >= frame {
+                break;
+            }
+            total -= bytes;
+            gone.extend(self.thumbs.remove(&path));
+            drawn.remove(&path);
+        }
+        gone
     }
 
     /// Takes the copies `gone` picks out of the list: their folders, to remove.
@@ -338,6 +416,14 @@ fn with_details(shown: &mut HashMap<Key, Vec<Attachment>>, details: &[MessageDet
             shown.insert(k, d.attachments.clone());
         }
     }
+}
+
+/// The memory a decoded picture holds.
+fn picture_bytes(p: &RenderImage) -> usize {
+    (0..p.frame_count())
+        .filter_map(|i| p.as_bytes(i))
+        .map(<[u8]>::len)
+        .sum()
 }
 
 /// Lets decoded pictures' memory go, once no window is being drawn, so each lets its copy go.
@@ -383,67 +469,73 @@ impl Hush {
         let paths: HashSet<String> = files.filter_map(ready_path).collect();
         let gone = f.thumbs.extract_if(|path, _| !paths.contains(path));
         drop_thumbs(gone.map(|(_, thumb)| thumb).collect(), cx);
+        f.drawn.get_mut().retain(|path, _| paths.contains(path));
+        f.wanted.get_mut().retain(|(_, path)| paths.contains(path));
         f.lengths.retain(|id, _| ids.contains(id));
         f.unplayable.retain(|id| ids.contains(id));
     }
 
-    /// Decodes the pictures and reads the recordings' lengths not asked for yet, one at a time,
-    /// while their chat stays open.
-    fn load_media(&mut self, cx: &mut Context<Self>) {
+    /// Decodes the pictures drawn with none decoded, one at a time, until none waits. A chat
+    /// switched to meanwhile has its own wanted: the one decoding for the last is dropped.
+    pub(super) fn decode_pictures(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
-        let (mut pictures, mut recordings) = (vec![], vec![]);
+        if self.files.decoding {
+            return;
+        }
+        self.files.decoding = true;
+        cx.spawn(async move |this, cx| loop {
+            let next = this.update(cx, |app, _| {
+                let next = app.files.next_wanted();
+                app.files.decoding = next.is_some();
+                next
+            });
+            let Ok(Some((id, path))) = next else { return };
+            // decrypted in memory only
+            let thumb = match Compat::new(client.file_bytes(path.clone())).await {
+                Ok(bytes) => cx.background_spawn(async move { thumbnail(&bytes) }).await,
+                Err(e) => Err(format!("it didn't read: {e}")),
+            };
+            let shown = this.update(cx, |app, cx| {
+                // its chat closed meanwhile
+                if !matches!(app.files.thumbs.get(&path), Some(Thumb::Loading)) {
+                    return;
+                }
+                let thumb = thumb.map_or_else(
+                    |e| {
+                        tracing::warn!(file = id, error = %e, "a picture isn't shown");
+                        Thumb::Failed
+                    },
+                    |thumb| Thumb::Shown(Arc::new(thumb)),
+                );
+                let gone = app.files.decoded(path, thumb);
+                drop_thumbs(gone, cx);
+                cx.notify();
+            });
+            if shown.is_err() {
+                return;
+            }
+        })
+        .detach();
+    }
+
+    /// Decodes the pictures drawn and reads the recordings' lengths not asked for yet, one at a
+    /// time, while their chat stays open.
+    pub(super) fn load_media(&mut self, cx: &mut Context<Self>) {
+        self.decode_pictures(cx);
+        let Some(client) = self.client.clone() else { return };
+        let mut recordings = vec![];
         for a in self.files.by_message.values().flatten() {
             let Some(path) = ready_path(a) else { continue };
-            if is_image(a) && !self.files.thumbs.contains_key(&path) {
-                self.files.thumbs.insert(path.clone(), Thumb::Loading);
-                pictures.push((a.id, path));
-            } else if is_audio(a) && a.size <= LENGTH_READ_LIMIT && !self.files.lengths.contains_key(&a.id) {
+            if is_audio(a) && a.size <= LENGTH_READ_LIMIT && !self.files.lengths.contains_key(&a.id) {
                 self.files.lengths.insert(a.id, None);
                 recordings.push((a.id, path, a.content_type.clone()));
             }
         }
-        if pictures.is_empty() && recordings.is_empty() {
+        if recordings.is_empty() {
             return;
         }
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
-            for (id, path) in pictures {
-                // gone with the chat it was in
-                let wanted = this.update(cx, |app, _| {
-                    let open = app.generation == generation;
-                    (
-                        open,
-                        open && matches!(app.files.thumbs.get(&path), Some(Thumb::Loading)),
-                    )
-                });
-                match wanted {
-                    Ok((true, true)) => {}
-                    Ok((true, false)) => continue,
-                    _ => return,
-                }
-                // decrypted in memory only
-                let thumb = match Compat::new(client.file_bytes(path.clone())).await {
-                    Ok(bytes) => cx.background_spawn(async move { thumbnail(&bytes) }).await,
-                    Err(e) => Err(format!("it didn't read: {e}")),
-                };
-                let shown = this.update(cx, |app, cx| {
-                    if !matches!(app.files.thumbs.get(&path), Some(Thumb::Loading)) {
-                        return;
-                    }
-                    let thumb = thumb.map_or_else(
-                        |e| {
-                            tracing::warn!(file = id, error = %e, "a picture isn't shown");
-                            Thumb::Failed
-                        },
-                        |thumb| Thumb::Shown(Arc::new(thumb)),
-                    );
-                    app.files.thumbs.insert(path, thumb);
-                    cx.notify();
-                });
-                if shown.is_err() {
-                    return;
-                }
-            }
             for (id, path, content_type) in recordings {
                 let wanted = this.update(cx, |app, _| {
                     let open = app.generation == generation;
@@ -478,6 +570,8 @@ impl Hush {
     pub(super) fn clear_files(&mut self, cx: &mut Context<Self>) {
         self.files.by_message.clear();
         drop_thumbs(self.files.thumbs.drain().map(|(_, thumb)| thumb).collect(), cx);
+        self.files.drawn.get_mut().clear();
+        self.files.wanted.get_mut().clear();
         self.files.lengths.clear();
         self.files.unplayable.clear();
         self.files.playing = None;
@@ -1119,11 +1213,13 @@ fn mark_from_elsewhere(_: &Path) -> std::io::Result<()> {
 mod tests {
     // not `super::*`: GPUI's `test` attribute would come with it
     use super::{
-        byte_count, clear_open_copies, clock, display_size, file_name, is_audio, is_image, length, openable, thumbnail,
-        view, with_details, Attachment, Clock, Copy, Duration, Files, Look, Thumb, Tick, PLAY_LIMIT,
+        byte_count, clear_open_copies, clock, display_size, file_name, is_audio, is_image, length, openable,
+        picture_bytes, thumbnail, view, with_details, Attachment, Clock, Copy, Duration, Files, Look, Thumb, Tick,
+        PICTURE_BUDGET, PLAY_LIMIT,
     };
     use gpui_kit::{DevicePixels, Size};
     use sig_core::projection::{AttachmentState, Message, MessageDetails, MessageKey, MessageKind, MessageStatus};
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1170,6 +1266,84 @@ mod tests {
             (a.state, a.available) = (state, available);
             assert_eq!(view::wants_download(&a), wants, "{state:?}, available: {available}");
         }
+    }
+
+    #[test]
+    fn scrolling_through_many_photos_keeps_their_pictures_within_a_budget() {
+        let photo = |id: i64| Attachment {
+            id,
+            path: Some(format!("p{id}")),
+            ..file("image/jpeg", None)
+        };
+        // as big as a photo is decoded: 1.6 MB
+        let decoded = Arc::new(thumbnail(&png(640, 640)).unwrap());
+        let held = |f: &Files| -> usize {
+            f.thumbs
+                .values()
+                .map(|t| match t {
+                    Thumb::Shown(p) => picture_bytes(p),
+                    _ => 0,
+                })
+                .sum()
+        };
+        // decoded so far, and let go (each to `drop_image`, which frees its GPU copy too)
+        let (decodes, let_go) = (Cell::new(0), Cell::new(0));
+        // a frame: these rows are drawn, then what they wait for is decoded
+        let draw = |files: &mut Files, rows: &[Attachment]| {
+            files.new_frame();
+            for a in rows {
+                files.look(a);
+            }
+            while let Some((_, path)) = files.next_wanted() {
+                decodes.set(decodes.get() + 1);
+                let gone = files.decoded(path, Thumb::Shown(decoded.clone()));
+                let_go.set(let_go.get() + gone.len());
+            }
+        };
+        let mut files = Files::default();
+        let mut peak = 0;
+        // 150 photos, four rows on screen, scrolled a row at a time, down and back up: the least
+        // recently drawn go, not the first decoded
+        for top in (0..150).chain((0..150).rev()) {
+            let on_screen: Vec<Attachment> = (top..(top + 4).min(150)).map(photo).collect();
+            draw(&mut files, &on_screen);
+            for a in &on_screen {
+                assert!(matches!(files.look(a), Look::Picture(Some(_))), "photo {} shows", a.id);
+            }
+            peak = peak.max(held(&files));
+        }
+        assert!(peak <= PICTURE_BUDGET, "{peak} bytes of pictures held");
+        let shown = files.thumbs.values().filter(|t| matches!(t, Thumb::Shown(_))).count();
+        assert_eq!(
+            let_go.get() + shown,
+            decodes.get(),
+            "every picture let go is handed back to be dropped"
+        );
+        assert!(
+            peak > PICTURE_BUDGET - 2 * picture_bytes(&decoded),
+            "the budget is used: {peak}"
+        );
+        // scrolled down again: the photos let go are decoded again as their rows show
+        files.new_frame();
+        files.look(&photo(149));
+        assert_eq!(files.next_wanted(), Some((149, "p149".to_string())));
+
+        // an album of 30 photos is one row, more than the budget: while it shows, all of it
+        // stays, and nothing is decoded again and again
+        let album: Vec<Attachment> = (200..230).map(photo).collect();
+        draw(&mut files, &album);
+        draw(&mut files, &album);
+        files.new_frame();
+        for a in &album {
+            files.look(a);
+        }
+        assert_eq!(files.next_wanted(), None);
+        assert!(album.iter().all(|a| matches!(files.look(a), Look::Picture(Some(_)))));
+        // scrolled past before its turn came: not decoded
+        files.new_frame();
+        files.look(&photo(300));
+        files.new_frame();
+        assert_eq!(files.next_wanted(), None);
     }
 
     #[test]
@@ -1367,6 +1541,14 @@ mod tests {
         // player, and so does a recording too large to read into memory
         let expected = ["picture", "file", "placeholder", "audio 42 false", "file", "file"];
         assert_eq!(looks, expected);
+    }
+
+    #[test]
+    fn only_a_downloaded_picture_with_none_decoded_is_asked_for() {
+        let files = shown();
+        files.of(&message(MessageKind::Normal));
+        // decoded, failed, or not downloaded yet: nothing to decode
+        assert!(!files.wants_pictures());
     }
 
     #[test]
@@ -1598,11 +1780,16 @@ mod window_tests {
         hush
     }
 
-    /// Messages with files, pictures decoded, recordings' lengths.
-    fn kept(hush: &Entity<Hush>, cx: &mut TestAppContext) -> (usize, usize, usize) {
+    /// Messages with files, pictures decoded and drawn, recordings' lengths.
+    fn kept(hush: &Entity<Hush>, cx: &mut TestAppContext) -> (usize, usize, usize, usize) {
         hush.read_with(cx, |app, _| {
             let f = &app.files;
-            (f.by_message.len(), f.thumbs.len(), f.lengths.len())
+            (
+                f.by_message.len(),
+                f.thumbs.len(),
+                f.drawn.borrow().len(),
+                f.lengths.len(),
+            )
         })
     }
 
@@ -1610,13 +1797,24 @@ mod window_tests {
     fn rows_that_go_take_their_pictures_and_lengths_with_them(cx: &mut TestAppContext) {
         let hush = open(cx);
         // a recording, files, and two photos last
-        assert_eq!(kept(&hush, cx), (7, 2, 1));
+        assert_eq!(kept(&hush, cx), (7, 2, 2, 1));
         // the recording's row and the photos' go (scrolled back to the newest, say)
         hush.update(cx, |app, cx| {
             let middle = app.messages[1..5].to_vec();
             app.set_messages(middle, cx);
         });
         cx.run_until_parked();
-        assert_eq!(kept(&hush, cx), (4, 0, 0));
+        assert_eq!(kept(&hush, cx), (4, 0, 0, 0));
+    }
+
+    #[gpui::test]
+    fn a_picture_drawn_with_none_decoded_is_asked_for(cx: &mut TestAppContext) {
+        let hush = open(cx);
+        hush.update(cx, |app, cx| {
+            app.files.thumbs.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(hush.read_with(cx, |app, _| app.files.wants_pictures()));
     }
 }
