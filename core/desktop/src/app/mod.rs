@@ -21,6 +21,7 @@ use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, Gro
 use crate::{key, text};
 
 mod actions;
+mod files;
 mod view;
 
 /// How the phone lists this computer.
@@ -132,6 +133,7 @@ pub struct Hush {
     cancelling: bool,
     /// The open chat's reactions, and the reply or edit in the composer.
     actions: actions::Actions,
+    files: files::Files,
 }
 
 /// The open core, for `quit`.
@@ -148,6 +150,10 @@ pub fn quit(cx: &mut App) {
     let client = client.clone();
     cx.spawn(async move |cx| {
         Compat::new(client.stop()).await;
+        // opened files' decrypted copies go with the app
+        if let Some(dir) = dirs::data_local_dir() {
+            files::clear_open_copies(&dir.join(DATA_FOLDER));
+        }
         cx.update(|cx| cx.quit());
     })
     .detach();
@@ -174,6 +180,8 @@ fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), St
     let key = key::db_key()?;
     let client =
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
+    // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
+    files::clear_open_copies(&data_dir);
     Ok((client, data_dir))
 }
 
@@ -281,6 +289,7 @@ impl Hush {
             dialog: None,
             cancelling: false,
             actions: actions::Actions::new(window, cx),
+            files: Default::default(),
         }
     }
 
@@ -309,6 +318,14 @@ impl Hush {
                     let ana = app.contacts.first().map(|(aci, _)| aci.clone());
                     app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
                 }
+            }
+            crate::Demo::Files => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some(format!("c:{}", crate::demo::BOGDAN));
+                let messages = crate::demo::file_messages();
+                app.files = files::Files::demo(crate::demo::files(&messages));
+                app.set_messages(messages, cx);
             }
         }
         app
@@ -407,15 +424,17 @@ impl Hush {
                 HistoryStage::NoHistory => self.history = None,
                 stage => self.history = Some((stage, done, total)),
             },
-            CoreEvent::MessageChanged { conversation_id, .. } | CoreEvent::MessageExpired { conversation_id, .. } => {
+            CoreEvent::MessageChanged { conversation_id, key } | CoreEvent::MessageExpired { conversation_id, key } => {
+                self.drop_copies_if_gone(&key, cx);
                 self.refresh_chats(cx);
                 if self.selected.as_deref() == Some(conversation_id.as_str()) {
                     self.reload_messages(cx);
                 }
             }
+            CoreEvent::AttachmentChanged { conversation_id, .. } => self.attachment_changed(&conversation_id, cx),
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, calls, stories, files, notifications (a reaction shows with
-            // its message's `MessageChanged`)
+            // not in this version: typing, calls, stories, notifications (a reaction shows with its
+            // message's `MessageChanged`)
             _ => return,
         }
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
@@ -543,6 +562,7 @@ impl Hush {
         });
         self.generation += 1;
         self.messages.clear();
+        self.clear_files(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
         self.mark_read(true, cx);
@@ -900,8 +920,10 @@ impl Hush {
             self.selected = None;
             self.generation += 1;
             self.messages.clear();
+            self.clear_files(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
+        self.drop_chat_copies(&id);
         self.drafts.remove(&id);
         cx.notify();
         cx.spawn(async move |this, cx| {

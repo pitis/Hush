@@ -1,13 +1,13 @@
 //! Made-up chats for `--snapshot`: the screens render without a core or anyone's real messages.
 
 use sig_core::projection::{
-    BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKey, MessageKind, MessageStatus, Quote,
-    Reaction, TextStyle,
+    Attachment, AttachmentState, BodyRange, Conversation, ConversationKind, FileSummary, Message, MessageKey,
+    MessageKind, MessageStatus, Quote, Reaction, TextStyle,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
 const ANA: &str = "11111111-1111-4111-8111-111111111111";
-const BOGDAN: &str = "22222222-2222-4222-8222-222222222222";
+pub const BOGDAN: &str = "22222222-2222-4222-8222-222222222222";
 const HOUR: i64 = 3_600_000;
 
 pub fn names() -> Vec<(String, String)> {
@@ -168,6 +168,103 @@ pub fn messages() -> Vec<Message> {
         failed,
         sending,
     ]
+}
+
+/// Who sent the messages with files in Bogdan's chat, and how many minutes ago, oldest first.
+const FILES_AGO: [(&str, i64); 7] = [
+    (BOGDAN, 90),
+    (BOGDAN, 80),
+    (BOGDAN, 70),
+    (BOGDAN, 60),
+    (BOGDAN, 50),
+    (BOGDAN, 40),
+    (ME, 20),
+];
+
+/// Bogdan's chat: a voice message, a file, files still to download, on their way or failed, a
+/// captioned photo, and one of ours (the pictures last, where the timeline opens).
+pub fn file_messages() -> Vec<Message> {
+    let captions = [None, None, None, None, None, Some("The view from the hotel"), None];
+    FILES_AGO
+        .iter()
+        .zip(captions)
+        .map(|(&(author, ago), caption)| {
+            let mut m = message(author, ago, caption.unwrap_or_default());
+            m.conversation_id = format!("c:{BOGDAN}");
+            m.body = caption.map(Into::into);
+            m
+        })
+        .collect()
+}
+
+/// The files of `file_messages`, one each.
+pub fn files(messages: &[Message]) -> Vec<Attachment> {
+    let file = |i: usize, content_type: &str, name: Option<&str>, size: u64, state: AttachmentState| Attachment {
+        id: i as i64 + 1,
+        message: messages[i].key(),
+        content_type: content_type.into(),
+        file_name: name.map(Into::into),
+        size,
+        width: None,
+        height: None,
+        is_voice_note: false,
+        path: (state == AttachmentState::Ready).then(|| format!("demo-{i}")),
+        state,
+    };
+    let mut voice = file(0, "audio/aac", None, 160_000, AttachmentState::Ready);
+    voice.is_voice_note = true;
+    let mut later = file(2, "image/jpeg", None, 3_100_000, AttachmentState::Pending);
+    (later.width, later.height) = (Some(4032), Some(3024));
+    let mut hotel = file(5, "image/jpeg", None, 2_400_000, AttachmentState::Ready);
+    (hotel.width, hotel.height) = (Some(1600), Some(1200));
+    let mut ours = file(6, "image/jpeg", None, 1_800_000, AttachmentState::Ready);
+    (ours.width, ours.height) = (Some(1200), Some(800));
+    vec![
+        voice,
+        file(
+            1,
+            "application/pdf",
+            Some("Menu.pdf"),
+            1_234_567,
+            AttachmentState::Ready,
+        ),
+        later,
+        file(
+            3,
+            "video/mp4",
+            Some("Beach.mp4"),
+            18_500_000,
+            AttachmentState::Downloading,
+        ),
+        file(
+            4,
+            "application/zip",
+            Some("Tickets.zip"),
+            340_000,
+            AttachmentState::Failed,
+        ),
+        hotel,
+        ours,
+    ]
+}
+
+/// A made-up photo, as PNG: a dusk sky over the sea.
+pub fn picture() -> Vec<u8> {
+    let sky = image::RgbaImage::from_fn(800, 600, |_, y| {
+        let t = y as f32 / 600.;
+        let (top, bottom) = if t < 0.62 {
+            ([64., 92., 170.], [244., 164., 120.])
+        } else {
+            ([40., 70., 110.], [20., 36., 60.])
+        };
+        let t = if t < 0.62 { t / 0.62 } else { (t - 0.62) / 0.38 };
+        let mix = |i: usize| (top[i] + (bottom[i] - top[i]) * t) as u8;
+        image::Rgba([mix(0), mix(1), mix(2), 255])
+    });
+    let mut out = std::io::Cursor::new(vec![]);
+    sky.write_to(&mut out, image::ImageFormat::Png)
+        .expect("a picture in memory is written");
+    out.into_inner()
 }
 
 /// Reactions to "everyone's in" (ours among them) and to the salad.

@@ -335,7 +335,7 @@ impl Hush {
         });
     }
 
-    /// Reads the open chat's reactions; calls while a load runs are folded into one more.
+    /// Reads the open chat's reactions (and files); calls while a load runs are folded into one more.
     fn load_reactions(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         if self.actions.loading {
@@ -345,14 +345,15 @@ impl Hush {
         self.actions.loading = true;
         let generation = self.generation;
         cx.spawn(async move |this, cx| loop {
-            let Ok(keys) = this.update(cx, |app, _| app.messages.iter().map(Message::key).collect()) else {
+            let Ok(keys) = this.update(cx, |app, _| app.messages.iter().map(Message::key).collect::<Vec<_>>()) else {
                 return;
             };
-            let details = Compat::new(client.details(keys)).await;
+            let details = Compat::new(client.details(keys.clone())).await;
             let again = this.update(cx, |app, cx| {
                 if app.generation != generation {
                     return false; // another chat: its own load runs
                 }
+                app.files_loaded(&keys, &details, cx);
                 app.reactions_loaded(details, cx);
                 app.actions.loading = std::mem::take(&mut app.actions.again);
                 app.actions.loading
