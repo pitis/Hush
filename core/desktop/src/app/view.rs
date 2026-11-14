@@ -758,7 +758,15 @@ impl Hush {
             .child(
                 self.with_paging(
                     MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
-                        let row = this.upgrade().and_then(|app| app.read(cx).row(group, ix, now));
+                        let app = this.upgrade();
+                        let row = app.as_ref().and_then(|app| app.read(cx).row(group, ix, now));
+                        // a picture drawn with none decoded (new, or let go past the budget) is decoded
+                        if app.is_some_and(|app| app.read(cx).files.wants_pictures()) {
+                            let this = this.clone();
+                            cx.defer(move |cx| {
+                                let _ = this.update(cx, |app, cx| app.load_media(cx));
+                            });
+                        }
                         match row {
                             Some(row) => render_row(&row, &out_fill, &act, &this, style::palette(cx)),
                             None => div().id(("row", ix)),
