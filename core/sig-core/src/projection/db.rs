@@ -45,7 +45,7 @@ macro_rules! is_request {
     () => {
         "(EXISTS (SELECT 1 FROM storage_sync WHERE version > 0)
            AND NOT c.whitelisted AND NOT c.blocked AND NOT c.phone_contact AND c.group_standing = 0
-           AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.conversation_id = c.id AND o.is_outgoing = 1))"
+           AND NOT c.has_sent)"
     };
 }
 
@@ -826,7 +826,8 @@ impl ProjectionDb {
     }
 
     /// Deletes a chat's contents here: messages, their files, reactions, edits, events and held
-    /// receipts; its request is no longer accepted (`whitelisted` off, for the phone to learn).
+    /// receipts; its request is no longer accepted: `whitelisted` off (for the phone to learn) and
+    /// `has_sent` off.
     /// The row and its other flags stay, unlisted until a new message. presage's copy of the
     /// thread is queued (`presage_forget_threads`) in the same transaction.
     pub async fn delete_chat(&self, id: &str) -> Result<(), sqlx::Error> {
@@ -892,7 +893,7 @@ impl ProjectionDb {
                 .rows_affected()
                 == 1;
         sqlx::query(
-            "UPDATE conversations SET whitelisted = 0, marked_unread = 0,
+            "UPDATE conversations SET whitelisted = 0, has_sent = 0, marked_unread = 0,
                storage_dirty = CASE WHEN ?2 THEN 1 ELSE storage_dirty END WHERE id = ?1",
         )
         .bind(id)
@@ -2816,6 +2817,12 @@ impl ProjectionDb {
                 .bind(kind_to_i64(kind))
                 .execute(&mut *tx)
                 .await?;
+            if msg.is_outgoing {
+                sqlx::query("UPDATE conversations SET has_sent = 1 WHERE id = ?1")
+                    .bind(&msg.conversation_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             let quote = msg.quote.as_ref();
             let (body, quote_text, body_ranges, quote_ranges) = if msg.deleted {
                 (None, None, None, None)
@@ -3316,8 +3323,9 @@ async fn insert_message_in(conn: &mut SqliteConnection, m: &Message) -> Result<b
     let inserted = res.rows_affected() == 1;
     if inserted {
         if m.is_outgoing {
-            // writing in an archived chat brings it back (Desktop's rule; an incoming message doesn't)
-            sqlx::query("UPDATE conversations SET archived = 0 WHERE id = ?1 AND archived = 1")
+            // writing in an archived chat brings it back (Desktop's rule; an incoming message
+            // doesn't), and accepts it until the chat is deleted (`has_sent`)
+            sqlx::query("UPDATE conversations SET archived = 0, has_sent = 1 WHERE id = ?1")
                 .bind(&m.conversation_id)
                 .execute(&mut *conn)
                 .await?;
@@ -4118,6 +4126,24 @@ mod tests {
                 (c.archived, c.pinned_order, c.mute_until, c.marked_unread),
                 (false, Some(2), 0, false)
             );
+        }
+
+        /// Our message in the backup accepts the chat for good, as a live one does.
+        #[tokio::test]
+        async fn an_imported_message_of_ours_keeps_the_chat_accepted_once_gone() {
+            let db = db().await;
+            phone_state_known(&db).await;
+            let mut mine = imported("c:alice", "me", 2, "mine", MessageStatus::Sent);
+            mine.message.is_outgoing = true;
+            mine.message.expires_at = Some(10);
+            db.import_history(&batch_with(vec![
+                imported("c:alice", "alice", 1, "hi", MessageStatus::Read),
+                mine,
+            ]))
+            .await
+            .unwrap();
+            assert_eq!(db.delete_expired(10).await.unwrap().len(), 1);
+            assert!(!conv(&db, "c:alice").await.message_request);
         }
 
         #[tokio::test]
@@ -7352,6 +7378,58 @@ mod tests {
         assert!(conv(&db, "c:carol").await.blocked);
     }
 
+    /// Writing in a chat accepts it for good (Desktop's sent-message count): our messages
+    /// expiring don't turn it back into a request whose calls wait.
+    #[tokio::test]
+    async fn a_chat_we_wrote_in_stays_accepted_after_our_messages_expire() {
+        let db = db().await;
+        phone_state_known(&db).await;
+        db.insert_message(&msg("alice", 1, "hello?")).await.unwrap();
+        db.insert_message(&Message {
+            expires_at: Some(10),
+            ..mine("c:alice", 2)
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.delete_expired(10).await.unwrap().len(), 1);
+        assert!(!conv(&db, "c:alice").await.message_request);
+        assert!(!db.is_unaccepted("c:alice").await.unwrap());
+    }
+
+    /// Chats we wrote in before the flag existed keep it (migration 0027).
+    #[tokio::test]
+    async fn chats_we_wrote_in_earlier_stay_accepted() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run_to(26, &pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(id, kind) VALUES ('c:alice', 0), ('c:bob', 0);
+             INSERT INTO messages(conversation_id, author, sent_at, received_at, is_outgoing, status)
+               VALUES ('c:alice', 'me', 1, 1, 1, 1), ('c:bob', 'bob', 2, 2, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        migrator.run(&pool).await.unwrap();
+        let db = ProjectionDb {
+            pool,
+            files: None,
+            account_changes: Default::default(),
+        };
+        phone_state_known(&db).await;
+        assert!(!db.is_unaccepted("c:alice").await.unwrap());
+        assert!(
+            db.is_unaccepted("c:bob").await.unwrap(),
+            "only received: still a request"
+        );
+    }
+
     #[tokio::test]
     async fn block_and_accept_set_the_flags_and_mark_the_chat_for_the_phone() {
         let db = db().await;
@@ -7467,6 +7545,7 @@ mod tests {
         let db = db().await.with_files(files.0.clone());
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&in_conv("c:bob", msg("bob", 2, "b"))).await.unwrap();
+        db.insert_message(&mine("c:alice", 3)).await.unwrap();
         db.apply(&add(k("alice", 1), vec![new_attachment("image/jpeg", 3, false)], None))
             .await
             .unwrap();
@@ -7564,6 +7643,7 @@ mod tests {
         let db = db().await;
         db.insert_message(&msg("alice", 1, "a")).await.unwrap();
         db.insert_message(&in_conv(G, msg("bob", 2, "b"))).await.unwrap();
+        db.insert_message(&mine(G, 3)).await.unwrap();
         let alice = |response| Op::RequestResponse {
             thread: RequestThread::Aci("alice".into()),
             response,
@@ -7582,6 +7662,10 @@ mod tests {
         .unwrap();
         assert!(db.message(&k("bob", 2)).await.unwrap().is_none());
         assert!(db.dirty_chats().await.unwrap().is_empty());
+        // deleted there, our message there no longer accepts it
+        phone_state_known(&db).await;
+        db.insert_message(&in_conv(G, msg("bob", 4, "again"))).await.unwrap();
+        assert!(conv(&db, G).await.message_request);
     }
 
     #[tokio::test]
