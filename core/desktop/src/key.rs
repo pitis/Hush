@@ -7,14 +7,29 @@ const ACCOUNT: &str = "db-key";
 
 /// 32 random bytes as 64 lowercase hex characters; created on first use.
 pub fn db_key() -> Result<String, String> {
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| match keyring::Entry::store_status() {
+    key_in(&entry()?)
+}
+
+/// Removes the key, once the data it opened is gone (unlinking); none kept is fine.
+pub fn forget() -> Result<(), String> {
+    forget_in(&entry()?)
+}
+
+fn entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SERVICE, ACCOUNT).map_err(|e| match keyring::Entry::store_status() {
         // the store's own reason; `e` only says there is no store
         Err(why) => {
             format!("the keychain isn't available ({why}); on Linux, Hush needs GNOME Keyring or KWallet running")
         }
         Ok(()) => format!("the keychain isn't available: {e}"),
-    })?;
-    key_in(&entry)
+    })
+}
+
+fn forget_in(entry: &keyring::Entry) -> Result<(), String> {
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("couldn't remove the database key from the keychain: {e}")),
+    }
 }
 
 fn key_in(entry: &keyring::Entry) -> Result<String, String> {
@@ -55,6 +70,16 @@ mod tests {
         assert_eq!(key.len(), 64);
         assert!(key.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(key_in(&entry).unwrap(), key);
+    }
+
+    #[test]
+    fn a_forgotten_key_is_followed_by_a_new_one() {
+        let entry = entry();
+        forget_in(&entry).expect("none kept is fine");
+        let old = key_in(&entry).unwrap();
+        forget_in(&entry).unwrap();
+        assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+        assert_ne!(key_in(&entry).unwrap(), old);
     }
 
     #[test]
