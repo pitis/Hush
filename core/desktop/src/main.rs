@@ -75,6 +75,10 @@ pub enum Demo {
     Chat,
     /// The chat, with the New Group dialog over it.
     NewGroup,
+    /// The chat, replying to a message whose buttons and reaction picker show.
+    Reply,
+    /// A chat's pictures, recordings and files.
+    Files,
     /// Every chat searched.
     Search,
     /// The open chat searched, its newest match opened.
@@ -96,6 +100,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("empty", Demo::Empty),
                 ("chat", Demo::Chat),
                 ("new-group", Demo::NewGroup),
+                ("reply", Demo::Reply),
+                ("files", Demo::Files),
                 ("search", Demo::Search),
                 ("search-in-chat", Demo::SearchInChat),
             ];

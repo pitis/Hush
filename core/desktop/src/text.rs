@@ -125,8 +125,9 @@ pub fn preview(c: &Conversation, author: &str, name: impl Fn(&str) -> String) ->
     }
 }
 
-/// A message's text in the timeline, with where its "@name"s are.
-pub fn message(m: &Message, name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
+/// A message's text in the timeline, with where its "@name"s are. `files`: its files show above
+/// it, so without a caption it has none.
+pub fn message(m: &Message, files: bool, name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
     if m.deleted {
         return ("This message was deleted".into(), vec![]);
     }
@@ -135,9 +136,8 @@ pub fn message(m: &Message, name: impl Fn(&str) -> String) -> (String, Vec<Range
     }
     match m.body.as_deref() {
         Some(body) if !body.trim().is_empty() => marked(body, &m.ranges, name),
-        // shortcut: files aren't shown, and a captioned one shows only its caption: `Message`
-        // carries no file, so show them with `Client::attachments`
-        _ => ("📎 Attachment".into(), vec![]),
+        _ if files => (String::new(), vec![]),
+        _ => ("Attachment".into(), vec![]),
     }
 }
 
@@ -222,7 +222,7 @@ pub fn status(s: MessageStatus) -> &'static str {
 }
 
 /// A placeholder message's text, or None for a normal one (Signal Desktop's words).
-fn placeholder(kind: &MessageKind) -> Option<String> {
+pub fn placeholder(kind: &MessageKind) -> Option<String> {
     Some(match kind {
         MessageKind::Normal => return None,
         MessageKind::Sticker { emoji } => match emoji {
@@ -238,7 +238,9 @@ fn placeholder(kind: &MessageKind) -> Option<String> {
     })
 }
 
-fn describe(file: &FileSummary, caption: &str) -> String {
+/// A message with files, as in Signal Desktop's lists: the kind's emoji, then the caption or the
+/// kind ("📷 Photo", "📷 sunset").
+pub fn describe(file: &FileSummary, caption: &str) -> String {
     let t = file.content_type.as_str();
     let (emoji, word) = match t {
         "image/gif" => ("🎡", "GIF"),
@@ -420,6 +422,35 @@ mod tests {
         });
         c.last_message_preview = String::new();
         assert_eq!(preview(&c, "Ana", name), "You: 📷 Photo");
+    }
+
+    #[test]
+    fn files_without_a_caption_say_nothing_and_a_message_with_neither_says_attachment() {
+        let mut m = Message {
+            conversation_id: "g:00".into(),
+            author: "a".into(),
+            sent_at: 1,
+            received_at: 1,
+            body: None,
+            ranges: vec![],
+            is_outgoing: false,
+            status: MessageStatus::Read,
+            edited: false,
+            deleted: false,
+            quote: None,
+            kind: MessageKind::Normal,
+            expires_in: 0,
+            expires_at: None,
+            story: None,
+        };
+        assert_eq!(message(&m, false, name).0, "Attachment");
+        assert_eq!(message(&m, true, name).0, "");
+        m.body = Some("the view from the hotel".into());
+        assert_eq!(
+            message(&m, true, name).0,
+            "the view from the hotel",
+            "a caption stays with its file"
+        );
     }
 
     #[test]

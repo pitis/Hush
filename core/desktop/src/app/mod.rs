@@ -20,6 +20,8 @@ use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, Gro
 
 use crate::{key, text};
 
+mod actions;
+mod files;
 pub mod search;
 mod view;
 
@@ -135,6 +137,9 @@ pub struct Hush {
     dialog: Option<Dialog>,
     /// A join request is being withdrawn.
     cancelling: bool,
+    /// The open chat's reactions, and the reply or edit in the composer.
+    actions: actions::Actions,
+    files: files::Files,
 }
 
 /// The open core, for `quit`.
@@ -151,6 +156,10 @@ pub fn quit(cx: &mut App) {
     let client = client.clone();
     cx.spawn(async move |cx| {
         Compat::new(client.stop()).await;
+        // opened files' decrypted copies go with the app
+        if let Some(dir) = dirs::data_local_dir() {
+            files::clear_open_copies(&dir.join(DATA_FOLDER));
+        }
         cx.update(|cx| cx.quit());
     })
     .detach();
@@ -177,6 +186,8 @@ fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), St
     let key = key::db_key()?;
     let client =
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
+    // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
+    files::clear_open_copies(&data_dir);
     Ok((client, data_dir))
 }
 
@@ -294,6 +305,8 @@ impl Hush {
             contacts: vec![],
             dialog: None,
             cancelling: false,
+            actions: actions::Actions::new(window, cx),
+            files: Default::default(),
         }
     }
 
@@ -311,12 +324,17 @@ impl Hush {
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
-            crate::Demo::Chat | crate::Demo::NewGroup | crate::Demo::Search | crate::Demo::SearchInChat => {
+            crate::Demo::Chat
+            | crate::Demo::NewGroup
+            | crate::Demo::Reply
+            | crate::Demo::Search
+            | crate::Demo::SearchInChat => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
                 app.selected = Some("g:01".into());
                 app.set_messages(crate::demo::messages(), cx);
+                app.demo_actions(matches!(screen, crate::Demo::Reply));
                 if let crate::Demo::NewGroup = screen {
                     let ana = app.contacts.first().map(|(aci, _)| aci.clone());
                     app.open_dialog(DialogKind::Group(ana.into_iter().collect()), window, cx);
@@ -324,6 +342,14 @@ impl Hush {
                 if let crate::Demo::Search | crate::Demo::SearchInChat = screen {
                     app.demo_search(matches!(screen, crate::Demo::SearchInChat), window, cx);
                 }
+            }
+            crate::Demo::Files => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some(format!("c:{}", crate::demo::BOGDAN));
+                let messages = crate::demo::file_messages();
+                app.files = files::Files::demo(crate::demo::files(&messages));
+                app.set_messages(messages, cx);
             }
         }
         app
@@ -382,6 +408,7 @@ impl Hush {
 
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         if let CoreEvent::MessageExpired { key, .. } = &event {
+            self.message_expired(key, cx);
             self.forget_hit(key);
         }
         match event {
@@ -422,14 +449,17 @@ impl Hush {
                 HistoryStage::NoHistory => self.history = None,
                 stage => self.history = Some((stage, done, total)),
             },
-            CoreEvent::MessageChanged { conversation_id, .. } | CoreEvent::MessageExpired { conversation_id, .. } => {
+            CoreEvent::MessageChanged { conversation_id, key } | CoreEvent::MessageExpired { conversation_id, key } => {
+                self.drop_copies_if_gone(&key, cx);
                 self.refresh_chats(cx);
                 if self.selected.as_deref() == Some(conversation_id.as_str()) {
                     self.reload_messages(cx);
                 }
             }
+            CoreEvent::AttachmentChanged { conversation_id, .. } => self.attachment_changed(&conversation_id, cx),
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, reactions, calls, stories, files, notifications
+            // not in this version: typing, calls, stories, notifications (a reaction shows with its
+            // message's `MessageChanged`)
             _ => return,
         }
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
@@ -544,7 +574,7 @@ impl Hush {
             return cx.notify();
         }
         let draft = self.drafts.remove(&id).unwrap_or_default();
-        let unsent = self.composer.read(cx).value().to_string();
+        let unsent = self.actions.leave(self.composer.read(cx).value().to_string());
         if let Some(left) = self.selected.replace(id) {
             if !unsent.trim().is_empty() {
                 self.drafts.insert(left, unsent);
@@ -558,6 +588,7 @@ impl Hush {
         self.generation += 1;
         self.depth = PAGE;
         self.messages.clear();
+        self.clear_files(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
         self.mark_read(true, cx);
@@ -621,7 +652,13 @@ impl Hush {
             .map(|m| m.author.clone())
             .collect();
         wanted.extend(self.messages.iter().flat_map(|m| mentioned(&m.ranges)));
+        wanted.extend(
+            self.messages
+                .iter()
+                .flat_map(|m| m.quote.iter().flat_map(|q| mentioned(&q.ranges))),
+        );
         self.load_names(wanted, cx);
+        self.messages_loaded(cx);
         self.reveal_found(cx);
     }
 
@@ -694,12 +731,14 @@ impl Hush {
             return;
         };
         let body = self.composer.read(cx).value().trim().to_string();
-        if body.is_empty() {
+        if body.is_empty() || self.save_edit(body.clone(), window, cx) {
             return;
         }
+        let reply = self.take_reply();
+        let quote = reply.as_ref().map(actions::quote);
         self.composer.update(cx, |input, cx| input.clean(window, cx));
         cx.spawn_in(window, async move |this, cx| {
-            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], None, None)).await;
+            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], quote, None)).await;
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
                 app.error = Some(format!("Couldn't send the message: {e}"));
@@ -708,7 +747,13 @@ impl Hush {
                 if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
                     app.composer_empty = false;
                     app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
+                    app.restore_reply(reply);
                 } else {
+                    if reply.is_some() {
+                        app.error = Some(format!(
+                            "Couldn't send the reply: {e}. Its text is back in its chat, without the quote."
+                        ));
+                    }
                     app.drafts.entry(id).or_insert(body);
                 }
                 cx.notify();
@@ -902,8 +947,10 @@ impl Hush {
             self.selected = None;
             self.generation += 1;
             self.messages.clear();
+            self.clear_files(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
+        self.drop_chat_copies(&id);
         self.drafts.remove(&id);
         cx.notify();
         cx.spawn(async move |this, cx| {

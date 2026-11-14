@@ -22,9 +22,20 @@ futures = "0.3"
 hex = "0.4"
 rand = "0.9"
 chrono = "0.4"
+# chats' pictures, decoded small (GPUI's own decoding keeps a photo's every pixel); already GPUI's
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico", "pnm"] }
+# voice and audio messages, played in the bubble from memory: GPUI has no audio (CoreAudio, WASAPI,
+# ALSA through cpal; AAC/M4A, MP3, Ogg Vorbis, FLAC and WAV through Symphonia)
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp4", "mp3", "vorbis", "flac", "wav", "tracing"] }
+# warnings (ids and errors only) into the core's log
+tracing = "0.1"
 # only for `snapshot`: GPUI's offscreen rendering is test support (gpui-kit's own test-support
 # would also pull in a second GPUI)
 gpui-pre-platform = { version = "=0.3.11", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# the quarantine mark on files from chats, as the Mac app sets it
+libc = "0.2"
 
 [features]
 # `--snapshot <folder>`: renders made-up screens to PNGs
