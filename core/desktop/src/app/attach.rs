@@ -127,7 +127,7 @@ impl Hush {
 
     /// The picker can open, and the composer have the keys after it: nothing is over the chat.
     fn can_attach(&self) -> bool {
-        matches!(self.screen, Screen::Chats) && self.dialog.is_none() && self.writable()
+        matches!(self.screen, Screen::Chats) && self.dialog.is_none() && self.group.is_none() && self.writable()
     }
 
     /// "+" and ⇧⌘A: the system's file picker, for several files.

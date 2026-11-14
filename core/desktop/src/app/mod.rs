@@ -25,6 +25,7 @@ mod actions;
 pub mod attach;
 pub mod compose;
 mod files;
+mod group;
 pub mod navigate;
 mod paging;
 mod previews;
@@ -151,6 +152,8 @@ pub struct Hush {
     /// Who a new group can have, by name: (ACI, name).
     contacts: Vec<(String, String)>,
     dialog: Option<Dialog>,
+    /// The Group Info panel, over the chat.
+    group: Option<group::Panel>,
     /// A join request is being withdrawn.
     cancelling: bool,
     /// The open chat's reactions, and the reply or edit in the composer.
@@ -341,6 +344,7 @@ impl Hush {
             timeline,
             contacts: vec![],
             dialog: None,
+            group: None,
             cancelling: false,
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
@@ -371,7 +375,10 @@ impl Hush {
             | crate::Demo::Search
             | crate::Demo::SearchInChat
             | crate::Demo::History
-            | crate::Demo::LinkPreview => {
+            | crate::Demo::LinkPreview
+            | crate::Demo::GroupInfo
+            | crate::Demo::EditGroup
+            | crate::Demo::AddMembers => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -393,6 +400,12 @@ impl Hush {
                 }
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
+                }
+                match screen {
+                    crate::Demo::GroupInfo => app.demo_group(None, window, cx),
+                    crate::Demo::EditGroup => app.demo_group(Some(true), window, cx),
+                    crate::Demo::AddMembers => app.demo_group(Some(false), window, cx),
+                    _ => {}
                 }
             }
             crate::Demo::Files => {
@@ -528,6 +541,7 @@ impl Hush {
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
         if !matches!(self.screen, Screen::Chats) {
             self.dialog = None;
+            self.group = None;
         }
         cx.notify();
     }
@@ -577,6 +591,8 @@ impl Hush {
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
+        // the chat changes with every change stored: the group too, maybe
+        self.read_group(cx);
     }
 
     /// The chats the sidebar lists: all but the archived ones.

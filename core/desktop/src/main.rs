@@ -120,6 +120,12 @@ pub enum Demo {
     /// The chat with a received link preview and a group's invite link, writing a link with its
     /// preview above the composer.
     LinkPreview,
+    /// The Family group's info, as an admin sees it.
+    GroupInfo,
+    /// Its name and description being edited.
+    EditGroup,
+    /// Members being added to it.
+    AddMembers,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -144,6 +150,9 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("search-in-chat", Demo::SearchInChat),
                 ("history", Demo::History),
                 ("link-preview", Demo::LinkPreview),
+                ("group-info", Demo::GroupInfo),
+                ("edit-group", Demo::EditGroup),
+                ("add-members", Demo::AddMembers),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
