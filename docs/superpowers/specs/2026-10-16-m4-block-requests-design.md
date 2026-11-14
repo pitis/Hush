@@ -71,8 +71,10 @@ Signal Desktop's rules (main, `ts/util/isConversationAccepted`, `MessageReceiver
 - not in the phone's address book: its `ContactRecord` has no system name
   (`systemGivenName`/`systemFamilyName`/`systemNickname`, Desktop's "system contact" test).
   presage's own contact list can't stand in: it saves every sender "on first sight";
-- no outgoing message in the chat (ours from this Mac, synced from the phone, or imported
-  history — Note to Self always has them).
+- we have never written in the chat (`has_sent`, set when a message of ours is stored: from
+  this Mac, synced from the phone, or imported history — Note to Self always has them). It
+  stays when our messages expire, as Desktop's sent-message count; only deleting the chat
+  clears it (`delete_chat`, or the phone's Delete / Block-and-Delete answer).
 
 A chat with no messages isn't listed, so the empty-chat rule needs nothing.
 
@@ -91,7 +93,7 @@ timestamp) and removed by the existing sweep. Logged as a count with the kind on
 | `accept_request(id)` | `whitelisted=1, blocked=0` | 1:1: MRR `ACCEPT`; if it was blocked: `Blocked` list | 1:1: our profile key (`DataMessage{flags: PROFILE_KEY_UPDATE}`); the held read receipts |
 | `block(id)` | `blocked=1, whitelisted=0` | 1:1: MRR `BLOCK`; `Blocked` list | — |
 | `unblock(id)` | as `accept_request` | as `accept_request` | as `accept_request` |
-| `delete_chat(id)` | `whitelisted=0`, unpinned; messages, files, events, search rows gone; presage thread cleared | 1:1: MRR `DELETE` | — |
+| `delete_chat(id)` | `whitelisted=0`, `has_sent=0`, unpinned; messages, files, events, search rows gone; presage thread cleared | 1:1: MRR `DELETE` | — |
 
 Every change marks the chat `storage_dirty` and triggers a storage sync, so the record follows
 (when the chat has one; when it doesn't, the `Blocked` list and the MRR tell the phone, which
@@ -153,9 +155,11 @@ GroupV2Record 2/3); `clear_dirty` compares all five flags. Everything else in #5
 - `presage_forget_threads (conversation_id TEXT PRIMARY KEY)`: presage threads to clear,
   processed by the sweep next to `presage_forget`, so a deleted chat's copies go even if
   clearing fails once.
+- `conversations.has_sent` (migration 0027): set from the outgoing messages already stored.
 
 ## Testing
-- db: `message_request` true/false across whitelisted, blocked, outgoing present, storage state
+- db: `message_request` true/false across whitelisted, blocked, `has_sent` (kept when our messages
+  expire, cleared by deleting the chat; set by migration 0027 from outgoing rows), storage state
   unknown; `unsent_receipts` skips requests and blocked chats, and returns them after accept;
   `delete_chat` removes messages, events, files and queues the thread; block/accept set flags and
   dirty; the `Blocked` list replace (added, removed, unknown ACI, group by identifier); MRR types.
