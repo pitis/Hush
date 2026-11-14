@@ -416,7 +416,8 @@ impl Hush {
                 HistoryStage::NoHistory => self.history = None,
                 stage => self.history = Some((stage, done, total)),
             },
-            CoreEvent::MessageChanged { conversation_id, .. } | CoreEvent::MessageExpired { conversation_id, .. } => {
+            CoreEvent::MessageChanged { conversation_id, key } | CoreEvent::MessageExpired { conversation_id, key } => {
+                self.drop_copies_if_gone(&key, cx);
                 self.refresh_chats(cx);
                 if self.selected.as_deref() == Some(conversation_id.as_str()) {
                     self.reload_messages(cx);
@@ -900,6 +901,7 @@ impl Hush {
             self.clear_files(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
+        self.drop_chat_copies(&id);
         self.drafts.remove(&id);
         cx.notify();
         cx.spawn(async move |this, cx| {

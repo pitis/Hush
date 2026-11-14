@@ -9,7 +9,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use sig_core::projection::{Attachment, AttachmentState};
 
-use super::{byte_count, clock, display_size, Audio, Look, Shown};
+use super::{byte_count, clock, display_size, openable, Audio, Look, Shown, TRACK};
 use crate::app::view::icon;
 use crate::app::Hush;
 
@@ -115,10 +115,6 @@ fn playable(
                 this_.cursor_pointer().on_click(on(this, a, Hush::download))
             }),
     };
-    let fraction = match audio.length {
-        length if length > 0. => (audio.elapsed / length).clamp(0., 1.) as f32,
-        _ => 0.,
-    };
     let time = if audio.playing || audio.elapsed > 0. {
         audio.elapsed
     } else {
@@ -128,12 +124,18 @@ fn playable(
         // how far it has played
         .child(
             div()
-                .w(px(140.))
+                .w(px(TRACK as f32))
                 .h(px(4.))
                 .flex_none()
                 .rounded_full()
                 .bg(color.opacity(0.25))
-                .child(div().h_full().rounded_full().bg(color).w(px(140. * fraction))),
+                .child(
+                    div()
+                        .h_full()
+                        .rounded_full()
+                        .bg(color)
+                        .w(px((TRACK * audio.fraction) as f32)),
+                ),
         )
         .child(
             div()
@@ -247,15 +249,17 @@ fn file_icon(content_type: &str) -> &'static str {
     }
 }
 
-/// A file's Open and Save As… on right-click.
+/// A file's Open and Save As… on right-click; a program or a script has Save As… only.
 fn menu(
     this: &WeakEntity<Hush>,
     a: &Attachment,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     let (this, a) = (this.clone(), a.clone());
     move |menu, _, _| {
-        menu.item(PopupMenuItem::new("Open").on_click(on(&this, &a, Hush::open_file)))
-            .item(PopupMenuItem::new("Save As…").on_click(on(&this, &a, Hush::save_file)))
+        menu.when(openable(&a), |menu| {
+            menu.item(PopupMenuItem::new("Open").on_click(on(&this, &a, Hush::open_file)))
+        })
+        .item(PopupMenuItem::new("Save As…").on_click(on(&this, &a, Hush::save_file)))
     }
 }
 
