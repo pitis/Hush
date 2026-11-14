@@ -21,6 +21,7 @@ use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, Gro
 use crate::{key, text};
 
 mod actions;
+pub mod attach;
 mod files;
 pub mod search;
 mod view;
@@ -125,6 +126,8 @@ pub struct Hush {
     composer: Entity<TextareaState>,
     /// Nothing to send: the send button hides.
     composer_empty: bool,
+    /// Files to send with the next message.
+    tray: Vec<attach::Outgoing>,
     /// The sidebar's search field and its words (chats whose name has them; messages in `find`).
     search: Entity<InputState>,
     query: String,
@@ -155,9 +158,10 @@ pub fn quit(cx: &mut App) {
     let client = client.clone();
     cx.spawn(async move |cx| {
         Compat::new(client.stop()).await;
-        // opened files' decrypted copies go with the app
+        // opened files' decrypted copies go with the app, and pasted pictures
         if let Some(dir) = dirs::data_local_dir() {
             files::clear_open_copies(&dir.join(DATA_FOLDER));
+            attach::clear_pasted(&dir.join(DATA_FOLDER));
         }
         cx.update(|cx| cx.quit());
     })
@@ -187,6 +191,7 @@ fn open(events: UnboundedSender<CoreEvent>) -> Result<(Arc<Client>, PathBuf), St
         Client::open(dir, key, Arc::new(Listener(events))).map_err(|e| format!("couldn't open the data: {e}"))?;
     // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
     files::clear_open_copies(&data_dir);
+    attach::clear_pasted(&data_dir);
     Ok((client, data_dir))
 }
 
@@ -301,6 +306,7 @@ impl Hush {
             window_visible: window.is_visible(),
             composer,
             composer_empty: true,
+            tray: vec![],
             search,
             query: String::new(),
             find: Default::default(),
@@ -353,6 +359,7 @@ impl Hush {
                 let messages = crate::demo::file_messages();
                 app.files = files::Files::demo(crate::demo::files(&messages));
                 app.set_messages(messages, cx);
+                app.demo_tray();
             }
         }
         app
@@ -596,6 +603,7 @@ impl Hush {
         self.depth = PAGE;
         self.messages.clear();
         self.clear_files(cx);
+        self.clear_tray(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
         self.reload_messages(cx);
         self.mark_read(true, cx);
@@ -747,21 +755,32 @@ impl Hush {
             return;
         };
         let body = self.composer.read(cx).value().trim().to_string();
-        if body.is_empty() || self.save_edit(body.clone(), window, cx) {
+        // an edit changes the text only: the files wait for the next message
+        let files = !self.tray.is_empty() && !self.actions.editing();
+        if (body.is_empty() && !files) || self.save_edit(body.clone(), window, cx) {
             return;
         }
         let reply = self.take_reply();
         let quote = reply.as_ref().map(actions::quote);
         self.composer.update(cx, |input, cx| input.clean(window, cx));
+        let files = self.take_tray();
         cx.spawn_in(window, async move |this, cx| {
-            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], quote, None)).await;
+            let sent = if files.is_empty() {
+                Compat::new(client.send_text(id.clone(), body.clone(), vec![], quote, None)).await
+            } else {
+                // the text goes with the files, as their caption
+                let outgoing = files.iter().map(attach::Outgoing::file).collect();
+                let caption = Some(body.clone()).filter(|b| !b.is_empty());
+                Compat::new(client.send_attachments(id.clone(), outgoing, caption, vec![], quote)).await
+            };
+            let _ = this.update(cx, |app, cx| app.tray_back(&id, files, sent.is_ok(), cx));
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
                 app.error = Some(format!("Couldn't send the message: {e}"));
                 // the text goes back to its chat: into the composer if that chat is still open
                 // and nothing new was typed, else into its draft
                 if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
-                    app.composer_empty = false;
+                    app.composer_empty = body.is_empty();
                     app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
                     app.restore_reply(reply);
                 } else {
@@ -964,6 +983,7 @@ impl Hush {
             self.generation += 1;
             self.messages.clear();
             self.clear_files(cx);
+            self.clear_tray(cx);
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
         self.drop_chat_copies(&id);

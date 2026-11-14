@@ -704,7 +704,7 @@ impl Hush {
         // shortcut: message requests, invitations and blocked chats are answered on the phone,
         // and a join request's Delete and Cancel Request don't ask first; the Mac app offers
         // Accept, Block and the others here, and asks: add them with a confirmation dialog
-        let answer_first = c.message_request || c.group_invitation || c.group_join_requested || c.blocked;
+        let answer_first = answer_first(c);
         let answer_where = if c.blocked {
             "This chat is blocked. Unblock it on your phone to write here."
         } else if c.group_join_requested {
@@ -798,12 +798,14 @@ impl Hush {
                         )
                     })
             } else {
-                self.with_composer_bar(self.render_composer(p, cx), p, cx)
+                self.with_composer_bar(self.with_attach(self.render_composer(p, cx), p, cx), p, cx)
             })
+            .map(|chat| self.with_drop(chat, !answer_first, p, cx))
     }
 
     fn render_composer(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let editing = self.actions.editing();
+        let empty = self.composer_empty && self.tray.is_empty();
         div().flex_none().px(px(14.)).pt(px(8.)).pb(px(12.)).child(
             h_flex()
                 .items_end()
@@ -812,7 +814,7 @@ impl Hush {
                 .bg(p.field)
                 // with the field's own 10×8 padding: the Mac app's 14×9
                 .pl(px(4.))
-                .pr(px(if self.composer_empty { 4. } else { 6. }))
+                .pr(px(if empty { 4. } else { 6. }))
                 .child(
                     div()
                         .flex_1()
@@ -821,7 +823,7 @@ impl Hush {
                         .text_size(px(14.))
                         .child(Textarea::new(&self.composer).appearance(false).aria_label("Message")),
                 )
-                .when(!self.composer_empty, |this| {
+                .when(!empty, |this| {
                     this.child(
                         div()
                             .id("send")
@@ -1060,6 +1062,12 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
                 )
                 .map(|line| actions::view::with_menu(line, &row.actions, act)),
         )
+}
+
+/// Message requests, invitations, join requests and blocked chats are answered before anything is
+/// written in them: they have no composer.
+pub(super) fn answer_first(c: &Conversation) -> bool {
+    c.message_request || c.group_invitation || c.group_join_requested || c.blocked
 }
 
 /// A person's or chat's picture, or their initials on their colour.

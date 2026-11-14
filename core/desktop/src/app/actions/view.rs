@@ -84,6 +84,7 @@ impl Hush {
                 }
             }))
             .children(bar.map(|bar| div().px(px(14.)).pt(px(8.)).child(bar)))
+            .children(self.render_tray(p, cx))
             .child(composer)
     }
 }
