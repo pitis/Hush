@@ -17,8 +17,8 @@ use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"HUSHBAK1";
 const HEADER_LEN: usize = 8 + 16 + 12;
-const CHUNK: usize = 1 << 20;
-const TAG: usize = 16;
+pub(crate) const CHUNK: usize = 1 << 20;
+pub(crate) const TAG: usize = 16;
 /// Argon2id at OWASP's first recommendation: about half a second here (tests: cheap).
 const MEMORY_KIB: u32 = if cfg!(test) { 64 } else { 64 * 1024 };
 const PASSES: u32 = if cfg!(test) { 1 } else { 3 };
@@ -77,37 +77,30 @@ fn nonce(n: u64, last: bool) -> [u8; 12] {
 
 const UNDECRYPTABLE: &str = "a chunk doesn't decrypt";
 
-/// Writes a backup to `out`: add entries, then `finish`.
-pub(crate) struct Writer<W: Write> {
+/// The chunks above, sealed as bytes come (`put`): a backup's stream, and each kept file's
+/// (`crate::files`).
+pub(crate) struct Sealer<W: Write> {
     out: W,
     cipher: Aes256Gcm,
-    header: [u8; HEADER_LEN],
+    header: Vec<u8>,
     chunk: Vec<u8>,
     n: u64,
 }
 
-impl<W: Write> Writer<W> {
-    pub(crate) fn new(mut out: W, passphrase: &str) -> Result<Self, BackupError> {
-        let salt: [u8; 16] = rand::random();
-        let mut header = [0; HEADER_LEN];
-        header[..8].copy_from_slice(MAGIC);
-        header[8..24].copy_from_slice(&salt);
-        header[24..28].copy_from_slice(&MEMORY_KIB.to_le_bytes());
-        header[28..32].copy_from_slice(&PASSES.to_le_bytes());
-        header[32..36].copy_from_slice(&LANES.to_le_bytes());
-        let key = key(passphrase, &salt, MEMORY_KIB, PASSES, LANES).expect("our parameters are valid");
-        let cipher = Aes256Gcm::new((&key).into());
+impl<W: Write> Sealer<W> {
+    /// Writes `header`, every chunk's associated data, to `out`.
+    pub(crate) fn new(mut out: W, key: &[u8; 32], header: Vec<u8>) -> std::io::Result<Self> {
         out.write_all(&header)?;
         Ok(Self {
             out,
-            cipher,
+            cipher: Aes256Gcm::new(key.into()),
             header,
             chunk: Vec::with_capacity(CHUNK),
             n: 0,
         })
     }
 
-    fn put(&mut self, mut bytes: &[u8]) -> Result<(), BackupError> {
+    pub(crate) fn put(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
         while !bytes.is_empty() {
             if self.chunk.len() == CHUNK {
                 self.seal(false)?;
@@ -119,7 +112,7 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    fn seal(&mut self, last: bool) -> Result<(), BackupError> {
+    fn seal(&mut self, last: bool) -> std::io::Result<()> {
         let sealed = self
             .cipher
             .encrypt(
@@ -136,6 +129,50 @@ impl<W: Write> Writer<W> {
         self.chunk.clear();
         self.n += 1;
         Ok(())
+    }
+
+    /// Seals the last chunk and returns the output, flushed.
+    pub(crate) fn finish(mut self) -> std::io::Result<W> {
+        self.seal(true)?;
+        self.out.flush()?;
+        Ok(self.out)
+    }
+}
+
+impl<W: Write> Write for Sealer<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.put(bytes)?;
+        Ok(bytes.len())
+    }
+
+    /// Nothing: a chunk is sealed once full, or by `finish`.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes a backup to `out`: add entries, then `finish`.
+pub(crate) struct Writer<W: Write> {
+    sealer: Sealer<W>,
+}
+
+impl<W: Write> Writer<W> {
+    pub(crate) fn new(out: W, passphrase: &str) -> Result<Self, BackupError> {
+        let salt: [u8; 16] = rand::random();
+        let mut header = vec![0; HEADER_LEN];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..24].copy_from_slice(&salt);
+        header[24..28].copy_from_slice(&MEMORY_KIB.to_le_bytes());
+        header[28..32].copy_from_slice(&PASSES.to_le_bytes());
+        header[32..36].copy_from_slice(&LANES.to_le_bytes());
+        let key = key(passphrase, &salt, MEMORY_KIB, PASSES, LANES).expect("our parameters are valid");
+        Ok(Self {
+            sealer: Sealer::new(out, &key, header)?,
+        })
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> Result<(), BackupError> {
+        Ok(self.sealer.put(bytes)?)
     }
 
     fn entry_header(&mut self, name: &str, size: u64) -> Result<(), BackupError> {
@@ -172,17 +209,15 @@ impl<W: Write> Writer<W> {
     /// Ends the backup and returns the output, flushed.
     pub(crate) fn finish(mut self) -> Result<W, BackupError> {
         self.put(&0u16.to_le_bytes())?;
-        self.seal(true)?;
-        self.out.flush()?;
-        Ok(self.out)
+        Ok(self.sealer.finish()?)
     }
 }
 
-/// The decrypted plaintext of a backup, read chunk by chunk.
-struct Plain<R: Read> {
+/// The decrypted plaintext of sealed chunks (a backup's, a file's), read chunk by chunk.
+pub(crate) struct Plain<R: Read> {
     input: R,
     cipher: Aes256Gcm,
-    header: [u8; HEADER_LEN],
+    header: Vec<u8>,
     chunk: Vec<u8>,
     at: usize,
     n: u64,
@@ -204,17 +239,21 @@ impl<R: Read> Plain<R> {
             return Err(BackupError::NotABackup);
         }
         let key = key(passphrase, &header[8..24], memory, passes, lanes).ok_or(BackupError::NotABackup)?;
-        let cipher = Aes256Gcm::new((&key).into());
+        Self::new(input, &key, header.to_vec())
+    }
+
+    /// The chunks in `input`, after their `header` (read already). The first chunk is read: one
+    /// that doesn't decrypt is a wrong key (`Undecryptable`), or damage right there.
+    pub(crate) fn new(input: R, key: &[u8; 32], header: Vec<u8>) -> Result<Self, BackupError> {
         let mut plain = Self {
             input,
-            cipher,
+            cipher: Aes256Gcm::new(key.into()),
             header,
             chunk: vec![],
             at: 0,
             n: 0,
             ended: false,
         };
-        // the first chunk that doesn't decrypt is a wrong passphrase (or damage right there)
         plain.next_chunk().map_err(|e| match e {
             BackupError::Damaged(why) if why == UNDECRYPTABLE => BackupError::Undecryptable,
             e => e,
@@ -271,6 +310,23 @@ impl<R: Read> Plain<R> {
             out = &mut out[take..];
         }
         Ok(())
+    }
+}
+
+/// The plaintext as a stream: it ends only at the last chunk, so a cut-off one is an error.
+impl<R: Read> Read for Plain<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.at == self.chunk.len() {
+            if self.ended {
+                return Ok(0);
+            }
+            self.next_chunk()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }
+        let take = out.len().min(self.chunk.len() - self.at);
+        out[..take].copy_from_slice(&self.chunk[self.at..self.at + take]);
+        self.at += take;
+        Ok(take)
     }
 }
 

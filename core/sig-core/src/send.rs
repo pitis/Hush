@@ -941,7 +941,8 @@ async fn upload(
             .map_err(|e| e.to_string())?
             .ok_or("a file of the message is gone")?;
         let path = a.path.ok_or("a file of the message is missing")?;
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+        let kept = db.kept(std::path::Path::new(&path)).await.map_err(|e| e.to_string())?;
+        let bytes = tokio::task::spawn_blocking(move || kept.read())
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;

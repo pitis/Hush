@@ -52,10 +52,14 @@ pub(crate) fn parse_link(link: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 /// What to keep of presage's `pack`: each sticker presage has the image of, written once to
-/// `<dir>/<hex pack id>/<sticker id>` (one without an image, one whose image can't be written and
-/// a repeated id are left out), and whether that is the whole pack, every image there. Blocking
-/// file IO: off the core's thread.
-pub(crate) fn keep(pack: &presage::store::StickerPack, dir: &Path) -> (KeptPack, bool) {
+/// `<dir>/<hex pack id>/<sticker id>` encrypted under `key(path)` (one without an image, one whose
+/// image can't be written and a repeated id are left out), and whether that is the whole pack,
+/// every image there. Blocking file IO: off the core's thread.
+pub(crate) fn keep(
+    pack: &presage::store::StickerPack,
+    dir: &Path,
+    key: impl Fn(&Path) -> Option<crate::files::FileKey>,
+) -> (KeptPack, bool) {
     let mut whole = true;
     let mut seen = std::collections::HashSet::new();
     let stickers = pack
@@ -73,10 +77,12 @@ pub(crate) fn keep(pack: &presage::store::StickerPack, dir: &Path) -> (KeptPack,
             };
             let path = image_path(dir, &pack.id, s.id);
             if !path.exists() {
-                let written = path
-                    .parent()
-                    .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|_| std::fs::write(&path, bytes));
+                let written = key(&path)
+                    .ok_or_else(|| std::io::Error::other("no key for it"))
+                    .and_then(|key| {
+                        path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+                        crate::files::seal(bytes.as_slice(), &path, &key)
+                    });
                 if let Err(e) = written {
                     tracing::warn!(error = %e, pack = %pack_tag(&pack.id), sticker = s.id, "a sticker's image couldn't be written");
                     // a partial file would pass for the image next time
@@ -191,7 +197,16 @@ mod tests {
                 ],
             },
         };
-        let (kept, whole) = keep(&pack, &dir);
+        let key = |_: &Path| Some([7; 32]);
+        let read = |path: &str| {
+            crate::files::Kept {
+                path: path.into(),
+                key: Some([7; 32]),
+            }
+            .read()
+            .unwrap()
+        };
+        let (kept, whole) = keep(&pack, &dir, key);
         assert!(!whole, "sticker 1 has no image");
         assert_eq!(kept.stickers[0].content_type, "image/webp");
         let info = pack_info(&kept, &dir);
@@ -201,14 +216,12 @@ mod tests {
         );
         let shown: Vec<_> = info.stickers.iter().map(|s| (s.id, s.emoji.as_deref())).collect();
         assert_eq!(shown, vec![(0, Some("🦊")), (2, None)]);
-        assert_eq!(std::fs::read(&info.stickers[0].path).unwrap(), b"fox");
+        assert_eq!(read(&info.stickers[0].path), b"fox");
+        assert_ne!(std::fs::read(&info.stickers[0].path).unwrap(), b"fox", "encrypted");
         // written once: keeping again keeps the file
-        std::fs::write(&info.stickers[0].path, b"kept").unwrap();
-        let (again, _) = keep(&pack, &dir);
-        assert_eq!(
-            std::fs::read(&pack_info(&again, &dir).stickers[0].path).unwrap(),
-            b"kept"
-        );
+        crate::files::seal(&b"kept"[..], Path::new(&info.stickers[0].path), &[7; 32]).unwrap();
+        let (again, _) = keep(&pack, &dir, key);
+        assert_eq!(read(&pack_info(&again, &dir).stickers[0].path), b"kept");
         assert!(has_images(&kept, &dir));
         std::fs::remove_file(&info.stickers[1].path).unwrap();
         assert!(!has_images(&kept, &dir));

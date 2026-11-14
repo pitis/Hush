@@ -8,6 +8,7 @@ mod download;
 mod error;
 mod events;
 mod export;
+mod files;
 mod groups;
 mod history;
 mod link_preview;

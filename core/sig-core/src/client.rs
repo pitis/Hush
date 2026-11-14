@@ -10,6 +10,7 @@ use crate::backup;
 use crate::download::Download;
 use crate::error::CoreError;
 use crate::events::{from_applied, CoreEvent, EventListener};
+use crate::files::Kept;
 use crate::groups::{GroupChange, GroupInfo, GroupJoined, GroupPreview};
 use crate::projection::db::MAX_ATTACHMENT;
 use crate::projection::{
@@ -184,7 +185,7 @@ impl Client {
 
     /// Where fetched preview images wait until sent.
     fn previews_dir(&self) -> PathBuf {
-        self.data_dir.join("previews")
+        self.data_dir.join(crate::files::PREVIEWS)
     }
 
     /// The stored link preview of our message `key`, for the send job.
@@ -304,7 +305,7 @@ fn write_export(
     folder: &std::path::Path,
     title: &str,
     messages: &[Message],
-    files: &[Vec<crate::projection::Attachment>],
+    files: &[Vec<(crate::projection::Attachment, Option<Kept>)>],
     names: &std::collections::HashMap<String, String>,
 ) -> Result<String, CoreError> {
     let base = crate::export::file_name(title);
@@ -340,7 +341,7 @@ fn fill_export(
     dir: &std::path::Path,
     title: &str,
     messages: &[Message],
-    files: &[Vec<crate::projection::Attachment>],
+    files: &[Vec<(crate::projection::Attachment, Option<Kept>)>],
     names: &std::collections::HashMap<String, String>,
 ) -> Result<(), CoreError> {
     std::fs::create_dir_all(dir.join("files")).map_err(storage("can't make the export folder"))?;
@@ -348,12 +349,13 @@ fn fill_export(
     let mut exported = vec![];
     for (m, attachments) in messages.iter().zip(files) {
         let mut out = vec![];
-        for a in attachments {
+        for (a, kept) in attachments {
             let shown = a.file_name.clone().unwrap_or_else(|| format!("file {}", a.id));
             let (mut path, mut missing) = (None, false);
-            if let Some(source) = &a.path {
+            if let Some(source) = kept {
                 let to = format!("files/{}-{}", a.id, crate::export::file_name(&shown));
-                match std::fs::copy(source, dir.join(&to)) {
+                // decrypted: the export is for reading anywhere
+                match source.copy_to(&dir.join(&to)) {
                     Ok(_) => path = Some(to),
                     // gone from disk since: the page says so, and the rest still exports
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -556,7 +558,7 @@ impl Client {
             remove(&self.data_dir.join(format!("presage.db{suffix}")), false).map_err(&removing)?;
         }
         // presage's packs go with its store: so do our copies of their images
-        remove(&self.data_dir.join("stickers"), true).map_err(&removing)?;
+        remove(&self.data_dir.join(crate::files::STICKERS), true).map_err(&removing)?;
         remove(&self.data_dir.join("history.tmp"), false).map_err(&removing)
     }
 
@@ -601,12 +603,13 @@ impl Client {
         let linked = Arc::new(AtomicBool::new(false));
         let own_aci = Arc::new(Mutex::new(None));
         let data_dir = PathBuf::from(data_dir);
-        // preview images of drafts from before (never sent) don't stay, nor a backup's leftovers;
-        // a restore stopped while it swapped finishes
+        // preview images of drafts from before (never sent) don't stay, nor a backup's leftovers,
+        // nor sticker images from before they were encrypted (copies of presage's, written again
+        // encrypted); a restore stopped while it swapped finishes
         if data_dir.join(RESTORING).join(READY).exists() {
             swap_in_restore(&data_dir).map_err(storage("can't finish restoring the backup"))?;
         }
-        for left in ["previews", BACKING_UP, RESTORING] {
+        for left in [crate::files::PREVIEWS, "stickers", BACKING_UP, RESTORING] {
             let _ = std::fs::remove_dir_all(data_dir.join(left));
         }
         let h = actor::spawn(
@@ -913,7 +916,11 @@ impl Client {
                 let _ = std::fs::remove_dir_all(&dir);
                 // named by a timestamp nothing else takes (the one a message would get)
                 let path = dir.join(self.next_sent_at().to_string());
-                let saved = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes));
+                let key = self.db.derived_key(&path).ok_or_else(|| CoreError::Storage {
+                    message: "no folder for preview images".into(),
+                })?;
+                let saved =
+                    std::fs::create_dir_all(&dir).and_then(|_| crate::files::seal(bytes.as_slice(), &path, &key));
                 // without the image the preview still says what the link is
                 saved.ok().map(|_| OutgoingFile {
                     path: path.to_string_lossy().into_owned(),
@@ -1078,7 +1085,7 @@ impl Client {
             }
         }
         // sticker images are copies out of presage's store
-        for dir in ["attachments", "stickers"] {
+        for dir in ["attachments", crate::files::STICKERS] {
             match std::fs::remove_dir_all(self.data_dir.join(dir)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(storage(e)),
                 _ => {}
@@ -1244,11 +1251,17 @@ impl Client {
             }
             // a deleted message's files are gone; view-once media is never kept
             let kept = !m.deleted && !matches!(m.kind, crate::projection::MessageKind::ViewOnce { .. });
-            files.push(if kept {
-                self.db.attachments(&m.key()).await?
-            } else {
-                vec![]
-            });
+            let mut with_files = vec![];
+            if kept {
+                for a in self.db.attachments(&m.key()).await? {
+                    let file = match &a.path {
+                        Some(path) => Some(self.db.kept(std::path::Path::new(path)).await?),
+                        None => None,
+                    };
+                    with_files.push((a, file));
+                }
+            }
+            files.push(with_files);
         }
         let mut names = std::collections::HashMap::new();
         for aci in named {
@@ -1283,6 +1296,27 @@ impl Client {
 
     pub async fn attachment(&self, id: i64) -> Result<Option<Attachment>, CoreError> {
         Ok(self.db.attachment(id).await?)
+    }
+
+    /// A file Hush keeps (an attachment, a chat's picture, a sticker, a draft's preview image),
+    /// decrypted in memory: they are encrypted on disk. Any other file as it is.
+    pub async fn file_bytes(&self, path: String) -> Result<Vec<u8>, CoreError> {
+        let kept = self.db.kept(std::path::Path::new(&path)).await?;
+        tokio::task::spawn_blocking(move || kept.read())
+            .await
+            .map_err(|e| CoreError::Storage { message: e.to_string() })?
+            .map_err(storage("can't read the file"))
+    }
+
+    /// Copies a file Hush keeps, decrypted, to a new file at `to` (one there is an error), as
+    /// `file_bytes` reads it: for Quick Look, opening and playing it.
+    pub async fn copy_file(&self, path: String, to: String) -> Result<(), CoreError> {
+        let kept = self.db.kept(std::path::Path::new(&path)).await?;
+        tokio::task::spawn_blocking(move || kept.copy_to(std::path::Path::new(&to)))
+            .await
+            .map_err(|e| CoreError::Storage { message: e.to_string() })?
+            .map(|_| ())
+            .map_err(storage("can't copy the file"))
     }
 
     /// Reacts to a message with `emoji`, or takes back our reaction `emoji` (`remove`). It shows
@@ -1960,8 +1994,18 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            std::fs::create_dir_all(from.0.join("attachments")).unwrap();
-            std::fs::write(from.0.join("attachments").join("1"), b"photo").unwrap();
+            // a file of ours, encrypted: its key travels in the database
+            let photo = file_in(&from.0.join("src"), "beach.heic", b"photo");
+            client
+                .send_attachments(
+                    format!("c:{ALICE}"),
+                    vec![outgoing(photo, "image/heic")],
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
             std::fs::write(from.0.join("attachments").join("2.part"), b"half").unwrap();
             client
                 .back_up(file.to_string_lossy().into(), "correct horse".into())
@@ -1982,12 +2026,16 @@ mod tests {
         });
         drop(fresh);
         assert!(!to.0.join(RESTORING).exists() && !to.0.join("presage.db").exists());
-        assert_eq!(std::fs::read(to.0.join("attachments").join("1")).unwrap(), b"photo");
+        let restored = to.0.join("attachments").join("1");
+        assert_ne!(std::fs::read(&restored).unwrap(), b"photo", "as it was: encrypted");
         assert!(!to.0.join("attachments").join("2.part").exists());
         let reopened = Client::open(to.0.to_string_lossy().into(), "cd".repeat(32), sink).unwrap();
         rt.block_on(async {
             assert_eq!(reopened.conversations().await.unwrap().len(), 1);
             assert!(!reopened.history_pending().await.unwrap());
+            let path = reopened.attachment(1).await.unwrap().unwrap().path.unwrap();
+            assert_eq!(path, restored.to_string_lossy());
+            assert_eq!(reopened.file_bytes(path).await.unwrap(), b"photo");
         });
     }
 
@@ -3196,7 +3244,7 @@ mod tests {
             let copy = files[0].path.clone().unwrap();
             assert_ne!(copy, photo);
             std::fs::remove_file(&photo).unwrap();
-            assert_eq!(std::fs::read(&copy).unwrap(), b"heic");
+            assert_eq!(client.db.plain(&copy).await, b"heic");
             // no caption is fine too
             let key = client
                 .send_attachments(
@@ -3255,14 +3303,15 @@ mod tests {
         let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap();
         std::fs::create_dir_all(dir.0.join("attachments")).unwrap();
         std::fs::write(dir.0.join("attachments").join("1"), b"photo").unwrap();
-        std::fs::create_dir_all(dir.0.join("stickers").join("ab")).unwrap();
-        std::fs::write(dir.0.join("stickers").join("ab").join("1"), b"fox").unwrap();
+        let stickers = dir.0.join(crate::files::STICKERS);
+        std::fs::create_dir_all(stickers.join("ab")).unwrap();
+        std::fs::write(stickers.join("ab").join("1"), b"fox").unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async { client.unlink(false).await.unwrap() });
-        for gone in ["presage.db", "projection.db", "attachments", "stickers"] {
+        for gone in ["presage.db", "projection.db", "attachments", crate::files::STICKERS] {
             assert!(!dir.0.join(gone).exists(), "{gone} is still there");
         }
         assert!(matches!(client.start(), Err(CoreError::Closed)));
@@ -3373,7 +3422,12 @@ mod tests {
             // the fetched image is the message's own copy once sent: the fetched file goes
             let fetched = client.data_dir.join("previews").join("1");
             std::fs::create_dir_all(fetched.parent().unwrap()).unwrap();
-            std::fs::write(&fetched, b"jpg").unwrap();
+            // as `link_preview_for` writes it
+            crate::files::seal(&b"jpg"[..], &fetched, &client.db.derived_key(&fetched).unwrap()).unwrap();
+            assert_eq!(
+                client.file_bytes(fetched.to_string_lossy().into()).await.unwrap(),
+                b"jpg"
+            );
             let with_image = PreviewDraft {
                 image: Some(OutgoingFile {
                     path: fetched.to_string_lossy().into_owned(),
@@ -3401,7 +3455,7 @@ mod tests {
                 .unwrap()
                 .image
                 .unwrap();
-            assert_eq!(std::fs::read(image.path.unwrap()).unwrap(), b"jpg");
+            assert_eq!(client.db.plain(image.path.unwrap()).await, b"jpg");
             // no page is fetched while the phone hasn't allowed link previews
             assert_eq!(
                 client
