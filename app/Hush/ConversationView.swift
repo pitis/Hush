@@ -368,6 +368,9 @@ struct TimelineList: View {
                                 canEdit: MessageActions.canEdit(m, me: store.ownAci),
                                 canDelete: MessageActions.canDelete(m, me: store.ownAci),
                                 react: { emoji in Task { await store.react(to: m, with: emoji) } },
+                                unreact: { emoji in
+                                    Task { await store.sendReaction(to: m, emoji: emoji, remove: true) }
+                                },
                                 edit: { store.startEditing(m) },
                                 delete: { Task { await store.deleteForEveryone(m) } },
                                 viewOnce: { Task { await store.viewOnceOpened(m) } },
@@ -547,6 +550,8 @@ struct MessageRow: View {
         var canEdit = false
         var canDelete = false
         var react: (String) -> Void = { _ in }
+        /// Remove in the who-reacted list: always takes it back, whatever was sent since it loaded.
+        var unreact: (String) -> Void = { _ in }
         var edit: () -> Void = {}
         var delete: () -> Void = {}
         /// View-once media was opened.
@@ -901,7 +906,7 @@ struct MessageRow: View {
                         if r.reactor == actions.me {
                             Button("Remove") {
                                 showingReactors = false
-                                actions.react(r.emoji)
+                                actions.unreact(r.emoji)
                             }
                             .controlSize(.small)
                         }

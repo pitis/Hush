@@ -200,5 +200,48 @@ final class AppStoreMessageActionsTests: XCTestCase {
         fake.messageAnswers["c:a"] = [message("c:a", "alice", 1), gone]
         store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "me", sentAt: 2)))
         await eventually { store.editing == nil }
+        XCTAssertEqual(
+            store.lastError, "The message you were editing was deleted or disappeared, so the edit wasn't sent.")
+    }
+
+    func testRemoveTakesTheReactionBackEvenOneJustTakenBack() async {
+        let fake = FakeClient(linked: true)
+        let target = MessageKey(author: "alice", sentAt: 1)
+        fake.reactionAnswers[target] = [Reaction(reactor: "me", emoji: "❤️")]
+        let store = await store(fake)
+        await eventually { store.reactions[target] != nil }
+        await store.react(to: store.messages[0], with: "❤️")  // taken back in the picker, not reloaded yet
+        // the who-reacted list still shows "You ❤️": Remove there must not send it again
+        await store.sendReaction(to: store.messages[0], emoji: "❤️", remove: true)
+        XCTAssertEqual(fake.reacted.map(\.remove), [true, true])
+        XCTAssertNil(store.myReaction(to: store.messages[0]))
+    }
+
+    func testAReplyToAMessageDeletedForEveryoneEnds() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.reply(to: store.messages[0])
+        var gone = message("c:a", "alice", 1)
+        gone.deleted = true
+        gone.body = nil
+        fake.messageAnswers["c:a"] = [gone, message("c:a", "me", 2, "typo", outgoing: true)]
+        store.handle(.messageChanged(conversationId: "c:a", key: MessageKey(author: "alice", sentAt: 1)))
+        await eventually { store.replyTo == nil }
+    }
+
+    func testAnExpiredMessageEndsTheReplyToItAndTheEditOfIt() async {
+        let fake = FakeClient(linked: true)
+        let store = await store(fake)
+        store.reply(to: store.messages[0])
+        store.handle(.messageExpired(conversationId: "c:a", key: MessageKey(author: "bob", sentAt: 9)))
+        XCTAssertNotNil(store.replyTo, "another message expired")
+        store.handle(.messageExpired(conversationId: "c:a", key: MessageKey(author: "alice", sentAt: 1)))
+        XCTAssertNil(store.replyTo)
+
+        store.startEditing(store.messages[0])  // ours, the one left
+        store.handle(.messageExpired(conversationId: "c:a", key: MessageKey(author: "me", sentAt: 2)))
+        XCTAssertNil(store.editing)
+        XCTAssertEqual(
+            store.lastError, "The message you were editing was deleted or disappeared, so the edit wasn't sent.")
     }
 }

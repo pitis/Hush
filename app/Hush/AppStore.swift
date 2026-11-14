@@ -346,6 +346,7 @@ final class AppStore {
                 messages.removeAll { $0.author == key.author && $0.sentAt == key.sentAt }
             }
             searchResults.removeAll { $0.message.author == key.author && $0.message.sentAt == key.sentAt }
+            endReplyOrEdit { $0 == key }
             notifiedMessages[key] = nil
             if let author = opaque(key.author) {
                 notifier?.remove(idPrefix: Notifications.idPrefix(author: author, sentAt: key.sentAt))
@@ -514,9 +515,15 @@ final class AppStore {
 
     /// Reacts to a message: our current reaction again takes it back, another replaces it.
     func react(to m: Message, with emoji: String) async {
+        let (emoji, remove) = MessageActions.reaction(choosing: emoji, mine: myReaction(to: m))
+        await sendReaction(to: m, emoji: emoji, remove: remove)
+    }
+
+    /// Sends our reaction `emoji`, or takes it back (`remove`): Remove in the who-reacted list
+    /// always does, whatever was sent since that list loaded.
+    func sendReaction(to m: Message, emoji: String, remove: Bool) async {
         guard let client else { return }
         let key = MessageKey(author: m.author, sentAt: m.sentAt)
-        let (emoji, remove) = MessageActions.reaction(choosing: emoji, mine: myReaction(to: m))
         do {
             try await client.react(target: key, emoji: emoji, remove: remove)
             pendingReactions[key] = .some(remove ? nil : emoji)
@@ -549,6 +556,16 @@ final class AppStore {
     }
 
     func cancelEditing() { editing = nil }
+
+    /// A reply to or an edit of a message that is `gone` (deleted for everyone, or its timer ran
+    /// out) ends: sending would quote its text again, or edit nothing.
+    private func endReplyOrEdit(if gone: (MessageKey) -> Bool) {
+        if let r = replyTo, gone(MessageKey(author: r.author, sentAt: r.sentAt)) { replyTo = nil }
+        if let e = editing, gone(MessageKey(author: e.author, sentAt: e.sentAt)) {
+            editing = nil
+            showError("The message you were editing was deleted or disappeared, so the edit wasn't sent.")
+        }
+    }
 
     /// ↑ in an empty composer: edits our newest message that can still be edited. False if none.
     func editLast() -> Bool {
@@ -1635,11 +1652,8 @@ final class AppStore {
                     }
                     await loadDetails(for: needDetails, generation: generation)
                 } catch { append("query failed: \(error)") }
-                // the message being edited was deleted (here or on the phone): nothing left to edit
-                if let e = editing,
-                    messages.contains(where: { $0.author == e.author && $0.sentAt == e.sentAt && $0.deleted })
-                {
-                    editing = nil
+                // deleted here or on the phone
+                endReplyOrEdit { k in messages.contains { $0.deleted && $0.author == k.author && $0.sentAt == k.sentAt }
                 }
             } while reloadMessagesAgain && generation == selectionGeneration
             if generation == selectionGeneration { reloadEvents() }
