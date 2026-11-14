@@ -67,7 +67,7 @@ impl Hush {
     }
 
     /// In place of the composer, as Desktop's: a message request's, an invitation's, our join
-    /// request's or a blocked chat's buttons, the default one last (`RequestBar`).
+    /// request's or a blocked chat's buttons (`RequestBar`).
     pub(in crate::app) fn render_request_bar(&self, c: &Conversation, p: Palette, cx: &mut Context<Self>) -> Div {
         let name = text::title(c, self.own_aci.as_deref());
         let shown = answers(c);
@@ -75,8 +75,9 @@ impl Hush {
             let id = c.id.clone();
             Button::new(("answer", i))
                 .label(a.label())
-                .when(i + 1 == shown.len(), |b| b.primary())
-                .disabled(self.answering && a.waits())
+                .when(a.is_default(), |b| b.primary())
+                // one answer at a time: a Delete during a Cancel Request would delete twice
+                .disabled(self.answering)
                 .on_click(cx.listener(move |this, _, window, cx| this.answer(a, id.clone(), window, cx)))
         });
         v_flex()
@@ -119,7 +120,7 @@ impl Hush {
         )
     }
 
-    /// Out of the archive, in New Chat's place (the Mac app's toolbar).
+    /// Out of the archive: before the search field while New Chat is away (the Mac app's toolbar).
     pub(in crate::app) fn render_archive_back(&self, p: Palette, cx: &mut Context<Self>) -> Button {
         Button::new("back-to-chats")
             .ghost()

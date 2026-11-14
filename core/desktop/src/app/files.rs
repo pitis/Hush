@@ -821,7 +821,7 @@ pub(super) fn open_link(url: String, cx: &mut Context<Hush>) {
 
 /// Opens a copy (or a link) in the system's app for its kind, off the main thread; a failure is
 /// said.
-fn launch(file: impl AsRef<std::ffi::OsStr> + Send + 'static, what: String, cx: &mut Context<Hush>) {
+pub(super) fn launch(file: impl AsRef<std::ffi::OsStr> + Send + 'static, what: String, cx: &mut Context<Hush>) {
     cx.spawn(async move |this, cx| {
         let opened = cx.background_spawn(async move { open_with_system(&file) }).await;
         if let Err(e) = opened {

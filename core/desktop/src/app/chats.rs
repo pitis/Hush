@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_compat::Compat;
-use futures::future::Shared;
-use futures::FutureExt;
 use gpui_kit::*;
 use sig_core::projection::{Conversation, ConversationKind};
 use sig_core::{Client, CoreError, GroupChange};
@@ -19,7 +17,7 @@ use crate::text;
 
 pub(super) mod view;
 
-/// How many chats can be pinned (the phone's limit; the core refuses more).
+/// How many chats can be pinned (the phone's limit; the core refuses more, `ProjectionDb::MAX_PINNED`).
 const MAX_PINNED: usize = 4;
 
 /// How long a chat can be muted for, as Desktop offers it: hours, or for good.
@@ -39,16 +37,17 @@ pub(super) fn mute_until(hours: Option<i64>, now_ms: i64) -> i64 {
 /// The archive, and the chat changes on their way.
 #[derive(Default)]
 pub(super) struct ChatActions {
-    /// The sidebar lists the archived chats instead of the inbox.
+    /// The sidebar lists the archived chats instead of the inbox, but not during a search
+    /// (`Hush::in_archive`).
     pub(super) archive: bool,
     /// The last change asked for: the next one waits for it, so two quick ones land in order.
-    last: Option<Shared<Task<()>>>,
+    last: Option<Task<()>>,
 }
 
 /// A chat's right-click menu item.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Item {
-    /// Not offered while as many as can be are pinned.
+    /// Greyed out while as many as can be are pinned.
     Pin {
         allowed: bool,
     },
@@ -137,15 +136,16 @@ impl Answer {
         }
     }
 
-    /// Asks the server: not again while it does.
-    pub(super) fn waits(self) -> bool {
-        matches!(self, Answer::Join | Answer::Decline | Answer::CancelRequest)
+    /// The bar's default button, as the Mac app's (a join request's has none).
+    /// shortcut: styled only, Return doesn't press it as on the Mac app; bind it if missed.
+    pub(super) fn is_default(self) -> bool {
+        matches!(self, Answer::Accept | Answer::Unblock | Answer::Join)
     }
 }
 
 /// The bar's buttons, the default one last: a blocked chat's Delete and Unblock, our join
-/// request's Delete and Cancel Request, an invitation's Block, Decline and Join, a message
-/// request's Block, Delete and Accept.
+/// request's Delete (the way out should cancelling fail for good) and Cancel Request, an
+/// invitation's Block, Decline and Join, a message request's Block, Delete and Accept.
 pub(super) fn answers(c: &Conversation) -> &'static [Answer] {
     use Answer::*;
     match () {
@@ -241,7 +241,7 @@ impl Hush {
                 let what = if pin { "pin the chat" } else { "unpin the chat" };
                 self.change(what, cx, move |c| async move { c.set_pinned(id, pin).await })
             }
-            // its submenu's
+            // picked in its submenu, which calls `mute`
             Item::Mute => {}
             Item::Unmute => self.mute(id, 0, cx),
             Item::MarkRead => self.change(
@@ -250,7 +250,7 @@ impl Hush {
                 |c| async move { c.mark_read(id).await.map(drop) },
             ),
             Item::MarkUnread => {
-                // the open chat would count as read again at once: it closes, as on Desktop
+                // it closes, as on Desktop: a chat marked unread is one to come back to
                 if self.selected.as_ref() == Some(&id) {
                     self.switch(None, window, cx);
                 }
@@ -302,7 +302,12 @@ impl Hush {
         match a {
             // accepting a blocked chat unblocks it
             Answer::Accept | Answer::Unblock => {
-                self.change("accept the chat", cx, |c| async move { c.accept_request(id).await })
+                let what = if a == Answer::Unblock {
+                    "unblock the chat"
+                } else {
+                    "accept the chat"
+                };
+                self.change(what, cx, |c| async move { c.accept_request(id).await })
             }
             Answer::Block => self.change("block the chat", cx, |c| async move { c.block(id).await }),
             Answer::Delete => self.delete_chat(id, cx),
@@ -350,6 +355,8 @@ impl Hush {
 
     /// A change to a chat (`AppStore.change`): the core tells when the list changed; a failure is
     /// said. Each waits for the one before.
+    /// shortcut: Delete doesn't wait in this line, and a later change that works leaves an earlier
+    /// failure up; the Mac app does both. Add them if changes ever come quicker than prompts.
     fn change<F>(&mut self, what: &'static str, cx: &mut Context<Self>, call: impl FnOnce(Arc<Client>) -> F + 'static)
     where
         F: Future<Output = Result<(), CoreError>> + 'static,
@@ -367,7 +374,7 @@ impl Hush {
                 });
             }
         });
-        self.chat_actions.last = Some(change.shared());
+        self.chat_actions.last = Some(change);
     }
 
     /// Asks where, then exports the chat there and shows the new folder (`SidebarView.export`).
@@ -381,9 +388,10 @@ impl Hush {
         });
         cx.spawn(async move |this, cx| {
             let made = match chosen.await {
+                // none: the folder chosen isn't a local one
                 Ok(Ok(Some(paths))) => match paths.into_iter().next() {
                     Some(folder) => export_to(&client, id, &folder).await,
-                    None => return,
+                    None => Err("that folder isn't on this computer's disk".into()),
                 },
                 Ok(Err(e)) => Err(e.to_string()),
                 // cancelled
@@ -397,7 +405,9 @@ impl Hush {
                     if let Some(e) = failed.first() {
                         tracing::warn!(error = %e, count = failed.len(), "marking exported files failed");
                     }
-                    cx.update(|cx| cx.reveal_path(&made));
+                    // not GPUI's `reveal_path`: it says nothing when it fails, and on Windows logs
+                    // the path (the chat's name)
+                    let _ = this.update(cx, |_, cx| files::launch(made, "the exported chat".into(), cx));
                 }
                 Err(e) => {
                     let _ = this.update(cx, |app, cx| {
@@ -486,7 +496,7 @@ mod tests {
             ..chat("c:a", "Ana")
         };
         assert_eq!(labels(&marked, 0)[1..3], ["Mute notifications", "Mark as read"]);
-        // a fifth pin isn't offered; our own chat can't be blocked
+        // a fifth pin is greyed out; our own chat can't be blocked
         assert_eq!(
             menu(&chat("c:a", "Ana"), Some("me"), 4, now)[0],
             Item::Pin { allowed: false }
@@ -562,12 +572,13 @@ mod tests {
             ..chat("c:a", "Ana")
         };
         assert_eq!(prompt(&person, "Ana"), "You blocked Ana.");
-        // only the ones that ask the server wait for it
-        let waiting: Vec<Answer> = [Accept, Block, Delete, Unblock, Join, Decline, CancelRequest]
-            .into_iter()
-            .filter(|a| a.waits())
-            .collect();
-        assert_eq!(waiting, [Join, Decline, CancelRequest]);
+        // each bar's default is its last button, but a join request's has none
+        for c in [&request, &invited, &blocked] {
+            let defaults: Vec<bool> = answers(c).iter().map(|a| a.is_default()).collect();
+            assert_eq!(defaults.iter().filter(|d| **d).count(), 1);
+            assert_eq!(defaults.last(), Some(&true));
+        }
+        assert!(!answers(&asked).iter().any(|a| a.is_default()));
     }
 
     #[test]
@@ -629,10 +640,15 @@ mod tests {
 }
 
 /// A chat's actions in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+/// With a core that isn't linked, every change fails at once: its message shows it was asked.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Context, Entity, TestAppContext, Window, WindowOptions};
 
+    use super::super::attach::window_tests::with_core;
     use super::super::Hush;
     use super::{Answer, Item};
     use crate::demo::{ANA, STRANGER};
@@ -653,6 +669,18 @@ mod window_tests {
         opened
     }
 
+    /// `open`, with a core in a data folder of its own (removed by the caller).
+    fn open_with_core(name: &str, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>, PathBuf) {
+        let data = std::env::temp_dir().join(format!("hush-desktop-chats-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let (window, hush) = open(Demo::Request, cx);
+        with_core(&hush, &data, cx);
+        // the core answers from its own threads
+        cx.executor().allow_parking();
+        (window, hush, data)
+    }
+
     fn act(
         window: AnyWindowHandle,
         hush: &Entity<Hush>,
@@ -669,6 +697,23 @@ mod window_tests {
         hush.read_with(cx, |app, _| app.listed().iter().map(|c| c.id.clone()).collect())
     }
 
+    fn open_chat(hush: &Entity<Hush>, cx: &mut TestAppContext) -> Option<String> {
+        hush.read_with(cx, |app, _| app.selected.clone())
+    }
+
+    /// The error said once the core has answered (on its own threads), and cleared.
+    fn said(hush: &Entity<Hush>, cx: &mut TestAppContext) -> String {
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let error = hush.update(cx, |app, _| app.error.take());
+            if let Some(error) = error {
+                return error;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("nothing was said");
+    }
+
     #[gpui::test]
     fn the_archive_lists_the_archived_chats_until_back(cx: &mut TestAppContext) {
         let (window, hush) = open(Demo::Chat, cx);
@@ -677,10 +722,7 @@ mod window_tests {
         assert_eq!(listed(&hush, cx), ["g:03"]);
         // the keys move through what is listed
         cx.simulate_keystrokes(window, "alt-down");
-        assert_eq!(
-            hush.read_with(cx, |app, _| app.selected.clone()).as_deref(),
-            Some("g:03")
-        );
+        assert_eq!(open_chat(&hush, cx).as_deref(), Some("g:03"));
 
         // a search covers every chat, then the archive is back
         cx.simulate_keystrokes(window, "secondary-k");
@@ -695,39 +737,56 @@ mod window_tests {
     }
 
     #[gpui::test]
+    fn an_archive_that_empties_closes(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Archive, cx);
+        let mut back = crate::demo::chats();
+        back.iter_mut().for_each(|c| c.archived = false);
+        act(window, &hush, cx, |app, _, cx| app.set_chats(back, cx));
+        assert!(!hush.read_with(cx, |app, _| app.chat_actions.archive));
+        assert_eq!(listed(&hush, cx).len(), 7, "the inbox, with the chat that came back");
+    }
+
+    #[gpui::test]
     fn marking_the_open_chat_unread_closes_it(cx: &mut TestAppContext) {
         let (window, hush) = open(Demo::Chat, cx);
         let ana = format!("c:{ANA}");
         act(window, &hush, cx, |app, window, cx| {
             app.pick(Item::MarkUnread, ana, window, cx)
         });
-        assert_eq!(
-            hush.read_with(cx, |app, _| app.selected.clone()).as_deref(),
-            Some("g:01")
-        );
+        assert_eq!(open_chat(&hush, cx).as_deref(), Some("g:01"));
         act(window, &hush, cx, |app, window, cx| {
             app.pick(Item::MarkUnread, "g:01".into(), window, cx)
         });
-        assert_eq!(hush.read_with(cx, |app, _| app.selected.clone()), None);
+        assert_eq!(open_chat(&hush, cx), None);
     }
 
     #[gpui::test]
-    fn block_and_delete_ask_first_and_accept_goes_ahead(cx: &mut TestAppContext) {
-        let (window, hush) = open(Demo::Request, cx);
+    fn block_and_delete_ask_first_and_go_ahead_only_on_yes(cx: &mut TestAppContext) {
+        let (window, hush, data) = open_with_core("ask", cx);
         let stranger = format!("c:{STRANGER}");
-        let ask = stranger.clone();
+        let id = stranger.clone();
         act(window, &hush, cx, |app, window, cx| {
-            app.answer(Answer::Accept, ask, window, cx)
+            app.answer(Answer::Accept, id, window, cx)
         });
-        assert!(!cx.has_pending_prompt());
+        assert!(!cx.has_pending_prompt(), "Accept doesn't ask");
+        assert!(said(&hush, cx).starts_with("Couldn't accept the chat"));
 
-        let ask = stranger.clone();
+        let id = stranger.clone();
         act(window, &hush, cx, |app, window, cx| {
-            app.answer(Answer::Delete, ask, window, cx)
+            app.answer(Answer::Delete, id, window, cx)
         });
-        let (question, _) = cx.pending_prompt().expect("asked");
-        assert_eq!(question, "Delete this chat?");
+        assert_eq!(cx.pending_prompt().expect("asked").0, "Delete this chat?");
         cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(open_chat(&hush, cx), Some(stranger.clone()), "kept");
+        let id = stranger.clone();
+        act(window, &hush, cx, |app, window, cx| {
+            app.answer(Answer::Delete, id, window, cx)
+        });
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert_eq!(open_chat(&hush, cx), None, "deleted: it closed");
+        assert!(said(&hush, cx).starts_with("Couldn't delete the chat"));
 
         let ana = format!("c:{ANA}");
         act(window, &hush, cx, |app, window, cx| {
@@ -736,6 +795,31 @@ mod window_tests {
         let (question, detail) = cx.pending_prompt().expect("asked");
         assert_eq!(question, "Block Ana Popescu?");
         assert_eq!(detail, "They won't be able to message or call you.");
-        cx.simulate_prompt_answer("Cancel");
+        cx.simulate_prompt_answer("Block");
+        assert!(said(&hush, cx).starts_with("Couldn't block the chat"));
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_menu_changes_the_chat_as_picked(cx: &mut TestAppContext) {
+        let (window, hush, data) = open_with_core("menu", cx);
+        let ana = format!("c:{ANA}");
+        let picks = [
+            (Item::Pin { allowed: true }, "Couldn't pin the chat"),
+            (Item::Unpin, "Couldn't unpin the chat"),
+            (Item::Unmute, "Couldn't unmute the chat"),
+            (Item::MarkRead, "Couldn't mark the chat read"),
+            (Item::Archive, "Couldn't archive the chat"),
+            (Item::Unarchive, "Couldn't unarchive the chat"),
+            (Item::Unblock, "Couldn't unblock the chat"),
+        ];
+        for (item, failure) in picks {
+            let id = ana.clone();
+            act(window, &hush, cx, |app, window, cx| app.pick(item, id, window, cx));
+            assert!(!cx.has_pending_prompt(), "{item:?} doesn't ask");
+            let error = said(&hush, cx);
+            assert!(error.starts_with(failure), "{item:?}: {error}");
+        }
+        std::fs::remove_dir_all(&data).unwrap();
     }
 }

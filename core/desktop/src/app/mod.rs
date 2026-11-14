@@ -577,6 +577,8 @@ impl Hush {
         }
         self.contacts = addable(&all, self.own_aci.as_deref());
         self.chats = all;
+        // an archive that emptied (the last chat unarchived, or written in) closes
+        self.chat_actions.archive &= self.chats.iter().any(|c| c.archived);
         // group rows say who wrote the last message
         let authors = self
             .chats
@@ -587,11 +589,6 @@ impl Hush {
         self.load_names(wanted, cx);
         self.load_pictures(cx);
         self.mark_read(false, cx);
-    }
-
-    /// The inbox: all but the archived chats.
-    fn inbox(&self) -> impl Iterator<Item = &Conversation> {
-        self.chats.iter().filter(|c| !c.archived)
     }
 
     /// The chat list's pictures not asked for yet (a new picture is a new file).

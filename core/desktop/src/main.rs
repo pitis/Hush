@@ -197,8 +197,8 @@ fn snapshot(dir: std::path::PathBuf) {
         });
 }
 
-/// A right-click on Ana's row, under the window buttons, the search field, the pinned Family and
-/// the Chats title (the rows laid out by a frame already).
+/// A right-click on Ana's row, under the search field, the pinned Family and the Chats title, and
+/// on macOS the window buttons' strip (the rows laid out by a frame already).
 #[cfg(feature = "snapshot")]
 fn right_click_ana(window: &mut Window, cx: &mut App) {
     let at = point(px(120.), px(if cfg!(target_os = "macos") { 238. } else { 194. }));

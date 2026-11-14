@@ -206,7 +206,7 @@ impl Hush {
         if !self.query.is_empty() && !shown.is_empty() {
             list = list.child(section("Chats", p));
         }
-        // (searching one chat lists none)
+        // no title while searching one chat: it lists none
         if archive && self.find.scope.is_none() {
             list = list.child(section("Archived", p));
         }
@@ -681,7 +681,7 @@ impl Hush {
             .as_ref()
             .and_then(|id| self.chats.iter().find(|c| &c.id == id));
         let Some(c) = open else {
-            let (title, detail) = match (self.inbox().next().is_none(), &self.connection) {
+            let (title, detail) = match (self.chats.is_empty(), &self.connection) {
                 (false, _) => ("Select a chat", ""),
                 (true, ConnectionState::Online) => (
                     "Connected — no messages yet",

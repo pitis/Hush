@@ -126,7 +126,7 @@ pub fn chats() -> Vec<Conversation> {
     let mut stranger = chat(&format!("c:{STRANGER}"), ConversationKind::Direct, "", 200, "Hi!");
     stranger.message_request = true;
     stranger.username = Some("radu.42".into());
-    // only a search shows it
+    // archived: the archive, or a search, shows it
     let mut swap = chat("g:03", ConversationKind::Group, "Book swap", 900, "Who has Dune?");
     swap.archived = true;
     vec![family, ana, bogdan, note, club, stranger, swap]
