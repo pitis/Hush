@@ -49,7 +49,7 @@ struct Row {
     files: Vec<files::Shown>,
     /// Under the files.
     preview: Option<previews::Card>,
-    /// A poll's or view-once media's, in place of its words.
+    // a poll's card or view-once media's button, in place of its words
     poll: Option<polls::Card>,
     view_once: Option<view_once::State>,
     edited: bool,

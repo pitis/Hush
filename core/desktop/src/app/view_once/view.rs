@@ -1,4 +1,4 @@
-//! How view-once media is drawn: its button or words in the bubble (`ConversationView.viewOnce`),
+//! How view-once media is drawn: its button or words in the bubble (`MessageRow.viewOnce`),
 //! and the look over the window (the Mac app's Quick Look).
 
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -119,7 +119,7 @@ impl Hush {
                             .text_size(px(12.))
                             .text_color(p.secondary)
                             .text_center()
-                            .child("It's playing in your video player. Close this when you're done: the video is removed from this computer then."),
+                            .child("It's playing in your video player. When you're done, close it there, then here: the video is then removed from this computer."),
                     )
                     .child(
                         Button::new("view-once-close")

@@ -80,7 +80,10 @@ pub fn shortcuts(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) 
 impl Hush {
     /// The sidebar is there, with no dialog over it.
     pub(super) fn can_search(&self) -> bool {
-        matches!(self.screen, Screen::Chats) && self.dialog.is_none() && self.group.is_none()
+        matches!(self.screen, Screen::Chats)
+            && self.dialog.is_none()
+            && self.group.is_none()
+            && !self.view_once.showing()
     }
 
     /// The sidebar's search field gets the keys.

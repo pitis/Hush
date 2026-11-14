@@ -613,6 +613,7 @@ impl Hush {
         if !matches!(self.screen, Screen::Chats) {
             self.dialog = None;
             self.group = None;
+            self.end_view_once(cx);
         }
         cx.notify();
     }
@@ -750,6 +751,7 @@ impl Hush {
         self.messages.clear();
         self.clear_files(cx);
         self.clear_previews(cx);
+        self.end_view_once(cx);
         // the draft's link, as if typed: putting text in the field says nothing
         self.composer_changed(cx);
         self.clear_tray(cx);

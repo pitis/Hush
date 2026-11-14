@@ -287,13 +287,13 @@ impl Files {
     }
 
     /// A message's files as the core has them, whatever its kind: a view-once message's, which
-    /// `of` doesn't show (nor decode).
+    /// `of` doesn't show, so its pictures are never decoded.
     pub(super) fn attachments(&self, m: &Message) -> &[Attachment] {
         let files = self.by_message.get(&(m.author.clone(), m.sent_at));
         files.map(Vec::as_slice).unwrap_or_default()
     }
 
-    /// Whether file `path`'s picture is decoded for a bubble.
+    /// Whether file `path` is in the bubbles' picture cache at all (decoded, decoding or failed).
     #[cfg(all(test, feature = "snapshot"))]
     pub(super) fn has_picture(&self, path: &str) -> bool {
         self.thumbs.contains_key(path)
@@ -649,7 +649,9 @@ impl Hush {
                         launch(file, what, cx);
                     }
                     // its message went meanwhile, and its copy with it
-                    (Ok(()), None) => remove_copies([dir]),
+                    (Ok(()), None) => {
+                        remove_copies([dir]);
+                    }
                     (Err(e), copy) => {
                         if copy.is_some() {
                             app.files.copies.remove(&id);
@@ -919,15 +921,18 @@ pub(super) fn clear_open_copies(data_dir: &Path) {
 }
 
 /// Removes opened copies' folders; one that can't go is said in the log (the next launch tries
-/// again).
-pub(super) fn remove_copies(dirs: impl IntoIterator<Item = PathBuf>) {
+/// again). False if any couldn't.
+pub(super) fn remove_copies(dirs: impl IntoIterator<Item = PathBuf>) -> bool {
+    let mut all = true;
     for dir in dirs {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(error = %e, "an opened file's copy couldn't be removed");
+                all = false;
             }
         }
     }
+    all
 }
 
 /// Removes a half-made copy; one that can't go is said in the log.
