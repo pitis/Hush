@@ -386,7 +386,7 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         if let reactionDelay { try? await Task.sleep(for: reactionDelay) }
         return answer
     }
-    /// When set, `details()` waits for `releaseDetails()` first (a slow core).
+    /// When set, `details()` waits for `releaseDetails()` first (a slow core), which ends the hold.
     var holdDetails = false
     private var heldDetails: [CheckedContinuation<Void, Never>] = []
 
@@ -400,8 +400,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
 
     /// A message after another, as the core reads them.
     func details(keys: [MessageKey]) async -> [MessageDetails] {
-        if lock.withLock({ holdDetails }) {
-            await withCheckedContinuation { c in lock.withLock { heldDetails.append(c) } }
+        await withCheckedContinuation { c in
+            // decided under the lock: a release in between would miss it
+            let held = lock.withLock { () -> Bool in
+                if holdDetails { heldDetails.append(c) }
+                return holdDetails
+            }
+            if !held { c.resume() }
         }
         var out: [MessageDetails] = []
         for key in keys {
