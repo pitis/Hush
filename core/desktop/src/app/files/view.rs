@@ -231,7 +231,7 @@ fn orange() -> Hsla {
 }
 
 /// An SF Symbol's ".circle.fill": a circle of `color` with the glyph cut out of it in `behind`.
-fn disc(glyph: &str, size: f32, color: Hsla, behind: Hsla) -> Div {
+pub fn disc(glyph: &str, size: f32, color: Hsla, behind: Hsla) -> Div {
     div()
         .size(px(size))
         .flex_none()

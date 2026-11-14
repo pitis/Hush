@@ -330,6 +330,7 @@ impl Hush {
         self.actions.pending.retain(|k, _| loaded.contains(k));
         self.keep_files(&loaded, cx);
         self.keep_previews(&loaded, cx);
+        self.polls.keep(&loaded);
         self.read_details(came, cx);
     }
 
@@ -387,6 +388,7 @@ impl Hush {
                 details.retain(|d| loaded.contains(&(d.key.author.clone(), d.key.sent_at)));
                 app.files_loaded(&details, cx);
                 app.previews_loaded(&details, cx);
+                app.polls_loaded(&details, cx);
                 app.reactions_loaded(details, cx);
                 true
             });

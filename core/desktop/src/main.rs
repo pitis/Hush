@@ -141,6 +141,10 @@ pub enum Demo {
     EditGroup,
     /// Members being added to it.
     AddMembers,
+    /// The Family group's polls and view-once media.
+    Polls,
+    /// A view-once photo shown over that chat.
+    ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
 }
@@ -175,6 +179,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("group-info", Demo::GroupInfo),
                 ("edit-group", Demo::EditGroup),
                 ("add-members", Demo::AddMembers),
+                ("polls", Demo::Polls),
+                ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),
             ];
             cx.spawn(async move |cx| {

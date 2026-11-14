@@ -33,10 +33,12 @@ pub mod navigate;
 pub mod notifications;
 mod options;
 mod paging;
+mod polls;
 mod previews;
 pub mod search;
 mod typing;
 mod view;
+mod view_once;
 
 /// How the phone lists this computer.
 const DEVICE_NAME: &str = "Hush Desktop";
@@ -173,6 +175,10 @@ pub struct Hush {
     /// The open chat's events among its messages.
     events: events::Events,
     options: options::Options,
+    /// The open chat's polls, as their votes stand.
+    polls: polls::Polls,
+    /// View-once media's one look.
+    view_once: view_once::ViewOnce,
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
@@ -371,6 +377,8 @@ impl Hush {
             previews: Default::default(),
             events: Default::default(),
             options: Default::default(),
+            polls: Default::default(),
+            view_once: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
         }
@@ -448,6 +456,15 @@ impl Hush {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.demo_chats(screen, cx);
+            }
+            crate::Demo::Polls | crate::Demo::ViewOnce => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.demo_polls(cx);
+                if let crate::Demo::ViewOnce = screen {
+                    app.demo_view_once(window, cx);
+                }
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;
@@ -612,6 +629,7 @@ impl Hush {
         if !matches!(self.screen, Screen::Chats) {
             self.dialog = None;
             self.group = None;
+            self.end_view_once(cx);
         }
         cx.notify();
     }
@@ -749,6 +767,7 @@ impl Hush {
         self.messages.clear();
         self.clear_files(cx);
         self.clear_previews(cx);
+        self.end_view_once(cx);
         // the draft's link, as if typed: putting text in the field says nothing
         self.composer_changed(cx);
         self.clear_tray(cx);

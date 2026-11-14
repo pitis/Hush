@@ -18,7 +18,9 @@ use sig_core::{ConnectionState, HistoryStage};
 
 use super::actions::{self, view::ActionCx};
 use super::options::{self, backed};
-use super::{events, files, join_step, matching, previews, typing, Dialog, DialogKind, Hush, JoinStep, Screen};
+use super::{
+    events, files, join_step, matching, polls, previews, typing, view_once, Dialog, DialogKind, Hush, JoinStep, Screen,
+};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -47,6 +49,9 @@ pub(super) struct Row {
     files: Vec<files::Shown>,
     /// Under the files.
     preview: Option<previews::Card>,
+    // a poll's card or view-once media's button, in place of its words
+    poll: Option<polls::Card>,
+    view_once: Option<view_once::State>,
     edited: bool,
     time: String,
     status: Option<MessageStatus>,
@@ -106,6 +111,12 @@ impl Hush {
             _ if hidden => text::plain(m.body.as_deref().unwrap_or_default(), &m.ranges, |aci| self.name(aci)),
             _ => body.clone(),
         };
+        let (poll, view_once) = (self.poll_card(m), self.view_once_state(m));
+        // its card or button stands for its words (still read out)
+        let (body, runs) = match poll.is_some() || view_once.is_some() {
+            true => (String::new(), vec![]),
+            false => (body, runs),
+        };
         let time = text::bubble_time(m.sent_at);
         let status = m.is_outgoing.then_some(m.status);
         let said = status.map(|s| format!(", {}", text::status(s))).unwrap_or_default();
@@ -128,6 +139,8 @@ impl Hush {
             text: body,
             files,
             preview: self.preview_card(m),
+            poll,
+            view_once,
             runs,
             note: m.deleted,
             edited: m.edited && !m.deleted,
@@ -1005,6 +1018,8 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
                     )),
             )
         })
+        .children(polls::card(&row.poll, this, color, behind))
+        .children(view_once::bubble(&row.view_once, this, color))
         .child(meta);
     let bubble = v_flex()
         .max_w_full()
@@ -1312,5 +1327,6 @@ impl Render for Hush {
             .children(history)
             .children(dialog)
             .children(group)
+            .children(self.render_view_once(p, cx))
     }
 }
