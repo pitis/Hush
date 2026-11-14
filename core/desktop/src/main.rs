@@ -29,6 +29,8 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
+            // before any window or notification
+            cx.set_app_identity(app::notifications::APP_ID, "Hush");
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys(key_bindings());
             cx.set_menus([
@@ -43,6 +45,7 @@ fn main() {
             app::search::shortcuts(window, hush.downgrade(), cx);
             app::attach::shortcut(window, hush.downgrade(), cx);
             app::navigate::shortcuts(window, hush.downgrade(), cx);
+            app::notifications::responses(window, hush.downgrade(), cx);
             cx.activate(true);
         });
 }
@@ -92,6 +95,8 @@ fn window_options(cx: &App) -> WindowOptions {
             traffic_light_position: Some(point(px(22.), px(22.))),
         }),
         window_min_size: Some(size(px(820.), px(520.))),
+        // Linux: its launcher, the one with the unread count
+        app_id: Some(app::notifications::APP_ID.into()),
         ..Default::default()
     }
 }

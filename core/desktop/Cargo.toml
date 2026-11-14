@@ -40,6 +40,14 @@ gpui-pre-platform = { version = "=0.3.11", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # the quarantine mark on files from chats, as the Mac app sets it
 libc = "0.2"
+# the Dock's unread badge (GPUI has none); already GPUI's
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
+# the launcher's unread count over D-Bus (GPUI has none); already the keyring's Secret Service
+zbus = "5"
 
 [features]
 # `--snapshot <folder>`: renders made-up screens to PNGs
