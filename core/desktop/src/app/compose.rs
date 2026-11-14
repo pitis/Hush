@@ -22,14 +22,20 @@ pub(super) mod view;
 gpui_kit::actions!(compose, [Bold, Italic, Strikethrough, Monospace, Spoiler]);
 
 /// Desktop's shortcuts (`ComposerText.style(forKey:)`): ⌘B, ⌘I, ⇧⌘X, ⌘E, ⇧⌘B; Ctrl off macOS.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("secondary-b", Bold, Some("Input")),
-        KeyBinding::new("secondary-i", Italic, Some("Input")),
-        KeyBinding::new("secondary-shift-x", Strikethrough, Some("Input")),
-        KeyBinding::new("secondary-e", Monospace, Some("Input")),
-        KeyBinding::new("secondary-shift-b", Spoiler, Some("Input")),
-    ]);
+pub fn keys() -> [KeyBinding; 5] {
+    // not `secondary-`: `KeyBinding::new` doesn't know the system and panics on it
+    let keys = if cfg!(target_os = "macos") {
+        ["cmd-b", "cmd-i", "cmd-shift-x", "cmd-e", "cmd-shift-b"]
+    } else {
+        ["ctrl-b", "ctrl-i", "ctrl-shift-x", "ctrl-e", "ctrl-shift-b"]
+    };
+    [
+        KeyBinding::new(keys[0], Bold, Some("Input")),
+        KeyBinding::new(keys[1], Italic, Some("Input")),
+        KeyBinding::new(keys[2], Strikethrough, Some("Input")),
+        KeyBinding::new(keys[3], Monospace, Some("Input")),
+        KeyBinding::new(keys[4], Spoiler, Some("Input")),
+    ]
 }
 
 /// How many matches the picker shows (`MentionPicker.shown`).
@@ -103,25 +109,32 @@ pub(super) struct Picker {
 fn typing(styles: &[u8], range: &Range<usize>, pending: Option<(usize, u8)>) -> u8 {
     match pending {
         Some((at, s)) if range.is_empty() && at == range.start => s,
-        _ if !range.is_empty() => styles[range.start],
-        _ if range.start > 0 => styles[range.start - 1],
+        // past them (an input method's text isn't reported until committed): plain
+        _ if !range.is_empty() => styles.get(range.start).copied().unwrap_or(0),
+        _ if range.start > 0 => styles.get(range.start - 1).copied().unwrap_or(0),
         _ => styles.first().copied().unwrap_or(0),
     }
 }
 
-/// `styles` (of `old`) once `old[range]` became `new`; what's typed takes the typing styles. What
-/// an edit rewrites unchanged keeps its styles: an input method commits the whole text.
+/// `styles` (of `old`) once `old[range]` became `new`; what's typed takes the typing styles. An
+/// input method commits by rewriting the whole text: what it didn't change keeps its styles.
 fn edited(styles: &mut Vec<u8>, old: &str, range: Range<usize>, new: &str, pending: Option<(usize, u8)>) {
     if styles.len() != old.len() || old.get(range.clone()).is_none() {
         // out of step (can't happen): plain, rather than styles on the wrong words
         *styles = vec![0; old.len()];
     }
     let Some(replaced) = old.get(range.clone()) else { return };
-    let same =
-        |a: &mut dyn Iterator<Item = (char, char)>| a.take_while(|(x, y)| x == y).map(|(x, _)| x.len_utf8()).sum();
-    let head: usize = same(&mut replaced.chars().zip(new.chars()));
-    let (replaced, new) = (&replaced[head..], &new[head..]);
-    let tail: usize = same(&mut replaced.chars().rev().zip(new.chars().rev()));
+    let (mut head, mut tail) = (0, 0);
+    // shortcut: what a commit writes next to the same letters (か before か) may take theirs;
+    // other edits say exactly what they changed, so they aren't trimmed
+    if range == (0..old.len()) {
+        let same = |a: &mut dyn Iterator<Item = (char, char)>| -> usize {
+            a.take_while(|(x, y)| x == y).map(|(x, _)| x.len_utf8()).sum()
+        };
+        head = same(&mut replaced.chars().zip(new.chars()));
+        tail = same(&mut replaced[head..].chars().rev().zip(new[head..].chars().rev()));
+    }
+    let new = &new[head..];
     let range = range.start + head..range.end - tail;
     let style = typing(styles, &range, pending);
     styles.splice(range, std::iter::repeat_n(style, new.len() - tail));
@@ -198,19 +211,28 @@ pub(super) fn message(typed: &Typed) -> (String, Vec<BodyRange>) {
 }
 
 /// `body` with its styles and mentions (named by `name`), to edit (`ComposerText.attributed`). A
-/// range that doesn't fit is left out; a mention covers one placeholder.
+/// range that doesn't fit is left out, but a spoiler, which covers to the end in the bubble (and
+/// so after the edit); a mention covers one placeholder.
 pub(super) fn load(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> Typed {
     let mut units: Vec<(u16, u8)> = body.encode_utf16().map(|u| (u, 0)).collect();
-    let fit = |r: &&BodyRange| r.length > 0 && (r.start as usize).saturating_add(r.length as usize) <= units.len();
-    let fitting: Vec<&BodyRange> = ranges.iter().filter(fit).collect();
-    for r in &fitting {
-        let bit = text::bit(&r.style);
-        let span = r.start as usize..r.start as usize + r.length as usize;
-        units[span].iter_mut().for_each(|u| u.1 |= bit);
+    let len = units.len();
+    for r in ranges {
+        let start = r.start as usize;
+        let end = start.saturating_add(r.length as usize);
+        let end = if r.style == TextStyle::Spoiler {
+            end.min(len)
+        } else {
+            end
+        };
+        if start < end && end <= len {
+            units[start..end].iter_mut().for_each(|u| u.1 |= text::bit(&r.style));
+        }
     }
     let mention = |i: usize| {
-        fitting.iter().find_map(|r| match &r.style {
-            TextStyle::Mention { aci } if r.start as usize == i && r.length == 1 => Some(aci.as_str()),
+        ranges.iter().find_map(|r| match &r.style {
+            TextStyle::Mention { aci } if r.start as usize == i && r.length == 1 && units[i].0 == 0xFFFC => {
+                Some(aci.as_str())
+            }
             _ => None,
         })
     };
@@ -345,7 +367,8 @@ impl Hush {
         if self.compose.styles.len() != self.compose.text.len() {
             self.compose.styles = vec![0; self.compose.text.len()];
         }
-        if self.picker(cx).is_none() {
+        // Esc keeps the picker closed while that "@word" is typed (`MentionPicker.update`)
+        if self.mention_query(cx).is_none() {
             self.compose.dismissed = None;
         }
     }
@@ -353,6 +376,8 @@ impl Hush {
     /// ⌘B and the others: the selection takes the style (or loses it, if all of it has it), or
     /// what's typed next does.
     pub(super) fn toggle_style(&mut self, bit: u8, cx: &mut Context<Self>) {
+        // shortcut: Undo takes back typing, not a style (the field's history holds no styles); the
+        // Mac app's undoes both. Keep a history of style changes here if that's wanted.
         let range = self.composer.read(cx).selected_range();
         let c = &mut self.compose;
         if range.is_empty() {
@@ -403,17 +428,22 @@ impl Hush {
         .detach();
     }
 
+    /// The "@word" before the caret, with nothing selected.
+    fn mention_query(&self, cx: &App) -> Option<(Range<usize>, String)> {
+        let input = self.composer.read(cx);
+        let selection = input.selected_range();
+        let tokens: Vec<Range<usize>> = input.tokens().iter().map(|t| t.range()).collect();
+        selection
+            .is_empty()
+            .then(|| mention_query(&input.value(), &tokens, selection.start))?
+    }
+
     /// The members matching the "@word" before the caret, unless Esc closed it.
     pub(super) fn picker(&self, cx: &App) -> Option<Picker> {
         if self.compose.members.is_empty() {
             return None;
         }
-        let input = self.composer.read(cx);
-        let selection = input.selected_range();
-        let tokens: Vec<Range<usize>> = input.tokens().iter().map(|t| t.range()).collect();
-        let (range, query) = selection
-            .is_empty()
-            .then(|| mention_query(&input.value(), &tokens, selection.start))??;
+        let (range, query) = self.mention_query(cx)?;
         if self.compose.dismissed == Some(range.start) {
             return None;
         }
@@ -448,6 +478,9 @@ impl Hush {
         let Some((aci, name)) = p.matches.get(index.unwrap_or(p.selected)) else {
             return false;
         };
+        // shortcut: the field's tokens are atomic: Backspace deletes a mention whole and the caret
+        // can't go inside it, where the Mac app's turns plain once typed into. Turn a token into
+        // text on a click or an arrow into it if that's wanted.
         let token = InlineToken::new(aci.clone(), format!("@{name}"));
         let added = self.composer.update(cx, |input, cx| {
             input.replace_range_with_token(p.range, token, window, cx)?;
@@ -493,42 +526,42 @@ mod tests {
     use gpui_kit::component::input::{InlineToken, InputContent};
     use sig_core::projection::{BodyRange, TextStyle};
 
-    use super::{edited, load, matches, mention_query, message, runs, toggle, Typed, SHOWN};
-    use crate::text::{BOLD, ITALIC, MENTION};
+    use super::{edited, load, matches, mention_query, message, runs, toggle, typing, Typed, SHOWN};
+    use crate::text::{BOLD, ITALIC, MENTION, SPOILER};
 
-    /// Text typed at `at` into `text` with `styles`.
-    fn typed_into(text: &str, styles: &mut Vec<u8>, at: Range<usize>, new: &str, pending: Option<(usize, u8)>) {
-        edited(styles, text, at, new, pending);
+    /// The same ranges, in any order.
+    fn same(a: &[BodyRange], b: &[BodyRange]) -> bool {
+        a.len() == b.len() && a.iter().all(|r| b.contains(r))
     }
 
     #[test]
     fn what_is_typed_takes_the_styles_before_it_or_those_toggled() {
         let mut styles = vec![BOLD, BOLD, 0, 0];
-        typed_into("ab  ", &mut styles, 2..2, "c", None);
+        edited(&mut styles, "ab  ", 2..2, "c", None);
         assert_eq!(styles, [BOLD, BOLD, BOLD, 0, 0], "after a bold one, bold");
-        typed_into("abc  ", &mut styles, 0..0, "x", None);
+        edited(&mut styles, "abc  ", 0..0, "x", None);
         assert_eq!(styles[0], BOLD, "at the start, the first one's");
         let mut styles = vec![BOLD, 0];
-        typed_into("ab", &mut styles, 1..1, "é", Some((1, BOLD | ITALIC)));
+        edited(&mut styles, "ab", 1..1, "é", Some((1, BOLD | ITALIC)));
         assert_eq!(
             styles,
             [BOLD, BOLD | ITALIC, BOLD | ITALIC, 0],
             "what was toggled there"
         );
         let mut styles = vec![BOLD, 0];
-        typed_into("ab", &mut styles, 2..2, "c", Some((1, ITALIC)));
+        edited(&mut styles, "ab", 2..2, "c", Some((1, ITALIC)));
         assert_eq!(styles, [BOLD, 0, 0], "toggled elsewhere: not here");
         let mut styles = vec![];
-        typed_into("", &mut styles, 0..0, "hi", None);
+        edited(&mut styles, "", 0..0, "hi", None);
         assert_eq!(styles, [0, 0]);
     }
 
     #[test]
     fn replacing_a_selection_takes_its_first_characters_styles_and_deleting_drops_them() {
         let mut styles = vec![0, ITALIC, BOLD, 0];
-        typed_into("abcd", &mut styles, 1..3, "xyz", None);
+        edited(&mut styles, "abcd", 1..3, "xyz", None);
         assert_eq!(styles, [0, ITALIC, ITALIC, ITALIC, 0]);
-        typed_into("axyzd", &mut styles, 1..4, "", None);
+        edited(&mut styles, "axyzd", 1..4, "", None);
         assert_eq!(styles, [0, 0]);
     }
 
@@ -536,7 +569,7 @@ mod tests {
     fn an_input_methods_whole_text_commit_keeps_the_styles_of_what_stayed() {
         let mut styles = vec![BOLD, BOLD, 0, ITALIC, ITALIC];
         // "ab" + "か" composed + "cd", committed as one edit of the whole text
-        typed_into("ab cd", &mut styles, 0..5, "ab か cd", None);
+        edited(&mut styles, "ab cd", 0..5, "ab か cd", None);
         assert_eq!(styles, [BOLD, BOLD, 0, 0, 0, 0, 0, ITALIC, ITALIC]);
     }
 
@@ -605,12 +638,9 @@ mod tests {
         assert_eq!(typed.words(), "👋 @Name a, look: big pot");
         assert_eq!(typed.content.tokens().len(), 1);
         assert_eq!(typed.content.tokens()[0].token().id().as_ref(), "a");
-        let (sent, mut back) = message(&typed);
+        let (sent, back) = message(&typed);
         assert_eq!(sent, body);
-        let mut ranges = ranges;
-        back.sort_by_key(|r| (r.start, r.length));
-        ranges.sort_by_key(|r| (r.start, r.length));
-        assert_eq!(back, ranges);
+        assert!(same(&back, &ranges), "{back:?}");
     }
 
     #[test]
@@ -625,7 +655,65 @@ mod tests {
         );
         assert_eq!(typed.words(), "hi \u{FFFC}");
         assert!(typed.content.tokens().is_empty());
-        assert!(typed.styles.iter().all(|&s| s == 0));
+        assert_eq!(message(&typed).1, []);
+    }
+
+    #[test]
+    fn an_edit_keeps_a_spoiler_running_past_the_end_covering_to_the_end() {
+        // shown covered to the end in the bubble: saving it unchanged keeps it so
+        let typed = load("hi there", &[range(3, 50, TextStyle::Spoiler)], name);
+        assert_eq!(message(&typed).1, [range(3, 5, TextStyle::Spoiler)]);
+    }
+
+    #[test]
+    fn a_mention_not_on_a_placeholder_isnt_loaded() {
+        // on the first half of 👍: as a token it would break the emoji
+        let typed = load("👍", &[mention(0, "a")], name);
+        assert_eq!(typed.words(), "👍");
+        assert_eq!(message(&typed), ("👍".into(), vec![]));
+    }
+
+    #[test]
+    fn typing_where_no_styles_are_known_is_plain() {
+        // an input method's text isn't reported until committed: the caret can be past them
+        assert_eq!(typing(&[BOLD], &(5..5), None), 0);
+        assert_eq!(typing(&[BOLD], &(3..4), None), 0);
+    }
+
+    #[test]
+    fn typing_over_a_selection_takes_its_first_characters_styles_even_if_the_same_letter_follows() {
+        let mut styles = vec![BOLD, 0, 0];
+        edited(&mut styles, "abc", 0..2, "b", None);
+        assert_eq!(styles, [BOLD, 0]);
+    }
+
+    #[test]
+    fn a_toggle_keeps_the_other_styles() {
+        let mut styles = vec![ITALIC, ITALIC | SPOILER];
+        toggle(&mut styles, 0..2, BOLD);
+        assert_eq!(styles, [BOLD | ITALIC, BOLD | ITALIC | SPOILER]);
+        toggle(&mut styles, 0..2, BOLD);
+        assert_eq!(styles, [ITALIC, ITALIC | SPOILER]);
+    }
+
+    #[test]
+    fn only_touching_runs_of_one_style_go_out_as_one_range() {
+        let bold_ends = Typed {
+            content: InputContent::new("a b c"),
+            styles: vec![BOLD, 0, 0, 0, BOLD],
+        };
+        assert_eq!(
+            message(&bold_ends).1,
+            [range(0, 1, TextStyle::Bold), range(4, 1, TextStyle::Bold)]
+        );
+        let side_by_side = Typed {
+            content: InputContent::new("abcd"),
+            styles: vec![BOLD, BOLD, ITALIC, ITALIC],
+        };
+        assert_eq!(
+            message(&side_by_side).1,
+            [range(0, 2, TextStyle::Bold), range(2, 2, TextStyle::Italic)]
+        );
     }
 
     #[test]
@@ -634,6 +722,11 @@ mod tests {
         assert_eq!(
             runs(&styles, std::slice::from_ref(&(2..4))),
             [(0..2, BOLD), (2..4, MENTION), (5..6, ITALIC)]
+        );
+        assert_eq!(
+            runs(&[BOLD, 0, BOLD], &[]),
+            [(0..1, BOLD), (2..3, BOLD)],
+            "not across a gap"
         );
     }
 
@@ -649,6 +742,11 @@ mod tests {
         assert_eq!(q("@Ana", ana), None, "a finished mention isn't one");
         assert_eq!(q("@Ana@b", ana), None);
         assert_eq!(mention_query("@an", &[], 9), None, "past the end");
+        assert_eq!(
+            mention_query("@an x", &[], 3),
+            Some((0..3, "an".into())),
+            "the caret mid-text"
+        );
     }
 
     #[test]
@@ -663,5 +761,148 @@ mod tests {
         assert!(found("na").is_empty(), "a word's start, not its middle");
         let many: Vec<(String, String)> = (0..12).map(|i| (i.to_string(), format!("Ana {i:02}"))).collect();
         assert_eq!(matches(&many, "a").len(), SHOWN);
+    }
+}
+
+/// The composer in a real (headless) window: keys go through GPUI's dispatch and the field. Needs
+/// GPUI's test support, which `snapshot` turns on: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Entity, TestAppContext, WindowOptions};
+    use sig_core::projection::{BodyRange, Message, TextStyle};
+
+    use super::super::Hush;
+    use super::message;
+    use crate::Demo;
+
+    /// `screen`, its composer with the keys.
+    fn open(screen: Demo, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>) {
+        let (window, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.bind_keys(crate::key_bindings());
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(screen, window, cx))
+            })
+            .expect("the window opens")
+        });
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| app.composer.update(cx, |c, cx| c.focus(window, cx)))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        (window, hush)
+    }
+
+    /// The picker's names and the chosen one, if open.
+    fn picker(hush: &Entity<Hush>, cx: &mut TestAppContext) -> Option<(Vec<String>, usize)> {
+        hush.read_with(cx, |app, cx| {
+            let p = app.picker(cx)?;
+            Some((p.matches.into_iter().map(|m| m.1).collect(), p.selected))
+        })
+    }
+
+    /// What ↩ would send.
+    fn sent(hush: &Entity<Hush>, cx: &mut TestAppContext) -> (String, Vec<BodyRange>) {
+        hush.read_with(cx, |app, cx| message(&app.typed(cx)))
+    }
+
+    fn range(start: u32, length: u32, style: TextStyle) -> BodyRange {
+        BodyRange { start, length, style }
+    }
+
+    fn mention(start: u32, aci: &str) -> BodyRange {
+        range(start, 1, TextStyle::Mention { aci: aci.into() })
+    }
+
+    #[gpui::test]
+    fn esc_closes_the_mention_picker_until_another_at_word(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Compose, cx);
+        assert_eq!(picker(&hush, cx), Some((vec!["Bogdan Ionescu".into()], 0)));
+        cx.simulate_keystrokes(window, "escape");
+        assert_eq!(picker(&hush, cx), None);
+        cx.simulate_input(window, "g");
+        assert_eq!(picker(&hush, cx), None, "the same @word stays closed");
+        cx.simulate_input(window, " @");
+        assert!(picker(&hush, cx).is_some(), "another opens it");
+    }
+
+    #[gpui::test]
+    fn a_picked_member_goes_out_as_a_mention(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Compose, cx);
+        cx.simulate_keystrokes(window, "backspace backspace");
+        let both = vec!["Ana Popescu".to_string(), "Bogdan Ionescu".into()];
+        assert_eq!(picker(&hush, cx), Some((both.clone(), 0)));
+        cx.simulate_keystrokes(window, "down down");
+        assert_eq!(picker(&hush, cx), Some((both, 0)), "↓ past the last wraps");
+        cx.simulate_keystrokes(window, "down enter");
+        assert_eq!(picker(&hush, cx), None);
+        let words = hush.read_with(cx, |app, cx| app.typed(cx).words());
+        assert!(words.ends_with("@Bogdan Ionescu "), "{words:?}");
+        let (body, ranges) = sent(&hush, cx);
+        assert!(body.ends_with('\u{FFFC}'), "{body:?}");
+        let at = body.encode_utf16().count() as u32 - 1;
+        assert!(ranges.contains(&mention(at, crate::demo::BOGDAN)), "{ranges:?}");
+    }
+
+    /// Edits `m` in the composer.
+    fn edit(window: AnyWindowHandle, hush: &Entity<Hush>, m: &Message, cx: &mut TestAppContext) {
+        window
+            .update(cx, |_, window, cx| {
+                hush.update(cx, |app, cx| app.start_editing(m, window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn an_edited_message_goes_back_with_its_styles_and_mentions(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        let ours = |app: &Hush| {
+            let found = app
+                .messages
+                .iter()
+                .find(|m| m.body.as_deref() == Some("On my way, 20 minutes"));
+            found.cloned().expect("the demo has it")
+        };
+        let mut m = hush.read_with(cx, |app, _| ours(app));
+        assert_eq!(m.ranges, [range(11, 10, TextStyle::Monospace)]);
+        edit(window, &hush, &m, cx);
+        assert_eq!(sent(&hush, cx), (m.body.clone().unwrap(), m.ranges.clone()));
+
+        let (ana, bogdan) = ("11111111-1111-4111-8111-111111111111", crate::demo::BOGDAN);
+        m.body = Some("\u{FFFC} and \u{FFFC}, bring it".into());
+        for ranges in [
+            vec![mention(0, ana)],
+            vec![range(0, 5, TextStyle::Bold), mention(0, ana), mention(6, bogdan)],
+        ] {
+            m.ranges = ranges.clone();
+            edit(window, &hush, &m, cx);
+            let (body, back) = sent(&hush, cx);
+            assert_eq!(body, "\u{FFFC} and \u{FFFC}, bring it");
+            assert!(
+                back.len() == ranges.len() && back.iter().all(|r| ranges.contains(r)),
+                "{back:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn styles_toggled_with_nothing_selected_go_to_what_is_typed_next(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        cx.simulate_keystrokes(window, "secondary-b secondary-i");
+        cx.simulate_input(window, "x");
+        assert_eq!(
+            sent(&hush, cx),
+            (
+                "x".into(),
+                vec![range(0, 1, TextStyle::Bold), range(0, 1, TextStyle::Italic)]
+            )
+        );
+
+        let (window, hush) = open(Demo::Chat, cx);
+        cx.simulate_keystrokes(window, "secondary-b secondary-b");
+        cx.simulate_input(window, "y");
+        assert_eq!(sent(&hush, cx), ("y".into(), vec![]), "twice: off again");
     }
 }

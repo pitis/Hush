@@ -37,12 +37,14 @@ pub fn can_delete(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
 }
 
 /// The Mac app's rule: as `can_delete`, and it has text to edit whose mentions a composer can
-/// hold (one placeholder each, inside the text): an edit would lose any other. Not a reply to a
-/// story: an edit goes without the story it answers.
+/// hold (each on its own placeholder): an edit would lose any other. Not a reply to a story: an
+/// edit goes without the story it answers.
 pub fn can_edit(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
-    let length = m.body.as_deref().map_or(0, |b| b.encode_utf16().count());
+    let units: Vec<u16> = m.body.as_deref().unwrap_or_default().encode_utf16().collect();
+    let length = units.len();
+    // stricter than the Mac app's: one beside its placeholder (on half an emoji) would break it
     let holdable = m.ranges.iter().all(|r| match r.style {
-        TextStyle::Mention { .. } => r.length == 1 && (r.start as usize) < length,
+        TextStyle::Mention { .. } => r.length == 1 && units.get(r.start as usize) == Some(&0xFFFC),
         _ => true,
     });
     can_delete(m, me, now_ms) && length > 0 && m.story.is_none() && holdable
@@ -729,6 +731,10 @@ mod tests {
         assert!(can_edit(&bold, Some(ME), NOW));
         // a mention no composer can hold (the Mac app's neither): an edit would lose it
         mention.ranges[0].length = 2;
+        assert!(!can_edit(&mention, Some(ME), NOW));
+        // nor one that isn't on a placeholder (half of an emoji)
+        mention.body = Some("👍 hi".into());
+        mention.ranges[0].length = 1;
         assert!(!can_edit(&mention, Some(ME), NOW));
     }
 

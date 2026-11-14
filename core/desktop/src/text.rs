@@ -14,11 +14,6 @@ const HIDDEN_SPOILER: &str = "■■■■";
 /// as the phone sends them; one that doesn't fit the text is skipped, except a spoiler, which
 /// hides up to the end of the text.
 pub fn plain(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> String {
-    marked(body, ranges, name).0
-}
-
-/// `plain`, with where its "@name"s are (byte ranges).
-pub fn marked(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -> (String, Vec<Range<usize>>) {
     let units: Vec<u16> = body.encode_utf16().collect();
     let span = |r: &BodyRange| (r.start as usize, r.start as usize + r.length as usize);
     let spoilers: Vec<(usize, usize, Option<&str>)> = ranges
@@ -38,27 +33,15 @@ pub fn marked(body: &str, ranges: &[BodyRange], name: impl Fn(&str) -> String) -
     let fits = |i: usize| i == units.len() || !(0xDC00..=0xDFFF).contains(&units[i]);
     let mut text = units.clone();
     let mut end = units.len();
-    // the "@name"s so far, in UTF-16 units of `text`: each replacement before them moves them
-    let mut names: Vec<Range<usize>> = vec![];
     for (start, stop, aci) in replaced {
         if stop > end || stop == start || !fits(start) || !fits(stop) {
             continue;
         }
         let with = aci.map_or_else(|| HIDDEN_SPOILER.to_string(), |aci| format!("@{}", name(aci)));
-        let with: Vec<u16> = with.encode_utf16().collect();
-        let moved = with.len() as isize - (stop - start) as isize;
-        for r in &mut names {
-            *r = r.start.saturating_add_signed(moved)..r.end.saturating_add_signed(moved);
-        }
-        if aci.is_some() {
-            names.push(start..start + with.len());
-        }
-        text.splice(start..stop, with);
+        text.splice(start..stop, with.encode_utf16());
         end = start;
     }
-    let bytes = |unit: usize| String::from_utf16_lossy(&text[..unit]).len();
-    let names = names.into_iter().rev().map(|r| bytes(r.start)..bytes(r.end)).collect();
-    (String::from_utf16_lossy(&text), names)
+    String::from_utf16_lossy(&text)
 }
 
 /// A run's styles (`MessageText.Styles`), as bits.
@@ -394,12 +377,14 @@ mod tests {
     }
 
     #[test]
-    fn mentions_say_where_they_are_for_bold() {
+    fn mentions_read_as_bold_names_in_a_bubble() {
         let body = "👋 \u{FFFC} and \u{FFFC}!";
-        let (text, names) = marked(body, &[mention(3, "a"), mention(9, "b")], name);
+        let (text, _) = styled(body, &[mention(3, "a"), mention(9, "b")], name, false);
         assert_eq!(text, "👋 @<a> and @<b>!");
-        let found: Vec<&str> = names.iter().map(|r| &text[r.clone()]).collect();
-        assert_eq!(found, ["@<a>", "@<b>"]);
+        assert_eq!(
+            runs(body, &[mention(3, "a"), mention(9, "b")], false),
+            [("@<a>".into(), BOLD), ("@<b>".into(), BOLD)]
+        );
     }
 
     #[test]
@@ -519,6 +504,15 @@ mod tests {
             runs("the \u{FFFC} did it", &ranges, true),
             [("@<a>".into(), BOLD)],
             "revealed: plain text but the name"
+        );
+    }
+
+    #[test]
+    fn styled_runs_dont_join_across_plain_text() {
+        let ranges = [style(0, 2, TextStyle::Bold), style(3, 2, TextStyle::Bold)];
+        assert_eq!(
+            runs("ab cd", &ranges, false),
+            [("ab".into(), BOLD), ("cd".into(), BOLD)]
         );
     }
 

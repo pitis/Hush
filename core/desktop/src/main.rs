@@ -29,10 +29,8 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
-            app::compose::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| app::quit(cx));
-            cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
-            cx.bind_keys(app::search::keys());
+            cx.bind_keys(key_bindings());
             cx.set_menus([
                 Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
                 Menu::new("Chats").items([
@@ -48,6 +46,14 @@ fn main() {
             app::search::shortcuts(window, hush.downgrade(), cx);
             cx.activate(true);
         });
+}
+
+/// Every shortcut the app binds, before the menus are set (which show them).
+fn key_bindings() -> Vec<KeyBinding> {
+    let mut all = vec![KeyBinding::new(QUIT_KEY, Quit, None)];
+    all.extend(app::search::keys());
+    all.extend(app::compose::keys());
+    all
 }
 
 fn window_options(cx: &App) -> WindowOptions {
@@ -148,4 +154,13 @@ fn snapshot(dir: std::path::PathBuf) {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_shortcut_parses() {
+        // `KeyBinding::new` panics on a keystroke it can't read (`secondary-`, a typo): at launch
+        assert!(!super::key_bindings().is_empty());
+    }
 }
