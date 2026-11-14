@@ -84,6 +84,25 @@ pub struct Hush {
     timeline: Entity<MessageScrollerState>,
 }
 
+/// The open core, for `quit`.
+struct Core(Arc<Client>);
+
+impl Global for Core {}
+
+/// Quits once the core has stopped (a few seconds at most): it first handles what it has already
+/// received, which the server counts as delivered and never sends again.
+pub fn quit(cx: &mut App) {
+    let Some(Core(client)) = cx.try_global::<Core>() else {
+        return cx.quit();
+    };
+    let client = client.clone();
+    cx.spawn(async move |cx| {
+        Compat::new(client.stop()).await;
+        cx.update(|cx| cx.quit());
+    })
+    .detach();
+}
+
 struct Listener(UnboundedSender<CoreEvent>);
 
 impl EventListener for Listener {
@@ -257,6 +276,7 @@ impl Hush {
                 self.screen = Screen::Failed(e.to_string());
             }
         }
+        cx.set_global(Core(client.clone()));
         self.client = Some(client);
         // an unlinked core has no chats yet: its `Ready` after linking loads them
         if linked {

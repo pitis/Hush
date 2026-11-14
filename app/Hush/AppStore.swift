@@ -26,7 +26,7 @@ final class AppStore {
     static let typingTimeout: TimeInterval = 15
     static let deviceName = "Hush"
     /// App state for Console.app (subsystem dev.pitis.hush). Never URLs or message content.
-    private static let logger = Logger(subsystem: "dev.pitis.hush", category: "app")
+    static let logger = Logger(subsystem: "dev.pitis.hush", category: "app")
 
     /// The one active (or just-ended) call, driving the call window.
     struct ActiveCall: Equatable {
@@ -968,6 +968,10 @@ final class AppStore {
     func networkReturned() {
         if screen == .chats { retryConnection() }
     }
+
+    /// Quitting: the core handles what it has already received (the server counts it as
+    /// delivered and never sends it again), then stops; a few seconds at most.
+    func stop() async { await client?.stop() }
 
     /// Chats whose secure-session reset is on its way: until it's recorded, or anything fails.
     private(set) var resettingSessions: Set<String> = []
