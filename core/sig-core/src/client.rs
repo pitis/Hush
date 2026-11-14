@@ -2310,6 +2310,22 @@ mod tests {
         assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
     }
 
+    /// Other users of the computer can't read the chats: the data folder is ours alone, made so
+    /// and tightened when an older one is opened.
+    #[cfg(unix)]
+    #[test]
+    fn the_data_folder_is_ours_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("client-mode");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let mode = || std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+        drop(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink.clone()).unwrap());
+        assert_eq!(mode(), 0o700, "made so");
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).unwrap());
+        assert_eq!(mode(), 0o700, "tightened");
+    }
+
     #[test]
     fn unreadable_registration_fails_open_instead_of_looking_unlinked() {
         let dir = temp_dir("client-corrupt");

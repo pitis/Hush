@@ -237,7 +237,10 @@ final class AppStore {
     }
 
     nonisolated static func openReal(listener: EventListener) throws -> any ClientProtocol {
-        try Client.open(dataDir: dataDirectory().path, dbKeyHex: Keychain().dbKey(), listener: listener)
+        let client = try Client.open(dataDir: dataDirectory().path, dbKeyHex: Keychain().dbKey(), listener: listener)
+        // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
+        Files.clearLeftovers()
+        return client
     }
 
     /// Opens the core (off the main thread), then either starts receiving or starts linking. Runs once.
@@ -399,6 +402,7 @@ final class AppStore {
         previewDraft = nil
         previewLink = nil
         dismissedPreviews = []
+        Files.discard(outgoingFiles.map(\.path))
         outgoingFiles = []
         changedKeys = []
         changedAt = [:]
@@ -450,12 +454,13 @@ final class AppStore {
                 // the text goes with the files, as their caption
                 _ = try await client.sendAttachments(
                     conversationId: id, files: files, caption: body.isEmpty ? nil : body, ranges: ranges, quote: quote)
+                Files.discard(files.map(\.path))
             }
             replyTo = nil
             return true
         } catch {
             // back in the tray, unless the chat changed meanwhile
-            if selectedId == id { outgoingFiles = files + outgoingFiles }
+            if selectedId == id { outgoingFiles = files + outgoingFiles } else { Files.discard(files.map(\.path)) }
             lastError = Self.describe(error)
             append("send failed: \(error)")
             return false
@@ -669,7 +674,10 @@ final class AppStore {
         for f in files where !outgoingFiles.contains(where: { $0.path == f.path }) { outgoingFiles.append(f) }
     }
 
-    func removeFile(_ path: String) { outgoingFiles.removeAll { $0.path == path } }
+    func removeFile(_ path: String) {
+        outgoingFiles.removeAll { $0.path == path }
+        Files.discard([path])
+    }
 
     /// Downloads a file that didn't download by itself, or failed.
     func download(_ id: Int64) {
@@ -1252,7 +1260,13 @@ final class AppStore {
             return nil
         }
         do {
-            return URL(fileURLWithPath: try await client.exportChat(conversationId: id, folder: folder.path))
+            let made = URL(fileURLWithPath: try await client.exportChat(conversationId: id, folder: folder.path))
+            // the chat's files get Gatekeeper's check, as when opened here; the page is Hush's own.
+            // Off the main thread (a chat can have thousands), and extra: the export is done.
+            let files = made.appendingPathComponent("files", isDirectory: true)
+            let failed = await Task.detached { Files.quarantineFiles(in: files) }.value
+            if let first = failed.first { append("quarantining \(failed.count) exported files failed: \(first)") }
+            return made
         } catch {
             append("exporting a chat failed: \(error)")
             showError("Couldn't export the chat: \(Self.fileFailure(error))")
