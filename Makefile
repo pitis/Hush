@@ -59,10 +59,14 @@ format: ## Format Rust and Swift sources
 lint: ## rustfmt check, clippy -D warnings, swift-format lint --strict
 	cd core && cargo fmt --check
 	cd core && cargo clippy --all-targets -q -- -D warnings
+	@# the desktop's window tests build only with this feature
+	cd core && cargo clippy --all-targets --features hush-desktop/snapshot -q -- -D warnings
 	xcrun swift-format lint --strict -r app/Hush app/HushTests
 
 test: core project ## Rust tests + XCTest
-	cd core && cargo test -q
+	@# with the desktop's window tests, which build only with this feature (workspace-wide, so the
+	@# core's dependencies keep the features of the plain build and aren't compiled twice)
+	cd core && cargo test --features hush-desktop/snapshot -q
 	$(XCB) test -quiet 2>&1 | $(XCB_FILTER)
 
 check: lint test ## The full gate: run before every push
