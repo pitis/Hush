@@ -180,10 +180,12 @@ impl Hush {
         let Some(ix) = shown.iter().position(|c| c.id == id) else {
             return;
         };
-        // the titles above it: "Chats" while searching; else "Pinned", and "Chats" after those
-        let pinned = self.query.is_empty() && shown.iter().any(|c| c.pinned_order.is_some());
+        // the titles above it: "Chats" while searching, "Archived" in the archive; else "Pinned",
+        // and "Chats" after those
+        let archive = self.in_archive();
+        let pinned = self.query.is_empty() && !archive && shown.iter().any(|c| c.pinned_order.is_some());
         let titles = match () {
-            _ if !self.query.is_empty() => 1,
+            _ if !self.query.is_empty() || archive => 1,
             _ if pinned && shown[ix].pinned_order.is_none() => 2,
             _ if pinned => 1,
             _ => 0,

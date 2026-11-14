@@ -191,7 +191,8 @@ impl Hush {
 
     fn render_sidebar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let shown = self.listed();
-        let pinned = self.query.is_empty() && shown.iter().any(|c| c.pinned_order.is_some());
+        let archive = self.in_archive();
+        let pinned = self.query.is_empty() && !archive && shown.iter().any(|c| c.pinned_order.is_some());
         let mut list = v_flex()
             .id("chat-list")
             .role(Role::List)
@@ -205,6 +206,10 @@ impl Hush {
         if !self.query.is_empty() && !shown.is_empty() {
             list = list.child(section("Chats", p));
         }
+        // no title while searching one chat: it lists none
+        if archive && self.find.scope.is_none() {
+            list = list.child(section("Archived", p));
+        }
         for (ix, c) in shown.iter().enumerate() {
             let first_unpinned = c.pinned_order.is_none() && ix > 0 && shown[ix - 1].pinned_order.is_some();
             if pinned && ix == 0 {
@@ -213,9 +218,11 @@ impl Hush {
             if pinned && first_unpinned {
                 list = list.child(section("Chats", p));
             }
-            list = list.child(self.render_chat_row(ix, c, p, cx));
+            list = list.child(self.with_chat_menu(self.render_chat_row(ix, c, p, cx), &c.id, cx));
         }
-        let list = list.children(self.render_results(p, cx));
+        let list = list
+            .children(self.render_archive_row(p, cx))
+            .children(self.render_results(p, cx));
         // macOS 26's sidebar: a panel floating in the window, inset from its edges
         v_flex()
             .w(px(SIDEBAR))
@@ -242,6 +249,7 @@ impl Hush {
                     .pt(px(8.))
                     .gap(px(6.))
                     .flex_none()
+                    .children(archive.then(|| self.render_archive_back(p, cx)))
                     .child(
                         h_flex()
                             .flex_1()
@@ -267,7 +275,7 @@ impl Hush {
                                     .flex_1(),
                             ),
                     )
-                    .child(self.render_new_chat(p, cx)),
+                    .children((!archive).then(|| self.render_new_chat(p, cx))),
             )
             .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
             .child(list)
@@ -688,7 +696,7 @@ impl Hush {
             .as_ref()
             .and_then(|id| self.chats.iter().find(|c| &c.id == id));
         let Some(c) = open else {
-            let (title, detail) = match (self.inbox().next().is_none(), &self.connection) {
+            let (title, detail) = match (self.chats.is_empty(), &self.connection) {
                 (false, _) => ("Select a chat", ""),
                 (true, ConnectionState::Online) => (
                     "Connected — no messages yet",
@@ -719,17 +727,7 @@ impl Hush {
                 _ => String::new(),
             },
         };
-        // shortcut: message requests, invitations and blocked chats are answered on the phone,
-        // and a join request's Delete and Cancel Request don't ask first; the Mac app offers
-        // Accept, Block and the others here, and asks: add them with a confirmation dialog
         let answer_first = answer_first(c);
-        let answer_where = if c.blocked {
-            "This chat is blocked. Unblock it on your phone to write here."
-        } else if c.group_join_requested {
-            "You asked to join this group. An admin has to let you in."
-        } else {
-            "Answer this chat on your phone to write here."
-        };
         let this = cx.entity().downgrade();
         let mut row_style = StyleRefinement::default();
         row_style.padding.bottom = Some(px(0.).into());
@@ -792,42 +790,7 @@ impl Hush {
                 ),
             )
             .child(if answer_first {
-                let id = c.id.clone();
-                v_flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(18.))
-                    .py(px(14.))
-                    .child(
-                        label("answer-first", Role::Label, answer_where)
-                            .text_center()
-                            .text_color(p.secondary),
-                    )
-                    .when(c.group_join_requested && !c.blocked, |this| {
-                        let delete = id.clone();
-                        this.child(
-                            h_flex()
-                                .gap(px(10.))
-                                // here only, should cancelling fail for good (the request stays)
-                                .child(
-                                    Button::new("delete-chat")
-                                        .label("Delete")
-                                        .disabled(self.cancelling)
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| this.delete_chat(delete.clone(), cx)),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("cancel-request")
-                                        .label("Cancel Request")
-                                        .disabled(self.cancelling)
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| this.cancel_join_request(id.clone(), cx)),
-                                        ),
-                                ),
-                        )
-                    })
+                self.render_request_bar(c, p, cx)
             } else {
                 let composer = self.with_attach(self.render_composer(p, cx), p, cx);
                 self.with_compose(self.with_composer_bar(composer, p, cx), p, cx)
