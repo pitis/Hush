@@ -32,12 +32,20 @@ fn main() {
             app::compose::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| app::quit(cx));
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
-            cx.set_menus([Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)])]);
+            cx.bind_keys(app::search::keys());
+            cx.set_menus([
+                Menu::new("Hush").items([MenuItem::action("Quit Hush", Quit)]),
+                Menu::new("Chats").items([
+                    MenuItem::action("Search", app::search::Search),
+                    MenuItem::action("Search in Chat", app::search::SearchInChat),
+                ]),
+            ]);
             cx.on_window_closed(|cx, _| app::quit(cx)).detach();
-            gpui_kit::open_window(window_options(cx), cx, |window, cx| {
+            let (window, hush) = gpui_kit::open_window(window_options(cx), cx, |window, cx| {
                 cx.new(|cx| app::Hush::new(window, cx))
             })
             .expect("the window opens");
+            app::search::shortcuts(window, hush.downgrade(), cx);
             cx.activate(true);
         });
 }
@@ -75,6 +83,10 @@ pub enum Demo {
     Files,
     /// The chat, writing a styled message with a mention, the mention picker open.
     Compose,
+    /// Every chat searched.
+    Search,
+    /// The open chat searched, its newest match opened.
+    SearchInChat,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -95,6 +107,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("reply", Demo::Reply),
                 ("files", Demo::Files),
                 ("compose", Demo::Compose),
+                ("search", Demo::Search),
+                ("search-in-chat", Demo::SearchInChat),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

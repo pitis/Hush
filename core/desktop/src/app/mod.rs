@@ -23,6 +23,7 @@ use crate::{key, text};
 mod actions;
 pub mod compose;
 mod files;
+pub mod search;
 mod view;
 
 /// How the phone lists this computer.
@@ -30,8 +31,8 @@ const DEVICE_NAME: &str = "Hush Desktop";
 /// Inside the OS's local app data folder (not Windows' roaming one: this device's keys stay on this
 /// computer); not the Mac app's "Hush", so the two never share data.
 const DATA_FOLDER: &str = "Hush Desktop";
-/// shortcut: only a chat's newest messages are loaded; page older ones with
-/// `Client::messages(id, before, limit)` once scrolling back is wanted.
+/// shortcut: only a chat's newest messages are loaded (back to a message opened from the search);
+/// page older ones with `Client::messages(id, before, limit)` once scrolling back is wanted.
 const PAGE: u32 = 100;
 
 enum Screen {
@@ -102,6 +103,8 @@ pub struct Hush {
     messages: Vec<Message>,
     /// Bumped on every selection, so a load for the chat open before is dropped.
     generation: u64,
+    /// How many of the open chat's newest messages load: `PAGE`, or back to a found message.
+    depth: u32,
     messages_loading: Option<u64>,
     messages_again: bool,
     /// Contacts' names by ACI.
@@ -123,9 +126,11 @@ pub struct Hush {
     composer: Entity<TextareaState>,
     /// Nothing to send: the send button hides.
     composer_empty: bool,
-    /// The sidebar's search field and its words (chats whose name or last message has them).
+    /// The sidebar's search field and its words (chats whose name has them; messages in `find`).
     search: Entity<InputState>,
     query: String,
+    /// The messages the search found.
+    find: search::Find,
     timeline: Entity<MessageScrollerState>,
     /// Who a new group can have, by name: (ACI, name).
     contacts: Vec<(String, String)>,
@@ -252,17 +257,30 @@ impl Hush {
             this.composer_edited(e, cx)
         })
         .detach();
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
-        cx.subscribe(&search, |this, search, event: &InputEvent, cx| {
-            if let InputEvent::Change = event {
-                this.query = search.read(cx).value().trim().to_lowercase();
-                cx.notify();
-            }
-        })
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search").clean_on_escape());
+        cx.subscribe_in(
+            &search,
+            window,
+            |this, search, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.query = search.read(cx).value().trim().to_lowercase();
+                    this.schedule_search(cx);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.submit_search(window, cx),
+                // leaving the field empty (Esc, a click elsewhere) ends the search and its chat scope
+                InputEvent::Blur if this.query.is_empty() => this.end_search(window, cx),
+                _ => {}
+            },
+        )
         .detach();
         let timeline = cx.new(|cx| MessageScrollerState::new(0, cx));
-        // scrolling down to the newest message reads it
-        cx.observe(&timeline, |this, _, cx| this.mark_read(false, cx)).detach();
+        // scrolling down to the newest message reads it, and drops a deep jump's older rows
+        cx.observe(&timeline, |this, _, cx| {
+            this.mark_read(false, cx);
+            this.back_to_newest(cx);
+        })
+        .detach();
 
         Self {
             client: None,
@@ -278,6 +296,7 @@ impl Hush {
             selected: None,
             messages: vec![],
             generation: 0,
+            depth: PAGE,
             messages_loading: None,
             messages_again: false,
             names: HashMap::new(),
@@ -291,6 +310,7 @@ impl Hush {
             composer_empty: true,
             search,
             query: String::new(),
+            find: Default::default(),
             timeline,
             contacts: vec![],
             dialog: None,
@@ -315,7 +335,12 @@ impl Hush {
                 }
             }
             crate::Demo::Empty => app.screen = Screen::Chats,
-            crate::Demo::Chat | crate::Demo::NewGroup | crate::Demo::Reply | crate::Demo::Compose => {
+            crate::Demo::Chat
+            | crate::Demo::NewGroup
+            | crate::Demo::Reply
+            | crate::Demo::Compose
+            | crate::Demo::Search
+            | crate::Demo::SearchInChat => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -328,6 +353,9 @@ impl Hush {
                 }
                 if let crate::Demo::Compose = screen {
                     app.demo_compose(window, cx);
+                }
+                if let crate::Demo::Search | crate::Demo::SearchInChat = screen {
+                    app.demo_search(matches!(screen, crate::Demo::SearchInChat), window, cx);
                 }
             }
             crate::Demo::Files => {
@@ -394,8 +422,13 @@ impl Hush {
     }
 
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
-        if let CoreEvent::MessageExpired { key, .. } = &event {
-            self.message_expired(key, cx);
+        match &event {
+            CoreEvent::MessageExpired { key, .. } => {
+                self.message_expired(key, cx);
+                self.forget_hit(key);
+            }
+            CoreEvent::MessageChanged { key, .. } => self.recheck_hit(key, cx),
+            _ => {}
         }
         match event {
             CoreEvent::LinkUrl { url } => {
@@ -571,6 +604,7 @@ impl Hush {
         self.composer.update(cx, |input, cx| input.focus(window, cx));
         self.load_members(cx);
         self.generation += 1;
+        self.depth = PAGE;
         self.messages.clear();
         self.clear_files(cx);
         self.timeline.update(cx, |t, cx| t.reset(0, cx));
@@ -584,7 +618,7 @@ impl Hush {
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
             return;
         };
-        let generation = self.generation;
+        let (generation, mut depth) = (self.generation, self.depth);
         if self.messages_loading == Some(generation) {
             self.messages_again = true;
             return;
@@ -592,24 +626,33 @@ impl Hush {
         self.messages_loading = Some(generation);
         self.messages_again = false;
         cx.spawn(async move |this, cx| loop {
-            let page = Compat::new(client.messages(id.clone(), None, PAGE)).await;
+            let page = Compat::new(client.messages(id.clone(), None, depth)).await;
             let again = this.update(cx, |app, cx| {
                 if app.generation != generation {
-                    return false; // another chat was opened meanwhile
+                    return None; // another chat was opened meanwhile
+                }
+                // more is wanted now (back to a found message): not shown, read again
+                if depth < app.depth {
+                    app.messages_again = false;
+                    return Some(app.depth);
                 }
                 match page {
                     Ok(page) => app.set_messages(page, cx),
-                    Err(e) => app.error = Some(format!("Couldn't load the messages: {e}")),
+                    Err(e) => {
+                        app.messages_failed();
+                        app.error = Some(format!("Couldn't load the messages: {e}"));
+                    }
                 }
                 let again = std::mem::take(&mut app.messages_again);
                 if !again {
                     app.messages_loading = None;
                 }
                 cx.notify();
-                again
+                again.then_some(app.depth)
             });
-            if !again.unwrap_or(false) {
-                break;
+            match again {
+                Ok(Some(wanted)) => depth = wanted,
+                _ => break,
             }
         })
         .detach();
@@ -643,6 +686,7 @@ impl Hush {
         );
         self.load_names(wanted, cx);
         self.messages_loaded(cx);
+        self.reveal_found(cx);
     }
 
     /// Looks up each unknown contact's name; a failed lookup is tried again next time.
@@ -1093,7 +1137,7 @@ mod tests {
     use sig_core::projection::{Conversation, ConversationKind, MessageKind, MessageStatus};
     use sig_core::{CoreError, GroupPreview};
 
-    fn chat(id: &str, title: &str) -> Conversation {
+    pub(super) fn chat(id: &str, title: &str) -> Conversation {
         Conversation {
             id: id.into(),
             title: title.into(),
