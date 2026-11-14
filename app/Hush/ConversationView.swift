@@ -408,17 +408,17 @@ struct TimelineList: View {
             // chat's first page: the empty timeline before it counts as at the top.
             if nearTop, old != nil { loadOlder() }
         }
-        .onChange(of: store.messages.last?.sentAt) { _, _ in
-            let own = store.messages.last?.isOutgoing ?? false
-            switch Timeline.onNewLastMessage(atBottom: atBottom, isOwn: own) {
-            case .scrollToBottom:
+        .onChange(of: store.messages.last) { old, new in
+            switch Timeline.onNewLastMessage(new, after: old, atBottom: atBottom) {
+            case nil: break
+            case .scrollToBottom?:
                 // at the bottom, the follow keeps the end in view (a scroll of its own would race it),
                 // but it waits while a search result shows
                 if !atBottom || store.highlighted != nil {
                     withAnimation(.easeOut(duration: 0.15)) { position.scrollTo(edge: .bottom) }
                 }
                 unseenNew = false
-            case .showPill: unseenNew = true
+            case .showPill?: unseenNew = true
             }
         }
         .onChange(of: conversation.id) { _, _ in

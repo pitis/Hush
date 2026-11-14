@@ -84,12 +84,19 @@ enum Timeline {
         }
     }
 
-    /// What the timeline does when its last message changes: follow it when the reader is at the
+    /// What the timeline does when a new message comes in last: follow it when the reader is at the
     /// bottom or it is their own message, otherwise show the "New messages" pill.
     enum NewMessageAction: Equatable { case scrollToBottom, showPill }
 
-    static func onNewLastMessage(atBottom: Bool, isOwn: Bool) -> NewMessageAction {
-        atBottom || isOwn ? .scrollToBottom : .showPill
+    /// Nil when no new message came in: the same one changed, the last one went (expired), or a chat's
+    /// messages arrived with it (as it opens, or a search result's page in another chat). An empty
+    /// chat's first message reads the same as its first page: nil, and the timeline is at its end anyway.
+    static func onNewLastMessage(_ new: Message?, after old: Message?, atBottom: Bool) -> NewMessageAction? {
+        // ordered like the core's pages
+        guard let new, let old, new.conversationId == old.conversationId,
+            (new.sentAt, new.author) > (old.sentAt, old.author)
+        else { return nil }
+        return atBottom || new.isOutgoing ? .scrollToBottom : .showPill
     }
 
     /// Within this many points of the edge counts as being there.

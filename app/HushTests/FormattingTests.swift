@@ -224,9 +224,34 @@ final class ComposerTests: XCTestCase {
 
 final class ScrollDecisionTests: XCTestCase {
     func testFollowsNewMessagesOnlyAtTheBottomOrForOwnMessages() {
-        XCTAssertEqual(Timeline.onNewLastMessage(atBottom: true, isOwn: false), .scrollToBottom)
-        XCTAssertEqual(Timeline.onNewLastMessage(atBottom: false, isOwn: true), .scrollToBottom)
-        XCTAssertEqual(Timeline.onNewLastMessage(atBottom: false, isOwn: false), .showPill)
+        let last = message("c:alice", "alice", 1000)
+        let theirs = message("c:alice", "alice", 2000)
+        let mine = message("c:alice", "me-aci", 2000, outgoing: true)
+        XCTAssertEqual(Timeline.onNewLastMessage(theirs, after: last, atBottom: true), .scrollToBottom)
+        XCTAssertEqual(Timeline.onNewLastMessage(mine, after: last, atBottom: false), .scrollToBottom)
+        XCTAssertEqual(Timeline.onNewLastMessage(theirs, after: last, atBottom: false), .showPill)
+    }
+
+    /// Messages that arrive with a chat aren't new ones: a scroll of their own would race the one to a
+    /// search result's message.
+    func testAChatsPageIsNoNewMessage() {
+        let page = message("c:alice", "alice", 400_000)
+        XCTAssertNil(Timeline.onNewLastMessage(page, after: nil, atBottom: true), "the chat's first page")
+        // the newest one their own: still no new message
+        let mine = message("c:alice", "me-aci", 400_000, outgoing: true)
+        XCTAssertNil(
+            Timeline.onNewLastMessage(mine, after: message("c:bob", "bob", 30_000), atBottom: false),
+            "another chat's page")
+        var read = page
+        read.status = .read
+        XCTAssertNil(Timeline.onNewLastMessage(read, after: page, atBottom: true), "the same message, changed")
+        XCTAssertNil(Timeline.onNewLastMessage(nil, after: page, atBottom: true), "the chat closed")
+        XCTAssertNil(
+            Timeline.onNewLastMessage(message("c:alice", "alice", 1000), after: page, atBottom: false),
+            "the last one expired")
+        XCTAssertEqual(
+            Timeline.onNewLastMessage(message("c:alice", "bob", 400_000), after: page, atBottom: false), .showPill,
+            "another member's, sent the same millisecond")
     }
 
     /// As the app's window reports it: a 465pt container between a 52pt toolbar and a 55pt composer.
