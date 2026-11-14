@@ -66,13 +66,20 @@ final class AppStoreBackupTests: XCTestCase {
         await store.boot()
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("hush-export-\(UUID())")
         defer { try? FileManager.default.removeItem(at: out) }
+        // a file that can't be marked (gone since: a link to nothing)
+        let files = out.appendingPathComponent("Chat/files")
+        try FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: files.appendingPathComponent("0-gone"), withDestinationURL: out.appendingPathComponent("nothing"))
         let exported = await store.exportChat("c:a", to: out)
-        let made = try XCTUnwrap(exported)
+        let made = try XCTUnwrap(exported, "the export is done: marking its files is extra")
         XCTAssertEqual(made.path, out.path + "/Chat")
         XCTAssertEqual(fake.exports.map(\.conversationId), ["c:a"])
+        XCTAssertNil(store.lastError)
+        XCTAssertEqual(store.log.last?.text.hasPrefix("quarantining 1 exported files failed"), true)
         // the chat's files get Gatekeeper's check, as when opened in Hush; the page is Hush's own
-        XCTAssertEqual(try quarantineAgent(made.appendingPathComponent("files/1-run.command")), "Hush")
-        XCTAssertNil(try quarantineAgent(made.appendingPathComponent("chat.html")))
+        XCTAssertEqual(quarantineMark(made.appendingPathComponent("files/1-run.command"))?.hasSuffix(";Hush;"), true)
+        XCTAssertNil(quarantineMark(made.appendingPathComponent("chat.html")))
         fake.exportError = CoreError.Storage(message: "can't copy a file: disk full")
         let failed = await store.exportChat("c:a", to: out)
         XCTAssertNil(failed)

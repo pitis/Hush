@@ -227,7 +227,10 @@ final class AppStore {
     }
 
     nonisolated static func openReal(listener: EventListener) throws -> any ClientProtocol {
-        try Client.open(dataDir: dataDirectory().path, dbKeyHex: Keychain().dbKey(), listener: listener)
+        let client = try Client.open(dataDir: dataDirectory().path, dbKeyHex: Keychain().dbKey(), listener: listener)
+        // only now: a second copy of Hush, refused the folder, mustn't clear the running one's
+        Files.clearLeftovers()
+        return client
     }
 
     /// Opens the core (off the main thread), then either starts receiving or starts linking. Runs once.
@@ -1192,11 +1195,11 @@ final class AppStore {
         }
         do {
             let made = URL(fileURLWithPath: try await client.exportChat(conversationId: id, folder: folder.path))
-            // the chat's files get Gatekeeper's check, as when opened here; the page is Hush's own
+            // the chat's files get Gatekeeper's check, as when opened here; the page is Hush's own.
+            // Off the main thread (a chat can have thousands), and extra: the export is done.
             let files = made.appendingPathComponent("files", isDirectory: true)
-            for name in try FileManager.default.contentsOfDirectory(atPath: files.path) {
-                try Files.quarantine(files.appendingPathComponent(name))
-            }
+            let failed = await Task.detached { Files.quarantineFiles(in: files) }.value
+            if let first = failed.first { append("quarantining \(failed.count) exported files failed: \(first)") }
             return made
         } catch {
             append("exporting a chat failed: \(error)")

@@ -100,15 +100,29 @@ enum Files {
 
     /// Marks a file from a chat as come from someone else, as a browser marks its downloads:
     /// Gatekeeper checks it before it runs (a `.command` a contact sent, opened from Quick Look's
-    /// Open With or from Finder).
+    /// Open With or from Finder). A file already marked keeps its mark, and with it any "Open
+    /// Anyway" given before.
     static func quarantine(_ file: URL) throws {
-        var file = file
-        var values = URLResourceValues()
-        values.quarantineProperties = [
-            kLSQuarantineAgentNameKey as String: "Hush",
-            kLSQuarantineTypeKey as String: kLSQuarantineTypeInstantMessageAttachment as String,
-        ]
-        try file.setResourceValues(values)
+        let name = "com.apple.quarantine"
+        guard getxattr(file.path, name, nil, 0, 0, 0) < 0 else { return }
+        // Launch Services' download flags, written directly: through its API each mark would also
+        // be a lasting row in its quarantine events database, a record of when files were opened
+        let mark = "0081;\(String(Int(Date().timeIntervalSince1970), radix: 16));Hush;"
+        guard setxattr(file.path, name, mark, mark.utf8.count, 0, 0) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    /// Quarantines each file in `folder` (an export's `files/`), as many as it can: what failed.
+    static func quarantineFiles(in folder: URL) -> [Error] {
+        do {
+            return try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil).compactMap {
+                do {
+                    try quarantine($0)
+                    return nil
+                } catch { return error }
+            }
+        } catch { return [error] }
     }
 
     /// Done with an opened file: its link goes.
@@ -119,12 +133,15 @@ enum Files {
     /// Files out of the tray, sent (the core keeps its own copy) or dropped: the pictures pasted
     /// into it go. Files chosen or dropped from the user's folders are theirs and stay.
     static func discard(_ paths: [String]) {
-        for path in paths where path.hasPrefix(pasteRoot.path + "/") {
-            try? FileManager.default.removeItem(atPath: path)
+        let root = pasteRoot.standardizedFileURL.path
+        for path in paths {
+            let file = URL(fileURLWithPath: path).standardizedFileURL  // no `..` climbing out
+            if file.deletingLastPathComponent().path == root { try? FileManager.default.removeItem(at: file) }
         }
     }
 
-    /// At launch: what a previous run left open or pasted goes.
+    /// At launch, once the core holds the data folder: what a previous run left open or pasted
+    /// goes.
     static func clearLeftovers() {
         for root in [openRoot, pasteRoot] { try? FileManager.default.removeItem(at: root) }
     }
