@@ -181,7 +181,8 @@ impl Hush {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client.clone() else { return };
-        if self.in_front() {
+        // off: nothing is read for one (`words` says none too, for a change made meanwhile)
+        if self.in_front() || settings::chosen::<NotificationContent>(cx) == NotificationContent::Off {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -288,6 +289,20 @@ impl Hush {
 
     /// The chat list changed: the chats read take their notifications with them, and the unread
     /// count is set again, and again when a timed mute ends.
+    /// Starting over (`AppStore.restart`): the count goes, and what this run showed goes with the
+    /// data if that's gone (the message previews in them); what the new state keeps tracking.
+    /// shortcut: those from earlier runs have no tag known here, and Linux takes nothing back.
+    pub(super) fn start_over(&mut self, data_gone: bool, cx: &mut Context<Self>) -> Notifications {
+        if data_gone {
+            Self::take_back(self.notifications.take(|_| true), cx);
+        }
+        show_badge(0);
+        Notifications {
+            shown: std::mem::take(&mut self.notifications.shown),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn chats_counted(&mut self, cx: &mut Context<Self>) {
         Self::take_back(self.notifications.of_read(&self.chats), cx);
         let now = chrono::Utc::now().timestamp_millis();
@@ -916,6 +931,55 @@ mod window_tests {
         chats[0].unread_count = 0;
         act(window, &hush, cx, |app, _, cx| app.set_chats(chats, cx));
         assert_eq!(on_show(cx), ["r"], "a reaction isn't unread: reading leaves it");
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn starting_over_takes_back_what_was_shown_only_with_the_data(cx: &mut TestAppContext) {
+        let (_, hush, data) = open("start-over", cx);
+        let ana = format!("c:{ANA}");
+        post(&hush, "m1", &ana, key(ANA, 1), false, cx);
+        let kept = hush.update(cx, |app, cx| app.start_over(false, cx));
+        assert_eq!(on_show(cx), ["m1"], "relinking keeps them");
+        assert_eq!(kept.chat_of("m1"), Some(ana), "and still knows their chat");
+        hush.update(cx, |app, cx| {
+            app.notifications = kept;
+            app.start_over(true, cx)
+        });
+        assert!(on_show(cx).is_empty(), "unlinking takes them back with the data");
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_notification_shows_what_the_setting_lets_it(cx: &mut TestAppContext) {
+        use super::NotificationContent;
+        let (_, hush, data) = open("setting", cx);
+        let about = |tag: &str| About {
+            tag: tag.into(),
+            message: super::tests::message(Some("Dinner at 8?"), MessageKind::Normal),
+            file: None,
+            group: Some("Family".into()),
+            names: vec![],
+        };
+        let show = |hush: &Entity<Hush>, setting, tag: &str, cx: &mut TestAppContext| {
+            cx.update(|cx| cx.set_global(setting));
+            let about = about(tag);
+            hush.update(cx, |app, cx| app.show("g:01".into(), key(ANA, 1), None, about, cx));
+        };
+        show(&hush, NotificationContent::NameOnly, "name", cx);
+        show(&hush, NotificationContent::NoNameOrMessage, "count", cx);
+        show(&hush, NotificationContent::Off, "off", cx);
+        let shown = cx.shown_system_notifications();
+        let said: Vec<_> = shown
+            .iter()
+            .map(|n| (n.title.as_ref(), n.body.as_ref(), n.actions.len()))
+            .collect();
+        assert_eq!(
+            said,
+            [("Ana Popescu in Family", "New Message", 0), ("Hush", "New Message", 0)],
+            "no content, no Mark as Read; none at all when off"
+        );
+        assert_eq!(on_show(cx), ["name", "count"]);
         std::fs::remove_dir_all(&data).unwrap();
     }
 

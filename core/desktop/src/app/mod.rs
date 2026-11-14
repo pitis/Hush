@@ -32,11 +32,13 @@ pub mod navigate;
 pub mod notifications;
 mod options;
 mod paging;
+mod polls;
 mod previews;
 pub mod search;
 pub mod settings;
 mod typing;
 mod view;
+mod view_once;
 
 /// How the phone lists this computer.
 const DEVICE_NAME: &str = "Hush Desktop";
@@ -177,19 +179,24 @@ pub struct Hush {
     /// The open core's events, handled; dropped with this state when it starts over, so an old
     /// core's last ones never reach the new one.
     listening: Task<()>,
+    /// The open chat's polls, as their votes stand.
+    polls: polls::Polls,
+    /// View-once media's one look.
+    view_once: view_once::ViewOnce,
     notifications: notifications::Notifications,
     /// Who is typing where, and where we are.
     typing: typing::Typing,
 }
 
-/// This computer's data folder and keychain entry. Only the real window has them: made-up screens
-/// and window tests never touch the owner's data.
+/// This computer's data folder and keychain entry: set by `Hush::new` for the real window, and by
+/// window tests over a folder of their own; made-up screens have none and never touch the owner's
+/// data.
 #[derive(Clone)]
 struct Home {
     folder: PathBuf,
     /// The database key, made on first use.
     key: fn() -> Result<String, String>,
-    /// Removes it, with the data it opened (unlinking).
+    /// Removes it, once the data it opened is gone (unlinking).
     forget_key: fn() -> Result<(), String>,
 }
 
@@ -208,14 +215,15 @@ pub fn quit(cx: &mut App) {
         return cx.quit();
     };
     let (client, written) = (client.clone(), drafts.finish());
+    let folder = cx.try_global::<Home>().map(|home| home.folder.clone());
     cx.spawn(async move |cx| {
         // the last thing typed is kept
         written.await;
         Compat::new(client.stop()).await;
         // opened files' decrypted copies go with the app, and pasted pictures
-        if let Some(dir) = dirs::data_local_dir() {
-            files::clear_open_copies(&dir.join(DATA_FOLDER));
-            attach::clear_pasted(&dir.join(DATA_FOLDER));
+        if let Some(folder) = folder {
+            files::clear_open_copies(&folder);
+            attach::clear_pasted(&folder);
         }
         cx.update(|cx| cx.quit());
     })
@@ -263,8 +271,8 @@ impl Hush {
         app
     }
 
-    /// Whether the window is active and seen; once, not with the state: starting over builds that
-    /// again.
+    /// Whether the window is active and seen: registered once, outside `window`, which starting
+    /// over runs again.
     fn observe(window: &mut Window, cx: &mut Context<Self>) {
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
@@ -413,6 +421,8 @@ impl Hush {
             options: Default::default(),
             settings: Default::default(),
             listening: Task::ready(()),
+            polls: Default::default(),
+            view_once: Default::default(),
             notifications: Default::default(),
             typing: Default::default(),
         }
@@ -498,6 +508,15 @@ impl Hush {
                 app.selected = Some("g:01".into());
                 app.set_messages(crate::demo::messages(), cx);
                 app.demo_settings(matches!(screen, crate::Demo::Unlinked), window, cx);
+            }
+            crate::Demo::Polls | crate::Demo::ViewOnce => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.selected = Some("g:01".into());
+                app.demo_polls(cx);
+                if let crate::Demo::ViewOnce = screen {
+                    app.demo_view_once(window, cx);
+                }
             }
             crate::Demo::Files => {
                 app.screen = Screen::Chats;
@@ -662,6 +681,7 @@ impl Hush {
         if !matches!(self.screen, Screen::Chats) {
             self.dialog = None;
             self.group = None;
+            self.end_view_once(cx);
         }
         cx.notify();
     }
@@ -799,6 +819,7 @@ impl Hush {
         self.messages.clear();
         self.clear_files(cx);
         self.clear_previews(cx);
+        self.end_view_once(cx);
         // the draft's link, as if typed: putting text in the field says nothing
         self.composer_changed(cx);
         self.clear_tray(cx);

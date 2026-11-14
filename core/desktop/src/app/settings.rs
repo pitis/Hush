@@ -1,6 +1,6 @@
-//! Settings (the Mac app's `SettingsView` and `ProfileSettings.swift`): the appearance, our name
-//! and about, chat settings sync to the phone, and relinking or unlinking this computer; and the
-//! unlinked screen's Link Again.
+//! Settings (the Mac app's `SettingsView` and `ProfileSettings.swift`): the appearance and what
+//! notifications show, our name and about, chat settings sync to the phone, and relinking or
+//! unlinking this computer; and the unlinked screen's Link Again.
 
 use std::path::Path;
 
@@ -54,11 +54,14 @@ struct Panel {
     generation: u64,
     /// Chat settings sync to the phone, once read.
     sync: Option<bool>,
-    /// Why the last relink, unlink, sync change or appearance change failed.
+    /// Opened over the chats: the account's part is read and shown (opened before, it would wait
+    /// for reads never asked for).
+    account: bool,
+    /// Why the last thing done here failed, but the profile's own.
     problem: Option<String>,
 }
 
-/// Our name and about, trimmed (the core's `OwnProfile`).
+/// Our name and about (the core's `OwnProfile`).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Profile {
     given: String,
@@ -96,9 +99,22 @@ pub(super) trait Choice: Global + Copy + Default + PartialEq {
     const ALL: &'static [(Self, &'static str, &'static str)];
 
     fn read(folder: &Path) -> Self {
-        let kept = std::fs::read_to_string(folder.join(Self::FILE)).unwrap_or_default();
+        let kept = match std::fs::read_to_string(folder.join(Self::FILE)) {
+            Ok(kept) => kept,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, file = Self::FILE, "a setting kept couldn't be read");
+                return Self::default();
+            }
+        };
         let found = Self::ALL.iter().find(|(_, word, _)| *word == kept.trim());
-        found.map_or_else(Self::default, |(choice, _, _)| *choice)
+        found.map_or_else(
+            || {
+                tracing::warn!(file = Self::FILE, "a setting kept isn't one known");
+                Self::default()
+            },
+            |(choice, _, _)| *choice,
+        )
     }
 
     fn save(self, folder: &Path) -> std::io::Result<()> {
@@ -190,10 +206,11 @@ pub(super) fn load(window: &mut Window, cx: &mut Context<Hush>) {
 }
 
 impl Hush {
-    /// Settings…: the panel over the window; our profile and the sync switch are read each time it
-    /// opens (the phone changes them too).
+    /// Settings…: the panel over the window (not over another one: the keys stay with that); our
+    /// profile is read each time it opens (the phone changes it too), and the sync switch.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.panel.is_some() {
+        let over = self.dialog.is_some() || self.group.is_some() || self.view_once.showing();
+        if self.settings.panel.is_some() || over {
             return;
         }
         let mut field = || {
@@ -222,6 +239,7 @@ impl Hush {
             saving: false,
             generation: 0,
             sync: None,
+            account: matches!(self.screen, Screen::Chats),
             problem: None,
         });
         if matches!(self.screen, Screen::Chats) {
@@ -231,10 +249,15 @@ impl Hush {
         cx.notify();
     }
 
+    /// The panel is over the window: the chats' shortcuts wait.
+    pub(super) fn settings_open(&self) -> bool {
+        self.settings.panel.is_some()
+    }
+
     /// Done or Esc: back to the open chat's composer. A save or an unlink on its way still lands.
     pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.panel.take().is_some() {
-            if self.selected.is_some() {
+            if matches!(self.screen, Screen::Chats) && self.selected.is_some() {
                 self.composer.update(cx, |input, cx| input.focus(window, cx));
             }
             cx.notify();
@@ -310,7 +333,12 @@ impl Hush {
         cx.spawn_in(window, async move |this, cx| {
             let saved = Compat::new(client.set_profile(typed.given, typed.family, typed.about)).await;
             let _ = this.update_in(cx, |app, window, cx| {
-                let Some(p) = &mut app.settings.panel else { return };
+                let saved = saved.map_err(|e| server_failure("Couldn't save your profile", &e));
+                let Some(p) = &mut app.settings.panel else {
+                    // closed meanwhile: a failure is still said
+                    app.error = saved.err().or(app.error.take());
+                    return cx.notify();
+                };
                 p.saving = false;
                 match saved {
                     Ok(s) => {
@@ -323,7 +351,7 @@ impl Hush {
                         };
                         app.show_profile(saved, window, cx);
                     }
-                    Err(e) => p.save_failure = Some(server_failure("Couldn't save your profile", &e)),
+                    Err(why) => p.save_failure = Some(why),
                 }
                 cx.notify();
             });
@@ -417,8 +445,8 @@ impl Hush {
         .detach();
     }
 
-    /// This computer relinks as a new device; everything shown here is kept and the phone's
-    /// history merges in (`AppStore.relinkForHistory`).
+    /// This computer relinks as a new device; the chats here are kept and the phone's history
+    /// merges in (`AppStore.relinkForHistory`).
     fn relink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         if std::mem::replace(&mut self.settings.working, true) {
@@ -427,17 +455,20 @@ impl Hush {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let relinked = Compat::new(client.relink()).await;
-            let _ = this.update_in(cx, |app, window, cx| match relinked {
-                // the data stays, so its key does too
-                Ok(()) => app.restart(false, window, cx),
-                Err(e) => {
-                    tracing::error!(error = %e, "relinking failed");
-                    app.settings.working = false;
-                    app.settings_failed(describe(&e), cx);
-                }
-            });
+            let _ = this.update_in(cx, |app, window, cx| app.relinked(relinked, window, cx));
         })
         .detach();
+    }
+
+    /// The data stays, so its key does too. A relink fails only once the core has stopped: the
+    /// app opens it again either way (linked still if the old link wasn't removed yet), where the
+    /// Mac app stays with a stopped core.
+    fn relinked(&mut self, relinked: Result<(), CoreError>, window: &mut Window, cx: &mut Context<Self>) {
+        self.restart(false, window, cx);
+        if let Err(e) = relinked {
+            tracing::error!(error = %e, "relinking failed");
+            self.error = Some(format!("Couldn't relink: {}", describe(&e)));
+        }
     }
 
     /// Unlink This Computer…: asks first, as the Mac app does.
@@ -496,6 +527,7 @@ impl Hush {
             Err(e) => {
                 // the core has stopped: there is no going back to the chats
                 tracing::error!(error = %e, "removing the data failed");
+                self.settings.panel = None;
                 self.screen = Screen::Failed(format!(
                     "Hush couldn't remove its data ({}). Quit Hush, delete {}, and open it again.",
                     describe(&e),
@@ -527,14 +559,16 @@ impl Hush {
         .detach();
     }
 
-    /// Starts over with a fresh core, all that showed forgotten (`AppStore.restart`); the key goes
-    /// with the data it opened, unless relinking kept that.
+    /// Starts over with a fresh core, all that showed forgotten (`AppStore.restart`); the key and
+    /// the notifications shown go with the data they belong to, unless relinking kept that.
     fn restart(&mut self, forget_key: bool, window: &mut Window, cx: &mut Context<Self>) {
         // the old core is stopped: quitting has nothing of it to wait for
         if cx.has_global::<Core>() {
             cx.remove_global::<Core>();
         }
+        let notifications = self.start_over(forget_key, cx);
         *self = Self::window(window, cx);
+        self.notifications = notifications;
         self.boot(forget_key, cx);
         cx.notify();
     }
@@ -571,13 +605,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         assert_eq!(Appearance::read(&folder), Appearance::System, "none kept yet");
         assert_eq!(NotificationContent::read(&folder), NotificationContent::NameAndMessage);
-        for look in [Appearance::Dark, Appearance::Light, Appearance::System] {
+        for (look, _, _) in Appearance::ALL {
             look.save(&folder).unwrap();
-            assert_eq!(Appearance::read(&folder), look);
+            assert_eq!(Appearance::read(&folder), *look);
         }
-        NotificationContent::Off.save(&folder).unwrap();
-        assert_eq!(NotificationContent::read(&folder), NotificationContent::Off);
-        assert_eq!(Appearance::read(&folder), Appearance::System, "each in its own file");
+        for (content, _, _) in NotificationContent::ALL {
+            content.save(&folder).unwrap();
+            assert_eq!(NotificationContent::read(&folder), *content);
+        }
+        assert_eq!(Appearance::read(&folder), Appearance::Dark, "each in its own file");
         std::fs::write(folder.join(Appearance::FILE), "sepia\n").unwrap();
         assert_eq!(Appearance::read(&folder), Appearance::System, "one it doesn't know");
         std::fs::remove_dir_all(&folder).unwrap();
@@ -587,8 +623,8 @@ mod tests {
 /// Settings in a real (headless) window, over a core that isn't linked, in a folder of its own.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use gpui_kit::component::{Theme, ThemeMode};
@@ -597,7 +633,7 @@ mod window_tests {
 
     use super::super::attach::window_tests::with_core;
     use super::super::{Home, Hush, Screen};
-    use super::{Appearance, NotificationContent, Profile};
+    use super::{chosen, Appearance, Choice, NotificationContent, Profile};
     use crate::Demo;
 
     /// A test's key is refused: the app doesn't open a core again (it would start linking).
@@ -605,6 +641,30 @@ mod window_tests {
 
     fn refused() -> Result<String, String> {
         Err(REFUSED.into())
+    }
+
+    thread_local! {
+        /// This test's core folder, and whether its key was forgotten (the app's background work
+        /// runs on the test's thread).
+        static KEY: RefCell<(Option<PathBuf>, bool)> = const { RefCell::new((None, false)) };
+    }
+
+    /// Forgets the key, which must outlive no data.
+    fn forget() -> Result<(), String> {
+        KEY.with_borrow_mut(|(core, forgot)| {
+            let core = core.as_ref().expect("the test's folder");
+            assert!(!core.join("projection.db").exists(), "the key outlives its data");
+            *forgot = true;
+        });
+        Ok(())
+    }
+
+    fn forgot() -> bool {
+        KEY.with_borrow(|(_, forgot)| *forgot)
+    }
+
+    fn keep_key() -> Result<(), String> {
+        panic!("the key is kept")
     }
 
     fn open(screen: Demo, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>) {
@@ -616,6 +676,7 @@ mod window_tests {
             })
             .expect("the window opens");
             super::shortcut(window, hush.downgrade(), cx);
+            super::super::navigate::shortcuts(window, hush.downgrade(), cx);
             (window, hush)
         });
         cx.run_until_parked();
@@ -636,6 +697,7 @@ mod window_tests {
         let (window, hush) = open(screen, cx);
         with_core(&hush, &data, cx);
         let folder = data.join("core");
+        KEY.set((Some(folder.clone()), false));
         hush.update(cx, |app, _| app.data_dir = folder.clone());
         cx.update(|cx| {
             cx.set_global(Home {
@@ -663,7 +725,7 @@ mod window_tests {
 
     /// Waits for the core's answer (on its own threads) until `done`.
     fn until(hush: &Entity<Hush>, cx: &mut TestAppContext, done: impl Fn(&Hush) -> bool) {
-        for _ in 0..300 {
+        for _ in 0..1000 {
             cx.run_until_parked();
             if hush.read_with(cx, |app, _| done(app)) {
                 return;
@@ -680,10 +742,12 @@ mod window_tests {
         }
     }
 
-    /// Everything shown was forgotten: the made-up chats, the open one, the panel.
-    fn forgotten(hush: &Entity<Hush>, cx: &mut TestAppContext) -> bool {
+    /// Started over: everything shown was forgotten (the made-up chats, the open one, the panel),
+    /// and the core opened again.
+    fn started_over(hush: &Entity<Hush>, cx: &mut TestAppContext) -> bool {
         hush.read_with(cx, |app, _| {
-            app.chats.is_empty() && app.selected.is_none() && app.settings.panel.is_none() && app.client.is_none()
+            let forgotten = app.chats.is_empty() && app.selected.is_none() && app.settings.panel.is_none();
+            forgotten && app.client.is_none() && failed(app) == Some(REFUSED)
         })
     }
 
@@ -691,22 +755,22 @@ mod window_tests {
         core.join(file).exists()
     }
 
-    fn keep_key() -> Result<(), String> {
-        panic!("relinking keeps the key")
+    fn put(path: PathBuf) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "soup").unwrap();
+        path
     }
 
     #[gpui::test]
-    fn unlinking_asks_then_removes_the_data_and_the_key_and_starts_over(cx: &mut TestAppContext) {
-        static FORGOT: AtomicBool = AtomicBool::new(false);
-        fn forget() -> Result<(), String> {
-            FORGOT.store(true, Ordering::SeqCst);
-            Ok(())
-        }
+    fn unlinking_asks_then_removes_the_data_and_then_the_key_and_starts_over(cx: &mut TestAppContext) {
         let (window, hush, data) = open_with_core("unlink", Demo::Chat, forget, cx);
         let core = data.join("core");
-        let open_copy = core.join("open").join("1").join("menu.txt");
-        std::fs::create_dir_all(open_copy.parent().unwrap()).unwrap();
-        std::fs::write(&open_copy, "soup").unwrap();
+        let kept = [
+            put(core.join("open").join("1").join("menu.txt")),
+            put(core.join("paste").join("shot.png")),
+            put(core.join("attachments").join("photo")),
+        ];
+        assert!(exists(&core, "presage.db"));
         act(window, &hush, cx, |app, window, cx| app.open_settings(window, cx));
         act(window, &hush, cx, |app, window, cx| app.confirm_unlink(window, cx));
         assert_eq!(cx.pending_prompt().expect("asked").0, "Unlink this computer?");
@@ -718,29 +782,29 @@ mod window_tests {
         act(window, &hush, cx, |app, window, cx| app.confirm_unlink(window, cx));
         cx.simulate_prompt_answer("Unlink");
         until(&hush, cx, |app| failed(app).is_some());
-        for gone in ["projection.db", "presage.db", "attachments"] {
+        for gone in ["projection.db", "presage.db"] {
             assert!(!exists(&core, gone), "{gone} is removed");
         }
-        assert!(!open_copy.exists(), "an opened file's copy goes with the data");
-        assert!(FORGOT.load(Ordering::SeqCst), "the key goes with the data");
-        assert!(forgotten(&hush, cx));
-        assert_eq!(
-            hush.read_with(cx, |app, _| failed(app).map(str::to_owned)).as_deref(),
-            Some(REFUSED),
-            "opened again"
-        );
+        for file in kept {
+            assert!(!file.exists(), "{} goes with the data", file.display());
+        }
+        assert!(forgot(), "the key goes with the data");
+        assert!(started_over(&hush, cx));
         std::fs::remove_dir_all(&data).unwrap();
     }
 
     #[gpui::test]
     fn an_unreachable_server_offers_to_unlink_anyway(cx: &mut TestAppContext) {
-        let (window, hush, data) = open_with_core("unreachable", Demo::Chat, keep_key, cx);
-        act(window, &hush, cx, |app, window, cx| {
+        let (window, hush, data) = open_with_core("unreachable", Demo::Chat, forget, cx);
+        let unreachable = |app: &mut Hush, window: &mut Window, cx: &mut Context<Hush>| {
+            // as `unlink` leaves it
+            app.settings.working = true;
             let e = CoreError::Network {
                 message: "timed out".into(),
             };
             app.unlinked(true, Err(e), window, cx)
-        });
+        };
+        act(window, &hush, cx, unreachable);
         let (question, detail) = cx.pending_prompt().expect("asked");
         assert_eq!(question, "The server couldn't be reached");
         assert!(
@@ -750,8 +814,38 @@ mod window_tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert!(exists(&data.join("core"), "projection.db"), "nothing removed");
+        assert!(!forgot());
         assert!(hush.read_with(cx, |app, _| matches!(app.screen, Screen::Chats)
             && !app.chats.is_empty()));
+
+        act(window, &hush, cx, unreachable);
+        cx.simulate_prompt_answer("Unlink Anyway");
+        until(&hush, cx, |app| failed(app).is_some());
+        assert!(!exists(&data.join("core"), "projection.db"));
+        assert!(forgot());
+        assert!(started_over(&hush, cx));
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn data_that_couldnt_be_removed_says_which_folder_and_keeps_the_key(cx: &mut TestAppContext) {
+        let (window, hush, data) = open_with_core("stuck", Demo::Chat, keep_key, cx);
+        act(window, &hush, cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.settings.working = true;
+            let e = CoreError::Storage {
+                message: "in use".into(),
+            };
+            app.unlinked(true, Err(e), window, cx)
+        });
+        let (why, panel, working) = hush.read_with(cx, |app, _| {
+            let why = failed(app).map(str::to_owned).unwrap_or_default();
+            (why, app.settings.panel.is_some(), app.settings.working)
+        });
+        let folder = data.join("core").display().to_string();
+        assert!(why.starts_with("Hush couldn't remove its data ("), "{why}");
+        assert!(why.contains(&folder), "{why}");
+        assert!(!panel && !working, "the failure isn't under the panel");
         std::fs::remove_dir_all(&data).unwrap();
     }
 
@@ -759,6 +853,7 @@ mod window_tests {
     fn relinking_asks_then_keeps_the_chats_and_the_key_and_starts_over(cx: &mut TestAppContext) {
         let (window, hush, data) = open_with_core("relink", Demo::Chat, keep_key, cx);
         let core = data.join("core");
+        assert!(exists(&core, "presage.db"));
         act(window, &hush, cx, |app, window, cx| app.open_settings(window, cx));
         act(window, &hush, cx, |app, window, cx| app.confirm_relink(window, cx));
         assert_eq!(
@@ -769,23 +864,31 @@ mod window_tests {
         until(&hush, cx, |app| failed(app).is_some());
         assert!(!exists(&core, "presage.db"), "the old link is gone");
         assert!(exists(&core, "projection.db"), "the chats stay");
-        assert!(forgotten(&hush, cx));
+        assert!(started_over(&hush, cx));
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_failed_relink_starts_over_too_and_says_so(cx: &mut TestAppContext) {
+        let (window, hush, data) = open_with_core("relink-failed", Demo::Chat, keep_key, cx);
+        act(window, &hush, cx, |app, window, cx| {
+            app.relinked(Err(CoreError::Closed), window, cx)
+        });
+        until(&hush, cx, |app| failed(app).is_some());
+        assert!(started_over(&hush, cx), "not left with a stopped core");
+        let error = hush.read_with(cx, |app, _| app.error.clone()).unwrap_or_default();
+        assert!(error.starts_with("Couldn't relink: "), "{error}");
         std::fs::remove_dir_all(&data).unwrap();
     }
 
     #[gpui::test]
     fn link_again_removes_the_data_without_asking_and_starts_over(cx: &mut TestAppContext) {
-        static FORGOT: AtomicBool = AtomicBool::new(false);
-        fn forget() -> Result<(), String> {
-            FORGOT.store(true, Ordering::SeqCst);
-            Ok(())
-        }
         let (window, hush, data) = open_with_core("link-again", Demo::Unlinked, forget, cx);
         act(window, &hush, cx, |app, window, cx| app.unlink(false, window, cx));
-        assert!(!cx.has_pending_prompt());
         until(&hush, cx, |app| failed(app).is_some());
         assert!(!exists(&data.join("core"), "projection.db"));
-        assert!(FORGOT.load(Ordering::SeqCst));
+        assert!(forgot());
+        assert!(started_over(&hush, cx));
         std::fs::remove_dir_all(&data).unwrap();
     }
 
@@ -811,6 +914,9 @@ mod window_tests {
                 (p.typed(cx), p.can_save(cx))
             })
         };
+        let saved = |hush: &Entity<Hush>, cx: &mut TestAppContext| {
+            hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().saved.clone())
+        };
         let read = ana("Hiking");
         act(window, &hush, cx, move |app, window, cx| {
             app.profile_read(0, Ok(read), window, cx)
@@ -834,20 +940,26 @@ mod window_tests {
         act(window, &hush, cx, move |app, window, cx| {
             app.profile_read(0, Ok(read), window, cx)
         });
-        let (shown, _) = typed(&hush, cx);
-        assert_eq!(shown.given, "Anna");
-        let saved = hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().saved.clone());
-        assert_eq!(saved, Some(ana("Climbing")));
+        assert_eq!(typed(&hush, cx).0.given, "Anna");
+        assert_eq!(saved(&hush, cx), Some(ana("Climbing")));
 
-        // a read begun before a save is stale
-        act(window, &hush, cx, |app, _, _| {
-            app.settings.panel.as_mut().unwrap().generation = 1
+        // a read that comes while a save is on its way, or that began before it, is stale; the
+        // save fails (not linked) and says so, the edit kept to try again
+        act(window, &hush, cx, |app, window, cx| {
+            app.save_profile(window, cx);
+            app.profile_read(1, Ok(ana("Old")), window, cx)
         });
+        until(&hush, cx, |app| {
+            app.settings.panel.as_ref().is_some_and(|p| p.save_failure.is_some())
+        });
+        let failure = hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().save_failure.clone());
+        assert!(failure.is_some_and(|f| f.starts_with("Couldn't save your profile")));
         act(window, &hush, cx, |app, window, cx| {
             app.profile_read(0, Ok(ana("Old")), window, cx)
         });
-        let saved = hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().saved.clone());
-        assert_eq!(saved, Some(ana("Climbing")));
+        assert_eq!(saved(&hush, cx), Some(ana("Climbing")));
+        assert_eq!(typed(&hush, cx).0.given, "Anna");
+        assert!(typed(&hush, cx).1, "saved again");
 
         // a first name is needed
         act(window, &hush, cx, move |_, window, cx| {
@@ -855,6 +967,24 @@ mod window_tests {
         });
         assert!(!typed(&hush, cx).1);
         std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[gpui::test]
+    fn the_account_shows_only_when_opened_over_the_chats(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Unlinked, cx);
+        act(window, &hush, cx, |app, window, cx| app.open_settings(window, cx));
+        let account = |hush: &Entity<Hush>, cx: &mut TestAppContext| {
+            hush.read_with(cx, |app, _| app.settings.panel.as_ref().map(|p| p.account))
+        };
+        assert_eq!(account(&hush, cx), Some(false));
+        // linked meanwhile: no read was asked for, so none waits to be shown
+        act(window, &hush, cx, |app, _, _| app.screen = Screen::Chats);
+        assert_eq!(account(&hush, cx), Some(false));
+        act(window, &hush, cx, |app, window, cx| {
+            app.close_settings(window, cx);
+            app.open_settings(window, cx)
+        });
+        assert_eq!(account(&hush, cx), Some(true));
     }
 
     #[gpui::test]
@@ -880,33 +1010,56 @@ mod window_tests {
     }
 
     #[gpui::test]
-    fn a_choice_applies_at_once_and_esc_closes_the_panel(cx: &mut TestAppContext) {
+    fn the_panel_keeps_the_keys_and_esc_closes_it(cx: &mut TestAppContext) {
         let (window, hush) = open(Demo::Chat, cx);
         cx.simulate_keystrokes(window, "secondary-,");
         assert!(
             hush.read_with(cx, |app, _| app.settings.panel.is_some()),
             "the shortcut opens it"
         );
-        act(window, &hush, cx, |app, window, cx| {
-            app.choose_appearance(Appearance::Dark, window, cx)
-        });
-        assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Dark);
-        act(window, &hush, cx, |app, window, cx| {
-            app.choose_appearance(Appearance::Light, window, cx)
-        });
-        assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Light);
-        act(window, &hush, cx, |app, _, cx| {
-            app.choose(NotificationContent::NameOnly, cx)
-        });
-        let content = cx.update(|cx| super::chosen::<NotificationContent>(cx));
+        // the chats behind wait
+        cx.simulate_keystrokes(window, "alt-down secondary-2 secondary-shift-c");
         assert_eq!(
-            content,
-            NotificationContent::NameOnly,
-            "what notifications show from now on"
+            hush.read_with(cx, |app, _| app.selected.clone()).as_deref(),
+            Some("g:01")
         );
-        // no data folder here: nothing was kept, nor failed to be
-        assert!(hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().problem.is_none()));
         cx.simulate_keystrokes(window, "escape");
         assert!(hush.read_with(cx, |app, _| app.settings.panel.is_none()));
+    }
+
+    #[gpui::test]
+    fn choices_apply_at_once_and_are_kept_for_the_next_launch(cx: &mut TestAppContext) {
+        let (window, hush) = open(Demo::Chat, cx);
+        let folder = std::env::temp_dir().join(format!("hush-desktop-settings-choices-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(NotificationContent::FILE), "count\n").unwrap();
+        std::fs::write(folder.join(Appearance::FILE), "dark").unwrap();
+        let home = Home {
+            folder: folder.clone(),
+            key: refused,
+            forget_key: keep_key,
+        };
+        cx.update(|cx| cx.set_global(home));
+        act(window, &hush, cx, |_, window, cx| super::load(window, cx));
+        let content = cx.update(|cx| chosen::<NotificationContent>(cx));
+        assert_eq!(content, NotificationContent::NoNameOrMessage, "the Mac app's words");
+        assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Dark);
+
+        act(window, &hush, cx, |app, window, cx| {
+            app.open_settings(window, cx);
+            app.choose_appearance(Appearance::Light, window, cx);
+            app.choose(NotificationContent::Off, cx)
+        });
+        assert_eq!(cx.update(|cx| Theme::global(cx).mode), ThemeMode::Light);
+        let content = cx.update(|cx| chosen::<NotificationContent>(cx));
+        assert_eq!(content, NotificationContent::Off, "what notifications show from now on");
+        let kept = |file: &str| std::fs::read_to_string(folder.join(file)).unwrap();
+        assert_eq!(
+            (kept(Appearance::FILE), kept(NotificationContent::FILE)),
+            ("light".into(), "off".into())
+        );
+        assert!(hush.read_with(cx, |app, _| app.settings.panel.as_ref().unwrap().problem.is_none()));
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 }

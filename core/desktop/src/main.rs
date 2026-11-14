@@ -151,6 +151,10 @@ pub enum Demo {
     Settings,
     /// Removed on the phone: Link Again.
     Unlinked,
+    /// The Family group's polls and view-once media.
+    Polls,
+    /// A view-once photo shown over that chat.
+    ViewOnce,
     /// The chat with someone typing in it, and in another chat.
     Typing,
 }
@@ -187,6 +191,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("add-members", Demo::AddMembers),
                 ("settings", Demo::Settings),
                 ("unlinked", Demo::Unlinked),
+                ("polls", Demo::Polls),
+                ("view-once", Demo::ViewOnce),
                 ("typing", Demo::Typing),
             ];
             cx.spawn(async move |cx| {

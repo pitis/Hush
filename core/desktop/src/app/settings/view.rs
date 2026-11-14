@@ -57,7 +57,7 @@ impl Hush {
                 };
                 let _ = this.update(cx, |app, cx| app.choose(*content, cx));
             });
-        let account = matches!(self.screen, Screen::Chats).then(|| self.render_account(s, p, cx));
+        let account = (s.account && matches!(self.screen, Screen::Chats)).then(|| self.render_account(s, p, cx));
         Some(modal(
             card(p)
                 .id("settings")

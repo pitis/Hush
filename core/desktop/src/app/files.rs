@@ -23,7 +23,7 @@ use super::Hush;
 
 mod view;
 
-pub(super) use view::render;
+pub(super) use view::{disc, render};
 
 /// An image bubble's longest side at most (`Files.imageBox`).
 const IMAGE_BOX: f64 = 320.;
@@ -51,7 +51,7 @@ const IDLE_TICKS: u32 = 1_200;
 /// Longer names are cut, keeping their extension.
 const NAME_LIMIT: usize = 200;
 /// Opened files' decrypted copies, in the data folder (which only we can read).
-const OPEN_FOLDER: &str = "open";
+pub(super) const OPEN_FOLDER: &str = "open";
 
 /// Programs and scripts, which are only saved, never handed to the system to open: Signal
 /// Desktop's list (`isFileDangerous`), and macOS's and Linux's.
@@ -284,6 +284,19 @@ impl Files {
             file: a.clone(),
         });
         shown.collect()
+    }
+
+    /// A message's files as the core has them, whatever its kind: a view-once message's, which
+    /// `of` doesn't show, so its pictures are never decoded.
+    pub(super) fn attachments(&self, m: &Message) -> &[Attachment] {
+        let files = self.by_message.get(&(m.author.clone(), m.sent_at));
+        files.map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// Whether file `path` is in the bubbles' picture cache at all (decoded, decoding or failed).
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn has_picture(&self, path: &str) -> bool {
+        self.thumbs.contains_key(path)
     }
 
     fn look(&self, a: &Attachment) -> Look {
@@ -636,7 +649,9 @@ impl Hush {
                         launch(file, what, cx);
                     }
                     // its message went meanwhile, and its copy with it
-                    (Ok(()), None) => remove_copies([dir]),
+                    (Ok(()), None) => {
+                        remove_copies([dir]);
+                    }
                     (Err(e), copy) => {
                         if copy.is_some() {
                             app.files.copies.remove(&id);
@@ -837,7 +852,7 @@ pub(super) fn launch(file: impl AsRef<std::ffi::OsStr> + Send + 'static, what: S
 /// Opens `file` (or an https link: `open` takes one after `--` too) in the system's app for its
 /// kind. Not GPUI's: that says nothing when no app opens it, and on Windows logs the file's path (a
 /// name the sender chose).
-fn open_with_system(file: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
+pub(super) fn open_with_system(file: impl AsRef<std::ffi::OsStr>) -> Result<(), String> {
     use std::process::{Command, Stdio};
     #[cfg(target_os = "macos")]
     let mut opener = {
@@ -906,15 +921,18 @@ pub(super) fn clear_open_copies(data_dir: &Path) {
 }
 
 /// Removes opened copies' folders; one that can't go is said in the log (the next launch tries
-/// again).
-fn remove_copies(dirs: impl IntoIterator<Item = PathBuf>) {
+/// again). False if any couldn't.
+pub(super) fn remove_copies(dirs: impl IntoIterator<Item = PathBuf>) -> bool {
+    let mut all = true;
     for dir in dirs {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(error = %e, "an opened file's copy couldn't be removed");
+                all = false;
             }
         }
     }
+    all
 }
 
 /// Removes a half-made copy; one that can't go is said in the log.
@@ -928,7 +946,7 @@ fn remove_copy(file: &Path) {
 
 /// `path`'s file decrypted into a new file at `to`, marked as come from someone else. `marked`:
 /// a copy that can't carry the mark goes.
-async fn copy_out(client: &Client, path: String, to: &Path, marked: bool) -> Result<(), String> {
+pub(super) async fn copy_out(client: &Client, path: String, to: &Path, marked: bool) -> Result<(), String> {
     let at = to.to_str().ok_or("the file's path isn't valid text")?.to_owned();
     Compat::new(client.copy_file(path, at))
         .await
@@ -958,7 +976,7 @@ async fn save(client: &Client, path: String, to: &Path) -> Result<(), String> {
     })
 }
 
-fn ready_path(a: &Attachment) -> Option<String> {
+pub(super) fn ready_path(a: &Attachment) -> Option<String> {
     a.path.clone().filter(|_| a.state == AttachmentState::Ready)
 }
 
@@ -1121,7 +1139,13 @@ fn extension(content_type: &str) -> Option<&str> {
 /// A picture decoded at most `MAX_PIXELS` either way, turned as its photo says, in GPUI's BGRA;
 /// or why not.
 pub(super) fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
-    let mut pixels = upright(bytes, MAX_PIXELS)?.into_rgba8();
+    picture(bytes, MAX_PIXELS)
+}
+
+/// A picture decoded at most `max` pixels either way, turned as its photo says, in GPUI's BGRA;
+/// or why not.
+pub(super) fn picture(bytes: &[u8], max: u32) -> Result<RenderImage, String> {
+    let mut pixels = upright(bytes, max)?.into_rgba8();
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
