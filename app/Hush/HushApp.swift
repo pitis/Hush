@@ -5,7 +5,23 @@ import UserNotifications
 /// Closing the window keeps Hush running (notifications, the menu bar item), as Signal
 /// Desktop does; ⌘Q quits.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    var store: AppStore?
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quits once the core has stopped (`AppStore.stop`), or after a few seconds should it hang.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let store else { return .terminateNow }
+        Task {
+            await store.stop()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(4))
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 }
 
 @main
@@ -36,6 +52,7 @@ struct HushApp: App {
         if let notificationDelegate { UNUserNotificationCenter.current().delegate = notificationDelegate }
         networkWatch = isTestHost ? nil : NetworkWatch { core.networkReturned() }
         menuBar = isTestHost ? nil : MenuBarItem(store: core)
+        appDelegate.store = core
     }
 
     var body: some Scene {

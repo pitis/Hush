@@ -375,6 +375,7 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     var resetError: Error?
     var eventAnswers: [String: [ChatEvent]] = [:]
     func reconnect() throws { lock.withLock { reconnects += 1 } }
+    func stop() async {}
     func resetSession(conversationId: String) throws {
         if let resetError { throw resetError }
         lock.withLock { sessionResets.append(conversationId) }

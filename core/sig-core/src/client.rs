@@ -1096,6 +1096,17 @@ impl Client {
         self.drop_presage()
     }
 
+    /// Stops the core as the app quits, within a few seconds: what the open connection has read
+    /// is handled first (the server counts it as delivered, so it never comes again). Nothing
+    /// works after.
+    pub async fn stop(&self) {
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        if self.send(Command::Stop { done }).is_ok() {
+            let _ = stopped.await;
+        }
+        self.join_core("stopping").await;
+    }
+
     /// Writes a backup of every chat and file here to `path` (replaced), encrypted with
     /// `passphrase` (at least 8 characters). Linked or not.
     pub async fn back_up(&self, path: String, passphrase: String) -> Result<(), CoreError> {
@@ -2227,6 +2238,22 @@ mod tests {
         // dropping the client waits for the core thread, so the files are free right away
         drop(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink.clone()).unwrap());
         assert!(Client::open(dir.0.to_string_lossy().into(), "cd".repeat(32), sink.clone()).is_err());
+        assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
+    }
+
+    /// Quitting stops the core: its thread ends and the data folder is free, even while the app
+    /// still holds the client.
+    #[test]
+    fn stopping_ends_the_core() {
+        let dir = temp_dir("client-stop");
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let client = Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink.clone()).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(client.stop());
+        assert!(matches!(client.start(), Err(CoreError::Closed)));
         assert!(Client::open(dir.0.to_string_lossy().into(), "ab".repeat(32), sink).is_ok());
     }
 

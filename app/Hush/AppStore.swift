@@ -969,6 +969,10 @@ final class AppStore {
         if screen == .chats { retryConnection() }
     }
 
+    /// Quitting: the core handles what it has already received (the server counts it as
+    /// delivered and never sends it again), then stops; a few seconds at most.
+    func stop() async { await client?.stop() }
+
     /// Chats whose secure-session reset is on its way: until it's recorded, or anything fails.
     private(set) var resettingSessions: Set<String> = []
 
