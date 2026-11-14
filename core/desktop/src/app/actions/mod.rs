@@ -362,6 +362,7 @@ impl Hush {
                     return false; // another chat: its own load runs
                 }
                 app.files_loaded(&keys, &details, cx);
+                app.previews_loaded(&keys, &details, cx);
                 app.reactions_loaded(details, cx);
                 app.actions.loading = std::mem::take(&mut app.actions.again);
                 app.actions.loading
@@ -457,6 +458,8 @@ impl Hush {
         self.actions.saving = false;
         let draft = self.actions.draft_before_edit.take().unwrap_or_default();
         self.set_typed(draft, window, cx);
+        // its link, as if typed: putting text in the field says nothing
+        self.composer_changed(cx);
     }
 
     /// Esc: drops the edit or the reply. False if there was neither.

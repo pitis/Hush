@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::panic::Location;
 use std::rc::Rc;
 
-use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
+use gpui_kit::base::{TextSelection, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::MoveUp;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
@@ -19,9 +19,9 @@ use sig_core::projection::Message;
 
 use super::{Item, RowActions, QUICK_REACTIONS};
 use crate::app::view::icon;
-use crate::app::Hush;
+use crate::app::{previews, Hush};
 use crate::style::Palette;
-use crate::text::{BOLD, ITALIC, MENTION, MONOSPACE, SPOILER, STRIKETHROUGH};
+use crate::text::{BOLD, ITALIC, LINK, MENTION, MONOSPACE, SPOILER, STRIKETHROUGH};
 
 /// The row the pointer is over: its buttons show.
 const GROUP: &str = "message";
@@ -321,9 +321,19 @@ pub(in crate::app) fn message_text(
             .child(covered(text, runs, act, p, behind))
             .into_any_element();
     }
+    // a group's invite link shows the group (`AppStore.handleLink`); other links stay text.
+    // shortcut: a covered message's links (above) and a quote's don't open; the Mac's do, outside a
+    // hidden spoiler. Mark them in `covered` and `quote` if they're wanted.
+    let links = previews::group_links(&text);
+    let linked = (!links.is_empty()).then(|| previews::linked(text.len(), runs, &links));
+    let runs = linked.as_deref().unwrap_or(runs);
+    let app = act.app.clone();
     Selectable::new("text", text.clone(), act)
         .with_highlights(highlights(runs, HighlightStyle::default(), p.accent))
         .with_font_family_overrides(fonts(runs, &act.mono))
+        .with_links(links, move |link, window, cx| {
+            let _ = app.update(cx, |app, cx| app.open_group_link(link, window, cx));
+        })
         .into_any_element()
 }
 
@@ -387,6 +397,10 @@ fn highlights(
                 color: None,
             }),
             color: (s & MENTION != 0).then_some(mention),
+            underline: (s & LINK != 0).then_some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         if s & SPOILER != 0 {
@@ -512,6 +526,8 @@ fn reactors(row: &Rc<RowActions>, act: &ActionCx, popover: Entity<PopoverState>)
         }))
 }
 
+type OnLink = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
 /// Message text that can be selected and copied (⌘C / Ctrl+C), as `gpui_base::SelectableText`,
 /// with highlights (its "@name"s in bold), which that one can't draw.
 pub(in crate::app) struct Selectable {
@@ -520,6 +536,9 @@ pub(in crate::app) struct Selectable {
     styled: StyledText,
     /// Takes the keyboard when a drag starts in it.
     focus: FocusHandle,
+    /// Byte ranges a click opens, and what it does with the one clicked.
+    links: Rc<[Range<usize>]>,
+    on_link: Option<OnLink>,
 }
 
 impl Selectable {
@@ -530,7 +549,20 @@ impl Selectable {
             styled: StyledText::new(text.clone()),
             text,
             focus: act.focus.clone(),
+            links: Rc::new([]),
+            on_link: None,
         }
+    }
+
+    /// `links` (byte ranges) open with a click that selects nothing: `on_link` gets the one clicked.
+    fn with_links(
+        mut self,
+        links: Vec<Range<usize>>,
+        on_link: impl Fn(String, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.links = links.into();
+        self.on_link = Some(Rc::new(on_link));
+        self
     }
 
     pub(in crate::app) fn with_highlights(
@@ -557,7 +589,7 @@ impl IntoElement for Selectable {
 
 impl Element for Selectable {
     type RequestLayoutState = TextSelectionHandle;
-    type PrepaintState = ();
+    type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -596,14 +628,15 @@ impl Element for Selectable {
         handle: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Hitbox {
         self.styled
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        let registration = TextSelectionRegistration::new(hitbox, bounds)
+        let registration = TextSelectionRegistration::new(hitbox.clone(), bounds)
             .with_text_bounds(vec![bounds])
             .with_rendered_element(handle, window, cx);
         handle.register(registration, window, cx);
+        hitbox
     }
 
     fn paint(
@@ -612,11 +645,12 @@ impl Element for Selectable {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         handle: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
+        hitbox: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let layout = self.styled.layout().clone();
+        self.paint_links(&layout, hitbox, window);
         let projection = handle.update_runs(&[TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)], cx);
         let color = gpui_kit::base::Theme::global(cx).tokens.colors.selection;
         for range in projection.ranges().iter().flatten() {
@@ -635,6 +669,48 @@ impl Element for Selectable {
     }
 }
 
+impl Selectable {
+    /// The links' pointer, and a click on one, as `gpui_base`'s inline links take it: on release,
+    /// when the press selected nothing.
+    fn paint_links(&self, layout: &TextLayout, hitbox: &Hitbox, window: &mut Window) {
+        let Some(on_link) = self.on_link.clone().filter(|_| !self.links.is_empty()) else {
+            return;
+        };
+        let (layout, links) = (layout.clone(), self.links.clone());
+        let at = Rc::new(move |position| {
+            let ix = layout.index_for_position(position).ok()?;
+            links.iter().position(|l| l.contains(&ix))
+        });
+        let over = hitbox.is_hovered(window) && at(window.mouse_position()).is_some();
+        if over {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        // onto a link or off one within the text: drawn again, for the pointer
+        let (moved, on) = (hitbox.clone(), at.clone());
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _| {
+            if phase.bubble() && (moved.is_hovered(window) && on(e.position).is_some()) != over {
+                window.refresh();
+            }
+        });
+        let (hitbox, text, links) = (hitbox.clone(), self.text.clone(), self.links.clone());
+        window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+            if !phase.bubble()
+                || e.button != MouseButton::Left
+                || !hitbox.is_hovered(window)
+                || TextSelection::has_selection(window, cx)
+            {
+                return;
+            }
+            let Some(link) = at(e.position).and_then(|i| text.get(links[i].clone())) else {
+                return;
+            };
+            TextSelection::end(window, cx);
+            cx.stop_propagation();
+            on_link(link.to_owned(), window, cx);
+        });
+    }
+}
+
 /// The selection between two caret positions: the rest of the first line, the lines between,
 /// and the start of the last.
 fn selection_quads(start: Point<Pixels>, end: Point<Pixels>, b: Bounds<Pixels>, line: Pixels) -> Vec<Bounds<Pixels>> {
@@ -650,4 +726,69 @@ fn selection_quads(start: Point<Pixels>, end: Point<Pixels>, b: Bounds<Pixels>, 
     }
     quads.push(Bounds::from_corners(point(b.left(), end.y), point(end.x, end.y + line)));
     quads
+}
+
+/// A message's links in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui_kit::prelude::*;
+    use gpui_kit::{
+        div, gpui, point, px, Context, Modifiers, MouseButton, TestAppContext, VisualTestContext, WeakEntity, Window,
+        WindowOptions,
+    };
+
+    use super::{ActionCx, Selectable};
+
+    /// Message text with a link at its start, and the links it opened.
+    struct Text {
+        act: ActionCx,
+        opened: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Render for Text {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let opened = self.opened.clone();
+            div().size_full().child(
+                Selectable::new("text", "https://signal.group/#abc and more words", &self.act)
+                    .with_links(std::iter::once(0..25).collect(), move |link, _, _| {
+                        opened.borrow_mut().push(link)
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_click_on_a_link_opens_it_and_a_drag_over_it_selects(cx: &mut TestAppContext) {
+        let opened = Rc::new(RefCell::new(vec![]));
+        let into = opened.clone();
+        let (window, _) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|cx| Text {
+                    act: ActionCx {
+                        app: WeakEntity::new_invalid(),
+                        focus: cx.focus_handle(),
+                        mono: "Menlo".into(),
+                    },
+                    opened: into,
+                })
+            })
+            .expect("the window opens")
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        cx.run_until_parked();
+        let (on_link, below) = (point(px(4.), px(6.)), point(px(4.), px(300.)));
+        cx.simulate_click(on_link, Modifiers::none());
+        assert_eq!(*opened.borrow(), ["https://signal.group/#abc"]);
+        cx.simulate_click(below, Modifiers::none());
+        assert_eq!(opened.borrow().len(), 1, "not on the text");
+
+        cx.simulate_mouse_down(on_link, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(point(px(60.), px(6.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(point(px(60.), px(6.)), MouseButton::Left, Modifiers::none());
+        assert_eq!(opened.borrow().len(), 1, "a selection, not a click");
+    }
 }

@@ -4029,6 +4029,7 @@ dependencies = [
  "rodio",
  "sig-core",
  "tracing",
+ "url",
 ]
 
 [[package]]
