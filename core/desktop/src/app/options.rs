@@ -54,8 +54,12 @@ impl Hush {
                                     let (this, id) = (this.clone(), id.clone());
                                     let item = PopupMenuItem::new(timer_choice(seconds))
                                         .checked(seconds == current)
-                                        .on_click(move |_, _, cx| {
-                                            let _ = this.update(cx, |app, cx| app.set_timer(id.clone(), seconds, cx));
+                                        // the one set again would be sent again, and shown to both
+                                        .when(seconds != current, |item| {
+                                            item.on_click(move |_, _, cx| {
+                                                let _ =
+                                                    this.update(cx, |app, cx| app.set_timer(id.clone(), seconds, cx));
+                                            })
                                         });
                                     menu = menu.item(item);
                                 }
@@ -312,5 +316,46 @@ mod tests {
         };
         assert!(!can_set_timer(&blocked));
         assert!(!can_set_timer(&request));
+    }
+}
+
+/// The options in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use std::sync::Arc;
+
+    use gpui_kit::{gpui, AppContext as _, TestAppContext, WindowOptions};
+
+    use super::super::Hush;
+    use crate::Demo;
+
+    struct Quiet;
+
+    impl sig_core::EventListener for Quiet {
+        fn on_event(&self, _: sig_core::CoreEvent) {}
+    }
+
+    #[gpui::test]
+    fn a_change_the_core_refuses_is_said(cx: &mut TestAppContext) {
+        let (_, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Events, window, cx))
+            })
+            .expect("the window opens")
+        });
+        let dir = std::env::temp_dir().join(format!("hush-desktop-options-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // not linked: it sends nothing
+        let client = sig_core::Client::open(dir.to_str().unwrap().into(), "ab".repeat(32), Arc::new(Quiet)).unwrap();
+        hush.update(cx, |app, cx| {
+            app.client = Some(client);
+            let chat = app.selected.clone().unwrap();
+            app.set_timer(chat, 30, cx);
+        });
+        cx.run_until_parked();
+        let error = hush.read_with(cx, |app, _| app.error.clone().unwrap_or_default());
+        assert!(error.starts_with("Couldn't set the disappearing timer: "), "{error}");
     }
 }

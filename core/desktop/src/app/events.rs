@@ -28,6 +28,11 @@ pub(super) struct Events {
     list: Vec<ChatEvent>,
     /// Bumped on every load, so an answer a newer load overtook is dropped.
     asked: u64,
+    /// The messages shown go back to the chat's start, as of the last load: the events before
+    /// them show too.
+    from_start: bool,
+    /// Where a chat with events only is scrolled to.
+    scroll: ScrollHandle,
     /// Chats whose secure-session reset is on its way: until it's recorded, or anything fails.
     resetting: HashSet<String>,
 }
@@ -42,9 +47,18 @@ pub(super) struct Line {
     text: String,
     /// A missed call: in red.
     missed: bool,
-    /// Reset Secure Session… under the notice: the chat, with whom, and whether a reset is on its
-    /// way.
-    reset: Option<(String, String, bool)>,
+    /// Reset Secure Session… under the notice.
+    reset: Option<Reset>,
+}
+
+/// Reset Secure Session… for a chat (the one clicked, whatever is open when the prompt is answered).
+#[derive(Clone)]
+struct Reset {
+    chat: String,
+    /// Whom the prompt names.
+    who: String,
+    /// One is on its way.
+    resetting: bool,
 }
 
 /// What a stretch of events shows, in order: each event, but messages that couldn't be decrypted one
@@ -62,15 +76,16 @@ enum Shown {
 
 impl Hush {
     /// Reloads the open chat's events since its oldest loaded message (all of them, with the chat
-    /// loaded from its start), as its messages load.
+    /// loaded from its start), as its messages are set (`depth` is theirs then).
     pub(super) fn reload_events(&mut self, cx: &mut Context<Self>) {
+        self.events.from_start = !self.may_have_older();
         let (Some(client), Some(id)) = (self.client.clone(), self.selected.clone()) else {
             return;
         };
         self.events.asked += 1;
         let (asked, generation) = (self.events.asked, self.generation);
         let since = match self.messages.first() {
-            Some(m) if self.may_have_older() => m.sent_at,
+            Some(m) if !self.events.from_start => m.sent_at,
             _ => 0,
         };
         cx.spawn(async move |this, cx| {
@@ -97,6 +112,8 @@ impl Hush {
         self.load_names(list.iter().map(|e| e.author.clone()).collect(), cx);
         self.events.generation = Some(self.generation);
         self.events.list = list;
+        // a chat with events only opens at its newest, as the timeline does
+        self.events.scroll.scroll_to_bottom();
         // the rows they show in grew or shrank
         self.timeline.update(cx, |t, cx| t.remeasure(cx));
     }
@@ -106,7 +123,9 @@ impl Hush {
         if kind == ChatEventKind::SessionReset {
             self.events.resetting.remove(chat);
         }
-        if self.selected.as_deref() == Some(chat) {
+        // a load on its way reloads them once its messages are in
+        let loading = self.messages_loading == Some(self.generation);
+        if self.selected.as_deref() == Some(chat) && !loading {
             self.reload_events(cx);
         }
     }
@@ -121,7 +140,7 @@ impl Hush {
     /// its start: older messages may come between.
     fn gap_at(&self, i: usize) -> Range<usize> {
         let loaded = self.events.generation == Some(self.generation);
-        if !loaded || (i == 0 && self.may_have_older()) {
+        if !loaded || (i == 0 && !self.events.from_start) {
             return 0..0;
         }
         gap(&self.events.list, &self.messages, i)
@@ -156,9 +175,10 @@ impl Hush {
                     (symbol, words, None)
                 }
                 Shown::Failures { count, reset, .. } => {
-                    let offer = (direct && !reset).then(|| {
-                        let resetting = self.events.resetting.contains(&c.id);
-                        (c.id.clone(), who.clone(), resetting)
+                    let offer = (direct && !reset).then(|| Reset {
+                        chat: c.id.clone(),
+                        who: who.clone(),
+                        resetting: self.events.resetting.contains(&c.id),
                     });
                     ("shield-alert", failures(count, &who), offer)
                 }
@@ -189,15 +209,21 @@ impl Hush {
             return timeline;
         }
         let this = cx.entity().downgrade();
+        // at the bottom while they fit, scrolled from the top when they don't
         div().flex_1().min_h_0().child(
-            v_flex()
+            div()
                 .id("events-only")
                 .size_full()
                 .overflow_y_scroll()
-                .justify_end()
-                .px(px(16.))
-                .pb(px(8.))
-                .children(render(&lines, c.wallpaper.is_some(), &this, p)),
+                .track_scroll(&self.events.scroll)
+                .child(
+                    v_flex()
+                        .min_h_full()
+                        .justify_end()
+                        .px(px(16.))
+                        .pb(px(8.))
+                        .children(render(&lines, c.wallpaper.is_some(), &this, p)),
+                ),
         )
     }
 
@@ -245,11 +271,7 @@ impl Hush {
         }
         self.selected = Some(id);
         let (messages, list) = crate::demo::timed_chat();
-        self.events = Events {
-            generation: Some(self.generation),
-            list,
-            ..Default::default()
-        };
+        self.set_events(list, cx);
         self.set_messages(messages, cx);
     }
 }
@@ -264,7 +286,7 @@ pub(super) fn render<'a>(
 ) -> impl Iterator<Item = Stateful<Div>> + 'a {
     lines.iter().map(move |l| {
         let color = if l.missed { p.danger.opacity(0.9) } else { p.secondary };
-        let reset = l.reset.clone().map(|(chat, who, resetting)| {
+        let reset = l.reset.clone().map(|Reset { chat, who, resetting }| {
             let this = this.clone();
             let words = if resetting {
                 "Resetting…"
@@ -382,7 +404,8 @@ mod tests {
 
     use super::{failures, gap, said, shown, Shown};
 
-    /// Midday, so a few minutes either way stay on one day wherever the tests run.
+    /// Noon UTC, at the earliest local midnight: the minutes after it stay on one day wherever the
+    /// tests run.
     const NOON: i64 = 1_800_000_000_000 - 1_800_000_000_000 % 86_400_000 + 12 * 3_600_000;
     const MINUTE: i64 = 60_000;
 
@@ -478,6 +501,14 @@ mod tests {
         );
         // a message between them: two notices, each in its own gap
         assert_eq!(
+            shown(&events, 0..1),
+            [Shown::Failures {
+                first: 0,
+                count: 1,
+                reset: true
+            }]
+        );
+        assert_eq!(
             shown(&events, 1..2),
             [Shown::Failures {
                 first: 1,
@@ -534,15 +565,19 @@ mod tests {
 /// The events in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
-    use gpui_kit::{gpui, AppContext as _, Entity, TestAppContext, WindowOptions};
-    use sig_core::projection::ChatEventKind;
+    use std::sync::Arc;
+
+    use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Entity, TestAppContext, WindowOptions};
+    use sig_core::projection::{ChatEvent, ChatEventKind, Conversation, ConversationKind};
     use sig_core::CoreEvent;
 
-    use super::super::Hush;
+    use super::super::{Hush, PAGE};
+    use super::Line;
+    use crate::demo::{ANA, ME};
     use crate::Demo;
 
-    fn open(cx: &mut TestAppContext) -> Entity<Hush> {
-        let (_, hush) = cx.update(|cx| {
+    fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Hush>) {
+        let opened = cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
                 cx.new(|cx| Hush::demo(Demo::Events, window, cx))
@@ -550,23 +585,62 @@ mod window_tests {
             .expect("the window opens")
         });
         cx.run_until_parked();
-        hush
+        opened
+    }
+
+    fn in_window(
+        window: AnyWindowHandle,
+        hush: &Entity<Hush>,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Hush, &mut gpui_kit::Window, &mut gpui_kit::Context<Hush>),
+    ) {
+        window
+            .update(cx, |_, window, cx| hush.update(cx, |app, cx| f(app, window, cx)))
+            .unwrap();
+    }
+
+    struct Quiet;
+
+    impl sig_core::EventListener for Quiet {
+        fn on_event(&self, _: CoreEvent) {}
+    }
+
+    /// A core that isn't linked, in a data folder of its own.
+    fn with_core(hush: &Entity<Hush>, name: &str, cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("hush-desktop-events-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = sig_core::Client::open(dir.to_str().unwrap().into(), "ab".repeat(32), Arc::new(Quiet)).unwrap();
+        hush.update(cx, |app, _| app.client = Some(client));
+    }
+
+    fn open_chat(app: &Hush) -> Conversation {
+        let open = app.chats.iter().find(|c| Some(&c.id) == app.selected.as_ref());
+        open.expect("a chat is open").clone()
+    }
+
+    /// The lines after the last message, of the open chat or of `c`.
+    fn after(hush: &Entity<Hush>, c: Option<Conversation>, cx: &mut TestAppContext) -> Vec<Line> {
+        hush.read_with(cx, |app, _| {
+            let c = c.unwrap_or_else(|| open_chat(app));
+            app.event_lines(&c, app.messages.len(), chrono::Local::now())
+        })
     }
 
     /// Whether the newest notice of messages that couldn't be decrypted says its reset is on its
     /// way.
     fn resetting(hush: &Entity<Hush>, cx: &mut TestAppContext) -> bool {
-        hush.read_with(cx, |app, _| {
-            let c = app.chats.iter().find(|c| Some(&c.id) == app.selected.as_ref()).unwrap();
-            let after = app.event_lines(c, app.messages.len(), chrono::Local::now());
-            let notice = after.last().and_then(|l| l.reset.clone()).expect("it offers a reset");
-            notice.2
-        })
+        let lines = after(hush, None, cx);
+        lines
+            .last()
+            .and_then(|l| l.reset.clone())
+            .expect("it offers a reset")
+            .resetting
     }
 
     #[gpui::test]
     fn a_reset_on_its_way_shows_until_it_is_recorded_or_anything_fails(cx: &mut TestAppContext) {
-        let hush = open(cx);
+        let (_, hush) = open(cx);
         let chat = hush.read_with(cx, |app, _| app.selected.clone().unwrap());
         assert!(!resetting(&hush, cx));
         let start = |cx: &mut TestAppContext| {
@@ -594,5 +668,121 @@ mod window_tests {
         };
         hush.update(cx, |app, cx| app.handle(failed, cx));
         assert!(!resetting(&hush, cx), "offered again after a failure");
+    }
+
+    #[gpui::test]
+    fn the_reset_asks_first_and_one_the_core_refuses_is_said(cx: &mut TestAppContext) {
+        let (window, hush) = open(cx);
+        with_core(&hush, "reset", cx);
+        let chat = format!("c:{ANA}");
+        let ask = |cx: &mut TestAppContext| {
+            let chat = chat.clone();
+            in_window(window, &hush, cx, |app, window, cx| {
+                app.confirm_reset(chat, "Ana".into(), window, cx)
+            });
+            cx.run_until_parked();
+        };
+        ask(cx);
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!resetting(&hush, cx), "cancelled: nothing is sent");
+        ask(cx);
+        cx.simulate_prompt_answer("Reset");
+        cx.run_until_parked();
+        assert!(resetting(&hush, cx));
+        // the core resets 1:1 sessions only
+        hush.update(cx, |app, cx| app.reset_session("g:01".into(), cx));
+        let error = hush.read_with(cx, |app, _| app.error.clone()).unwrap_or_default();
+        assert!(error.starts_with("Couldn't reset the session: "), "{error}");
+    }
+
+    #[gpui::test]
+    fn another_chats_events_never_show(cx: &mut TestAppContext) {
+        let (window, hush) = open(cx);
+        // no core: the events loaded for Ana's chat stay, as when another chat's load is slow
+        in_window(window, &hush, cx, |app, window, cx| {
+            app.switch(Some("g:01".into()), window, cx);
+            app.set_messages(crate::demo::messages(), cx);
+        });
+        hush.read_with(cx, |app, _| {
+            let family = open_chat(app);
+            for i in 0..=app.messages.len() {
+                assert!(app.events_before(i).is_empty(), "row {i}");
+                assert!(app.event_lines(&family, i, chrono::Local::now()).is_empty(), "row {i}");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn events_before_the_oldest_message_wait_while_older_ones_may_come_between(cx: &mut TestAppContext) {
+        let (_, hush) = open(cx);
+        let before_first = |cx: &mut TestAppContext| hush.read_with(cx, |app, _| app.events_before(0).len());
+        assert_eq!(before_first(cx), 3, "the whole chat is loaded: a day back's show");
+        // a full page: older messages may come before these
+        hush.update(cx, |app, cx| {
+            app.depth = app.messages.len() as u32;
+            app.set_messages(app.messages.clone(), cx);
+        });
+        assert_eq!(before_first(cx), 0);
+        // and while an older page is on its way, with an event come meanwhile
+        let chat = format!("c:{ANA}");
+        hush.update(cx, |app, cx| {
+            app.depth += PAGE;
+            app.messages_loading = Some(app.generation);
+            let added = CoreEvent::ChatEventAdded {
+                conversation_id: chat,
+                kind: ChatEventKind::MissedCall,
+            };
+            app.handle(added, cx);
+        });
+        assert_eq!(before_first(cx), 0, "not until the page is in");
+    }
+
+    #[gpui::test]
+    fn events_name_whom_they_are_about_and_offer_a_reset_in_direct_chats_only(cx: &mut TestAppContext) {
+        let (_, hush) = open(cx);
+        let last = hush.read_with(cx, |app, _| app.messages.last().unwrap().sent_at);
+        let event = |id: i64, at: i64, kind, author: &str| ChatEvent {
+            id,
+            conversation_id: format!("c:{ANA}"),
+            at,
+            kind,
+            author: author.into(),
+            value: Some(30),
+        };
+        const DAYS_2: i64 = 2 * 86_400_000;
+        hush.update(cx, |app, _| {
+            app.events.list = vec![
+                event(1, last + 1, ChatEventKind::TimerChanged, ME),
+                event(2, last + 2, ChatEventKind::DecryptionFailed, ANA),
+                event(3, last + DAYS_2, ChatEventKind::MissedCall, ANA),
+                event(4, last + DAYS_2 + 1, ChatEventKind::MissedCall, ANA),
+            ];
+        });
+        let lines = after(&hush, None, cx);
+        let days: Vec<bool> = lines.iter().map(|l| l.day.is_some()).collect();
+        assert_eq!(days, [false, false, true, false], "a separator above a new day only");
+        assert_eq!(lines[0].text, "You set the disappearing message time to 30 seconds.");
+        let reset = lines[1].reset.clone().expect("a direct chat's notice offers a reset");
+        assert_eq!((reset.chat, reset.who), (format!("c:{ANA}"), "Ana Popescu".into()));
+        // a group names who it's about; neither it nor a phone number's chat can be reset here
+        let ana = hush.read_with(cx, |app, _| open_chat(app));
+        let group = Conversation {
+            id: "g:x".into(),
+            kind: ConversationKind::Group,
+            title: "Family".into(),
+            ..ana.clone()
+        };
+        let lines = after(&hush, Some(group), cx);
+        assert!(lines[1].reset.is_none());
+        assert_eq!(
+            lines[1].text,
+            "A message between you and Ana Popescu couldn't be decrypted"
+        );
+        let by_number = Conversation {
+            id: "c:PNI:x".into(),
+            ..ana
+        };
+        assert!(after(&hush, Some(by_number), cx)[1].reset.is_none());
     }
 }

@@ -158,7 +158,8 @@ fn message(author: &str, ago_minutes: i64, body: &str) -> Message {
 }
 
 /// Ana's chat, disappearing messages turned on: its messages, oldest first, and its events of each
-/// kind, among them messages yesterday and just now that couldn't be decrypted.
+/// kind, among them messages a day back (answered by a reset) and just now that couldn't be
+/// decrypted.
 pub fn timed_chat() -> (Vec<Message>, Vec<ChatEvent>) {
     use ChatEventKind::*;
     let chat = format!("c:{ANA}");
@@ -183,16 +184,17 @@ pub fn timed_chat() -> (Vec<Message>, Vec<ChatEvent>) {
         author: ANA.into(),
         value,
     };
-    let yesterday = 26 * 60;
+    let day_back = 26 * 60;
     let events = vec![
-        event(1, yesterday + 10, DecryptionFailed, None),
-        event(2, yesterday + 9, DecryptionFailed, None),
-        event(3, yesterday, SessionReset, None),
+        event(1, day_back + 10, DecryptionFailed, None),
+        event(2, day_back + 9, DecryptionFailed, None),
+        event(3, day_back, SessionReset, None),
         event(4, 100, MissedCall, None),
         event(5, 95, OutgoingCall, Some(125)),
         event(6, 60, TimerChanged, Some(604_800)),
         event(7, 50, SafetyNumberChanged, None),
-        event(8, 10, DecryptionFailed, None),
+        event(8, 30, IncomingCall, Some(42)),
+        event(9, 10, DecryptionFailed, None),
     ];
     (messages, events)
 }

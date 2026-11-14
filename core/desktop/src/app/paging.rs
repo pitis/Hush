@@ -47,7 +47,8 @@ impl Hush {
         }
     }
 
-    /// Older messages than those loaded may be in the chat.
+    /// Older messages than those loaded may be in the chat: as many came as were asked for. While
+    /// a deeper load is on its way (`depth` is raised first), it says no.
     pub(super) fn may_have_older(&self) -> bool {
         // fewer than asked for is the whole chat; fewer than wanted, a load still on its way
         !self.messages.is_empty() && self.messages.len() as u32 >= self.depth

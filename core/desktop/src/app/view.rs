@@ -54,8 +54,9 @@ struct Row {
     actions: Rc<actions::RowActions>,
     /// Just opened from the search: outlined for a moment.
     found: bool,
-    /// What happened before it that isn't a message; for the last, after it too.
+    /// What happened before it that isn't a message.
     events: Vec<events::Line>,
+    /// The last row's only: what happened after it.
     after: Vec<events::Line>,
     /// Gone once its timer runs out: an hourglass by its time.
     disappears: bool,
