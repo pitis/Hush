@@ -17,22 +17,22 @@ use crate::style;
 
 /// What the toolbar and the chat list say while someone types.
 pub(super) const WORDS: &str = "typing…";
-/// Someone's typing that no stop ended goes after this long (`AppStore.typingTimeout`); a sender
-/// repeats its start every 10 s while typing goes on.
+/// Someone's typing that no stop ended goes after this long (`AppStore.typingTimeout`): longer than
+/// the 10 s a sender repeats its start at, so steady typing doesn't flicker.
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// One wave of the dots, left to right.
 const PULSE: Duration = Duration::from_millis(1250);
 
 #[derive(Default)]
 pub(super) struct Typing {
-    /// Who is typing where (in a group, several may), each with the start that times them out; by
-    /// ACI, as the Mac app picks the one shown.
+    /// Who is typing where (in a group, several may), each with the number of their latest start,
+    /// which their timeout must match; by ACI, so the first is the one shown, as on the Mac.
     typers: HashMap<String, BTreeMap<String, u64>>,
     /// Counts the starts, so a timeout a newer start overtook does nothing.
     starts: u64,
     /// The chat the core was told we're typing in, until it's told we stopped.
     ours: Option<String>,
-    /// What the core was told, in order.
+    /// What we told the core (or would have, with none open), in order.
     #[cfg(test)]
     told: Vec<(String, bool)>,
 }
@@ -55,8 +55,8 @@ impl Typing {
         start
     }
 
-    /// Start `n`'s timeout: it ends that typing, unless a newer start or a stop came since. True if
-    /// it did.
+    /// The timeout of start `n` ran out: it ends that typing, unless a newer start or a stop came
+    /// since. True if it ended it.
     fn expire(&mut self, chat: &str, who: &str, n: u64) -> bool {
         let current = self.typers.get(chat).and_then(|t| t.get(who)) == Some(&n);
         if current {
@@ -78,7 +78,7 @@ impl Hush {
         let start = self.typing.set(&chat, &who, started);
         self.typing_shown(&chat, cx);
         if let Some(n) = start {
-            // a group's bubble says who
+            // a group's bubble says who (the core doesn't pass group typing on yet)
             if chat.starts_with("g:") {
                 self.load_names(vec![who.clone()], cx);
             }
@@ -120,9 +120,9 @@ impl Hush {
         })
     }
 
-    /// The composer changed by hand: the open chat is told we're typing, or that we stopped once
-    /// nothing is left to send. Each change is told: the core repeats the start while they go on,
-    /// and stops by itself 10 s after the last one.
+    /// The composer changed by hand: the open chat is told we're typing, or that we stopped once its
+    /// text is blank. Each change is told: the core sends a start at most every 10 s while they go
+    /// on, and a stop 10 s after the last one.
     pub(super) fn composer_typed(&mut self) {
         match self.selected.clone() {
             Some(id) if !self.composer_empty => {
@@ -133,7 +133,8 @@ impl Hush {
         }
     }
 
-    /// We stopped typing where we were: sent, or the text replaced (another chat's draft, an edit).
+    /// We stopped typing where we were: cleared, sent, the chat left or deleted, or the text replaced
+    /// (another chat's draft, an edit).
     pub(super) fn stop_typing(&mut self) {
         if let Some(id) = self.typing.ours.take() {
             self.tell_typing(id, false);
@@ -214,6 +215,10 @@ impl RenderOnce for Bubble {
 
 #[cfg(test)]
 mod tests {
+    use sig_core::projection::Conversation;
+
+    use super::super::tests::chat;
+    use super::super::view::subtitle;
     use super::Typing;
 
     #[test]
@@ -232,6 +237,7 @@ mod tests {
         assert_eq!(t.typer("c:a"), Some("a"));
         assert!(t.expire("c:a", "a", again), "no stop came");
         assert_eq!(t.typer("c:a"), None);
+        assert!(t.typers.is_empty(), "a chat nobody types in is let go");
     }
 
     #[test]
@@ -245,11 +251,32 @@ mod tests {
         t.expire("g:1", "b", b);
         assert_eq!(t.typer("g:1"), None);
     }
+
+    #[test]
+    fn under_the_name_typing_comes_first() {
+        use sig_core::ConnectionState::{Offline, Online};
+
+        let mut c = Conversation {
+            expire_timer: 3_600,
+            username: Some("ana.42".into()),
+            ..chat("c:a", "Ana")
+        };
+        assert_eq!(subtitle(&c, &Offline, true), "typing…");
+        assert_eq!(subtitle(&c, &Offline, false), "Offline");
+        assert_eq!(subtitle(&c, &Online, false), "Disappearing messages: 1 hour");
+        c.expire_timer = 0;
+        assert_eq!(subtitle(&c, &Online, false), "@ana.42");
+        c.username = None;
+        assert_eq!(subtitle(&c, &Online, false), "");
+    }
 }
 
 /// Typing in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
 #[cfg(all(test, feature = "snapshot"))]
 mod window_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use gpui_kit::{gpui, AnyWindowHandle, AppContext as _, Context, Entity, TestAppContext, Window, WindowOptions};
     use sig_core::CoreEvent;
 
@@ -318,16 +345,36 @@ mod window_tests {
         let ana = format!("c:{ANA}");
         typing(&hush, &ana, ANA, true, cx);
         assert_eq!(typer(&hush, &ana, cx).as_deref(), Some(ANA));
+        let bubble = hush.read_with(cx, |app, _| {
+            let chat = app.chats.iter().find(|c| c.id == ana).unwrap();
+            app.typing_bubble(chat).map(|b| b.typer)
+        });
+        assert_eq!(bubble, Some(None), "a person's chat: no picture in it");
         typing(&hush, &ana, ANA, false, cx);
         assert_eq!(typer(&hush, &ana, cx), None, "stopped");
 
-        // in the open group: its bubble names who
-        typing(&hush, "g:01", BOGDAN, true, cx);
-        let bubble = hush.read_with(cx, |app, _| {
-            let family = app.chats.iter().find(|c| c.id == "g:01").unwrap();
-            app.typing_bubble(family).and_then(|b| b.typer)
+        // their message in: they stopped, whether or not their app said so
+        typing(&hush, &ana, ANA, true, cx);
+        let key = sig_core::projection::MessageKey {
+            author: ANA.into(),
+            sent_at: 1,
+        };
+        hush.update(cx, |app, cx| {
+            let conversation_id = ana.clone();
+            app.handle(CoreEvent::NewMessage { conversation_id, key }, cx)
         });
-        assert_eq!(bubble, Some((format!("c:{BOGDAN}"), "Bogdan Ionescu".into())));
+        assert_eq!(typer(&hush, &ana, cx), None, "their message came");
+
+        // in the open group: the last row ends with a bubble naming who
+        typing(&hush, "g:01", BOGDAN, true, cx);
+        let (last, before) = hush.read_with(cx, |app, _| {
+            let family = app.chats.iter().find(|c| c.id == "g:01").unwrap();
+            let (n, now) = (app.messages.len(), chrono::Local::now());
+            let bubble = |i| app.row(family, i, now).and_then(|r| r.typing).map(|b| b.typer);
+            (bubble(n - 1), bubble(n - 2))
+        });
+        assert_eq!(last, Some(Some((format!("c:{BOGDAN}"), "Bogdan Ionescu".into()))));
+        assert_eq!(before, None, "only after the last message");
 
         cx.executor().advance_clock(TIMEOUT / 2);
         // still typing: their start again times them out afresh
@@ -335,9 +382,15 @@ mod window_tests {
         cx.executor().advance_clock(TIMEOUT / 2);
         cx.run_until_parked();
         assert!(typer(&hush, "g:01", cx).is_some(), "the first timeout was overtaken");
+        let drawn = Rc::new(Cell::new(false));
+        let _watch = cx.update(|cx| {
+            let drawn = drawn.clone();
+            cx.observe(&hush, move |_, _| drawn.set(true))
+        });
         cx.executor().advance_clock(TIMEOUT / 2);
         cx.run_until_parked();
         assert_eq!(typer(&hush, "g:01", cx), None, "no stop came");
+        assert!(drawn.get(), "the window shows it gone");
     }
 
     #[gpui::test]
@@ -362,7 +415,7 @@ mod window_tests {
         });
         assert_eq!(told(&hush, cx), [started("g:01"), stopped("g:01")]);
 
-        // another chat: what's typed here waits as its draft
+        // leaving the chat stops our typing there (what's typed waits as its draft)
         cx.simulate_input(window, "y");
         let ana = format!("c:{ANA}");
         in_window(window, &hush, cx, |app, window, cx| app.select(ana.clone(), window, cx));
@@ -377,6 +430,12 @@ mod window_tests {
         in_window(window, &hush, cx, |app, window, cx| app.send(window, cx));
         cx.run_until_parked();
         assert_eq!(told(&hush, cx), [stopped(&ana)]);
+
+        // the chat deleted
+        cx.simulate_input(window, "z");
+        hush.update(cx, |app, cx| app.delete_chat(ana.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(told(&hush, cx), [started(&ana), stopped(&ana)]);
         hush.update(cx, |app, _| app.client = None);
         let _ = std::fs::remove_dir_all(&data);
     }

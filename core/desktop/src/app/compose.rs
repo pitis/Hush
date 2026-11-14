@@ -330,7 +330,7 @@ impl Hush {
     /// Puts `typed` in the composer (a draft, an edit, what was typed before it), the caret at
     /// its end; unless it is an edit, it is the open chat's draft from now on.
     pub(super) fn set_typed(&mut self, typed: Typed, window: &mut Window, cx: &mut Context<Self>) {
-        // put in, not typed: we stopped typing where we were (sent, left the chat, an edit)
+        // put in, not typed: any typing here is over
         self.stop_typing();
         let text = self.composer.update(cx, |input, cx| {
             input.set_value(typed.content, window, cx);

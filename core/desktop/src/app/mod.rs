@@ -581,6 +581,8 @@ impl Hush {
                 who,
                 started,
             } => self.typing_event(conversation_id, who, started, cx),
+            // their message is in: they stopped (not every app says so)
+            CoreEvent::NewMessage { conversation_id, key } => self.typing_event(conversation_id, key.author, false, cx),
             // not in this version: calls, stories, notifications (a reaction shows with its
             // message's `MessageChanged`)
             _ => return,
@@ -1135,6 +1137,7 @@ impl Hush {
     fn delete_chat(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         if self.selected.as_ref() == Some(&id) {
+            self.stop_typing();
             self.selected = None;
             self.generation += 1;
             self.messages.clear();

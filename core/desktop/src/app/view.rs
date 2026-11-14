@@ -29,7 +29,7 @@ const TOOLBAR: f32 = 52.;
 const RUN_GAP_MS: i64 = 3 * 60_000;
 
 /// A message as the timeline shows it.
-struct Row {
+pub(super) struct Row {
     /// A day separator above it ("Today").
     day: Option<String>,
     outgoing: bool,
@@ -60,7 +60,7 @@ struct Row {
     /// The last row's only: what happened after it.
     after: Vec<events::Line>,
     /// The last row's only: someone typing, after everything.
-    typing: Option<typing::Bubble>,
+    pub(super) typing: Option<typing::Bubble>,
     /// Gone once its timer runs out: an hourglass by its time.
     disappears: bool,
     /// The chat has a wallpaper: what isn't in a bubble gets a backing.
@@ -77,7 +77,7 @@ enum Gutter {
 impl Hush {
     /// The open chat's message `i` as its row shows it; built only for the rows on screen, so a
     /// long history costs nothing until it is scrolled to.
-    fn row(&self, c: &Conversation, i: usize, now: chrono::DateTime<chrono::Local>) -> Option<Row> {
+    pub(super) fn row(&self, c: &Conversation, i: usize, now: chrono::DateTime<chrono::Local>) -> Option<Row> {
         let group = c.kind == ConversationKind::Group;
         let ms = &self.messages;
         let m = ms.get(i)?;
@@ -536,7 +536,7 @@ impl Hush {
         };
         let unread = c.unread_count > 0 || c.marked_unread;
         let muted = c.mute_until > chrono::Utc::now().timestamp_millis();
-        // the last message's, not shown under a draft
+        // the last message's, not shown under a draft or while someone types
         let tick = (!drafted && !typing && c.last_message_outgoing && c.last_message_at > 0 && !c.last_message_deleted)
             .then(|| {
                 let behind = if focused {
@@ -748,17 +748,7 @@ impl Hush {
         let (open, now) = (c.clone(), chrono::Local::now());
         let out_fill = style::bubble_fill(c.chat_color.as_ref(), p.bubble_out);
         let title = text::title(c, self.own_aci.as_deref());
-        let subtitle = match &self.connection {
-            // the most pressing first (`ConversationChrome.subtitle`)
-            _ if self.is_typing(&c.id) => typing::WORDS.to_string(),
-            ConnectionState::Offline => "Offline".to_string(),
-            ConnectionState::Connecting => "Connecting…".to_string(),
-            _ if c.expire_timer > 0 => format!("Disappearing messages: {}", text::duration(c.expire_timer)),
-            _ => match (&c.kind, &c.username) {
-                (ConversationKind::Direct, Some(u)) if !c.title.is_empty() => format!("@{u}"),
-                _ => String::new(),
-            },
-        };
+        let subtitle = subtitle(c, &self.connection, self.is_typing(&c.id));
         let answer_first = answer_first(c);
         let this = cx.entity().downgrade();
         let mut row_style = StyleRefinement::default();
@@ -1089,6 +1079,21 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         )
         .children(events::render(&row.after, row.backed, this, p))
         .children(row.typing.clone())
+}
+
+/// Under the chat's name: what matters most now, in words ("" for nothing;
+/// `ConversationChrome.subtitle`).
+pub(super) fn subtitle(c: &Conversation, connection: &ConnectionState, typing: bool) -> String {
+    match connection {
+        _ if typing => typing::WORDS.to_string(),
+        ConnectionState::Offline => "Offline".to_string(),
+        ConnectionState::Connecting => "Connecting…".to_string(),
+        _ if c.expire_timer > 0 => format!("Disappearing messages: {}", text::duration(c.expire_timer)),
+        _ => match (&c.kind, &c.username) {
+            (ConversationKind::Direct, Some(u)) if !c.title.is_empty() => format!("@{u}"),
+            _ => String::new(),
+        },
+    }
 }
 
 /// A day separator in the timeline ("Today").
