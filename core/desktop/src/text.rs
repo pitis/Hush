@@ -222,7 +222,7 @@ pub fn status(s: MessageStatus) -> &'static str {
 }
 
 /// A placeholder message's text, or None for a normal one (Signal Desktop's words).
-fn placeholder(kind: &MessageKind) -> Option<String> {
+pub fn placeholder(kind: &MessageKind) -> Option<String> {
     Some(match kind {
         MessageKind::Normal => return None,
         MessageKind::Sticker { emoji } => match emoji {

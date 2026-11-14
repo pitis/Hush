@@ -19,6 +19,7 @@ use sig_core::{Client, ConnectionState, CoreEvent, EventListener, HistoryStage};
 
 use crate::{key, text};
 
+mod actions;
 mod view;
 
 /// How the phone lists this computer.
@@ -85,6 +86,8 @@ pub struct Hush {
     search: Entity<InputState>,
     query: String,
     timeline: Entity<MessageScrollerState>,
+    /// The open chat's reactions, and the reply or edit in the composer.
+    actions: actions::Actions,
 }
 
 /// The open core, for `quit`.
@@ -230,6 +233,7 @@ impl Hush {
             search,
             query: String::new(),
             timeline,
+            actions: actions::Actions::new(window, cx),
         }
     }
 
@@ -457,7 +461,7 @@ impl Hush {
             return;
         }
         let draft = self.drafts.remove(&id).unwrap_or_default();
-        let unsent = self.composer.read(cx).value().to_string();
+        let unsent = self.actions.leave(self.composer.read(cx).value().to_string());
         if let Some(left) = self.selected.replace(id) {
             if !unsent.trim().is_empty() {
                 self.drafts.insert(left, unsent);
@@ -534,6 +538,7 @@ impl Hush {
             .collect();
         wanted.extend(self.messages.iter().flat_map(|m| mentioned(&m.ranges)));
         self.load_names(wanted, cx);
+        self.messages_loaded(cx);
     }
 
     /// Looks up each unknown contact's name; a failed lookup is tried again next time.
@@ -605,12 +610,14 @@ impl Hush {
             return;
         };
         let body = self.composer.read(cx).value().trim().to_string();
-        if body.is_empty() {
+        if body.is_empty() || self.save_edit(body.clone(), window, cx) {
             return;
         }
+        let reply = self.take_reply();
+        let quote = reply.as_ref().map(actions::quote);
         self.composer.update(cx, |input, cx| input.clean(window, cx));
         cx.spawn_in(window, async move |this, cx| {
-            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], None, None)).await;
+            let sent = Compat::new(client.send_text(id.clone(), body.clone(), vec![], quote, None)).await;
             let Err(e) = sent else { return };
             let _ = this.update_in(cx, |app, window, cx| {
                 app.error = Some(format!("Couldn't send the message: {e}"));
@@ -619,6 +626,7 @@ impl Hush {
                 if app.selected.as_deref() == Some(id.as_str()) && app.composer.read(cx).value().is_empty() {
                     app.composer_empty = false;
                     app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
+                    app.restore_reply(reply);
                 } else {
                     app.drafts.entry(id).or_insert(body);
                 }
