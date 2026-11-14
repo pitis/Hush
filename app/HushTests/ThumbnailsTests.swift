@@ -33,4 +33,37 @@ final class ThumbnailsTests: XCTestCase {
         XCTAssertEqual([bubble.width, bubble.height], [640, 320])
         XCTAssertEqual(Thumbnails.cached(path, filling: 80)?.width, 160)
     }
+
+    /// A stored picture is encrypted on disk: what shows is what the core decrypts, in memory.
+    func testAStoredPictureIsDecodedFromWhatTheCoreDecrypts() async throws {
+        let png = try Data(contentsOf: URL(fileURLWithPath: try picture(width: 300, height: 100)))
+        let stored = "/nonexistent/attachments/\(UUID().uuidString)"
+        let fake = FakeClient(linked: true)
+        fake.decrypted[stored] = png
+        Files.core = fake
+        defer { Files.core = nil }
+        let image = await Thumbnails.load(stored, filling: 50)
+        XCTAssertEqual(image.map { [$0.width, $0.height] }, [150, 50])
+    }
+
+    /// A picture that didn't read (the core starting over, say) is tried again; one that read
+    /// but isn't a picture isn't.
+    func testOnlyAPictureThatDoesntDecodeIsRemembered() async throws {
+        let png = try Data(contentsOf: URL(fileURLWithPath: try picture(width: 10, height: 10)))
+        let stored = "/nonexistent/attachments/\(UUID().uuidString)"
+        let fake = FakeClient(linked: true)
+        Files.core = fake
+        defer { Files.core = nil }
+        let missing = await Thumbnails.load(stored)
+        XCTAssertNil(missing)
+        XCTAssertFalse(Thumbnails.isUndecodable(stored))
+        fake.decrypted[stored] = png
+        let read = await Thumbnails.load(stored)
+        XCTAssertNotNil(read, "tried again")
+        let other = "/nonexistent/attachments/\(UUID().uuidString)"
+        fake.decrypted[other] = Data("not a picture".utf8)
+        let undecodable = await Thumbnails.load(other)
+        XCTAssertNil(undecodable)
+        XCTAssertTrue(Thumbnails.isUndecodable(other))
+    }
 }

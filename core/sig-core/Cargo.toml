@@ -57,10 +57,24 @@ reqwest-websocket = "0.6"
 http = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-oslog = "0.3"
 # RingRTC and WebRTC log through `log`; without this bridge a failed call leaves no trace
 tracing-log = "0.2"
+# blanks ids out of log lines (already in the tree through phonenumber)
+regex = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
+
+# the unified log on Apple platforms; tracing-oslog builds elsewhere but logs nothing
+[target.'cfg(target_vendor = "apple")'.dependencies]
+tracing-oslog = "0.3"
+# a file's plain fsync, as std's is the drive-flushing F_FULLFSYNC there (already in the tree)
+libc = "0.2"
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# SQLCipher's crypto in Rust (the fork's provider): RingRTC's prebuilt WebRTC carries BoringSSL,
+# whose OpenSSL-named functions would take some of SQLCipher's OpenSSL calls and crash it on the
+# first write. Apple platforms keep CommonCrypto. The version is `[patch.crates-io]`'s.
+libsqlite3-sys = { version = "0.36.0", features = ["bundled-sqlcipher-custom-crypto"] }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["rt", "rt-multi-thread", "macros", "test-util"] }

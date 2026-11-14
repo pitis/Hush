@@ -4,8 +4,13 @@ import CoreImage.CIFilterBuiltins
 enum QRCode {
     /// A crisp QR code image for `string`, or nil if it can't be encoded.
     static func image(for string: String, scale: CGFloat = 10) -> NSImage? {
+        image(for: Data(string.utf8), scale: scale)
+    }
+
+    /// The same for raw bytes (a safety number's scannable form).
+    static func image(for data: Data, scale: CGFloat = 10) -> NSImage? {
         let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(string.utf8)
+        filter.message = data
         filter.correctionLevel = "M"
         guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) else {
             return nil

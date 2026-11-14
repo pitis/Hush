@@ -1,0 +1,35 @@
+[package]
+name = "hush-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[[bin]]
+name = "hush"
+path = "src/main.rs"
+
+[dependencies]
+sig-core = { path = "../sig-core" }
+# GPUI, its platform layer, gpui-component and the Lucide icons, at versions that fit together
+gpui-kit = "0.9.0"
+# the database key: macOS Keychain, Windows Credential Manager, Secret Service on Linux
+keyring = "4.2"
+dirs = "7"
+qrcode = { version = "0.14", default-features = false }
+# the core's async calls need a tokio context; the Swift app gets the same one through uniffi
+async-compat = "0.2"
+futures = "0.3"
+hex = "0.4"
+rand = "0.9"
+chrono = "0.4"
+# only for `snapshot`: GPUI's offscreen rendering is test support (gpui-kit's own test-support
+# would also pull in a second GPUI)
+gpui-pre-platform = { version = "=0.3.11", optional = true }
+
+[features]
+# `--snapshot <folder>`: renders made-up screens to PNGs
+snapshot = ["gpui-pre-platform/test-support"]
+
+[dev-dependencies]
+# keyring's own core (already in the tree), for its in-memory mock store
+keyring-core = "1"

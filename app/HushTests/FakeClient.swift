@@ -159,6 +159,8 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     private(set) var groupChanges: [(String, GroupChange)] = []
     /// This change is refused (the server's word: "refused"); the others go through.
     var failingGroupChange: GroupChange?
+    var safetyNumbers: [String: SafetyNumber] = [:]
+    func safetyNumber(aci: String) async throws -> SafetyNumber? { lock.withLock { safetyNumbers[aci] } }
     func groupInfo(conversationId: String) async throws -> GroupInfo? {
         if let groupInfoError { throw groupInfoError }
         return lock.withLock { groupInfoAnswers[conversationId] }
@@ -251,13 +253,35 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     }
     func block(conversationId: String) async throws { try await flag("block \(conversationId)") }
     func acceptRequest(conversationId: String) async throws { try await flag("accept \(conversationId)") }
-    func deleteChat(conversationId: String) async throws { try await flag("delete \(conversationId)") }
+    func deleteChat(conversationId: String) async throws {
+        try await flag("delete \(conversationId)")
+        lock.withLock { draftStore[conversationId] = nil }  // its draft goes with it, as in the core
+    }
     var storageWritesAnswer = true
     private(set) var storageWritesSet: [Bool] = []
     func storageWrites() async throws -> Bool { lock.withLock { storageWritesAnswer } }
     func setStorageWrites(on: Bool) async throws {
         if let changeError { throw changeError }
         lock.withLock { storageWritesSet.append(on) }
+    }
+    /// The core's opaque id, faked: readable, and never containing the id it hides.
+    func opaqueId(id: String) -> String { Data(id.utf8).base64EncodedString() }
+    /// The drafts the core keeps, by chat id.
+    var draftStore: [String: String] = [:]
+    var draftError: Error?
+    /// Each draft write waits this long first.
+    var draftDelay: Duration?
+    func setDraft(conversationId: String, text: String) async throws {
+        if let draftDelay { try? await Task.sleep(for: draftDelay) }
+        if let draftError { throw draftError }
+        lock.withLock {
+            draftStore[conversationId] = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+        }
+    }
+    var draftsError: Error?
+    func drafts() async throws -> [String: String] {
+        if let draftsError { throw draftsError }
+        return lock.withLock { draftStore }
     }
     /// What the core answers to "is this chat muted now?".
     var muted: Set<String> = []
@@ -289,6 +313,20 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
         lock.withLock { attachmentAnswers.values.flatMap { $0 }.first { $0.id == id } }
     }
     func linkPreview(key: MessageKey) async throws -> LinkPreview? { lock.withLock { previewAnswers[key] } }
+
+    /// What the core decrypts a stored file to, by path; any other file is read as it is.
+    var decrypted: [String: Data] = [:]
+    func fileBytes(path: String) async throws -> Data {
+        if let plain = lock.withLock({ decrypted[path] }) { return plain }
+        return try Data(contentsOf: URL(fileURLWithPath: path))
+    }
+    func copyFile(path: String, to: String) async throws {
+        if let plain = lock.withLock({ decrypted[path] }) {
+            try plain.write(to: URL(fileURLWithPath: to), options: .withoutOverwriting)
+        } else {
+            try FileManager.default.copyItem(atPath: path, toPath: to)
+        }
+    }
 
     private(set) var titleCalls = 0
     var reactionAnswers: [MessageKey: [Reaction]] = [:]
@@ -375,6 +413,8 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     var resetError: Error?
     var eventAnswers: [String: [ChatEvent]] = [:]
     func reconnect() throws { lock.withLock { reconnects += 1 } }
+    private(set) var stops = 0
+    func stop() async { lock.withLock { stops += 1 } }
     func resetSession(conversationId: String) throws {
         if let resetError { throw resetError }
         lock.withLock { sessionResets.append(conversationId) }
@@ -452,7 +492,13 @@ final class FakeClient: ClientProtocol, @unchecked Sendable {
     func exportChat(conversationId: String, folder: String) async throws -> String {
         if let exportError { throw exportError }
         lock.withLock { exports.append((conversationId, folder)) }
-        return folder + "/Chat"
+        // as the core makes it: the page, and the chat's files in `files/`
+        let made = URL(fileURLWithPath: folder).appendingPathComponent("Chat")
+        try FileManager.default.createDirectory(
+            at: made.appendingPathComponent("files"), withIntermediateDirectories: true)
+        try Data("<html>".utf8).write(to: made.appendingPathComponent("chat.html"))
+        try Data("echo hi".utf8).write(to: made.appendingPathComponent("files/1-run.command"))
+        return made.path
     }
 
     func restoreBackup(path: String, passphrase: String) async throws {
@@ -509,5 +555,5 @@ func message(_ conv: String, _ author: String, _ sentAt: Int64, _ body: String =
         conversationId: conv, author: author, sentAt: sentAt, receivedAt: sentAt, body: body, ranges: [],
         isOutgoing: outgoing,
         status: outgoing ? .sent : .delivered, edited: false, deleted: false, quote: nil, kind: .normal, expiresIn: 0,
-        expiresAt: nil)
+        expiresAt: nil, story: nil)
 }

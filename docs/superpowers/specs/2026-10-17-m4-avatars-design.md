@@ -17,7 +17,8 @@ their profile key (`retrieve_profile_avatar_by_uuid`) and a group's avatar with 
   not message requests: a stranger chooses that picture) not looked at in the last day (`avatars_to_fetch`, newest first) and fetches each (10 s each): a
   contact's with the profile key presage holds for them (ours for Note to Self; none known: no
   picture), a group's with its master key. `store_avatar` writes a new picture to a new file
-  beside the attachments (`avatar-<chat id>-<time>`: the app caches pictures by path), removes
+  beside the attachments (`avatar-<opaque id>-<time>`: a group's chat id is its key, so files are
+  named by the chat's keyed hash; the app caches pictures by path), removes
   the old one, and reports a change; a failed fetch only marks
   the chat looked at, and is tried again in a day. A change announces `ConversationsChanged`.
 - App: `AvatarPictures.shared` (paths by chat id, filled with the chat list, none for blocked

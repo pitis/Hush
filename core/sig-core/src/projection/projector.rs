@@ -394,12 +394,21 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
     let Some(sent_at) = dm.timestamp.and_then(|t| i64::try_from(t).ok()) else {
         return vec![];
     };
-    // Not shown yet: story replies (they belong to the story, M4).
-    if dm.story_context.is_some() {
-        return vec![];
-    }
+    // a reply or reaction to a story shows in the 1:1 chat, as in Signal's apps
+    let story = match &dm.story_context {
+        None => None,
+        // a group story's belong under the story, not in the group's chat
+        Some(_) if dm.group_v2.is_some() => return vec![],
+        Some(c) => match (
+            aci(c.author_aci.as_deref(), c.author_aci_binary.as_deref()),
+            c.sent_timestamp.and_then(|t| i64::try_from(t).ok()),
+        ) {
+            (Some(author), Some(sent_at)) => Some(MessageKey { author, sent_at }),
+            _ => return vec![],
+        },
+    };
     let view_once = dm.is_view_once == Some(true);
-    if let Some(r) = &dm.reaction {
+    if let Some(r) = dm.reaction.as_ref().filter(|_| story.is_none()) {
         let target = (|| {
             Some(MessageKey {
                 author: aci(r.target_author_aci.as_deref(), r.target_author_aci_binary.as_deref())?,
@@ -472,7 +481,13 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         }];
     }
     // what we can't show yet becomes a placeholder rather than vanishing
-    let kind = if view_once {
+    let kind = if let Some(r) = &dm.reaction {
+        // a story's (a reaction to a message returned above); one taken back isn't shown
+        match r.emoji.clone().filter(|e| !e.is_empty() && r.remove != Some(true)) {
+            Some(emoji) => MessageKind::StoryReaction { emoji },
+            None => return vec![],
+        }
+    } else if view_once {
         // we can't open what we sent
         MessageKind::ViewOnce { viewed: outgoing }
     } else if let Some(s) = &dm.sticker {
@@ -527,6 +542,7 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         expires_in,
         // ours start disappearing when sent; others' once read
         expires_at: (outgoing && expires_in > 0).then(|| sent_at + i64::from(expires_in) * 1000),
+        story,
     };
     let mut attachments: Vec<_> = dm.attachments.iter().map(new_attachment).collect();
     // a sticker's image is its file (most are WebP, often sent untyped)
@@ -537,9 +553,11 @@ fn data_message(dm: &DataMessage, conv: &str, author: &str, received_at: i64, ou
         }
         attachments.push(image);
     }
+    // checked against the text as kept (a view-once caption isn't, so it gets no card)
+    let text = message.body.as_deref().unwrap_or_default();
     let preview = dm.preview.first().and_then(|p| {
         Some(NewPreview {
-            url: p.url.clone()?,
+            url: p.url.clone().filter(|u| crate::link_preview::previewable(text, u))?,
             title: p.title.clone(),
             description: p.description.clone(),
             image: p.image.as_ref().map(new_attachment),
@@ -1093,16 +1111,80 @@ mod tests {
         );
     }
 
+    fn on_story(mut dm: DataMessage, author: &str, sent_at: u64) -> DataMessage {
+        dm.story_context = Some(StoryContext {
+            author_aci: Some(author.into()),
+            sent_timestamp: Some(sent_at),
+            ..Default::default()
+        });
+        dm
+    }
+
     #[test]
-    fn story_replies_are_not_shown_yet() {
-        let mut reply = text(460, "nice story");
-        reply.story_context = Some(StoryContext::default());
-        for dm in [reply.clone(), in_group(reply, KEY.to_vec())] {
+    fn a_reply_to_a_story_shows_in_the_chat_with_its_story() {
+        let reply = on_story(text(460, "nice story"), ME, 300);
+        let m = one(project(
+            &content(ALICE, 470, ContentBody::DataMessage(reply.clone())),
+            ME,
+        ));
+        assert_eq!(
+            (m.conversation_id, m.body.as_deref(), m.kind, m.story),
+            (
+                format!("c:{ALICE}"),
+                Some("nice story"),
+                MessageKind::Normal,
+                Some(key(ME, 300))
+            )
+        );
+        // ours, from the phone, to their story
+        let mine = one(project(
+            &content(ME, 480, sent_sync(ALICE, on_story(text(475, "ha"), ALICE, 310))),
+            ME,
+        ));
+        assert_eq!(
+            (mine.conversation_id, mine.is_outgoing, mine.story),
+            (format!("c:{ALICE}"), true, Some(key(ALICE, 310)))
+        );
+        // the story's author as binary
+        let mut binary = reply.clone();
+        binary.story_context = Some(StoryContext {
+            author_aci_binary: Some(uuid(ME).as_bytes().to_vec()),
+            sent_timestamp: Some(300),
+            ..Default::default()
+        });
+        let m = one(project(&content(ALICE, 470, ContentBody::DataMessage(binary)), ME));
+        assert_eq!(m.story, Some(key(ME, 300)));
+        // a group story's replies belong to the story; a story we can't name is dropped
+        let mut nameless = reply.clone();
+        nameless.story_context = Some(StoryContext::default());
+        for dm in [in_group(reply, KEY.to_vec()), nameless] {
             assert!(
                 project(&content(ALICE, 470, ContentBody::DataMessage(dm.clone())), ME).is_empty(),
                 "{dm:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_reply_names_its_story_as_the_story_is_kept() {
+        use presage::proto::{story_message, StoryMessage, TextAttachment};
+        let story = StoryMessage {
+            attachment: Some(story_message::Attachment::TextAttachment(TextAttachment {
+                text: Some("hello".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        // a story's id is its envelope's timestamp; a reply's context carries it
+        let mut c = content(ALICE, 910, ContentBody::StoryMessage(story));
+        c.metadata.client_timestamp = chrono::DateTime::from_timestamp_millis(900).unwrap();
+        let ops = project(&c, ME);
+        let Op::InsertStory(s) = &ops[0] else { panic!("{ops:?}") };
+        let reply = one(project(
+            &content(ME, 950, sent_sync(ALICE, on_story(text(940, "ha"), ALICE, 900))),
+            ME,
+        ));
+        assert_eq!(reply.story, Some(key(&s.author, s.sent_at)));
     }
 
     #[test]
@@ -1283,10 +1365,47 @@ mod tests {
     }
 
     #[test]
-    fn story_reaction_is_ignored() {
-        let mut dm = reaction("🔥", false, ME, 100);
-        dm.story_context = Some(StoryContext::default());
-        assert!(project(&content(ALICE, 604, ContentBody::DataMessage(dm)), ME).is_empty());
+    fn a_reaction_to_a_story_is_a_message_in_the_chat() {
+        let dm = on_story(reaction("🔥", false, ME, 300), ME, 300);
+        let m = one(project(&content(ALICE, 604, ContentBody::DataMessage(dm.clone())), ME));
+        assert_eq!(
+            (m.conversation_id, m.body, m.kind, m.story),
+            (
+                format!("c:{ALICE}"),
+                None,
+                MessageKind::StoryReaction { emoji: "🔥".into() },
+                Some(key(ME, 300))
+            )
+        );
+        // ours, from the phone, to their story
+        let mine = one(project(
+            &content(
+                ME,
+                620,
+                sent_sync(ALICE, on_story(reaction("🔥", false, ALICE, 310), ALICE, 310)),
+            ),
+            ME,
+        ));
+        assert_eq!(
+            (mine.conversation_id, mine.is_outgoing, mine.kind, mine.story),
+            (
+                format!("c:{ALICE}"),
+                true,
+                MessageKind::StoryReaction { emoji: "🔥".into() },
+                Some(key(ALICE, 310))
+            )
+        );
+        // taking it back, or a group story's: nothing in the chat
+        for dm in [
+            on_story(reaction("🔥", true, ME, 300), ME, 300),
+            on_story(reaction("", false, ME, 300), ME, 300),
+            in_group(dm, KEY.to_vec()),
+        ] {
+            assert!(
+                project(&content(ALICE, 604, ContentBody::DataMessage(dm.clone())), ME).is_empty(),
+                "{dm:?}"
+            );
+        }
     }
 
     #[test]
@@ -1628,7 +1747,7 @@ mod tests {
 
     #[test]
     fn attachments_and_previews_come_with_their_message() {
-        let mut dm = text(100, "look");
+        let mut dm = text(100, "look: https://example.org.");
         dm.attachments = vec![pointer("image/jpeg", 1000, 0), pointer("audio/aac", 50, 1)];
         dm.preview = vec![Preview {
             url: Some("https://example.org".into()),
@@ -1697,6 +1816,94 @@ mod tests {
         let mut dm = text(101, "hi");
         dm.preview = vec![Preview::default()];
         assert_eq!(project(&content(ALICE, 151, ContentBody::DataMessage(dm)), ME).len(), 1);
+    }
+
+    #[test]
+    fn a_preview_is_kept_only_if_its_https_link_is_in_the_message_whole() {
+        // the preview's url as kept from a received message and from one sent from the phone
+        let kept = |body: &str, url: &str| {
+            let mut dm = text(100, body);
+            dm.preview = vec![Preview {
+                url: Some(url.into()),
+                title: Some("Google Docs".into()),
+                ..Default::default()
+            }];
+            [
+                project(&content(ALICE, 150, ContentBody::DataMessage(dm.clone())), ME),
+                project(&content(ME, 150, sent_sync(ALICE, dm)), ME),
+            ]
+            .map(|ops| match ops.as_slice() {
+                [Op::InsertMessage(m), Op::AddAttachments { preview, .. }] if m.body.is_some() => {
+                    preview.as_ref().map(|p| p.url.clone())
+                }
+                [Op::InsertMessage(m)] if m.body.is_some() => None,
+                _ => panic!("{ops:?}"),
+            })
+        };
+        let yes = |body: &str, url: &str| assert_eq!(kept(body, url), [Some(url.into()), Some(url.into())], "{body}");
+        let no = |body: &str, url: &str| assert_eq!(kept(body, url), [None, None], "{body} / {url}");
+        yes("see https://docs.example/d/1", "https://docs.example/d/1");
+        // sentence punctuation and brackets around a link aren't part of it
+        yes("look: https://example.org.", "https://example.org");
+        yes(
+            "(https://en.wikipedia.org/wiki/Rust_(language))",
+            "https://en.wikipedia.org/wiki/Rust_(language)",
+        );
+        yes(
+            "(https://en.wikipedia.org/wiki/Rust_(language))",
+            "https://en.wikipedia.org/wiki/Rust_(language",
+        );
+        // a card for a link the message doesn't have: the message stays, the card goes
+        no("see https://docs.example/d/1", "https://elsewhere.example");
+        no("see https://docs.example/d/1", "https://docs.example/d/2");
+        no("no link here", "https://docs.example/d/1");
+        // nor for part of a link
+        no("see https://github.com/acme/repo", "https://github.co");
+        no(
+            "see https://accounts.google.com.au/login",
+            "https://accounts.google.com",
+        );
+        no(
+            "see https://docs.google.com/d/1#https://evil.example",
+            "https://evil.example",
+        );
+        no(
+            "see https://www.google.com/url?q=https://evil.example/x",
+            "https://evil.example/x",
+        );
+        // https links only, unparseable ones and ones with a name before the host left out
+        no("see http://docs.example/d/1", "http://docs.example/d/1");
+        no("see https://", "https://");
+        no(
+            "see https://docs.google.com@evil.example/d/1",
+            "https://docs.google.com@evil.example/d/1",
+        );
+        // the files stay without the card: its link elsewhere, no text, or a view-once caption
+        let photo = |body: Option<&str>, view_once| DataMessage {
+            body: body.map(Into::into),
+            timestamp: Some(100),
+            attachments: vec![pointer("image/jpeg", 1000, 0)],
+            is_view_once: Some(view_once),
+            preview: vec![Preview {
+                url: Some("https://docs.example/d/1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for dm in [
+            photo(Some("see https://elsewhere.example"), false),
+            photo(None, false),
+            photo(Some("see https://docs.example/d/1"), true),
+        ] {
+            let ops = project(&content(ALICE, 150, ContentBody::DataMessage(dm)), ME);
+            let [Op::InsertMessage(_), Op::AddAttachments {
+                attachments, preview, ..
+            }] = ops.as_slice()
+            else {
+                panic!("{ops:?}")
+            };
+            assert_eq!((attachments.len(), preview), (1, &None));
+        }
     }
 
     fn placeholder(dm: DataMessage) -> MessageKind {

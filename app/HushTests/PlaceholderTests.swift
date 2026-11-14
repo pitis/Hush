@@ -11,7 +11,41 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(Placeholder.text(.payment), "💳 Payment")
         XCTAssertEqual(Placeholder.text(.poll(question: "Pizza?")), "📊 Poll: Pizza?")
         XCTAssertEqual(Placeholder.text(.giftBadge), "✨ Gift badge")
+        XCTAssertEqual(Placeholder.text(.storyReaction(emoji: "👍")), "Reacted 👍 to a story")
         XCTAssertNil(Placeholder.text(.normal))
+    }
+
+    func testRepliesAndReactionsToStoriesSayWhoseStoryTheyAnswer() {
+        var m = message("c:a", "a", 5, "nice")
+        XCTAssertNil(Placeholder.storyHeader(m), "not about a story")
+        m.story = MessageKey(author: "me", sentAt: 1)
+        XCTAssertEqual(Placeholder.storyHeader(m), "Replied to your story")
+        m.kind = .storyReaction(emoji: "👍")
+        XCTAssertEqual(Placeholder.storyHeader(m), "Reacted 👍 to your story")
+        // ours, from the phone
+        var mine = message("c:a", "me", 6, "ha", outgoing: true)
+        mine.story = MessageKey(author: "a", sentAt: 2)
+        XCTAssertEqual(Placeholder.storyHeader(mine), "You replied to their story")
+        mine.kind = .storyReaction(emoji: "🔥")
+        XCTAssertEqual(Placeholder.storyHeader(mine), "You reacted 🔥 to their story")
+    }
+
+    func testTheStoryAReplyAnswersShowsItsWordsOrWhatItIs() {
+        let story = { (text: StoryText?, file: Attachment?) in
+            Story(conversationId: "c:me", author: "me", sentAt: 1, text: text, file: file, viewed: true)
+        }
+        let words = StoryText(
+            text: "at the beach", style: 0, foreground: nil, textBackground: nil, background: [], angle: 0, link: nil)
+        XCTAssertEqual(Placeholder.storyText(story(words, nil)), "at the beach")
+        let photo = Attachment(
+            id: 1, message: MessageKey(author: "me", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
+            width: nil, height: nil, isVoiceNote: false, path: nil, state: .pending)
+        XCTAssertEqual(Placeholder.storyText(story(nil, photo)), "📷 Photo")
+        let link = StoryText(
+            text: "", style: 0, foreground: nil, textBackground: nil, background: [], angle: 0,
+            link: "https://example.com")
+        XCTAssertEqual(Placeholder.storyText(story(link, nil)), "https://example.com", "a link alone")
+        XCTAssertEqual(Placeholder.storyText(story(nil, nil)), "Story")
     }
 
     func testViewOnceMediaOffersOneLookThenSaysViewed() {
@@ -37,14 +71,16 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(Placeholder.text(.viewOnce(viewed: false)), "View-once media")
     }
 
-    func testViewOnceMediaIsSpentOnlyOnceItOpened() {
+    @MainActor func testViewOnceMediaIsSpentOnlyOnceItOpened() async {
         let file = Attachment(
             id: 7, message: MessageKey(author: "a", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
             width: nil, height: nil, isVoiceNote: false, path: "/x", state: .ready)
         var spent = 0
-        XCTAssertFalse(ViewOnce.open(file, with: { _ in false }, then: { spent += 1 }))
+        let failed = await ViewOnce.open(file, with: { _ in false }, then: { spent += 1 })
+        XCTAssertFalse(failed)
         XCTAssertEqual(spent, 0, "a failed open keeps it for another try")
-        XCTAssertTrue(ViewOnce.open(file, with: { _ in true }, then: { spent += 1 }))
+        let opened = await ViewOnce.open(file, with: { _ in true }, then: { spent += 1 })
+        XCTAssertTrue(opened)
         XCTAssertEqual(spent, 1)
     }
 
@@ -163,12 +199,13 @@ final class AppStoreExpiryTests: XCTestCase {
         XCTAssertEqual(store.messages.map(\.sentAt), [2])
         // one prefix covers the message's notification and those of reactions to it, even ones
         // shown before the app started
-        // (boot also clears stale call rings, "call|"; that is not this message's doing)
-        XCTAssertEqual(notifier.removedPrefixes.filter { $0 != "call|" }, ["c:a|a|1|"])
-        XCTAssertTrue(Notifications.id("c:a", key, reactor: nil, emoji: nil).hasPrefix("c:a|a|1|"))
-        XCTAssertTrue(Notifications.id("c:a", key, reactor: "b", emoji: "👍").hasPrefix("c:a|a|1|"))
-        XCTAssertNotEqual(
-            Notifications.id("c:a", key, reactor: "b", emoji: "👍"),
-            Notifications.id("c:a", key, reactor: nil, emoji: nil))
+        // (boot also clears stale notifications; that is not this message's doing)
+        let prefix = Notifications.idPrefix(author: fake.opaqueId(id: "a"), sentAt: 1)
+        XCTAssertEqual(notifier.removedPrefixes.filter { !Notifications.stalePrefixes.contains($0) }, [prefix])
+        let own = Notifications.id(author: fake.opaqueId(id: "a"), sentAt: 1, reactor: nil, emoji: nil)
+        let reaction = Notifications.id(author: fake.opaqueId(id: "a"), sentAt: 1, reactor: "b", emoji: "👍")
+        XCTAssertTrue(own.hasPrefix(prefix))
+        XCTAssertTrue(reaction.hasPrefix(prefix))
+        XCTAssertNotEqual(own, reaction)
     }
 }

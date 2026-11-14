@@ -15,7 +15,8 @@ final class AppStoreCallTests: XCTestCase {
 
     func testAnIncomingCallRingsThenConnectsThenEnds() async {
         let notifier = FakeNotifier()
-        let store = await store(FakeClient(linked: true), notifier: notifier)
+        let fake = FakeClient(linked: true)
+        let store = await store(fake, notifier: notifier)
         active = false
         store.handle(.callChanged(conversationId: "c:alice", phase: .incoming, reason: nil))
         XCTAssertEqual(store.call?.phase, .incoming)
@@ -25,7 +26,7 @@ final class AppStoreCallTests: XCTestCase {
         XCTAssertEqual(store.call?.phase, .connecting)
         store.handle(.callChanged(conversationId: "c:alice", phase: .connected, reason: nil))
         XCTAssertNotNil(store.call?.connectedAt, "the duration ticker starts")
-        XCTAssertEqual(notifier.removedIds, [Notifications.callId("c:alice")], "the ring stops")
+        XCTAssertEqual(notifier.removedIds, [Notifications.callId(fake.opaqueId(id: "c:alice"))], "the ring stops")
         store.handle(.callChanged(conversationId: "c:alice", phase: .ended, reason: .remoteHungUp))
         XCTAssertEqual(store.call?.phase, .ended)
         XCTAssertEqual(store.call?.endedReason, .remoteHungUp)

@@ -50,4 +50,23 @@ final class StoriesTests: XCTestCase {
         XCTAssertEqual(fake.viewedStories, [MessageKey(author: "b", sentAt: 2)])
         XCTAssertTrue(store.stories[0].viewed)
     }
+
+    @MainActor func testAReplyFindsItsStoryWhileItLasts() async {
+        let fake = FakeClient(linked: true)
+        fake.storyAnswers = [story("me", "c:me", 2)]
+        let store = AppStore(open: { _ in fake })
+        await store.boot()
+        await store.refreshStories()
+        var reply = message("c:b", "b", 5, "nice")
+        XCTAssertNil(store.story(for: reply), "not a reply to a story")
+        reply.story = MessageKey(author: "me", sentAt: 2)
+        XCTAssertEqual(store.story(for: reply)?.sentAt, 2)
+        reply.story = MessageKey(author: "me", sentAt: 3)
+        XCTAssertNil(store.story(for: reply), "another story")
+        // a day on, it's gone
+        reply.story = MessageKey(author: "me", sentAt: 2)
+        fake.storyAnswers = []
+        store.handle(.storiesChanged)
+        await eventually { store.story(for: reply) == nil }
+    }
 }

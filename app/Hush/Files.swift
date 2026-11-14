@@ -1,6 +1,7 @@
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import os
 
 /// Attachments in the app: how they are described, laid out, opened, and prepared for sending.
 enum Files {
@@ -56,49 +57,145 @@ enum Files {
             height: height, isVoiceNote: false)
     }
 
-    /// Where opened files are linked; swapped only by tests.
+    static let logger = Logger(subsystem: "dev.pitis.hush", category: "files")
+
+    /// The core, which decrypts the files Hush keeps (they are encrypted on disk); set while one
+    /// is open. Without one, files are read as they are, but never an encrypted one.
+    static var core: (any ClientProtocol)? {
+        get { coreLock.withLock { _core } }
+        set { coreLock.withLock { _core = newValue } }
+    }
+    private static let coreLock = NSLock()
+    nonisolated(unsafe) private static var _core: (any ClientProtocol)?
+
+    /// How an encrypted file starts (the core's `files.rs`).
+    private static let sealed = Data("HUSHFIL1".utf8)
+
+    /// A file to read without the core (it is opening, or starting over): one it encrypted isn't
+    /// taken for its plaintext.
+    private static func unsealed(_ path: String) throws -> URL {
+        let url = URL(fileURLWithPath: path)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        if try handle.read(upToCount: sealed.count) == sealed { throw OpenError.notReady }
+        return url
+    }
+
+    /// A file's bytes: one Hush keeps decrypted by the core, in memory only; any other (one to
+    /// send) as it is.
+    static func bytes(_ path: String) async throws -> Data {
+        if let core { return try await core.fileBytes(path: path) }
+        return try Data(contentsOf: unsealed(path))
+    }
+
+    /// Where opened files are copied; swapped only by tests.
     static let defaultOpenRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
         "Hush-open", isDirectory: true)
     nonisolated(unsafe) static var openRoot = defaultOpenRoot
 
+    /// Where pasted pictures wait to be sent; swapped only by tests.
+    static let defaultPasteRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "Hush-paste", isDirectory: true)
+    nonisolated(unsafe) static var pasteRoot = defaultPasteRoot
+
     enum OpenError: LocalizedError {
         case notDownloaded
+        case notReady
 
-        var errorDescription: String? { "it isn't downloaded" }
+        var errorDescription: String? {
+            switch self {
+            case .notDownloaded: "it isn't downloaded"
+            case .notReady: "Hush is still opening its files"
+            }
+        }
+    }
+
+    /// Why a file didn't open, in words for the user (the core's own error is in the log).
+    static func whyNot(_ error: Error) -> String {
+        (error as? OpenError)?.localizedDescription ?? "its file is missing or damaged"
     }
 
     /// The downloaded file under its own name (or one with the right extension), for Quick Look
-    /// and players: stored files are named by id only. A hard link (a copy across volumes),
-    /// made fresh each time; `close` removes it, so a message deleted for everyone leaves nothing
-    /// readable here.
-    static func openable(_ a: Attachment) throws -> URL {
+    /// and players: stored files are named by id only, and encrypted. A decrypted copy, made
+    /// fresh each time in a folder of its own; `close` removes it, so a message deleted for
+    /// everyone leaves nothing readable here.
+    static func openable(_ a: Attachment) async throws -> URL {
         guard a.state == .ready, let path = a.path else { throw OpenError.notDownloaded }
         let ext = UTType(mimeType: a.contentType)?.preferredFilenameExtension
         // only the last part of a sender-chosen name, so it stays in our folder
         let given = a.fileName.map { URL(fileURLWithPath: $0).lastPathComponent }
             .flatMap { ["", ".", "..", "/"].contains($0) ? nil : $0 }
         let name = given ?? (ext.map { "file.\($0)" } ?? "file")
-        let dir = openRoot.appendingPathComponent(String(a.id), isDirectory: true)
+        let dir = openRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let url = dir.appendingPathComponent(name)
         let fm = FileManager.default
-        try? fm.removeItem(at: dir)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         do {
-            try fm.linkItem(at: URL(fileURLWithPath: path), to: url)
+            if let core {
+                try await core.copyFile(path: path, to: url.path)
+            } else {
+                try fm.copyItem(at: unsealed(path), to: url)
+            }
+            try quarantine(url)
         } catch {
-            try fm.copyItem(at: URL(fileURLWithPath: path), to: url)  // e.g. another volume
+            try? fm.removeItem(at: dir)
+            throw error
         }
         return url
     }
 
-    /// Done with an opened file: its link goes.
-    static func close(_ url: URL) {
-        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    /// Marks a file from a chat as come from someone else, as a browser marks its downloads:
+    /// Gatekeeper checks it before it runs (a `.command` a contact sent, opened from Quick Look's
+    /// Open With or from Finder). A file already marked keeps its mark, and with it any "Open
+    /// Anyway" given before.
+    static func quarantine(_ file: URL) throws {
+        let name = "com.apple.quarantine"
+        guard getxattr(file.path, name, nil, 0, 0, 0) < 0 else { return }
+        // Launch Services' download flags, written directly: through its API each mark would also
+        // be a lasting row in its quarantine events database, a record of when files were opened
+        let mark = "0081;\(String(Int(Date().timeIntervalSince1970), radix: 16));Hush;"
+        guard setxattr(file.path, name, mark, mark.utf8.count, 0, 0) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
-    /// At launch: what a previous run left open goes.
-    static func clearOpened() {
-        try? FileManager.default.removeItem(at: openRoot)
+    /// Quarantines each file in `folder` (an export's `files/`), as many as it can: what failed.
+    static func quarantineFiles(in folder: URL) -> [Error] {
+        do {
+            return try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil).compactMap {
+                do {
+                    try quarantine($0)
+                    return nil
+                } catch { return error }
+            }
+        } catch { return [error] }
+    }
+
+    /// Done with an opened file: its copy goes.
+    static func close(_ url: URL) {
+        do {
+            try FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            // closed already
+        } catch {
+            logger.error("an opened file's copy couldn't be removed: \(error, privacy: .public)")
+        }
+    }
+
+    /// Files out of the tray, sent (the core keeps its own copy) or dropped: the pictures pasted
+    /// into it go. Files chosen or dropped from the user's folders are theirs and stay.
+    static func discard(_ paths: [String]) {
+        let root = pasteRoot.standardizedFileURL.path
+        for path in paths {
+            let file = URL(fileURLWithPath: path).standardizedFileURL  // no `..` climbing out
+            if file.deletingLastPathComponent().path == root { try? FileManager.default.removeItem(at: file) }
+        }
+    }
+
+    /// At launch, once the core holds the data folder: what a previous run left open or pasted
+    /// goes.
+    static func clearLeftovers() {
+        for root in [openRoot, pasteRoot] { try? FileManager.default.removeItem(at: root) }
     }
 
     /// Of dropped or pasted items, the ones that can be sent: files (not folders) that exist.

@@ -194,6 +194,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         })
         .await
         .unwrap();
@@ -211,7 +212,7 @@ mod tests {
             got.iter().map(|a| a.state).collect::<Vec<_>>(),
             [AttachmentState::Ready, AttachmentState::Failed, AttachmentState::Ready]
         );
-        assert_eq!(std::fs::read(got[2].path.as_ref().unwrap()).unwrap(), b"two");
+        assert_eq!(db.plain(got[2].path.as_ref().unwrap()).await, b"two");
         // each one is reported when it starts and when it ends
         let changes = sink
             .0
@@ -234,7 +235,7 @@ mod tests {
         run(&db, &sink, Download::One(got[1].id), &fixed).await;
         let retried = db.attachment(got[1].id).await.unwrap().unwrap();
         assert_eq!(retried.state, AttachmentState::Ready);
-        assert_eq!(std::fs::read(retried.path.unwrap()).unwrap(), b"ok");
+        assert_eq!(db.plain(retried.path.unwrap()).await, b"ok");
     }
 
     #[tokio::test]
@@ -264,6 +265,7 @@ mod tests {
             kind: crate::projection::MessageKind::Normal,
             expires_in: 0,
             expires_at: None,
+            story: None,
         })
         .await
         .unwrap();

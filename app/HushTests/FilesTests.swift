@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import XCTest
 
@@ -58,18 +59,17 @@ final class FilesTests: XCTestCase {
         XCTAssertEqual(Files.outgoing(odd).contentType, "application/octet-stream")
     }
 
-    func testStoredFilesOpenUnderTheirOwnName() throws {
+    func testStoredFilesOpenUnderTheirOwnName() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-open-\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        Files.openRoot = dir.appendingPathComponent("open")
-        defer { Files.openRoot = Files.defaultOpenRoot }
+        useTemporaryRoots(in: dir)
         let stored = dir.appendingPathComponent("42")
         try Data("pdf".utf8).write(to: stored)
         let a = Attachment(
             id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "application/pdf", fileName: "plan.pdf",
             size: 3, width: nil, height: nil, isVoiceNote: false, path: stored.path, state: .ready)
-        let url = try Files.openable(a)
+        let url = try await Files.openable(a)
         XCTAssertEqual(url.lastPathComponent, "plan.pdf")
         XCTAssertEqual(try Data(contentsOf: url), Data("pdf".utf8))
         // closed, nothing of it is left outside Hush's folder
@@ -79,27 +79,171 @@ final class FilesTests: XCTestCase {
         try Data("new".utf8).write(to: dir.appendingPathComponent("43"))
         var other = a
         other.path = dir.appendingPathComponent("43").path
-        XCTAssertEqual(try Data(contentsOf: try Files.openable(other)), Data("new".utf8))
+        let fresh = try await Files.openable(other)
+        XCTAssertEqual(try Data(contentsOf: fresh), Data("new".utf8))
         // no name: the type gives the extension
         var unnamed = a
         unnamed.fileName = nil
-        XCTAssertEqual(try Files.openable(unnamed).pathExtension, "pdf")
+        let typed = try await Files.openable(unnamed)
+        XCTAssertEqual(typed.pathExtension, "pdf")
         // a name can't climb out of the folder, or be the folder
         var sneaky = a
         sneaky.fileName = "../../evil.pdf"
-        XCTAssertEqual(try Files.openable(sneaky).lastPathComponent, "evil.pdf")
+        let climbed = try await Files.openable(sneaky)
+        XCTAssertEqual(climbed.lastPathComponent, "evil.pdf")
         sneaky.fileName = ".."
-        XCTAssertEqual(try Files.openable(sneaky).lastPathComponent, "file.pdf")
+        let folder = try await Files.openable(sneaky)
+        XCTAssertEqual(folder.lastPathComponent, "file.pdf")
         // not downloaded, or its file gone: an error to show, not silence
         var pending = a
         pending.state = .pending
-        XCTAssertThrowsError(try Files.openable(pending))
+        for unopenable in [
+            pending,
+            {
+                var gone = a
+                gone.path = dir.appendingPathComponent("missing").path
+                return gone
+            }(),
+        ] {
+            do {
+                _ = try await Files.openable(unopenable)
+                XCTFail("opened \(unopenable.path ?? "nothing")")
+            } catch {}
+        }
+        // what a previous run left behind goes at launch
+        Files.clearLeftovers()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Files.openRoot.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.path), "only Hush's own folders go")
+    }
+
+    /// A file a contact sent (a `.command`, say) gets Gatekeeper's check before it runs from Quick
+    /// Look's Open With, as a browser's downloads do.
+    func testOpenedFilesAreQuarantined() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-quarantine-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        useTemporaryRoots(in: dir)
+        let stored = dir.appendingPathComponent("42")
+        try Data("echo hi".utf8).write(to: stored)
+        let a = Attachment(
+            id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "application/octet-stream",
+            fileName: "run.command", size: 7, width: nil, height: nil, isVoiceNote: false, path: stored.path,
+            state: .ready)
+        // a download's flags, from Hush; no event id, so Launch Services keeps no record of the open
+        let opened = try await Files.openable(a)
+        let mark = try XCTUnwrap(quarantineMark(opened))
+        XCTAssertNotNil(mark.wholeMatch(of: /0081;[0-9a-f]{8};Hush;/), mark)
+        XCTAssertNil(quarantineMark(stored), "a copy: the stored file isn't marked")
+        // each open is a new copy, marked afresh (an "Open Anyway" counts for that copy)
+        let again = try await Files.openable(a)
+        XCTAssertNotNil(quarantineMark(again))
+    }
+
+    /// Without the core (opening, starting over), a file it encrypted is never read as if it were
+    /// the file: a view-once look would be spent on its ciphertext.
+    func testAnEncryptedFileIsntReadWithoutTheCore() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-sealed-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        useTemporaryRoots(in: dir)
+        Files.core = nil
+        let stored = dir.appendingPathComponent("42")
+        try Data("HUSHFIL1 sealed bytes".utf8).write(to: stored)
+        do {
+            _ = try await Files.bytes(stored.path)
+            XCTFail("read without the core")
+        } catch Files.OpenError.notReady {}
+        let a = Attachment(
+            id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "image/jpeg", fileName: nil, size: 1,
+            width: nil, height: nil, isVoiceNote: false, path: stored.path, state: .ready)
+        do {
+            _ = try await Files.openable(a)
+            XCTFail("opened without the core")
+        } catch Files.OpenError.notReady {}
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: Files.openRoot.path), [])
+        XCTAssertEqual(Files.whyNot(Files.OpenError.notReady), "Hush is still opening its files")
+        XCTAssertEqual(
+            Files.whyNot(CoreError.Storage(message: "can't copy the file: x")), "its file is missing or damaged")
+        // a plain file (one to send) still reads as it is
+        let mine = dir.appendingPathComponent("mine.txt")
+        try Data("mine".utf8).write(to: mine)
+        let bytes = try await Files.bytes(mine.path)
+        XCTAssertEqual(bytes, Data("mine".utf8))
+    }
+
+    /// A recording's length shows before it plays: read from what the core decrypts, in memory,
+    /// and remembered; a large one's isn't read for it.
+    @MainActor func testARecordingsLengthIsKnownBeforeItPlays() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-length-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // a second of AAC in an M4A, as a recording comes
+        let made = dir.appendingPathComponent("made.m4a")
+        let pcm = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+        do {
+            let file = try AVAudioFile(
+                forWriting: made,
+                settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 44100, AVNumberOfChannelsKey: 1])
+            let second = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 44100)!
+            second.frameLength = 44100
+            try file.write(from: second)
+        }
+        let fake = FakeClient(linked: true)
+        Files.core = fake
+        defer { Files.core = nil }
+        let stored = dir.appendingPathComponent("7").path  // encrypted on disk: only the core reads it
+        fake.decrypted[stored] = try Data(contentsOf: made)
+        var a = Attachment(
+            id: Int64.random(in: 1_000_000...Int64.max), message: MessageKey(author: "a", sentAt: 1),
+            contentType: "audio/aac", fileName: nil, size: 20_000, width: nil, height: nil, isVoiceNote: true,
+            path: stored, state: .ready)
+        let read = await AudioAttachmentView.length(of: a)
+        let length = try XCTUnwrap(read)
+        XCTAssertEqual(length, 1, accuracy: 0.1)
+        fake.decrypted[stored] = Data("unreadable now".utf8)
+        let again = await AudioAttachmentView.length(of: a)
+        XCTAssertEqual(again, length, "remembered")
+        a.id += 1
+        a.size = AudioAttachmentView.lengthReadLimit + 1
+        let large = await AudioAttachmentView.length(of: a)
+        XCTAssertNil(large, "shown once played")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["made.m4a"], "no copy on disk")
+    }
+
+    /// Stored files are encrypted: they are read, and copied out to open, through the core.
+    func testStoredFilesAreDecryptedByTheCoreInMemoryOrIntoTheCopyThatOpens() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-decrypt-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        useTemporaryRoots(in: dir)
+        let stored = dir.appendingPathComponent("42")
+        try Data("sealed".utf8).write(to: stored)
+        let fake = FakeClient(linked: true)
+        fake.decrypted[stored.path] = Data("pdf".utf8)
+        Files.core = fake
+        defer { Files.core = nil }
+        let bytes = try await Files.bytes(stored.path)
+        XCTAssertEqual(bytes, Data("pdf".utf8))
+        let a = Attachment(
+            id: 42, message: MessageKey(author: "a", sentAt: 1), contentType: "application/pdf", fileName: "plan.pdf",
+            size: 3, width: nil, height: nil, isVoiceNote: false, path: stored.path, state: .ready)
+        let url = try await Files.openable(a)
+        XCTAssertEqual(try Data(contentsOf: url), Data("pdf".utf8))
+        // opened twice at once (played while its length is read): two copies, each closed alone
+        let other = try await Files.openable(a)
+        XCTAssertNotEqual(other, url)
+        Files.close(url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: other.path))
+        Files.close(other)
+        // one the core can't copy out leaves no folder behind
         var gone = a
         gone.path = dir.appendingPathComponent("missing").path
-        XCTAssertThrowsError(try Files.openable(gone))
-        // what a previous run left behind goes at launch
-        Files.clearOpened()
-        XCTAssertFalse(FileManager.default.fileExists(atPath: Files.openRoot.path))
+        do {
+            _ = try await Files.openable(gone)
+            XCTFail("opened a missing file")
+        } catch {}
+        let left = try FileManager.default.contentsOfDirectory(atPath: Files.openRoot.path)
+        XCTAssertEqual(left, [])
     }
 
     func testOnlyRegularFilesCanBeAttached() throws {
@@ -109,6 +253,28 @@ final class FilesTests: XCTestCase {
         let file = dir.appendingPathComponent("a.txt")
         try Data("x".utf8).write(to: file)
         XCTAssertEqual(Files.attachable([dir, file, dir.appendingPathComponent("missing")]), [file])
+    }
+}
+
+/// A file's quarantine mark (`com.apple.quarantine`), or nil if it has none.
+func quarantineMark(_ url: URL) -> String? {
+    let size = getxattr(url.path, "com.apple.quarantine", nil, 0, 0, 0)
+    guard size > 0 else { return nil }
+    var bytes = [UInt8](repeating: 0, count: size)
+    guard getxattr(url.path, "com.apple.quarantine", &bytes, size, 0, 0) == size else { return nil }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
+extension XCTestCase {
+    /// Both folders Hush leaves files in, inside `dir` for this test: they share this user's
+    /// temporary folder with the installed app, whose files `clearLeftovers` mustn't reach.
+    func useTemporaryRoots(in dir: URL) {
+        Files.openRoot = dir.appendingPathComponent("open")
+        Files.pasteRoot = dir.appendingPathComponent("paste")
+        addTeardownBlock {
+            Files.openRoot = Files.defaultOpenRoot
+            Files.pasteRoot = Files.defaultPasteRoot
+        }
     }
 }
 
@@ -130,6 +296,27 @@ final class AppStoreFilesTests: XCTestCase {
 
     private func file(_ name: String) -> OutgoingFile {
         OutgoingFile(path: "/tmp/\(name)", contentType: "image/png", width: 1, height: 1, isVoiceNote: false)
+    }
+
+    nonisolated override func tearDown() {
+        Files.core = nil
+        super.tearDown()
+    }
+
+    func testFilesAreReadThroughTheOpenCoreAndNotAClosedOne() async {
+        let fake = FakeClient(linked: false)
+        let opens = Counter()
+        let store = AppStore(open: { _ in
+            opens.increment()
+            if opens.value > 1 { throw CoreError.Closed }
+            return fake
+        })
+        await store.boot()
+        XCTAssertTrue(Files.core === fake)
+        // starting over (a restore): the old core goes, and none opened since
+        _ = await store.restoreBackup(from: URL(fileURLWithPath: "/tmp/Hush.hushbackup"), passphrase: "correct horse")
+        XCTAssertEqual(opens.value, 2)
+        XCTAssertNil(Files.core)
     }
 
     func testAMessagesFilesAndPreviewLoadWithIt() async {
@@ -193,6 +380,60 @@ final class AppStoreFilesTests: XCTestCase {
         XCTAssertNotNil(store.lastError)
     }
 
+    /// A pasted picture is Hush's own copy: it goes once sent (the core keeps its copy) or dropped
+    /// from the tray; files chosen or dropped from the user's folders stay.
+    func testPastedPicturesGoOnceSentOrDropped() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("hush-paste-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        useTemporaryRoots(in: root)
+        try FileManager.default.createDirectory(at: Files.pasteRoot, withIntermediateDirectories: true)
+        func made(_ name: String, _ dir: URL) -> OutgoingFile {
+            let url = dir.appendingPathComponent(name)
+            try? Data("png".utf8).write(to: url)
+            return Files.outgoing(url)
+        }
+        func exists(_ f: OutgoingFile) -> Bool { FileManager.default.fileExists(atPath: f.path) }
+        let fake = FakeClient(linked: true)
+        let store = await linkedStore(fake)
+        store.select("c:a")
+        let (sent, own) = (made("sent.png", Files.pasteRoot), made("own.png", root))
+        store.addFiles([sent, own])
+        fake.sendError = TestError(description: "offline")
+        _ = await store.send("")
+        XCTAssertTrue(exists(sent), "a failed send keeps it, back in the tray")
+        fake.sendError = nil
+        _ = await store.send("")
+        XCTAssertFalse(exists(sent))
+        XCTAssertTrue(exists(own), "the user's own file isn't Hush's to remove")
+        let removed = made("removed.png", Files.pasteRoot)
+        store.addFiles([removed, own])
+        store.removeFile(removed.path)
+        XCTAssertFalse(exists(removed))
+        store.removeFile(own.path)
+        XCTAssertTrue(exists(own))
+        store.removeFile(Files.pasteRoot.path + "/../own.png")
+        XCTAssertTrue(exists(own), "only what is in the paste folder itself")
+        let left = made("left.png", Files.pasteRoot)
+        store.addFiles([left])
+        store.select("c:b")
+        XCTAssertFalse(exists(left), "switching chats empties the tray")
+        // a send that fails after the chat was switched has no tray to go back to
+        fake.sendDelay = .milliseconds(300)
+        fake.sendError = TestError(description: "offline")
+        let late = made("late.png", Files.pasteRoot)
+        store.addFiles([late])
+        async let failed = store.send("")
+        await eventually { store.outgoingFiles.isEmpty }  // taken, waiting on the core
+        store.select("c:c")
+        _ = await failed
+        XCTAssertFalse(exists(late))
+        // what a previous run left pasted goes at launch
+        _ = made("leftover.png", Files.pasteRoot)
+        Files.clearLeftovers()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: Files.pasteRoot.path))
+    }
+
     func testAFailedSendKeepsTheFilesAndSwitchingChatsClearsThem() async {
         let fake = FakeClient(linked: true)
         fake.sendError = TestError(description: "too big")
@@ -210,6 +451,9 @@ final class AppStoreFilesTests: XCTestCase {
 
 final class PasteTests: XCTestCase {
     func testPastedFilesAndImagesBecomeAttachmentsButTextStaysText() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-pasted-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        useTemporaryRoots(in: dir)
         let board = NSPasteboard(name: NSPasteboard.Name("hush.tests.\(UUID())"))
         defer { board.releaseGlobally() }
         // text: the field pastes it
@@ -239,5 +483,7 @@ final class PasteTests: XCTestCase {
         XCTAssertEqual(pasted.count, 1)
         XCTAssertEqual(pasted.first?.pathExtension, "png")
         XCTAssertNotNil(NSImage(contentsOf: try XCTUnwrap(pasted.first)))
+        XCTAssertEqual(
+            pasted.first?.deletingLastPathComponent().standardizedFileURL, Files.pasteRoot.standardizedFileURL)
     }
 }

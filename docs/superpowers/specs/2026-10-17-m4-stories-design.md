@@ -18,8 +18,18 @@ or a group (`group`); its id is the envelope's timestamp. Our own come from the 
 4. Only stories from chats that aren't blocked or message requests show (as Desktop), and ours.
 
 ## Not in this slice
-Posting, replies and reactions to stories, viewed receipts to the author, story privacy
+Posting, replying and reacting to stories here, viewed receipts to the author, story privacy
 settings, hiding someone's stories.
+
+## Later: replies and reactions in the chat (issue #160)
+A 1:1 reply or reaction to a story (a `DataMessage` with `storyContext`, received or sent from
+the phone) is a message in that chat, as Signal's apps show it: `Message.story` names the story
+(migration 0028: `story_author`, `story_sent_at`); a reaction is `MessageKind::StoryReaction`
+(no text; one taken back isn't shown). The bubble's quote box reads "Replied to your story",
+"Reacted 👍 to your story" (ours: "You replied to their story"), with the story's words or
+picture while Hush still has it (a day), the header alone after. A group story's replies
+belong under the story and are still dropped, as are a phone history's (its backup doesn't
+name the story).
 
 ## Design
 - Migration 0016: `stories` (author, sent_at, conversation_id, text and its look, link, viewed,
