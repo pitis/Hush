@@ -88,15 +88,19 @@ impl Hush {
     }
 }
 
-/// A click that calls `f` with the row's message.
+/// A click that calls `f` with the row's message, as it is then.
 fn on(
     act: &ActionCx,
     row: &Rc<RowActions>,
     f: impl Fn(&mut Hush, &Message, &mut Window, &mut Context<Hush>) + 'static,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-    let (app, row) = (act.app.clone(), row.clone());
+    let (app, k) = (act.app.clone(), row.key.clone());
     move |_, window, cx| {
-        let _ = app.update(cx, |app, cx| f(app, &row.message, window, cx));
+        let _ = app.update(cx, |app, cx| {
+            if let Some(m) = app.message(&k) {
+                f(app, &m, window, cx);
+            }
+        });
     }
 }
 
@@ -144,14 +148,11 @@ fn build_menu(
                 row,
                 Hush::start_editing,
             ))),
-            Item::Copy => {
-                let text = row.copy.clone().unwrap_or_default();
-                menu.item(
-                    PopupMenuItem::new("Copy")
-                        .icon(symbol("copy"))
-                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))),
-                )
-            }
+            Item::Copy => menu.item(PopupMenuItem::new("Copy").icon(symbol("copy")).on_click(on(
+                act,
+                row,
+                |app, m, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(app.copy_text(m))),
+            ))),
             Item::Retry => menu.item(PopupMenuItem::new("Retry").icon(symbol("rotate-cw")).on_click(on(
                 act,
                 row,
@@ -180,7 +181,7 @@ pub(in crate::app) fn with_menu(line: Div, row: &Rc<RowActions>, act: &ActionCx)
 }
 
 /// A hover button, as the Mac app's: a circle behind it under the pointer.
-fn row_button(id: impl Into<ElementId>, name: &str, label: &'static str, p: Palette) -> Button {
+fn row_button(id: &'static str, name: &str, label: &'static str, p: Palette) -> Button {
     Button::new(id)
         .ghost()
         .icon(icon(name, 15., p.secondary))
@@ -191,37 +192,32 @@ fn row_button(id: impl Into<ElementId>, name: &str, label: &'static str, p: Pale
 
 /// The bubble, with the menu, Reply and React beside it on hover (React nearest the bubble), in
 /// the room the row keeps beside it, so they don't narrow it.
-pub(in crate::app) fn beside(
-    bubble: Div,
-    ix: usize,
-    row: &Rc<RowActions>,
-    outgoing: bool,
-    act: &ActionCx,
-    p: Palette,
-) -> Div {
+pub(in crate::app) fn beside(bubble: Div, row: &Rc<RowActions>, outgoing: bool, act: &ActionCx, p: Palette) -> Div {
     let wrap = div().relative().max_w_full().child(bubble);
-    if row.message.deleted {
+    if row.deleted {
         return wrap;
     }
     let react = {
-        let (app, picked, act) = (act.app.clone(), row.clone(), act.clone());
+        let (app, k, act) = (act.app.clone(), row.key.clone(), act.clone());
         let row = row.clone();
-        Popover::new(("react", ix))
+        // controlled: a picker whose row scrolled away and back shows again, as `picking` says
+        Popover::new("react")
             .anchor(if outgoing {
                 Anchor::BottomRight
             } else {
                 Anchor::BottomLeft
             })
-            .trigger(row_button(("react-button", ix), "face-slightly-smiling", "React", p))
+            .trigger(row_button("react-button", "face-slightly-smiling", "React", p))
+            .open(row.picking)
             .on_open_change(move |open, _, cx| {
-                let _ = app.update(cx, |app, cx| app.set_picking(&picked.message, *open, cx));
+                let _ = app.update(cx, |app, cx| app.set_picking(&k, *open, cx));
             })
             .content(move |_, _, cx| picker(&row, &act, cx.entity(), p))
     };
-    let reply = row_button(("reply-button", ix), "reply", "Reply", p).on_click(on(act, row, Hush::reply));
+    let reply = row_button("reply-button", "reply", "Reply", p).on_click(on(act, row, Hush::reply));
     let more = {
         let (row, act) = (row.clone(), act.clone());
-        row_button(("more-button", ix), "ellipsis", "More", p)
+        row_button("more-button", "ellipsis", "More", p)
             .dropdown_menu(move |menu, window, cx| build_menu(menu, &row, &act, window, cx))
     };
     let buttons = h_flex()
@@ -303,9 +299,9 @@ pub(in crate::app) fn quote(row: &RowActions) -> Option<Div> {
 }
 
 /// A failed send's tick: Retry.
-pub(in crate::app) fn retry(ix: usize, row: &Rc<RowActions>, act: &ActionCx, p: Palette) -> AnyElement {
+pub(in crate::app) fn retry(row: &Rc<RowActions>, act: &ActionCx, p: Palette) -> AnyElement {
     h_flex()
-        .id(("retry", ix))
+        .id("retry")
         .role(Role::Button)
         .aria_label("Not sent. Retry")
         .gap(px(3.))
@@ -339,7 +335,7 @@ impl IntoElement for Trigger {
 }
 
 /// Each emoji with how many, ours tinted, half over the bubble's edge. A click shows who reacted.
-pub(in crate::app) fn pill(ix: usize, row: &Rc<RowActions>, outgoing: bool, act: &ActionCx, p: Palette) -> Option<Div> {
+pub(in crate::app) fn pill(row: &Rc<RowActions>, outgoing: bool, act: &ActionCx, p: Palette) -> Option<Div> {
     if row.pill.is_empty() {
         return None;
     }
@@ -357,7 +353,7 @@ pub(in crate::app) fn pill(ix: usize, row: &Rc<RowActions>, outgoing: bool, act:
             .child(shown)
     });
     let trigger = h_flex()
-        .id(("pill", ix))
+        .id("pill")
         .role(Role::Button)
         .aria_label(spoken.join(", "))
         .gap(px(4.))
@@ -370,7 +366,7 @@ pub(in crate::app) fn pill(ix: usize, row: &Rc<RowActions>, outgoing: bool, act:
         .cursor_pointer()
         .children(entries);
     let (row, act) = (row.clone(), act.clone());
-    let popover = Popover::new(("reactors", ix))
+    let popover = Popover::new("reactors")
         .trigger(Trigger(trigger))
         .content(move |_, _, cx| reactors(&row, &act, cx.entity()));
     // as wide as its emoji, on the bubble's side
@@ -397,7 +393,8 @@ fn reactors(row: &Rc<RowActions>, act: &ActionCx, popover: Entity<PopoverState>)
                 return line;
             }
             let (popover, emoji) = (popover.clone(), emoji.clone());
-            let remove = on(act, row, move |app, m, _, cx| app.react(m, &emoji, cx));
+            // always a take-back, whatever was just sent: the list shows what's loaded
+            let remove = on(act, row, move |app, m, _, cx| app.send_reaction(m, &emoji, true, cx));
             line.child(
                 Button::new(("remove", i))
                     .label("Remove")

@@ -366,6 +366,9 @@ impl Hush {
     }
 
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
+        if let CoreEvent::MessageExpired { key, .. } = &event {
+            self.message_expired(key, cx);
+        }
         match event {
             CoreEvent::LinkUrl { url } => {
                 self.error = None;
@@ -603,6 +606,11 @@ impl Hush {
             .map(|m| m.author.clone())
             .collect();
         wanted.extend(self.messages.iter().flat_map(|m| mentioned(&m.ranges)));
+        wanted.extend(
+            self.messages
+                .iter()
+                .flat_map(|m| m.quote.iter().flat_map(|q| mentioned(&q.ranges))),
+        );
         self.load_names(wanted, cx);
         self.messages_loaded(cx);
     }
@@ -694,6 +702,11 @@ impl Hush {
                     app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
                     app.restore_reply(reply);
                 } else {
+                    if reply.is_some() {
+                        app.error = Some(format!(
+                            "Couldn't send the reply: {e}. Its text is back in its chat, without the quote."
+                        ));
+                    }
                     app.drafts.entry(id).or_insert(body);
                 }
                 cx.notify();

@@ -68,7 +68,7 @@ pub enum Demo {
     Chat,
     /// The chat, with the New Group dialog over it.
     NewGroup,
-    /// The chat, replying to a message whose buttons show.
+    /// The chat, replying to a message whose buttons and reaction picker show.
     Reply,
 }
 

@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use async_compat::Compat;
 use gpui_kit::*;
-use sig_core::projection::{Message, MessageKey, MessageStatus, Quote, Reaction, TextStyle};
+use sig_core::projection::{Message, MessageDetails, MessageKey, MessageStatus, Quote, Reaction, TextStyle};
 
 use super::Hush;
 use crate::text;
@@ -36,15 +36,23 @@ pub fn can_delete(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
     me.is_some_and(|me| m.author == me) && m.is_outgoing && !m.deleted && sent && now_ms - m.sent_at <= CHANGE_WINDOW_MS
 }
 
-/// As `can_delete`, and it has text to edit. Not a reply to a story: an edit goes without the
-/// story it answers.
-/// shortcut: this composer holds no styles or mentions, so a message with any isn't offered (an
-/// edit would lose them); the Mac app's composer holds both and lets those through.
+/// The Mac app's rule: as `can_delete`, and it has text to edit whose mentions a composer can
+/// hold (one placeholder each, inside the text): an edit would lose any other. Not a reply to a
+/// story: an edit goes without the story it answers.
+fn editable(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
+    let length = m.body.as_deref().map_or(0, |b| b.encode_utf16().count());
+    let holdable = m.ranges.iter().all(|r| match r.style {
+        TextStyle::Mention { .. } => r.length == 1 && (r.start as usize) < length,
+        _ => true,
+    });
+    can_delete(m, me, now_ms) && length > 0 && m.story.is_none() && holdable
+}
+
+/// `editable`, by this composer.
+/// shortcut: it holds no styles or mentions, so a message with any isn't offered (an edit would
+/// lose them); the Mac app's composer holds both. Lift this once it does.
 pub fn can_edit(m: &Message, me: Option<&str>, now_ms: i64) -> bool {
-    can_delete(m, me, now_ms)
-        && m.body.as_deref().is_some_and(|b| !b.is_empty())
-        && m.story.is_none()
-        && m.ranges.is_empty()
+    editable(m, me, now_ms) && m.ranges.is_empty()
 }
 
 /// Our reaction among a message's reactions.
@@ -59,6 +67,18 @@ pub fn mine<'a>(reactions: &'a [Reaction], me: Option<&str>) -> Option<&'a str> 
 /// replaces it (one reaction each).
 pub fn removes(emoji: &str, mine: Option<&str>) -> bool {
     Some(emoji) == mine
+}
+
+/// Drops our reactions sent but not loaded back once the loaded ones show them. Not sooner: a
+/// reload can come before the core recorded ours (it records each, sent or not).
+fn settle(pending: &mut HashMap<Key, Option<String>>, loaded: &HashMap<Key, Vec<Reaction>>, me: Option<&str>) {
+    pending.retain(|k, wanted| mine(loaded.get(k).map(Vec::as_slice).unwrap_or_default(), me) != wanted.as_deref());
+}
+
+/// `target` was deleted: the loaded `page` has it deleted. One older than the page is unknown, not
+/// gone (a disappearing one is told by `MessageExpired`).
+fn gone(target: &Message, page: &[Message]) -> bool {
+    page.iter().any(|m| key(m) == key(target) && m.deleted)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,9 +107,11 @@ pub fn pill(reactions: &[Reaction], me: Option<&str>) -> Vec<PillEntry> {
     entries
 }
 
-/// ↑ in an empty composer: the newest message of ours that can still be edited.
+/// ↑ in an empty composer: the newest message of ours the Mac app would edit, if this composer
+/// can (not an older one past it).
 pub fn last_editable<'a>(messages: &'a [Message], me: Option<&str>, now_ms: i64) -> Option<&'a Message> {
-    messages.iter().rev().find(|m| can_edit(m, me, now_ms))
+    let newest = messages.iter().rev().find(|m| editable(m, me, now_ms))?;
+    can_edit(newest, me, now_ms).then_some(newest)
 }
 
 /// A message's menu item (its right-click menu and its … button).
@@ -138,16 +160,19 @@ pub(super) fn quote(m: &Message) -> Quote {
 pub(super) struct Actions {
     /// By message.
     reactions: HashMap<Key, Vec<Reaction>>,
-    /// Our reactions sent but not loaded back yet (None: taken back), with the load they came
-    /// after, so a second click acts on what we just did. A later load is the core's word.
-    pending: HashMap<Key, (Option<String>, u64)>,
-    /// Bumped by each reactions load and each chat change: only the newest load is kept.
-    loads: u64,
+    /// Our reactions sent but not loaded back yet (None: taken back), so a second click acts on
+    /// what we just did.
+    pending: HashMap<Key, Option<String>>,
+    /// A reactions load runs; `again`: the messages changed meanwhile, one more follows.
+    loading: bool,
+    again: bool,
     reply_to: Option<Message>,
     /// Our message being edited in the composer; it ends replying (the two don't mix).
     editing: Option<Message>,
     /// What was typed before editing started; back once the edit is saved or cancelled.
     draft_before_edit: Option<String>,
+    /// The edit is on its way to the core: ↩ again doesn't send it twice.
+    saving: bool,
     /// The message whose reaction picker is open: its buttons stay shown.
     picking: Option<Key>,
     /// Takes the keyboard when message text is selected: in the composer, ⌘C would copy
@@ -161,18 +186,20 @@ impl Actions {
         Self {
             reactions: HashMap::new(),
             pending: HashMap::new(),
-            loads: 0,
+            loading: false,
+            again: false,
             reply_to: None,
             editing: None,
             draft_before_edit: None,
+            saving: false,
             picking: None,
             focus: cx.focus_handle(),
             window: window.window_handle(),
         }
     }
 
-    /// Another chat opens: nothing follows it there. Returns the draft of the one left (while
-    /// editing, what was typed before).
+    /// Another chat opens: nothing follows it there (a load still running drops what it reads).
+    /// Returns the draft of the one left (while editing, what was typed before).
     pub(super) fn leave(&mut self, typed: String) -> String {
         let draft = match self.editing.take() {
             Some(_) => self.draft_before_edit.take().unwrap_or_default(),
@@ -180,8 +207,10 @@ impl Actions {
         };
         self.reactions.clear();
         self.pending.clear();
-        self.loads += 1;
+        self.loading = false;
+        self.again = false;
         self.reply_to = None;
+        self.saving = false;
         self.picking = None;
         draft
     }
@@ -197,7 +226,11 @@ impl Actions {
 
 /// What a row shows of a message's actions and reactions.
 pub(super) struct RowActions {
-    pub message: Message,
+    /// The message, as its row's id (`author:sent_at`): popups and a selection stay with it when
+    /// the rows move.
+    pub id: SharedString,
+    key: Key,
+    pub deleted: bool,
     pub items: Vec<Item>,
     /// Ours, counting one just sent.
     pub mine: Option<String>,
@@ -206,8 +239,6 @@ pub(super) struct RowActions {
     pub pill: Vec<PillEntry>,
     /// Who reacted: emoji, name, ours.
     pub reactors: Vec<(String, String, bool)>,
-    /// The text Copy copies: mentions as "@name", spoilers shown.
-    pub copy: Option<String>,
     pub picking: bool,
 }
 
@@ -216,23 +247,17 @@ impl Hush {
         let me = self.own_aci.as_deref();
         let k = key(m);
         let reactions = self.actions.reactions.get(&k).map(Vec::as_slice).unwrap_or_default();
-        let name = |aci: &str| self.name(aci);
         let quote = m.quote.as_ref().filter(|_| !m.deleted).map(|q| {
             let header = if q.author == m.author { "Reply" } else { "Quoted" };
             let (text, mentions) = match &q.text {
-                Some(t) => text::marked(t, &q.ranges, name),
+                Some(t) => text::marked(t, &q.ranges, |aci| self.name(aci)),
                 None => ("Attachment".into(), vec![]),
             };
             (header, text, mentions)
         });
-        let shown: Vec<_> = m
-            .ranges
-            .iter()
-            .filter(|r| r.style != TextStyle::Spoiler)
-            .cloned()
-            .collect();
         Rc::new(RowActions {
-            message: m.clone(),
+            id: format!("{}:{}", m.author, m.sent_at).into(),
+            deleted: m.deleted,
             items: menu(m, me, now_ms),
             mine: self.my_reaction(m),
             quote,
@@ -241,20 +266,33 @@ impl Hush {
                 .iter()
                 .map(|r| (r.emoji.clone(), self.name(&r.reactor), Some(r.reactor.as_str()) == me))
                 .collect(),
-            copy: m
-                .body
-                .as_deref()
-                .filter(|_| !m.deleted)
-                .map(|b| text::plain(b, &shown, name)),
             picking: self.actions.picking.as_ref() == Some(&k),
+            key: k,
         })
+    }
+
+    /// One of the open chat's loaded messages.
+    fn message(&self, k: &Key) -> Option<Message> {
+        self.messages.iter().find(|m| key(m) == *k).cloned()
+    }
+
+    /// What Copy copies: the text, mentions as "@name", spoilers shown.
+    fn copy_text(&self, m: &Message) -> String {
+        let shown: Vec<_> = m
+            .ranges
+            .iter()
+            .filter(|r| r.style != TextStyle::Spoiler)
+            .cloned()
+            .collect();
+        let body = m.body.as_deref().unwrap_or_default();
+        text::plain(body, &shown, |aci| self.name(aci))
     }
 
     /// Our reaction to a message, counting one just sent.
     fn my_reaction(&self, m: &Message) -> Option<String> {
         let k = key(m);
         match self.actions.pending.get(&k) {
-            Some((pending, _)) => pending.clone(),
+            Some(pending) => pending.clone(),
             None => {
                 let reactions = self.actions.reactions.get(&k).map(Vec::as_slice).unwrap_or_default();
                 mine(reactions, self.own_aci.as_deref()).map(str::to_owned)
@@ -262,56 +300,104 @@ impl Hush {
         }
     }
 
-    /// The open chat's messages were loaded again: their reactions are read, and an edit of one
-    /// that was deleted meanwhile (here or on the phone) ends.
+    /// The open chat's messages were loaded again: their reactions are read, and a reply to or an
+    /// edit of one deleted meanwhile (here or on the phone) ends.
     pub(super) fn messages_loaded(&mut self, cx: &mut Context<Self>) {
-        let gone = self.actions.editing.as_ref().is_some_and(|e| {
-            let k = key(e);
-            self.messages.iter().any(|m| key(m) == k && m.deleted)
-        });
-        if gone {
-            // restoring the draft needs the window, which a load doesn't have
-            let (this, window) = (cx.entity().downgrade(), self.actions.window);
-            cx.defer(move |cx| {
-                let _ = window.update(cx, |_, window, cx| {
-                    this.update(cx, |app, cx| app.stop_editing(window, cx))
-                });
-            });
+        if self.actions.reply_to.as_ref().is_some_and(|r| gone(r, &self.messages)) {
+            self.actions.reply_to = None;
         }
-        let Some(client) = self.client.clone() else { return };
-        self.actions.loads += 1;
-        let load = self.actions.loads;
-        let keys: Vec<MessageKey> = self.messages.iter().map(Message::key).collect();
-        cx.spawn(async move |this, cx| {
-            let details = Compat::new(client.details(keys)).await;
-            let _ = this.update(cx, |app, cx| {
-                if app.actions.loads != load {
-                    return; // a newer load, or another chat
-                }
-                let before = app.actions.reactions.clone();
-                // a message the core couldn't read isn't in it, and keeps what it showed
-                for d in details {
-                    let k = (d.key.author, d.key.sent_at);
-                    if d.reactions.is_empty() {
-                        app.actions.reactions.remove(&k);
-                    } else {
-                        app.actions.reactions.insert(k, d.reactions);
-                    }
-                }
-                app.actions.pending.retain(|_, (_, after)| *after >= load);
-                if app.actions.reactions != before {
-                    app.timeline.update(cx, |t, cx| t.remeasure(cx));
-                }
-                cx.notify();
+        if self.actions.editing.as_ref().is_some_and(|e| gone(e, &self.messages)) {
+            self.edit_gone(cx);
+        }
+        self.load_reactions(cx);
+    }
+
+    /// A disappearing message's timer ran out: a reply to it or an edit of it ends.
+    pub(super) fn message_expired(&mut self, k: &MessageKey, cx: &mut Context<Self>) {
+        let k = (k.author.clone(), k.sent_at);
+        if self.actions.reply_to.as_ref().is_some_and(|r| key(r) == k) {
+            self.actions.reply_to = None;
+        }
+        if self.actions.editing.as_ref().is_some_and(|e| key(e) == k) {
+            self.edit_gone(cx);
+        }
+    }
+
+    /// The message being edited is gone: the edit ends, and the user is told why.
+    fn edit_gone(&mut self, cx: &mut Context<Self>) {
+        self.error = Some("The message you were editing was deleted or disappeared, so the edit wasn't sent.".into());
+        // restoring the draft needs the window, which a load or an event doesn't have
+        let (this, window) = (cx.entity().downgrade(), self.actions.window);
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                this.update(cx, |app, cx| app.stop_editing(window, cx))
             });
+        });
+    }
+
+    /// Reads the open chat's reactions; calls while a load runs are folded into one more.
+    fn load_reactions(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
+        if self.actions.loading {
+            self.actions.again = true;
+            return;
+        }
+        self.actions.loading = true;
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| loop {
+            let Ok(keys) = this.update(cx, |app, _| app.messages.iter().map(Message::key).collect()) else {
+                return;
+            };
+            let details = Compat::new(client.details(keys)).await;
+            let again = this.update(cx, |app, cx| {
+                if app.generation != generation {
+                    return false; // another chat: its own load runs
+                }
+                app.reactions_loaded(details, cx);
+                app.actions.loading = std::mem::take(&mut app.actions.again);
+                app.actions.loading
+            });
+            if !again.unwrap_or(false) {
+                break;
+            }
         })
         .detach();
     }
 
+    fn reactions_loaded(&mut self, details: Vec<MessageDetails>, cx: &mut Context<Self>) {
+        let before = self.actions.reactions.clone();
+        // a message the core couldn't read isn't in it, and keeps what it showed
+        for d in details {
+            let k = (d.key.author, d.key.sent_at);
+            if d.reactions.is_empty() {
+                self.actions.reactions.remove(&k);
+            } else {
+                self.actions.reactions.insert(k, d.reactions);
+            }
+        }
+        settle(
+            &mut self.actions.pending,
+            &self.actions.reactions,
+            self.own_aci.as_deref(),
+        );
+        if self.actions.reactions != before {
+            let reactors = self.actions.reactions.values().flatten().map(|r| r.reactor.clone());
+            let reactors = reactors.collect();
+            self.load_names(reactors, cx);
+            self.timeline.update(cx, |t, cx| t.remeasure(cx));
+        }
+        cx.notify();
+    }
+
     /// Reacts to a message: our current reaction again takes it back, another replaces it.
     pub(super) fn react(&mut self, m: &Message, emoji: &str, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
         let remove = removes(emoji, self.my_reaction(m).as_deref());
+        self.send_reaction(m, emoji, remove, cx);
+    }
+
+    /// Sends our reaction `emoji`, or takes it back (`remove`).
+    pub(super) fn send_reaction(&mut self, m: &Message, emoji: &str, remove: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else { return };
         let (k, target, emoji) = (key(m), m.key(), emoji.to_owned());
         self.actions.picking = None;
         cx.spawn(async move |this, cx| {
@@ -319,8 +405,7 @@ impl Hush {
             let _ = this.update(cx, |app, cx| {
                 match sent {
                     Ok(()) => {
-                        let load = app.actions.loads;
-                        app.actions.pending.insert(k, ((!remove).then_some(emoji), load));
+                        app.actions.pending.insert(k, (!remove).then_some(emoji));
                     }
                     Err(e) => app.error = Some(format!("Couldn't react: {e}")),
                 }
@@ -348,6 +433,7 @@ impl Hush {
             self.actions.draft_before_edit = Some(self.composer.read(cx).value().to_string());
         }
         self.actions.editing = Some(m.clone());
+        self.actions.saving = false;
         let body = m.body.clone().unwrap_or_default();
         self.composer_empty = body.trim().is_empty();
         self.composer.update(cx, |input, cx| {
@@ -362,6 +448,7 @@ impl Hush {
         if self.actions.editing.take().is_none() {
             return;
         }
+        self.actions.saving = false;
         let draft = self.actions.draft_before_edit.take().unwrap_or_default();
         self.composer_empty = draft.trim().is_empty();
         self.composer.update(cx, |input, cx| input.set_value(draft, window, cx));
@@ -404,26 +491,26 @@ impl Hush {
         }
     }
 
-    /// Sends `body` as the new text of the message being edited. False if nothing is edited.
+    /// Sends `body` as the new text of the message being edited; the composer keeps it until the
+    /// core took it. False if nothing is edited.
     pub(super) fn save_edit(&mut self, body: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let (Some(client), Some(m)) = (self.client.clone(), self.actions.editing.clone()) else {
             return false;
         };
-        self.composer.update(cx, |input, cx| input.clean(window, cx));
+        if std::mem::replace(&mut self.actions.saving, true) {
+            return true;
+        }
         cx.spawn_in(window, async move |this, cx| {
-            let saved = Compat::new(client.edit(m.key(), body.clone(), vec![])).await;
+            let saved = Compat::new(client.edit(m.key(), body, vec![])).await;
             let _ = this.update_in(cx, |app, window, cx| {
                 let still = app.actions.editing.as_ref().is_some_and(|e| key(e) == key(&m));
+                if still {
+                    app.actions.saving = false;
+                }
                 match saved {
                     Ok(()) if still => app.stop_editing(window, cx),
                     Ok(()) => {}
-                    Err(e) => {
-                        app.error = Some(format!("Couldn't edit the message: {e}"));
-                        if still && app.composer.read(cx).value().is_empty() {
-                            app.composer_empty = false;
-                            app.composer.update(cx, |input, cx| input.set_value(body, window, cx));
-                        }
-                    }
+                    Err(e) => app.error = Some(format!("Couldn't edit the message: {e}")),
                 }
                 cx.notify();
             });
@@ -475,11 +562,10 @@ impl Hush {
     }
 
     /// The reaction picker opened or closed.
-    pub(super) fn set_picking(&mut self, m: &Message, open: bool, cx: &mut Context<Self>) {
-        let k = key(m);
+    fn set_picking(&mut self, k: &Key, open: bool, cx: &mut Context<Self>) {
         if open {
-            self.actions.picking = Some(k);
-        } else if self.actions.picking.as_ref() == Some(&k) {
+            self.actions.picking = Some(k.clone());
+        } else if self.actions.picking.as_ref() == Some(k) {
             self.actions.picking = None;
         }
         cx.notify();
@@ -512,8 +598,8 @@ impl Hush {
 
 #[cfg(feature = "snapshot")]
 impl Hush {
-    /// `--snapshot`'s made-up reactions; `reply`: a reply waits in the composer, the buttons of the
-    /// message it answers show.
+    /// `--snapshot`'s made-up reactions; `reply`: a reply waits in the composer, the buttons and
+    /// the reaction picker of the message it answers show.
     pub(super) fn demo_actions(&mut self, reply: bool) {
         for (k, reactions) in crate::demo::reactions(&self.messages) {
             self.actions.reactions.insert((k.author, k.sent_at), reactions);
@@ -534,7 +620,11 @@ impl Hush {
 #[cfg(test)]
 mod tests {
     // not `super::*`: GPUI's glob brings its own `test` macro
-    use super::{can_delete, can_edit, last_editable, menu, mine, pill, removes, Item, PillEntry, CHANGE_WINDOW_MS};
+    use std::collections::HashMap;
+
+    use super::{
+        can_delete, can_edit, gone, last_editable, menu, mine, pill, removes, settle, Item, PillEntry, CHANGE_WINDOW_MS,
+    };
     use sig_core::projection::{BodyRange, Message, MessageKey, MessageKind, MessageStatus, Reaction, TextStyle};
 
     const ME: &str = "me";
@@ -680,5 +770,63 @@ mod tests {
         assert!(removes("❤️", Some("❤️")));
         assert!(!removes("👍", Some("❤️")));
         assert!(!removes("👍", None));
+    }
+
+    #[test]
+    fn up_does_nothing_when_this_composer_cant_edit_the_newest() {
+        let plain = ours(20_000);
+        let mut bold = ours(10_000);
+        bold.ranges = vec![BodyRange {
+            start: 0,
+            length: 5,
+            style: TextStyle::Bold,
+        }];
+        assert_eq!(
+            last_editable(&[plain.clone(), bold], Some(ME), NOW),
+            None,
+            "not the older one"
+        );
+        // a mention the Mac app's composer can't hold either: not editable there, so ↑ goes past it
+        let mut wide = ours(10_000);
+        wide.ranges = vec![BodyRange {
+            start: 0,
+            length: 2,
+            style: TextStyle::Mention { aci: "ana".into() },
+        }];
+        assert_eq!(last_editable(&[plain.clone(), wide], Some(ME), NOW), Some(&plain));
+    }
+
+    #[test]
+    fn a_reaction_just_sent_counts_until_the_loaded_ones_show_it() {
+        let k = ("ana".to_string(), 1);
+        let mut pending = HashMap::from([(k.clone(), Some("❤️".to_string()))]);
+        let mut loaded = HashMap::new();
+        settle(&mut pending, &loaded, Some(ME));
+        assert_eq!(
+            pending.len(),
+            1,
+            "a reload before it was recorded (a receipt's) keeps it"
+        );
+        loaded.insert(k.clone(), vec![reaction(ME, "❤️")]);
+        settle(&mut pending, &loaded, Some(ME));
+        assert!(pending.is_empty());
+        // taken back: until ours is gone from the loaded ones
+        pending.insert(k.clone(), None);
+        settle(&mut pending, &loaded, Some(ME));
+        assert_eq!(pending.len(), 1);
+        loaded.insert(k, vec![reaction("bob", "❤️")]);
+        settle(&mut pending, &loaded, Some(ME));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_reply_or_edit_ends_when_its_message_is_deleted_not_when_older_than_the_page() {
+        let m = ours(0);
+        let mut deleted = m.clone();
+        deleted.deleted = true;
+        deleted.body = None;
+        assert!(gone(&m, &[deleted]));
+        assert!(!gone(&m, std::slice::from_ref(&m)));
+        assert!(!gone(&m, &[]));
     }
 }
