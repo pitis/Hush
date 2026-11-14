@@ -982,7 +982,7 @@ fn extension(content_type: &str) -> Option<&str> {
 
 /// A picture decoded at most `MAX_PIXELS` either way, turned as its photo says, in GPUI's BGRA;
 /// or why not.
-fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
+pub(super) fn thumbnail(bytes: &[u8]) -> Result<RenderImage, String> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
