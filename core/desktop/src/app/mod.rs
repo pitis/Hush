@@ -35,6 +35,7 @@ mod options;
 mod paging;
 mod previews;
 pub mod search;
+mod typing;
 mod view;
 
 /// How the phone lists this computer.
@@ -173,6 +174,8 @@ pub struct Hush {
     events: events::Events,
     options: options::Options,
     notifications: notifications::Notifications,
+    /// Who is typing where, and where we are.
+    typing: typing::Typing,
 }
 
 /// The open core and the draft writes on their way, for `quit`.
@@ -285,6 +288,7 @@ impl Hush {
                     this.composer_empty = composer.read(cx).value().trim().is_empty();
                     this.composer_changed(cx);
                     this.keep_draft(cx);
+                    this.composer_typed();
                     cx.notify();
                 }
                 _ => {}
@@ -368,6 +372,7 @@ impl Hush {
             events: Default::default(),
             options: Default::default(),
             notifications: Default::default(),
+            typing: Default::default(),
         }
     }
 
@@ -395,7 +400,8 @@ impl Hush {
             | crate::Demo::LinkPreview
             | crate::Demo::GroupInfo
             | crate::Demo::EditGroup
-            | crate::Demo::AddMembers => {
+            | crate::Demo::AddMembers
+            | crate::Demo::Typing => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
                 app.contacts = addable(&app.chats, app.own_aci.as_deref());
@@ -419,6 +425,9 @@ impl Hush {
                 }
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
+                }
+                if let crate::Demo::Typing = screen {
+                    app.demo_typing(cx);
                 }
                 match screen {
                     crate::Demo::GroupInfo => app.demo_group(None, window, cx),
@@ -588,8 +597,15 @@ impl Hush {
                 ..
             } => self.attachment_changed(&conversation_id, &message, cx),
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, calls, stories (a reaction shows with its message's
-            // `MessageChanged`; `NewMessage` and `NewReaction` notify in the match above)
+            CoreEvent::Typing {
+                conversation_id,
+                who,
+                started,
+            } => self.typing_event(conversation_id, who, started, cx),
+            // their message is in: they stopped (not every app says so); it notified above
+            CoreEvent::NewMessage { conversation_id, key } => self.typing_event(conversation_id, key.author, false, cx),
+            // not in this version: calls, stories (a reaction shows with its message's
+            // `MessageChanged`; `NewReaction` notifies in the match above)
             _ => return,
         }
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
@@ -1146,6 +1162,7 @@ impl Hush {
     fn delete_chat(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else { return };
         if self.selected.as_ref() == Some(&id) {
+            self.stop_typing();
             self.selected = None;
             self.generation += 1;
             self.messages.clear();
