@@ -238,7 +238,7 @@ pub(in crate::app) fn linked(len: usize, runs: &[(Range<usize>, u8)], links: &[R
 }
 
 /// `link` parsed, if it is https with a host: what the core takes and the browser opens.
-fn https(link: &str) -> Option<Url> {
+pub(super) fn https(link: &str) -> Option<Url> {
     Url::parse(link)
         .ok()
         .filter(|u| u.scheme() == "https" && u.host_str().is_some())

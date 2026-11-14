@@ -3,7 +3,7 @@
 use sig_core::projection::{
     Attachment, AttachmentState, BodyRange, ChatEvent, ChatEventKind, Conversation, ConversationKind, FileSummary,
     LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile, Poll, PollOption, PreviewDraft, Quote,
-    Reaction, SearchHit, StickerInfo, StickerPackInfo, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
+    Reaction, SearchHit, StickerInfo, StickerPackInfo, Story, StoryText, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
@@ -690,4 +690,60 @@ pub fn sticker_messages() -> (Vec<Message>, Vec<Attachment>) {
         file(&messages[3], AttachmentState::Ready),
     ];
     (messages, files)
+}
+
+/// The last day's stories: ours on a gradient (seen), Ana's words with a link and her photo, a
+/// story in the Family group (none of those seen yet), and Bogdan's video (seen); and the photo's
+/// file, whose picture is drawn, not read.
+pub fn stories() -> (Vec<Story>, Attachment) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let words = |text: &str, style, foreground, background: &[u32]| StoryText {
+        text: text.into(),
+        style,
+        foreground: Some(foreground),
+        text_background: None,
+        background: background.to_vec(),
+        angle: 135,
+        link: None,
+    };
+    let story = |chat: String, author: &str, ago_hours: i64, viewed| Story {
+        conversation_id: chat,
+        author: author.into(),
+        sent_at: now - ago_hours * HOUR,
+        text: None,
+        file: None,
+        viewed,
+    };
+    let file = |s: &Story, id, content_type: &str, name: Option<&str>| Attachment {
+        id,
+        message: MessageKey {
+            author: s.author.clone(),
+            sent_at: s.sent_at,
+        },
+        content_type: content_type.into(),
+        file_name: name.map(Into::into),
+        size: 2_400_000,
+        width: Some(800),
+        height: Some(600),
+        is_voice_note: false,
+        path: Some(format!("demo-story-{id}")),
+        state: AttachmentState::Ready,
+        available: true,
+    };
+    let mut ours = story(format!("c:{ME}"), ME, 3, true);
+    ours.text = Some(words("Sunday dinner prep", 2, 0xFFFFFFFF, &[0xFF4F6DD9, 0xFFC14DB1]));
+    let mut terrace = story(format!("c:{ANA}"), ANA, 2, false);
+    terrace.text = Some(StoryText {
+        text_background: Some(0xFFFFFFFF),
+        link: Some("https://dulce.example/terrace".into()),
+        ..words("The terrace is open again", 3, 0xFF1B1B1D, &[0xFF2E7D6B])
+    });
+    let mut photo = story(format!("c:{ANA}"), ANA, 1, false);
+    let picture = file(&photo, 201, "image/png", None);
+    photo.file = Some(picture.clone());
+    let mut family = story("g:01".into(), BOGDAN, 4, false);
+    family.text = Some(words("Grandma turns 80 on Sunday!", 4, 0xFF5D2E0F, &[0xFFF2C38B]));
+    let mut beach = story(format!("c:{BOGDAN}"), BOGDAN, 6, true);
+    beach.file = Some(file(&beach, 202, "video/mp4", Some("Beach.mp4")));
+    (vec![beach, ours, family, terrace, photo], picture)
 }
