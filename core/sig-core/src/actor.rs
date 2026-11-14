@@ -130,6 +130,11 @@ pub enum Command {
         key: [u8; 32],
         done: oneshot::Sender<Result<Option<crate::groups::GroupInfo>, String>>,
     },
+    /// Our safety number with a contact (their ACI): None before any session with them.
+    SafetyNumber {
+        aci: presage::libsignal_service::prelude::Uuid,
+        done: oneshot::Sender<Result<Option<crate::safety::SafetyNumber>, String>>,
+    },
     /// Changes a group (its members are told), then stores it in its chat.
     ChangeGroup {
         key: [u8; 32],
@@ -714,6 +719,13 @@ async fn run(
                     None => Err("not linked yet".into()),
                 };
                 let _ = done.send(info);
+            }
+            Command::SafetyNumber { aci, done } => {
+                let number = match &manager {
+                    Some(m) => crate::safety::ours_with(m.store(), m.registration_data().service_ids.aci, aci).await,
+                    None => Err("not linked yet".into()),
+                };
+                let _ = done.send(number);
             }
             Command::ChangeGroup { key, edit, done } => match &manager {
                 Some(m) => {
@@ -2217,6 +2229,11 @@ async fn handle(
         // their device asks us to resend or restart the session; Hush doesn't, so a reset is offered
         Received::RetryReceipt { sender, .. } => decryption_failed(db, l, sender, None).await,
         Received::Content(content) => {
+            if let ServiceId::Aci(aci) = content.metadata.sender {
+                // just before the message that came with a new key
+                let at = content.metadata.client_timestamp.timestamp_millis() - 1;
+                crate::safety::notice(m.store(), db, l, me, [aci.service_id_string()], at).await;
+            }
             let unconfirmed = sync_group(m, db, l, &mut progress.refetches, wake, &content).await;
             match drop_blocked(db, &content, me, unconfirmed).await {
                 Ok(true) => return,

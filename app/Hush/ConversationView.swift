@@ -191,6 +191,14 @@ struct ConversationChrome: ViewModifier {
             && !conversation.id.hasPrefix("c:PNI:")
     }
 
+    /// A contact's ACI: not a phone number's chat, nor Note to Self.
+    private var contactAci: String? {
+        guard conversation.kind == .direct, !conversation.id.hasPrefix("c:PNI:"),
+            conversation.id != store.ownAci.map({ "c:\($0)" })
+        else { return nil }
+        return String(conversation.id.dropFirst(2))
+    }
+
     private var canCall: Bool {
         conversation.kind == .direct && !conversation.blocked && !conversation.messageRequest
             && !conversation.id.hasPrefix("c:PNI:")
@@ -213,6 +221,14 @@ struct ConversationChrome: ViewModifier {
                 }
             }
             .sheet(isPresented: $showingGroupInfo) { GroupInfoView(store: store, conversation: conversation) }
+            .sheet(
+                isPresented: Binding(
+                    get: { store.safetyNumberWith != nil }, set: { if !$0 { store.safetyNumberWith = nil } })
+            ) {
+                if let with = store.safetyNumberWith {
+                    SafetyNumberView(store: store, aci: with.aci, name: with.name)
+                }
+            }
     }
 
     private var callButton: some View {
@@ -245,6 +261,9 @@ struct ConversationChrome: ViewModifier {
             Button("Chat Colour and Wallpaper…") { choosingColor = true }
             Button("Search in Chat") { store.searchInChat() }
             if conversation.kind == .group { Button("Group Info…") { showingGroupInfo = true } }
+            if let aci = contactAci {
+                Button("View Safety Number…") { store.safetyNumberWith = (aci, store.title(conversation)) }
+            }
             // the note written about them on the phone
             if let note = conversation.note {
                 Divider()
@@ -309,7 +328,9 @@ struct TimelineList: View {
                             .wallpaperBacked()
                             .padding(.vertical, 10)
                     case .event(let e):
-                        ChatEventRow(event: e, name: name(e), me: store.ownAci)
+                        ChatEventRow(event: e, name: name(e), me: store.ownAci) {
+                            store.safetyNumberWith = (e.author, name(e))
+                        }
                     case .failures(let e, let count, let reset):
                         // presage resets sessions by ACI only
                         let direct = e.conversationId.hasPrefix("c:") && !e.conversationId.hasPrefix("c:PNI:")
@@ -917,6 +938,8 @@ struct ChatEventRow: View {
     let name: String
     /// Our ACI, to word our own changes ("You set…").
     var me: String?
+    /// Opens the safety number sheet with the event's author.
+    var viewSafetyNumber: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 6) {
@@ -949,6 +972,12 @@ struct ChatEventRow: View {
                 Label("Missed voice call", systemImage: "phone.down")
                     .font(.system(size: 12))
                     .foregroundStyle(.red.opacity(0.9))
+            case .safetyNumberChanged:
+                Label("Your safety number with \(name) changed", systemImage: "checkmark.shield")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondaryText)
+                Button("View Safety Number", action: viewSafetyNumber)
+                    .buttonStyle(.link).font(.system(size: 12))
             }
         }
         .wallpaperBacked()

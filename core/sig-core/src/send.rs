@@ -568,6 +568,7 @@ pub async fn sender(
         // the RefCell borrow is never held across the send itself
         let next = std::future::poll_fn(|cx| jobs.borrow_mut().poll_recv(cx)).await;
         let Some(job) = next else { return };
+        let sent_to = job.sent_to();
         match job {
             Job::Text(job) => send_text(&mut m, &db, l.as_ref(), job).await,
             Job::Mutation {
@@ -662,6 +663,31 @@ pub async fn sender(
                     tracing::warn!(conversation = %conversation_id, error = %e, "typing not sent");
                 }
             }
+        }
+        if let Some((conversation_id, at)) = sent_to {
+            let me = me.service_id_string();
+            crate::safety::notice_chat(m.store(), &db, l.as_ref(), &me, &conversation_id, at - 1).await;
+        }
+    }
+}
+
+impl Job {
+    /// The chat a message, change or call went to, and when: its people's keys are checked after
+    /// it (`safety::notice_chat`). Typing goes often and the message after it checks; the rest
+    /// goes to our own devices, or is rare.
+    fn sent_to(&self) -> Option<(String, i64)> {
+        match self {
+            Job::Text(job) => Some((job.conversation_id.clone(), job.key.sent_at)),
+            Job::Mutation {
+                conversation_id, at, ..
+            }
+            | Job::Timer {
+                conversation_id, at, ..
+            }
+            | Job::Call {
+                conversation_id, at, ..
+            } => Some((conversation_id.clone(), *at as i64)),
+            _ => None,
         }
     }
 }

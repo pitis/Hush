@@ -1651,6 +1651,74 @@ impl ProjectionDb {
             .collect()
     }
 
+    /// Notes `aci`'s identity key as presage has it now. A key other than the one noted before
+    /// adds a `SafetyNumberChanged` event at `at` to their 1:1 chat and to each group both they
+    /// and we (`me`) are in, and answers those chats; the first key noted (first contact) adds
+    /// none.
+    pub async fn note_identity_key(
+        &self,
+        aci: &str,
+        key: &[u8],
+        me: &str,
+        at: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let noted: Option<Vec<u8>> = sqlx::query_scalar("SELECT key FROM identity_keys WHERE aci = ?1")
+            .bind(aci)
+            .fetch_optional(&self.pool)
+            .await?;
+        match noted {
+            Some(noted) if noted == key => return Ok(Vec::new()),
+            None => {
+                sqlx::query("INSERT OR IGNORE INTO identity_keys(aci, key) VALUES (?1, ?2)")
+                    .bind(aci)
+                    .bind(key)
+                    .execute(&self.pool)
+                    .await?;
+                return Ok(Vec::new());
+            }
+            Some(_) => {}
+        }
+        let mut tx = self.pool.begin().await?;
+        // the update decides, so a change two checks both saw is told once
+        let changed = sqlx::query("UPDATE identity_keys SET key = ?2 WHERE aci = ?1 AND key != ?2")
+            .bind(aci)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1;
+        if !changed {
+            return Ok(Vec::new());
+        }
+        let direct = format!("c:{aci}");
+        sqlx::query("INSERT OR IGNORE INTO conversations(id, kind) VALUES (?1, ?2)")
+            .bind(&direct)
+            .bind(kind_to_i64(ConversationKind::Direct))
+            .execute(&mut *tx)
+            .await?;
+        let groups: Vec<String> = sqlx::query_scalar(
+            "SELECT them.conversation_id FROM group_members them
+             JOIN group_members us ON us.conversation_id = them.conversation_id AND us.aci = ?2
+             WHERE them.aci = ?1 ORDER BY them.conversation_id",
+        )
+        .bind(aci)
+        .bind(me)
+        .fetch_all(&mut *tx)
+        .await?;
+        let chats: Vec<String> = std::iter::once(direct).chain(groups).collect();
+        for chat in &chats {
+            sqlx::query("INSERT INTO chat_events(conversation_id, at, kind, author) VALUES (?1, ?2, ?3, ?4)")
+                .bind(chat)
+                .bind(at)
+                .bind(ChatEventKind::SafetyNumberChanged.to_i64())
+                .bind(aci)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(chats)
+    }
+
     /// How many messages of a conversation are newer than `key` (to load enough of it to show
     /// that message).
     pub async fn count_newer(&self, conversation_id: &str, key: &MessageKey) -> Result<u32, sqlx::Error> {
@@ -7035,6 +7103,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.search("believ", None, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_changed_identity_key_is_told_once_in_their_chat_and_the_groups_we_share() {
+        let db = db().await;
+        let (shared, left) = (format!("g:{}", "ab".repeat(32)), format!("g:{}", "cd".repeat(32)));
+        db.set_group(
+            &shared,
+            1,
+            "Hikers",
+            &["alice".into(), "me".into()],
+            0,
+            GroupStanding::Other,
+        )
+        .await
+        .unwrap();
+        // a group we left: still lists alice, not us
+        db.set_group(&left, 1, "Old", &["alice".into()], 0, GroupStanding::Other)
+            .await
+            .unwrap();
+        let changes = |chat: String| {
+            let db = db.clone();
+            async move {
+                db.chat_events(&chat, 0)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == ChatEventKind::SafetyNumberChanged)
+                    .map(|e| (e.at, e.author))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert!(db
+            .note_identity_key("alice", b"key1", "me", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            changes("c:alice".into()).await.is_empty(),
+            "first contact: nothing to tell"
+        );
+        assert!(db
+            .note_identity_key("alice", b"key1", "me", 20)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let told = db.note_identity_key("alice", b"key2", "me", 30).await.unwrap();
+        assert_eq!(told, vec!["c:alice".to_string(), shared.clone()]);
+        assert_eq!(changes("c:alice".into()).await, vec![(30, "alice".to_string())]);
+        assert_eq!(changes(shared.clone()).await, vec![(30, "alice".to_string())]);
+        assert!(changes(left.clone()).await.is_empty());
+        // seen again (another message from the new key): already told
+        assert!(db
+            .note_identity_key("alice", b"key2", "me", 40)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(changes("c:alice".into()).await.len(), 1);
+        // the chat isn't listed for it alone (no message yet)
+        assert!(db.conversations().await.unwrap().iter().all(|c| c.id != "c:alice"));
     }
 
     #[tokio::test]

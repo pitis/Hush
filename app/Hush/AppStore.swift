@@ -1714,6 +1714,27 @@ final class AppStore {
         }
     }
 
+    /// The safety number sheet open in the chat: with whom (ACI), and their name.
+    var safetyNumberWith: (aci: String, name: String)?
+
+    /// Reading our safety number with someone, for its sheet.
+    enum SafetyRead: Equatable {
+        case known(SafetyNumber)
+        /// No session with them yet: no key of theirs to make it from.
+        case unknown
+        case failed(String)
+    }
+
+    func safetyNumber(_ aci: String) async -> SafetyRead {
+        guard let client else { return .failed("Not linked yet.") }
+        do {
+            return try await client.safetyNumber(aci: aci).map(SafetyRead.known) ?? .unknown
+        } catch {
+            append("safety number failed: \(error)")
+            return .failed("Couldn't read the safety number: \(Self.describe(error))")
+        }
+    }
+
     /// A group member's name; we are "You".
     func memberName(_ aci: String) -> String {
         aci == ownAci ? "You" : senderName(aci)
