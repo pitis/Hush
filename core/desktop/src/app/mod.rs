@@ -2,6 +2,7 @@
 //! app's rules (`AppStore.swift`); where this one is simpler, a `shortcut:` comment says so.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::Theme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use sig_core::projection::{Conversation, ConversationKind, Message, MessageKey, TextStyle};
+use sig_core::projection::{Conversation, ConversationKind, Message, TextStyle};
 use sig_core::{Client, ConnectionState, CoreError, CoreEvent, EventListener, GroupPreview, HistoryStage};
 
 use crate::{key, text};
@@ -24,6 +25,8 @@ mod actions;
 pub mod attach;
 pub mod compose;
 mod files;
+pub mod navigate;
+mod paging;
 mod previews;
 pub mod search;
 mod view;
@@ -33,8 +36,10 @@ const DEVICE_NAME: &str = "Hush Desktop";
 /// Inside the OS's local app data folder (not Windows' roaming one: this device's keys stay on this
 /// computer); not the Mac app's "Hush", so the two never share data.
 const DATA_FOLDER: &str = "Hush Desktop";
-/// shortcut: only a chat's newest messages are loaded (back to a message opened from the search);
-/// page older ones with `Client::messages(id, before, limit)` once scrolling back is wanted.
+/// A chat's newest messages load, a page more each time the timeline is scrolled up to the oldest.
+/// shortcut: each load reads them all again, with their reactions and files, back to the oldest
+/// shown; merge pages read with `Client::messages(id, before, limit)` (`AppStore.merge`) if a long
+/// scroll back gets slow.
 const PAGE: u32 = 100;
 
 enum Screen {
@@ -105,7 +110,8 @@ pub struct Hush {
     messages: Vec<Message>,
     /// Bumped on every selection, so a load for the chat open before is dropped.
     generation: u64,
-    /// How many of the open chat's newest messages load: `PAGE`, or back to a found message.
+    /// How many of the open chat's newest messages load: `PAGE`, more for the older pages scrolled
+    /// to, or back to a found message.
     depth: u32,
     messages_loading: Option<u64>,
     messages_again: bool,
@@ -148,6 +154,8 @@ pub struct Hush {
     /// The open chat's reactions, and the reply or edit in the composer.
     actions: actions::Actions,
     files: files::Files,
+    /// Older pages on their way, and messages come in while scrolled up.
+    paging: paging::Paging,
     /// The composer's styles and mentions.
     compose: compose::Compose,
     previews: previews::Previews,
@@ -287,10 +295,12 @@ impl Hush {
         )
         .detach();
         let timeline = cx.new(|cx| MessageScrollerState::new(0, cx));
-        // scrolling down to the newest message reads it, and drops a deep jump's older rows
+        // scrolling down to the newest message reads it, and drops a deep jump's older rows;
+        // scrolling up loads older ones
         cx.observe(&timeline, |this, _, cx| {
             this.mark_read(false, cx);
             this.back_to_newest(cx);
+            this.timeline_moved(cx);
         })
         .detach();
 
@@ -332,6 +342,7 @@ impl Hush {
             cancelling: false,
             actions: actions::Actions::new(window, cx),
             files: Default::default(),
+            paging: Default::default(),
             compose: Default::default(),
             previews: Default::default(),
         }
@@ -357,6 +368,7 @@ impl Hush {
             | crate::Demo::Compose
             | crate::Demo::Search
             | crate::Demo::SearchInChat
+            | crate::Demo::History
             | crate::Demo::LinkPreview => {
                 app.screen = Screen::Chats;
                 app.chats = crate::demo::chats();
@@ -373,6 +385,9 @@ impl Hush {
                 }
                 if let crate::Demo::Search | crate::Demo::SearchInChat = screen {
                     app.demo_search(matches!(screen, crate::Demo::SearchInChat), window, cx);
+                }
+                if let crate::Demo::History = screen {
+                    app.demo_paging(cx);
                 }
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
@@ -493,10 +508,16 @@ impl Hush {
                 self.drop_copies_if_gone(&key, cx);
                 self.refresh_chats(cx);
                 if self.selected.as_deref() == Some(conversation_id.as_str()) {
+                    // its reactions, files or preview may have changed with it
+                    self.read_details([(key.author, key.sent_at)], cx);
                     self.reload_messages(cx);
                 }
             }
-            CoreEvent::AttachmentChanged { conversation_id, .. } => self.attachment_changed(&conversation_id, cx),
+            CoreEvent::AttachmentChanged {
+                conversation_id,
+                message,
+                ..
+            } => self.attachment_changed(&conversation_id, &message, cx),
             CoreEvent::Error { message } => self.error = Some(message),
             // not in this version: typing, calls, stories, notifications (a reaction shows with its
             // message's `MessageChanged`)
@@ -613,16 +634,25 @@ impl Hush {
             self.composer.update(cx, |input, cx| input.focus(window, cx));
             return cx.notify();
         }
-        let draft = self.drafts.remove(&id).unwrap_or_default();
+        self.switch(Some(id), window, cx);
+    }
+
+    /// Leaves the open chat, its unsent text kept as its draft, for `id` (into its composer) or for
+    /// none.
+    fn switch(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = id.as_ref().and_then(|id| self.drafts.remove(id)).unwrap_or_default();
         // drafts keep the words, not their styles (the Mac app's too)
         let unsent = self.actions.leave(self.typed(cx)).words();
-        if let Some(left) = self.selected.replace(id) {
+        if let Some(left) = std::mem::replace(&mut self.selected, id) {
             if !unsent.trim().is_empty() {
                 self.drafts.insert(left, unsent);
             }
         }
         self.set_typed(compose::Typed::plain(draft), window, cx);
-        self.composer.update(cx, |input, cx| input.focus(window, cx));
+        match self.selected {
+            Some(_) => self.composer.update(cx, |input, cx| input.focus(window, cx)),
+            None => window.blur(cx),
+        }
         self.load_members(cx);
         self.generation += 1;
         self.depth = PAGE;
@@ -661,6 +691,7 @@ impl Hush {
                     app.messages_again = false;
                     return Some(app.depth);
                 }
+                app.older_loaded();
                 match page {
                     Ok(page) => app.set_messages(page, cx),
                     Err(e) => {
@@ -684,19 +715,26 @@ impl Hush {
     }
 
     fn set_messages(&mut self, page: Vec<Message>, cx: &mut Context<Self>) {
-        let old: Vec<MessageKey> = self.messages.iter().map(Message::key).collect();
-        let new: Vec<MessageKey> = page.iter().map(Message::key).collect();
+        let key = |m: &Message| (m.author.clone(), m.sent_at);
+        let old: Vec<_> = self.messages.iter().map(key).collect();
+        let new: Vec<_> = page.iter().map(key).collect();
         self.messages = page;
-        let (range, count) = changed_rows(&old, &new);
+        let changes = changed_rows(&old, &new);
+        let came = changes
+            .iter()
+            .flat_map(|(range, count)| &new[range.start..range.start + count]);
+        let came: Vec<_> = came.cloned().collect();
         // only rows that came or went are replaced, so a reader scrolled up stays put; with the
         // same messages, some changed (a tick, an edit) and their heights may have too
         self.timeline.update(cx, |t, cx| {
-            if range.is_empty() && count == 0 {
+            if changes.is_empty() {
                 t.remeasure(cx);
-            } else {
+            }
+            for (range, count) in changes {
                 t.splice(range, count, cx);
             }
         });
+        self.new_rows(&old, &new, cx);
         let mut wanted: Vec<String> = self
             .messages
             .iter()
@@ -710,7 +748,7 @@ impl Hush {
                 .flat_map(|m| m.quote.iter().flat_map(|q| mentioned(&q.ranges))),
         );
         self.load_names(wanted, cx);
-        self.messages_loaded(cx);
+        self.messages_loaded(came, cx);
         self.reveal_found(cx);
     }
 
@@ -1141,17 +1179,32 @@ fn server_failure(what: &str, e: &CoreError) -> String {
     }
 }
 
-/// The rows that changed between two lists of keys: `old[range]` became `count` rows of `new`
-/// (what both share at the start and at the end stays).
-fn changed_rows<K: PartialEq>(old: &[K], new: &[K]) -> (Range<usize>, usize) {
-    let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-    let end = old[start..]
-        .iter()
-        .rev()
-        .zip(new[start..].iter().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
-    (start..old.len() - end, new.len() - start - end)
+/// The rows that changed between two lists of keys, in order: each `(range, count)` replaces the
+/// rows in `range` of the list as the ones before it left it with `count` rows of `new`. The rows
+/// both have stay (messages keep their order), so a scroll position on one of them holds.
+fn changed_rows<K: Eq + Hash>(old: &[K], new: &[K]) -> Vec<(Range<usize>, usize)> {
+    let (in_old, in_new): (HashSet<&K>, HashSet<&K>) = (old.iter().collect(), new.iter().collect());
+    let (mut i, mut j, mut changes) = (0, 0, vec![]);
+    while i < old.len() || j < new.len() {
+        if old.get(i).is_some_and(|k| new.get(j) == Some(k)) {
+            (i, j) = (i + 1, j + 1);
+            continue;
+        }
+        let (from_i, from_j) = (i, j);
+        while old.get(i).is_some_and(|k| !in_new.contains(k)) {
+            i += 1;
+        }
+        while new.get(j).is_some_and(|k| !in_old.contains(k)) {
+            j += 1;
+        }
+        // rows both have, in another order: the rest is replaced
+        if (i, j) == (from_i, from_j) {
+            (i, j) = (old.len(), new.len());
+        }
+        // `new[..from_j]` is in place by now, and `old[from_i..]` follows it
+        changes.push((from_j..from_j + i - from_i, j - from_j));
+    }
+    changes
 }
 
 /// The people a message's text mentions.
@@ -1321,16 +1374,43 @@ mod tests {
     #[test]
     fn only_the_rows_that_came_or_went_change() {
         // a new message
-        assert_eq!(changed_rows(&[1, 2, 3], &[1, 2, 3, 4]), (3..3, 1));
+        assert_eq!(changed_rows(&[1, 2, 3], &[1, 2, 3, 4]), [(3..3, 1)]);
         // the window moved on by one: the oldest went, a new one came
-        assert_eq!(changed_rows(&[1, 2, 3], &[2, 3, 4]), (0..3, 3));
+        assert_eq!(changed_rows(&[1, 2, 3], &[2, 3, 4]), [(0..1, 0), (2..2, 1)]);
+        // an older page came above
+        assert_eq!(changed_rows(&[3, 4], &[1, 2, 3, 4]), [(0..0, 2)]);
+        // back to the newest: the older ones went
+        assert_eq!(changed_rows(&[1, 2, 3, 4], &[3, 4]), [(0..2, 0)]);
         // one expired in the middle
-        assert_eq!(changed_rows(&[1, 2, 3], &[1, 3]), (1..2, 0));
+        assert_eq!(changed_rows(&[1, 2, 3], &[1, 3]), [(1..2, 0)]);
+        // one came and one went in the same place
+        assert_eq!(changed_rows(&[1, 2, 3], &[1, 5, 3]), [(1..2, 1)]);
         // nothing came or went
-        assert_eq!(changed_rows(&[1, 2], &[1, 2]), (2..2, 0));
-        // the first load
-        assert_eq!(changed_rows(&[], &[1, 2]), (0..0, 2));
-        // a key both at the start and the end is counted once
-        assert_eq!(changed_rows(&[1, 2, 1], &[1]), (1..3, 0));
+        assert!(changed_rows(&[1, 2], &[1, 2]).is_empty());
+        // the first load, and a chat that emptied
+        assert_eq!(changed_rows(&[], &[1, 2]), [(0..0, 2)]);
+        assert_eq!(changed_rows(&[1, 2], &[]), [(0..2, 0)]);
+        // rows in another order: from there on, all are replaced
+        assert_eq!(changed_rows(&[1, 2, 3], &[1, 3, 2]), [(1..3, 2)]);
+    }
+
+    #[test]
+    fn the_changed_rows_turn_the_old_list_into_the_new() {
+        let cases: [(&[u32], &[u32]); 5] = [
+            (&[1, 2, 3, 4, 5], &[0, 2, 4, 6]),
+            (&[1, 2, 3], &[7, 8, 1, 9, 3, 10]),
+            (&[5, 6], &[1, 2, 3]),
+            (&[1, 2, 3, 4], &[4, 3, 2, 1]),
+            (&[2, 4, 6, 8], &[1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ];
+        for (old, new) in cases {
+            let mut rows = old.to_vec();
+            for (range, count) in changed_rows(old, new) {
+                // the rows that come are new's, after those already in place
+                let start = range.start;
+                rows.splice(range, new[start..start + count].iter().copied());
+            }
+            assert_eq!(rows, new, "{old:?} to {new:?}");
+        }
     }
 }

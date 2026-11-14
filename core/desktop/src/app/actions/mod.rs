@@ -156,9 +156,11 @@ pub(super) struct Actions {
     /// Our reactions sent but not loaded back yet (None: taken back), so a second click acts on
     /// what we just did.
     pending: HashMap<Key, Option<String>>,
-    /// A reactions load runs; `again`: the messages changed meanwhile, one more follows.
+    /// Messages whose details (reactions, files, link previews) are to be read: rows that came
+    /// in, or that changed.
+    wanted: HashSet<Key>,
+    /// A details load runs: it reads what is wanted meanwhile before it ends.
     loading: bool,
-    again: bool,
     reply_to: Option<Message>,
     /// Our message being edited in the composer; it ends replying (the two don't mix).
     editing: Option<Message>,
@@ -181,8 +183,8 @@ impl Actions {
         Self {
             reactions: HashMap::new(),
             pending: HashMap::new(),
+            wanted: HashSet::new(),
             loading: false,
-            again: false,
             reply_to: None,
             editing: None,
             draft_before_edit: None,
@@ -203,8 +205,8 @@ impl Actions {
         };
         self.reactions.clear();
         self.pending.clear();
+        self.wanted.clear();
         self.loading = false;
-        self.again = false;
         self.reply_to = None;
         self.saving = false;
         self.picking = None;
@@ -308,16 +310,22 @@ impl Hush {
         }
     }
 
-    /// The open chat's messages were loaded again: their reactions are read, and a reply to or an
-    /// edit of one deleted meanwhile (here or on the phone) ends.
-    pub(super) fn messages_loaded(&mut self, cx: &mut Context<Self>) {
+    /// The open chat's messages were loaded again: the details of the rows that `came` in are
+    /// read, the rows that went take theirs with them, and a reply to or an edit of one deleted
+    /// meanwhile (here or on the phone) ends.
+    pub(super) fn messages_loaded(&mut self, came: Vec<Key>, cx: &mut Context<Self>) {
         if self.actions.reply_to.as_ref().is_some_and(|r| gone(r, &self.messages)) {
             self.actions.reply_to = None;
         }
         if self.actions.editing.as_ref().is_some_and(|e| gone(e, &self.messages)) {
             self.edit_gone(cx);
         }
-        self.load_reactions(cx);
+        let loaded: HashSet<Key> = self.messages.iter().map(key).collect();
+        self.actions.reactions.retain(|k, _| loaded.contains(k));
+        self.actions.pending.retain(|k, _| loaded.contains(k));
+        self.keep_files(&loaded, cx);
+        self.keep_previews(&loaded, cx);
+        self.read_details(came, cx);
     }
 
     /// A disappearing message's timer ran out: a reply to it or an edit of it ends.
@@ -343,35 +351,52 @@ impl Hush {
         });
     }
 
-    /// Reads the open chat's reactions (and files); calls while a load runs are folded into one more.
-    fn load_reactions(&mut self, cx: &mut Context<Self>) {
+    /// Reads these messages' details (reactions, files, link previews) with the others wanted
+    /// meanwhile, while their chat stays open. One not loaded (yet) is left out: its row coming in
+    /// asks again.
+    pub(super) fn read_details(&mut self, keys: impl IntoIterator<Item = Key>, cx: &mut Context<Self>) {
+        self.actions.wanted.extend(keys);
         let Some(client) = self.client.clone() else { return };
         if self.actions.loading {
-            self.actions.again = true;
             return;
         }
         self.actions.loading = true;
         let generation = self.generation;
         cx.spawn(async move |this, cx| loop {
-            let Ok(keys) = this.update(cx, |app, _| app.messages.iter().map(Message::key).collect::<Vec<_>>()) else {
-                return;
-            };
-            let details = Compat::new(client.details(keys.clone())).await;
-            let again = this.update(cx, |app, cx| {
+            let keys = this.update(cx, |app, _| {
                 if app.generation != generation {
-                    return false; // another chat: its own load runs
+                    return None; // another chat: its own load runs
                 }
-                app.files_loaded(&keys, &details, cx);
-                app.previews_loaded(&keys, &details, cx);
-                app.reactions_loaded(details, cx);
-                app.actions.loading = std::mem::take(&mut app.actions.again);
-                app.actions.loading
+                let keys = app.take_wanted();
+                app.actions.loading = !keys.is_empty();
+                app.actions.loading.then_some(keys)
             });
-            if !again.unwrap_or(false) {
+            let Ok(Some(keys)) = keys else { break };
+            let mut details = Compat::new(client.details(keys)).await;
+            let read = this.update(cx, |app, cx| {
+                if app.generation != generation {
+                    return false;
+                }
+                // rows that went meanwhile keep nothing
+                let loaded: HashSet<Key> = app.messages.iter().map(key).collect();
+                details.retain(|d| loaded.contains(&(d.key.author.clone(), d.key.sent_at)));
+                app.files_loaded(&details, cx);
+                app.previews_loaded(&details, cx);
+                app.reactions_loaded(details, cx);
+                true
+            });
+            if !read.unwrap_or(false) {
                 break;
             }
         })
         .detach();
+    }
+
+    /// The loaded messages wanted, in their order; the wish list empties.
+    pub(super) fn take_wanted(&mut self) -> Vec<MessageKey> {
+        let wanted = std::mem::take(&mut self.actions.wanted);
+        let loaded = self.messages.iter().filter(|m| wanted.contains(&key(m)));
+        loaded.map(Message::key).collect()
     }
 
     fn reactions_loaded(&mut self, details: Vec<MessageDetails>, cx: &mut Context<Self>) {
@@ -843,5 +868,34 @@ mod tests {
         assert!(gone(&m, &[deleted]));
         assert!(!gone(&m, std::slice::from_ref(&m)));
         assert!(!gone(&m, &[]));
+    }
+}
+
+/// The actions in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::{gpui, AppContext as _, TestAppContext, WindowOptions};
+
+    use super::super::Hush;
+    use crate::Demo;
+
+    #[gpui::test]
+    fn rows_that_go_take_their_reactions_with_them(cx: &mut TestAppContext) {
+        let (_, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Chat, window, cx))
+            })
+            .expect("the window opens")
+        });
+        cx.run_until_parked();
+        assert_eq!(hush.read_with(cx, |app, _| app.actions.reactions.len()), 2);
+        // only the newest rows stay, without reactions
+        hush.update(cx, |app, cx| {
+            let newest = app.messages[app.messages.len() - 2..].to_vec();
+            app.set_messages(newest, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(hush.read_with(cx, |app, _| app.actions.reactions.len()), 0);
     }
 }

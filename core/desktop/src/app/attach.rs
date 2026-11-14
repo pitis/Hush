@@ -16,6 +16,7 @@ use image::ImageDecoder as _;
 use sig_core::projection::db::MAX_ATTACHMENT;
 use sig_core::projection::OutgoingFile;
 
+use super::navigate::on;
 use super::view::{answer_first, icon};
 use super::{files, Hush, Screen};
 use crate::style::Palette;
@@ -108,17 +109,8 @@ pub fn keys() -> [KeyBinding; 1] {
 
 /// What `keys` does, wherever the window's focus is (as `search::shortcuts`).
 pub fn shortcut(window: AnyWindowHandle, hush: WeakEntity<Hush>, cx: &mut App) {
-    cx.on_action(move |_: &AttachFiles, cx| {
-        let hush = hush.clone();
-        // once the dispatch is over: it holds the window, which can't be updated inside it
-        cx.defer(move |cx| {
-            let done = window.update(cx, |_, window, cx| {
-                hush.update(cx, |app, cx| app.choose_files(window, cx))
-            });
-            if let Err(e) = done.and_then(|r| r) {
-                tracing::warn!(error = %e, "the attach shortcut found no window");
-            }
-        });
+    on(window, &hush, cx, |app, _: &AttachFiles, window, cx| {
+        app.choose_files(window, cx)
     });
 }
 

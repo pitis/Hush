@@ -63,64 +63,61 @@ enum Gutter {
 }
 
 impl Hush {
-    fn rows(&self, c: &Conversation) -> Vec<Row> {
-        let group = c.kind == ConversationKind::Group;
-        let now = chrono::Local::now();
-        let now_ms = now.timestamp_millis();
+    /// The open chat's message `i` as its row shows it; built only for the rows on screen, so a
+    /// long history costs nothing until it is scrolled to.
+    fn row(&self, group: bool, i: usize, now: chrono::DateTime<chrono::Local>) -> Option<Row> {
         let ms = &self.messages;
+        let m = ms.get(i)?;
         let joins = |a: &sig_core::projection::Message, b: &sig_core::projection::Message| {
             a.author == b.author
                 && a.is_outgoing == b.is_outgoing
                 && (b.sent_at - a.sent_at).abs() < RUN_GAP_MS
                 && text::same_day(a.sent_at, b.sent_at)
         };
-        let rows = ms.iter().enumerate().map(|(i, m)| {
-            let prev = i.checked_sub(1).map(|j| &ms[j]);
-            let next = ms.get(i + 1);
-            let new_day = prev.is_none_or(|p| !text::same_day(p.sent_at, m.sent_at));
-            let first = new_day || !prev.is_some_and(|p| joins(p, m));
-            let last = !next.is_some_and(|n| joins(m, n));
-            let name = self.name(&m.author);
-            let person = format!("c:{}", m.author);
-            let files = self.files.of(m);
-            let (body, runs) = text::message(m, !files.is_empty(), self.revealed(m), |aci| self.name(aci));
-            let hidden = runs.iter().any(|(_, s)| s & text::SPOILER != 0);
-            let spoken = match files.first() {
-                Some(f) if body.is_empty() => text::describe(&files::summary(&f.file), ""),
-                // what a spoiler covers isn't read out either
-                _ if hidden => text::plain(m.body.as_deref().unwrap_or_default(), &m.ranges, |aci| self.name(aci)),
-                _ => body.clone(),
-            };
-            let time = text::bubble_time(m.sent_at);
-            let status = m.is_outgoing.then_some(m.status);
-            let said = status.map(|s| format!(", {}", text::status(s))).unwrap_or_default();
-            Row {
-                day: new_day.then(|| text::day(m.sent_at, now)),
-                outgoing: m.is_outgoing,
-                first,
-                sender: (group && !m.is_outgoing && first).then(|| (name.clone(), style::avatar_color(&person))),
-                gutter: match () {
-                    _ if !group || m.is_outgoing => Gutter::None,
-                    _ if last => Gutter::Avatar {
-                        id: person,
-                        name: name.clone(),
-                    },
-                    _ => Gutter::Blank,
+        let prev = i.checked_sub(1).map(|j| &ms[j]);
+        let next = ms.get(i + 1);
+        let new_day = prev.is_none_or(|p| !text::same_day(p.sent_at, m.sent_at));
+        let first = new_day || !prev.is_some_and(|p| joins(p, m));
+        let last = !next.is_some_and(|n| joins(m, n));
+        let name = self.name(&m.author);
+        let person = format!("c:{}", m.author);
+        let files = self.files.of(m);
+        let (body, runs) = text::message(m, !files.is_empty(), self.revealed(m), |aci| self.name(aci));
+        let hidden = runs.iter().any(|(_, s)| s & text::SPOILER != 0);
+        let spoken = match files.first() {
+            Some(f) if body.is_empty() => text::describe(&files::summary(&f.file), ""),
+            // what a spoiler covers isn't read out either
+            _ if hidden => text::plain(m.body.as_deref().unwrap_or_default(), &m.ranges, |aci| self.name(aci)),
+            _ => body.clone(),
+        };
+        let time = text::bubble_time(m.sent_at);
+        let status = m.is_outgoing.then_some(m.status);
+        let said = status.map(|s| format!(", {}", text::status(s))).unwrap_or_default();
+        Some(Row {
+            day: new_day.then(|| text::day(m.sent_at, now)),
+            outgoing: m.is_outgoing,
+            first,
+            sender: (group && !m.is_outgoing && first).then(|| (name.clone(), style::avatar_color(&person))),
+            gutter: match () {
+                _ if !group || m.is_outgoing => Gutter::None,
+                _ if last => Gutter::Avatar {
+                    id: person,
+                    name: name.clone(),
                 },
-                label: format!("{name}: {spoken}. {time}{said}"),
-                text: body,
-                files,
-                preview: self.preview_card(m),
-                runs,
-                note: m.deleted,
-                edited: m.edited && !m.deleted,
-                time,
-                status,
-                actions: self.row_actions(m, now_ms),
-                found: self.is_found(&m.key()),
-            }
-        });
-        rows.collect()
+                _ => Gutter::Blank,
+            },
+            label: format!("{name}: {spoken}. {time}{said}"),
+            text: body,
+            files,
+            preview: self.preview_card(m),
+            runs,
+            note: m.deleted,
+            edited: m.edited && !m.deleted,
+            time,
+            status,
+            actions: self.row_actions(m, now.timestamp_millis()),
+            found: self.is_found(&m.key()),
+        })
     }
 
     fn render_link(&self, url: Option<&str>, p: Palette, cx: &mut Context<Self>) -> Div {
@@ -695,7 +692,7 @@ impl Hush {
                 )
                 .child(empty_state("messages-square", title, detail, p));
         };
-        let rows = Rc::new(self.rows(c));
+        let (group, now) = (c.kind == ConversationKind::Group, chrono::Local::now());
         let out_fill = style::bubble_fill(c.chat_color.as_ref(), p.bubble_out);
         let title = text::title(c, self.own_aci.as_deref());
         let subtitle = match &self.connection {
@@ -759,12 +756,17 @@ impl Hush {
                     }),
             )
             .child(
-                MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
-                    render_row(&rows[ix], &out_fill, &act, &this, style::palette(cx))
-                })
-                .with_row_style(row_style)
-                .flex_1()
-                .min_h_0(),
+                self.with_paging(
+                    MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
+                        let row = this.upgrade().and_then(|app| app.read(cx).row(group, ix, now));
+                        match row {
+                            Some(row) => render_row(&row, &out_fill, &act, &this, style::palette(cx)),
+                            None => div().id(("row", ix)),
+                        }
+                    })
+                    .with_row_style(row_style),
+                    p,
+                ),
             )
             .child(if answer_first {
                 let id = c.id.clone();

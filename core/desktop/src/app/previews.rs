@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_compat::Compat;
 use gpui_kit::*;
-use sig_core::projection::{LinkPreview, Message, MessageDetails, MessageKey, MessageKind, PreviewDraft};
+use sig_core::projection::{LinkPreview, Message, MessageDetails, MessageKind, PreviewDraft};
 use url::Url;
 
 use super::{files, DialogKind, Hush};
@@ -114,25 +114,34 @@ impl Previews {
         }
     }
 
-    /// The page's previews from the core's details of its messages (`keys`); a message the core
-    /// couldn't read isn't in them, and keeps what it showed. True if any changed.
-    fn loaded(&mut self, keys: &[MessageKey], details: &[MessageDetails]) -> bool {
-        let read: HashMap<Key, &Option<LinkPreview>> = details
-            .iter()
-            .map(|d| ((d.key.author.clone(), d.key.sent_at), &d.preview))
-            .collect();
-        let previews = keys.iter().filter_map(|k| {
-            let k = (k.author.clone(), k.sent_at);
-            let preview = match read.get(&k) {
-                Some(read) => read.as_ref()?,
-                None => self.by_message.get(&k)?,
+    /// Some messages' details were read: their previews as read, the others' as they were (a
+    /// message the core couldn't read isn't in them, and keeps what it showed). True if any
+    /// changed.
+    fn loaded(&mut self, details: &[MessageDetails]) -> bool {
+        let mut changed = false;
+        for d in details {
+            let k = (d.key.author.clone(), d.key.sent_at);
+            changed |= match &d.preview {
+                Some(p) => self.by_message.insert(k, p.clone()).as_ref() != Some(p),
+                None => self.by_message.remove(&k).is_some(),
             };
-            Some((k, preview.clone()))
-        });
-        let previews: HashMap<Key, LinkPreview> = previews.collect();
-        let changed = previews != self.by_message;
-        self.by_message = previews;
+        }
         changed
+    }
+
+    /// Only the `loaded` messages' previews stay, with their pictures and the draft's; the
+    /// pictures of the others are returned, to let go.
+    fn keep(&mut self, loaded: &HashSet<Key>) -> Vec<Arc<RenderImage>> {
+        self.by_message.retain(|k, _| loaded.contains(k));
+        let received = self.by_message.values().filter_map(ready);
+        let draft = self.draft.iter().filter_map(|d| Some(d.image.as_ref()?.path.as_str()));
+        let used: HashSet<&str> = received.chain(draft).collect();
+        let gone = self.pictures.extract_if(|path, _| !used.contains(path.as_str()));
+        gone.filter_map(|(_, p)| match p {
+            Picture::Shown(picture) => Some(picture),
+            Picture::Loading | Picture::Failed => None,
+        })
+        .collect()
     }
 
     /// The picture of file `path` as drawn: grey until it is decoded; none if it didn't.
@@ -158,6 +167,15 @@ impl Previews {
         });
         wanted.collect()
     }
+}
+
+/// Lets decoded pictures' memory go, once no window is being drawn, so each lets its copy go.
+fn drop_pictures(pictures: Vec<Arc<RenderImage>>, cx: &mut App) {
+    cx.defer(move |cx| {
+        for picture in pictures {
+            cx.drop_image(picture, None);
+        }
+    });
 }
 
 /// A received preview's picture, once downloaded.
@@ -240,9 +258,10 @@ fn openable(url: &str) -> Option<Url> {
 }
 
 impl Hush {
-    /// The open chat's messages' details were read: their previews show, and their pictures load.
-    pub(super) fn previews_loaded(&mut self, keys: &[MessageKey], details: &[MessageDetails], cx: &mut Context<Self>) {
-        if self.previews.loaded(keys, details) {
+    /// Some of the open chat's messages' details were read: their previews show, and their
+    /// pictures load.
+    pub(super) fn previews_loaded(&mut self, details: &[MessageDetails], cx: &mut Context<Self>) {
+        if self.previews.loaded(details) {
             // a card came or went: its row's height did too
             self.timeline.update(cx, |t, cx| t.remeasure(cx));
         }
@@ -317,12 +336,13 @@ impl Hush {
                 Picture::Loading | Picture::Failed => None,
             })
             .collect();
-        // once no window is being drawn, so each lets its copy go
-        cx.defer(move |cx| {
-            for picture in shown {
-                cx.drop_image(picture, None);
-            }
-        });
+        drop_pictures(shown, cx);
+    }
+
+    /// Only the `loaded` messages' previews stay: rows that went let their pictures' memory go.
+    pub(super) fn keep_previews(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
+        let gone = self.previews.keep(loaded);
+        drop_pictures(gone, cx);
     }
 
     /// Decodes the pictures not asked for yet, one at a time, while their chat stays open. They
@@ -336,6 +356,19 @@ impl Hush {
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
             for path in wanted {
+                // gone with its row meanwhile
+                let wanted = this.update(cx, |app, _| {
+                    let open = app.generation == generation;
+                    (
+                        open,
+                        open && matches!(app.previews.pictures.get(&path), Some(Picture::Loading)),
+                    )
+                });
+                match wanted {
+                    Ok((true, true)) => {}
+                    Ok((true, false)) => continue,
+                    _ => return,
+                }
                 // shortcut: decoded as the chat's photos are (640 pixels at most), more than a
                 // 52pt card needs; decode to the card's size if many previews show at once
                 let picture = match Compat::new(client.file_bytes(path.clone())).await {
@@ -562,26 +595,21 @@ mod tests {
     fn previews_come_from_the_details_and_a_message_the_core_couldnt_read_keeps_its_own() {
         let (a, b, c) = (key("x", 1), key("x", 2), key("y", 3));
         let mut p = Previews::default();
-        let keys = [a.clone(), b.clone(), c.clone()];
-        assert!(p.loaded(
-            &keys,
-            &[
-                details(&a, Some("https://a.example")),
-                details(&b, Some("https://b.example"))
-            ]
-        ));
+        let read = [
+            details(&a, Some("https://a.example")),
+            details(&b, Some("https://b.example")),
+            details(&c, None),
+        ];
+        assert!(p.loaded(&read));
         assert_eq!(p.by_message.len(), 2);
-        assert!(!p.loaded(
-            &keys,
-            &[
-                details(&a, Some("https://a.example")),
-                details(&b, Some("https://b.example"))
-            ]
-        ));
-        // a unread now: kept; b lost its preview (edited); c not on the page any more
-        assert!(p.loaded(&[a.clone(), b.clone()], &[details(&b, None)]));
+        assert!(!p.loaded(&read));
+        // a not read now: kept; b lost its preview (edited)
+        assert!(p.loaded(&[details(&b, None)]));
         let urls: Vec<&str> = p.by_message.values().map(|p| p.url.as_str()).collect();
         assert_eq!(urls, ["https://a.example"]);
+        // a's row went: its preview with it
+        assert!(p.keep(&[(b.author.clone(), b.sent_at)].into()).is_empty());
+        assert!(p.by_message.is_empty());
     }
 
     #[test]
@@ -603,12 +631,17 @@ mod tests {
         a.preview.as_mut().unwrap().image = Some(image(Some("files/1"), AttachmentState::Ready));
         let mut b = details(&key("x", 2), Some("https://b.example"));
         b.preview.as_mut().unwrap().image = Some(image(None, AttachmentState::Downloading));
-        p.loaded(&[a.key.clone(), b.key.clone()], &[a, b]);
+        let b_key = (b.key.author.clone(), b.key.sent_at);
+        p.loaded(&[a, b]);
         p.draft = Some(draft("https://c.example"));
         let mut wanted = p.wanted();
         wanted.sort();
         assert_eq!(wanted, ["files/1", "previews/1"]);
         assert!(p.wanted().is_empty(), "asked for already");
+        // a's row went: its picture goes, the draft's stays
+        p.keep(&[b_key].into());
+        let kept: Vec<&String> = p.pictures.keys().collect();
+        assert_eq!(kept, ["previews/1"]);
     }
 
     #[test]

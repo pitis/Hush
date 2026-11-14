@@ -327,23 +327,28 @@ impl Files {
     }
 }
 
-/// The page's files from the core's details of its messages (`keys`); a message the core
-/// couldn't read isn't in them, and keeps what it showed.
-fn with_details(
-    shown: &HashMap<Key, Vec<Attachment>>,
-    keys: &[MessageKey],
-    details: &[MessageDetails],
-) -> HashMap<Key, Vec<Attachment>> {
-    let read: HashMap<Key, &Vec<Attachment>> = details
-        .iter()
-        .map(|d| ((d.key.author.clone(), d.key.sent_at), &d.attachments))
-        .collect();
-    let files = keys.iter().filter_map(|k| {
-        let k = (k.author.clone(), k.sent_at);
-        let files = read.get(&k).copied().or_else(|| shown.get(&k))?;
-        (!files.is_empty()).then(|| (k, files.clone()))
+/// The files after the core's details of some messages were read: theirs as read, the others'
+/// as they were (a message the core couldn't read isn't in them, and keeps what it showed).
+fn with_details(shown: &mut HashMap<Key, Vec<Attachment>>, details: &[MessageDetails]) {
+    for d in details {
+        let k = (d.key.author.clone(), d.key.sent_at);
+        if d.attachments.is_empty() {
+            shown.remove(&k);
+        } else {
+            shown.insert(k, d.attachments.clone());
+        }
+    }
+}
+
+/// Lets decoded pictures' memory go, once no window is being drawn, so each lets its copy go.
+fn drop_thumbs(thumbs: Vec<Thumb>, cx: &mut App) {
+    cx.defer(move |cx| {
+        for thumb in thumbs {
+            if let Thumb::Shown(thumb) = thumb {
+                cx.drop_image(thumb, None);
+            }
+        }
     });
-    files.collect()
 }
 
 /// Why a recording didn't start.
@@ -354,18 +359,32 @@ enum Unplayed {
 }
 
 impl Hush {
-    /// The open chat's messages' details were read (with their reactions, `load_reactions`).
-    pub(super) fn files_loaded(&mut self, keys: &[MessageKey], details: &[MessageDetails], cx: &mut Context<Self>) {
-        self.files.by_message = with_details(&self.files.by_message, keys, details);
+    /// Some of the open chat's messages' details were read (with their reactions, `read_details`).
+    pub(super) fn files_loaded(&mut self, details: &[MessageDetails], cx: &mut Context<Self>) {
+        with_details(&mut self.files.by_message, details);
         self.load_media(cx);
     }
 
-    /// A file was added or changed state (downloading, ready, failed): the page's details are
-    /// read again.
-    pub(super) fn attachment_changed(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+    /// A file of `message` was added or changed state (downloading, ready, failed): its details
+    /// are read again.
+    pub(super) fn attachment_changed(&mut self, conversation_id: &str, message: &MessageKey, cx: &mut Context<Self>) {
         if self.selected.as_deref() == Some(conversation_id) {
-            self.messages_loaded(cx);
+            self.read_details([(message.author.clone(), message.sent_at)], cx);
         }
+    }
+
+    /// Only the `loaded` messages' files stay, with what is shown of them: rows that went let
+    /// their pictures' memory go (one still decoding isn't).
+    pub(super) fn keep_files(&mut self, loaded: &HashSet<Key>, cx: &mut Context<Self>) {
+        let f = &mut self.files;
+        f.by_message.retain(|k, _| loaded.contains(k));
+        let files = f.by_message.values().flatten();
+        let ids: HashSet<i64> = files.clone().map(|a| a.id).collect();
+        let paths: HashSet<String> = files.filter_map(ready_path).collect();
+        let gone = f.thumbs.extract_if(|path, _| !paths.contains(path));
+        drop_thumbs(gone.map(|(_, thumb)| thumb).collect(), cx);
+        f.lengths.retain(|id, _| ids.contains(id));
+        f.unplayable.retain(|id| ids.contains(id));
     }
 
     /// Decodes the pictures and reads the recordings' lengths not asked for yet, one at a time,
@@ -458,15 +477,7 @@ impl Hush {
     /// play is tried again next time.
     pub(super) fn clear_files(&mut self, cx: &mut Context<Self>) {
         self.files.by_message.clear();
-        let shown: Vec<_> = self.files.thumbs.drain().collect();
-        // once no window is being drawn, so each lets their copy go
-        cx.defer(move |cx| {
-            for (_, thumb) in shown {
-                if let Thumb::Shown(thumb) = thumb {
-                    cx.drop_image(thumb, None);
-                }
-            }
-        });
+        drop_thumbs(self.files.thumbs.drain().map(|(_, thumb)| thumb).collect(), cx);
         self.files.lengths.clear();
         self.files.unplayable.clear();
         self.files.playing = None;
@@ -1485,12 +1496,13 @@ mod tests {
             (("a".into(), 2), vec![file("image/jpeg", None)]),
             (("a".into(), 9), vec![file("image/jpeg", None)]),
         ]);
-        // 1 lost its file, 2 wasn't read, 3 got one, 9 left the page
+        // 1 lost its file, 2 wasn't read, 3 got one, 9 wasn't asked about
         let found = vec![details(1, vec![]), details(3, vec![file("video/mp4", None)])];
-        let new = with_details(&old, &[key(1), key(2), key(3)], &found);
+        let mut new = old.clone();
+        with_details(&mut new, &found);
         let mut kept: Vec<i64> = new.keys().map(|k| k.1).collect();
         kept.sort();
-        assert_eq!(kept, [2, 3]);
+        assert_eq!(kept, [2, 3, 9]);
     }
 
     fn png_turned(width: u32, height: u32, orientation: u16) -> Vec<u8> {
@@ -1546,5 +1558,48 @@ mod tests {
             None,
             "a final backslash would escape the closing quote"
         );
+    }
+}
+
+/// The files in a real (headless) window: `cargo test -p hush-desktop --features snapshot`.
+#[cfg(all(test, feature = "snapshot"))]
+mod window_tests {
+    use gpui_kit::{gpui, AppContext as _, Entity, TestAppContext, WindowOptions};
+
+    use super::super::Hush;
+    use crate::Demo;
+
+    fn open(cx: &mut TestAppContext) -> Entity<Hush> {
+        let (_, hush) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| Hush::demo(Demo::Files, window, cx))
+            })
+            .expect("the window opens")
+        });
+        cx.run_until_parked();
+        hush
+    }
+
+    /// Messages with files, pictures decoded, recordings' lengths.
+    fn kept(hush: &Entity<Hush>, cx: &mut TestAppContext) -> (usize, usize, usize) {
+        hush.read_with(cx, |app, _| {
+            let f = &app.files;
+            (f.by_message.len(), f.thumbs.len(), f.lengths.len())
+        })
+    }
+
+    #[gpui::test]
+    fn rows_that_go_take_their_pictures_and_lengths_with_them(cx: &mut TestAppContext) {
+        let hush = open(cx);
+        // a recording, files, and two photos last
+        assert_eq!(kept(&hush, cx), (7, 2, 1));
+        // the recording's row and the photos' go (scrolled back to the newest, say)
+        hush.update(cx, |app, cx| {
+            let middle = app.messages[1..5].to_vec();
+            app.set_messages(middle, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(kept(&hush, cx), (4, 0, 0));
     }
 }
