@@ -209,7 +209,11 @@ impl Hush {
     /// Settings…: the panel over the window (not over another one: the keys stay with that); our
     /// profile is read each time it opens (the phone changes it too), and the sync switch.
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let over = self.dialog.is_some() || self.group.is_some() || self.view_once.showing() || self.backup.showing();
+        let over = self.dialog.is_some()
+            || self.group.is_some()
+            || self.view_once.showing()
+            || self.stories.showing()
+            || self.backup.showing();
         if self.settings.panel.is_some() || over {
             return;
         }

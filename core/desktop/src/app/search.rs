@@ -85,6 +85,7 @@ impl Hush {
             && self.group.is_none()
             && !self.view_once.showing()
             && !self.settings_open()
+            && !self.stories.showing()
     }
 
     /// The sidebar's search field gets the keys.

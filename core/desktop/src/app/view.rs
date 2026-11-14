@@ -322,9 +322,16 @@ impl Hush {
                             ),
                     )
                     .children((!archive).then(|| self.render_new_chat(p, cx)))
+                    .children(self.render_stories_button(p, cx).filter(|_| !archive))
                     .child(self.render_settings_button(p, cx)),
             )
-            .children(self.error.clone().map(|e| self.render_error(e, p, cx)))
+            // the stories window, over it, says it there
+            .children(
+                self.error
+                    .clone()
+                    .filter(|_| !self.stories.showing())
+                    .map(|e| self.render_error(e, p, cx)),
+            )
             .child(list)
             .children(self.render_connection(p, cx))
     }
@@ -677,7 +684,7 @@ impl Hush {
             )
     }
 
-    fn render_error(&self, error: String, p: Palette, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_error(&self, error: String, p: Palette, cx: &mut Context<Self>) -> Div {
         div().px(px(10.)).pb(px(6.)).flex_none().child(
             h_flex()
                 .items_start()
@@ -1333,6 +1340,7 @@ impl Render for Hush {
             .children(history)
             .children(dialog)
             .children(group)
+            .children(self.render_stories(p, cx))
             .children(self.render_view_once(p, cx))
             .children(self.render_settings(p, cx))
             // Back Up opens from Settings: over it
