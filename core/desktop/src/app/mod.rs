@@ -30,6 +30,7 @@ mod events;
 mod files;
 mod group;
 pub mod navigate;
+pub mod notifications;
 mod options;
 mod paging;
 mod polls;
@@ -177,6 +178,7 @@ pub struct Hush {
     polls: polls::Polls,
     /// View-once media's one look.
     view_once: view_once::ViewOnce,
+    notifications: notifications::Notifications,
 }
 
 /// The open core and the draft writes on their way, for `quit`.
@@ -373,6 +375,7 @@ impl Hush {
             options: Default::default(),
             polls: Default::default(),
             view_once: Default::default(),
+            notifications: Default::default(),
         }
     }
 
@@ -522,11 +525,29 @@ impl Hush {
 
     fn handle(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         match &event {
-            CoreEvent::MessageExpired { key, .. } => {
+            CoreEvent::MessageExpired { conversation_id, key } => {
                 self.message_expired(key, cx);
                 self.forget_hit(key);
+                self.message_gone(conversation_id, key, cx);
             }
-            CoreEvent::MessageChanged { key, .. } => self.recheck_hit(key, cx),
+            CoreEvent::MessageChanged { conversation_id, key } => {
+                self.recheck_hit(key, cx);
+                self.recheck_notified(conversation_id, key, cx);
+            }
+            CoreEvent::NewMessage { conversation_id, key } => {
+                self.notify(conversation_id.clone(), key.clone(), None, cx)
+            }
+            CoreEvent::NewReaction {
+                conversation_id,
+                target,
+                reactor,
+                emoji,
+            } => self.notify(
+                conversation_id.clone(),
+                target.clone(),
+                Some((reactor.clone(), emoji.clone())),
+                cx,
+            ),
             CoreEvent::ChatEventAdded { conversation_id, kind } => self.event_added(conversation_id, *kind, cx),
             CoreEvent::Error { .. } => self.resets_failed(),
             _ => {}
@@ -584,8 +605,8 @@ impl Hush {
                 ..
             } => self.attachment_changed(&conversation_id, &message, cx),
             CoreEvent::Error { message } => self.error = Some(message),
-            // not in this version: typing, calls, stories, notifications (a reaction shows with its
-            // message's `MessageChanged`)
+            // not in this version: typing, calls, stories (a reaction shows with its message's
+            // `MessageChanged`; `NewMessage` and `NewReaction` notify in the match above)
             _ => return,
         }
         // a dialog belongs to the chats it was over: linking again doesn't bring it back
@@ -632,6 +653,7 @@ impl Hush {
         }
         self.contacts = addable(&all, self.own_aci.as_deref());
         self.chats = all;
+        self.chats_counted(cx);
         // an archive that emptied (the last chat unarchived, or written in) closes
         self.chat_actions.archive &= self.chats.iter().any(|c| c.archived);
         // group rows say who wrote the last message
@@ -705,6 +727,9 @@ impl Hush {
     /// Leaves the open chat, its unsent text kept as its draft, for `id` (into its composer) or for
     /// none.
     fn switch(&mut self, id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = &id {
+            self.chat_seen(id, cx);
+        }
         let draft = id
             .as_ref()
             .and_then(|id| self.drafts.get(id))
@@ -1147,6 +1172,7 @@ impl Hush {
             self.timeline.update(cx, |t, cx| t.reset(0, cx));
         }
         self.drop_chat_copies(&id);
+        self.chat_seen(&id, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let deleted = Compat::new(client.delete_chat(id.clone())).await;
