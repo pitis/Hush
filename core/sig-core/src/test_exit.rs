@@ -13,9 +13,10 @@ extern "C" {
 
 /// Called before an encrypted database opens. SQLCipher registers its exit handler in its init;
 /// this one, registered after it, runs before it and waits for sqlx's workers to end.
-pub(crate) fn wait_for_closing_databases() {
+pub(crate) fn wait_at_exit_for_closing_databases() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
+        // first: SQLCipher's init on an uninitialized SQLite deadlocks on SQLite's main mutex
         sqlite3_initialize();
         // SQLite runs SQLCipher's init after it counts as initialized: another test's first open can
         // still be in it. Called again, it waits for that one under SQLite's main mutex, or does it.
@@ -33,7 +34,7 @@ extern "C" fn wait() {
 }
 
 /// sqlx's worker threads still running: one per connection, ending once it closed.
-#[cfg(target_vendor = "apple")]
+#[cfg(target_os = "macos")]
 fn workers() -> usize {
     // <sys/proc_info.h>; not in libc
     const PROC_PIDLISTTHREADS: std::ffi::c_int = 6;
@@ -80,7 +81,7 @@ fn workers() -> usize {
         .count()
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn workers() -> usize {
     0
 }

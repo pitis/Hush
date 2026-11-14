@@ -289,7 +289,7 @@ impl Drop for PanicReporter {
 /// 2 MB: its hot pages are few, and a miss is a decrypt from the OS's file cache.
 pub(crate) fn sqlite_options(path: &std::path::Path, key: &str) -> Result<SqliteConnectOptions, CoreError> {
     #[cfg(test)]
-    crate::test_exit::wait_for_closing_databases();
+    crate::test_exit::wait_at_exit_for_closing_databases();
     Ok(SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
         .create_if_missing(true)
         .foreign_keys(true)

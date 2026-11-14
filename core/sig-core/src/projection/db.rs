@@ -174,7 +174,7 @@ impl ProjectionDb {
             .disable_statement_logging();
         if let Some(k) = key {
             #[cfg(test)]
-            crate::test_exit::wait_for_closing_databases();
+            crate::test_exit::wait_at_exit_for_closing_databases();
             if k.len() != 64 || !k.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(sqlx::Error::Configuration(
                     "database key must be 64 hex characters".into(),
