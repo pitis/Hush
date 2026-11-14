@@ -59,6 +59,17 @@ final class FilesTests: XCTestCase {
         XCTAssertEqual(Files.outgoing(odd).contentType, "application/octet-stream")
     }
 
+    func testAFileThatCantBeHadOffersNoDownload() {
+        var a = attachment(1, MessageKey(author: "a", sentAt: 1), state: .pending)
+        for (state, available, offered) in [
+            (AttachmentState.pending, true, true), (.failed, true, true), (.pending, false, false),
+            (.failed, false, false), (.downloading, true, false), (.ready, true, false),
+        ] {
+            (a.state, a.available) = (state, available)
+            XCTAssertEqual(Files.offersDownload(a), offered, "\(state), available: \(available)")
+        }
+    }
+
     func testStoredFilesOpenUnderTheirOwnName() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hush-open-\(UUID())")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

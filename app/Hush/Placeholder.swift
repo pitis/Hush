@@ -98,6 +98,8 @@ enum ViewOnce: Equatable {
     case viewed
     case download(Int64)
     case downloading
+    /// Its file can't be fetched (too big for the core, say).
+    case unavailable
     case open(Attachment)
 
     static func state(_ m: Message, files: [Attachment]) -> ViewOnce {
@@ -106,7 +108,7 @@ enum ViewOnce: Equatable {
         switch file.state {
         case .ready: return .open(file)
         case .downloading: return .downloading
-        case .pending, .failed: return .download(file.id)
+        case .pending, .failed: return Files.offersDownload(file) ? .download(file.id) : .unavailable
         }
     }
 
@@ -126,6 +128,7 @@ enum ViewOnce: Equatable {
         case .viewed: "Viewed"
         case .download: "Download view-once media"
         case .downloading: "Downloading…"
+        case .unavailable: "View-once media can't be downloaded"
         case .open(let file): file.contentType.hasPrefix("video/") ? "View video" : "View photo"
         }
     }

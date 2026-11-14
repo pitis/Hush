@@ -758,7 +758,7 @@ struct MessageRow: View {
                             Text(placeholder).italic()
                             // a sticker whose image didn't come: fetch it again
                             if let file = Placeholder.stickerFile(message, files: files) {
-                                DownloadState(state: file.state, download: { download(file.id) })
+                                DownloadState(file: file, download: { download(file.id) })
                             }
                         }
                     } else if let body = message.body, !body.isEmpty {
@@ -841,7 +841,7 @@ struct MessageRow: View {
             } label: {
                 label
             }.buttonStyle(.bordered)
-        case .sent, .viewed, .downloading:
+        case .sent, .viewed, .downloading, .unavailable:
             label.italic()
         }
     }

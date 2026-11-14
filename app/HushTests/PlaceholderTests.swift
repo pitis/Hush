@@ -62,6 +62,10 @@ final class PlaceholderTests: XCTestCase {
         XCTAssertEqual(ViewOnce.state(m, files: [file(.pending, "image/jpeg")]), .download(7))
         XCTAssertEqual(ViewOnce.state(m, files: [file(.failed, "image/jpeg")]), .download(7))
         XCTAssertEqual(ViewOnce.state(m, files: [file(.downloading, "image/jpeg")]), .downloading)
+        var gone = file(.pending, "video/mp4")
+        gone.available = false  // too big for the core, say
+        XCTAssertEqual(ViewOnce.state(m, files: [gone]), .unavailable)
+        XCTAssertEqual(ViewOnce.label(.unavailable), "View-once media can't be downloaded")
         XCTAssertEqual(ViewOnce.state(m, files: []), .viewed, "nothing left to open")
         m.kind = .viewOnce(viewed: true)
         XCTAssertEqual(ViewOnce.state(m, files: [file(.ready, "image/jpeg")]), .viewed)

@@ -13,7 +13,7 @@ or a group (`group`); its id is the envelope's timestamp. Our own come from the 
    step through them, into the next chat's; Esc closes.
 2. Text stories show their words in their style and colours on their background; photo stories
    show their image (downloaded like a message's), video stories play; a pending or failed file
-   offers Download/Retry.
+   offers Download/Retry, and one the core can't fetch (too big, say) says it can't be shown.
 3. Shown stories are marked seen here. Stories last a day.
 4. Only stories from chats that aren't blocked or message requests show (as Desktop), and ours.
 
