@@ -152,6 +152,11 @@ pub enum Command {
         link: GroupInviteLink,
         done: oneshot::Sender<Result<crate::groups::GroupPreview, String>>,
     },
+    /// Lists the chat of a group we're in that has none here (no messages since linking).
+    ListGroup {
+        key: [u8; 32],
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Joins a group through its link, or asks to, then lists its chat; answers whether we asked.
     JoinGroup {
         link: GroupInviteLink,
@@ -800,6 +805,18 @@ async fn run(
                     let _ = done.send(Err("not linked yet".into()));
                 }
             },
+            Command::ListGroup { key, done } => match &manager {
+                Some(m) => {
+                    let (m, db, l) = (m.clone(), projection.clone(), listener.clone());
+                    tokio::task::spawn_local(async move {
+                        let own = m.registration_data().service_ids.clone();
+                        let _ = done.send(list_group(m.store(), &own, &db, l.as_ref(), &key).await);
+                    });
+                }
+                None => {
+                    let _ = done.send(Err("not linked yet".into()));
+                }
+            },
             Command::JoinGroup { link, done } => match &manager {
                 Some(m) => {
                     let (mut m, db, l) = (m.clone(), projection.clone(), listener.clone());
@@ -1377,8 +1394,10 @@ async fn preview_link(
     let id = group_id(&link.master_key);
     let me = m.registration_data().service_ids.aci;
     let ours = m.store().group(link.master_key).await.map_err(|e| e.to_string())?;
-    if ours.is_some_and(|g| crate::groups::is_member(&g, me)) {
-        // a removed member can't fetch it: then they're asked as anyone with the link
+    // none here yet (relinked without history): the server says whether we're in it, and the
+    // fetch stores it for `list_group`. A removed member, or one never in it, can't fetch it:
+    // then they're asked as anyone with the link
+    if ours.is_none_or(|g| crate::groups::is_member(&g, me)) {
         if let Ok(Ok(g)) =
             tokio::time::timeout(Duration::from_secs(20), Box::pin(m.fetch_group(&link.master_key))).await
         {
@@ -1473,10 +1492,7 @@ async fn list_new_group(
     at: i64,
 ) {
     let listed = match store.group(*key).await {
-        Ok(Some(g)) => match store_group(db, key, &g, own).await {
-            Ok(_) => db.list_chat(&group_id(key), at).await.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        },
+        Ok(Some(g)) => list_group_chat(db, key, &g, own, at).await,
         Ok(None) => Err("presage hasn't it".into()),
         Err(e) => Err(e.to_string()),
     };
@@ -1486,6 +1502,37 @@ async fn list_new_group(
         });
     }
     l.on_event(CoreEvent::ConversationsChanged);
+}
+
+/// Lists the chat of a group we're in (as presage has it) that has none here: no messages
+/// since linking. Opened from its link, it lists from now.
+async fn list_group(
+    store: &SqliteStore,
+    own: &ServiceIds,
+    db: &ProjectionDb,
+    l: &dyn EventListener,
+    key: &[u8; 32],
+) -> Result<(), String> {
+    let g = match store.group(*key).await.map_err(|e| e.to_string())? {
+        Some(g) if crate::groups::is_member(&g, own.aci) => g,
+        _ => return Err("You're not in this group.".into()),
+    };
+    list_group_chat(db, key, &g, own, chrono::Utc::now().timestamp_millis()).await?;
+    l.on_event(CoreEvent::ConversationsChanged);
+    Ok(())
+}
+
+/// Stores a group in its chat, listed from `at` if it wasn't.
+async fn list_group_chat(
+    db: &ProjectionDb,
+    key: &[u8; 32],
+    g: &presage::model::groups::Group,
+    own: &ServiceIds,
+    at: i64,
+) -> Result<(), String> {
+    store_group(db, key, g, own).await.map_err(|e| e.to_string())?;
+    db.list_chat(&group_id(key), at).await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Installs a pack unless presage has it already.
@@ -3968,6 +4015,71 @@ mod tests {
             invite_link_password: vec![],
             description: None,
         }
+    }
+
+    /// A group we're in whose chat isn't listed here (no messages since linking) is listed when
+    /// its link's Open Chat asks; a group we're not in, or presage hasn't, isn't.
+    #[tokio::test]
+    async fn a_group_were_in_is_listed_when_opened_from_its_link() {
+        use presage::libsignal_service::groups_v2::Role;
+        use presage::libsignal_service::protocol::Aci;
+        use presage::model::groups::Member;
+        use presage::model::identity::OnNewIdentity;
+        use presage::store::ContentsStore;
+        use presage_store_sqlite::SqliteStore;
+        let dir = std::env::temp_dir().join(format!("sig-core-open-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStore::open_with_options(
+            super::sqlite_options(&dir.join("presage.db"), &"00".repeat(32)).unwrap(),
+            OnNewIdentity::Trust,
+        )
+        .await
+        .unwrap();
+        let db = crate::projection::ProjectionDb::open("sqlite::memory:", None)
+            .await
+            .unwrap();
+        let sink = Sink(std::sync::Mutex::new(vec![]));
+        let (ours, theirs) = ([5u8; 32], [6u8; 32]);
+        let mut g = hikers(2);
+        g.members.push(Member {
+            aci: Aci::from(own().aci),
+            role: Role::Default,
+            profile_key: presage::libsignal_service::prelude::ProfileKey::create([0; 32]),
+            joined_at_revision: 1,
+            label: None,
+            label_emoji: None,
+        });
+        store.save_group(ours, g).await.unwrap();
+        store.save_group(theirs, hikers(2)).await.unwrap();
+
+        let refused = Err("You're not in this group.".to_string());
+        assert_eq!(super::list_group(&store, &own(), &db, &sink, &theirs).await, refused);
+        assert_eq!(
+            super::list_group(&store, &own(), &db, &sink, &[7; 32]).await,
+            refused,
+            "presage hasn't it"
+        );
+        assert!(sink.0.lock().unwrap().is_empty());
+        assert!(db.conversations().await.unwrap().is_empty());
+
+        super::list_group(&store, &own(), &db, &sink, &ours).await.unwrap();
+        let chats = db.conversations().await.unwrap();
+        let [chat] = chats.as_slice() else {
+            panic!("one chat: {chats:?}")
+        };
+        assert_eq!(chat.id, crate::projection::ids::group_id(&ours));
+        assert_eq!(chat.title, "Hikers");
+        assert!(chat.last_message_at > 0, "listed");
+        assert!(matches!(
+            sink.0.lock().unwrap().as_slice(),
+            [CoreEvent::ConversationsChanged]
+        ));
+        // listed already (the app's list was behind): it keeps its place
+        let at = chat.last_message_at;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        super::list_group(&store, &own(), &db, &sink, &ours).await.unwrap();
+        assert_eq!(db.conversations().await.unwrap()[0].last_message_at, at);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A group that invites our number (or our account) is stored as an invitation; once

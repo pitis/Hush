@@ -498,10 +498,7 @@ struct JoinGroupSheet: View {
         if case .group(let group) = read {
             // asked from another device (no chat here): asking again lists it
             if group.member || (group.requested && store.conversations.contains { $0.id == group.conversationId }) {
-                Button("Open Chat") {
-                    store.select(group.conversationId)
-                    dismiss()
-                }
+                Button("Open Chat") { open(group.conversationId) }
             } else {
                 Button(group.approval ? "Ask to Join" : "Join", action: join)
             }
@@ -518,6 +515,16 @@ struct JoinGroupSheet: View {
             // the link changed meanwhile: this preview isn't the one to join from
             if link.trimmingCharacters(in: .whitespacesAndNewlines) == asked { read = answer }
             busy = false
+        }
+    }
+
+    private func open(_ conversationId: String) {
+        busy = true
+        problem = nil
+        Task {
+            problem = await store.openGroup(conversationId, link: link.trimmingCharacters(in: .whitespacesAndNewlines))
+            busy = false
+            if problem == nil { dismiss() }
         }
     }
 

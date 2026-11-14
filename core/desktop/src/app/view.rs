@@ -308,7 +308,7 @@ impl Hush {
             DialogKind::Group(_) => "Create",
             DialogKind::Join(None) => "Show Group",
             DialogKind::Join(Some(g)) => match join_step(g, self.chats.iter().any(|c| c.id == g.conversation_id)) {
-                JoinStep::Open => "Open Chat",
+                JoinStep::Open | JoinStep::List => "Open Chat",
                 JoinStep::Join => "Join",
                 JoinStep::AskToJoin => "Ask to Join",
             },

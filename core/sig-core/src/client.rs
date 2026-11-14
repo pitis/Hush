@@ -1777,6 +1777,33 @@ impl Client {
             .map_err(|message| CoreError::Network { message })
     }
 
+    /// Lists the chat of a link's group we're in but have no chat with here (no messages since
+    /// linking, or deleted), so its Open Chat has a chat to open, and accepts it as a join does
+    /// (we chose it). An error if we're not in it. The link holds the group's key: never logged.
+    pub async fn list_group(&self, link: String) -> Result<(), CoreError> {
+        let link = group_link(&link)?;
+        self.own_aci().ok_or(CoreError::NotLinked)?;
+        let conversation_id = crate::projection::ids::group_id(&link.master_key);
+        let (done, answer) = tokio::sync::oneshot::channel();
+        self.send(Command::ListGroup {
+            key: link.master_key,
+            done,
+        })?;
+        answer
+            .await
+            .map_err(|_| CoreError::Closed)?
+            .map_err(|message| CoreError::InvalidInput { message })?;
+        // listed whatever happens next: a failure here is said, not the opening's; its error may
+        // name the chat, whose id is the group's key: not for the log
+        if self.accept_request(conversation_id).await.is_err() {
+            tracing::warn!("an opened group's chat couldn't be accepted");
+            self.listener.on_event(CoreEvent::Error {
+                message: "The group's chat couldn't be accepted; accept it in the chat.".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Joins a group through its invite link, or asks to where admins approve; its chat is
     /// listed and accepted (as Signal's apps do: we chose it).
     pub async fn join_group(&self, link: String) -> Result<GroupJoined, CoreError> {
