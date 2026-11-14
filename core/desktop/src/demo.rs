@@ -1,9 +1,9 @@
 //! Made-up chats for `--snapshot`: the screens render without a core or anyone's real messages.
 
 use sig_core::projection::{
-    Attachment, AttachmentState, BodyRange, Conversation, ConversationKind, FileSummary, LinkPreview, Message,
-    MessageKey, MessageKind, MessageStatus, OutgoingFile, PreviewDraft, Quote, Reaction, SearchHit, TextStyle,
-    HIGHLIGHT_END, HIGHLIGHT_START,
+    Attachment, AttachmentState, BodyRange, ChatEvent, ChatEventKind, Conversation, ConversationKind, FileSummary,
+    LinkPreview, Message, MessageKey, MessageKind, MessageStatus, OutgoingFile, PreviewDraft, Quote, Reaction,
+    SearchHit, TextStyle, HIGHLIGHT_END, HIGHLIGHT_START,
 };
 
 pub const ME: &str = "00000000-0000-4000-8000-000000000000";
@@ -155,6 +155,46 @@ fn message(author: &str, ago_minutes: i64, body: &str) -> Message {
         expires_at: None,
         story: None,
     }
+}
+
+/// Ana's chat, disappearing messages turned on: its messages, oldest first, and its events of each
+/// kind, among them messages yesterday and just now that couldn't be decrypted.
+pub fn timed_chat() -> (Vec<Message>, Vec<ChatEvent>) {
+    use ChatEventKind::*;
+    let chat = format!("c:{ANA}");
+    let say = |author: &str, ago_minutes: i64, body: &str, timed: bool| {
+        let mut m = message(author, ago_minutes, body);
+        m.conversation_id = chat.clone();
+        m.expires_in = if timed { 604_800 } else { 0 };
+        m
+    };
+    let messages = vec![
+        say(ANA, 120, "Did you get my messages yesterday?", false),
+        say(ME, 118, "Only some, the rest didn't come through", false),
+        say(ANA, 58, "I've turned on disappearing messages here", true),
+        say(ME, 55, "Good idea 👍", true),
+    ];
+    let now = chrono::Utc::now().timestamp_millis();
+    let event = |id: i64, ago_minutes: i64, kind, value| ChatEvent {
+        id,
+        conversation_id: chat.clone(),
+        at: now - ago_minutes * 60_000,
+        kind,
+        author: ANA.into(),
+        value,
+    };
+    let yesterday = 26 * 60;
+    let events = vec![
+        event(1, yesterday + 10, DecryptionFailed, None),
+        event(2, yesterday + 9, DecryptionFailed, None),
+        event(3, yesterday, SessionReset, None),
+        event(4, 100, MissedCall, None),
+        event(5, 95, OutgoingCall, Some(125)),
+        event(6, 60, TimerChanged, Some(604_800)),
+        event(7, 50, SafetyNumberChanged, None),
+        event(8, 10, DecryptionFailed, None),
+    ];
+    (messages, events)
 }
 
 /// Messages found for "book" in every chat, newest first.

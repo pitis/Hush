@@ -120,6 +120,10 @@ pub enum Demo {
     /// The chat with a received link preview and a group's invite link, writing a link with its
     /// preview above the composer.
     LinkPreview,
+    /// A chat with disappearing messages on, and events of each kind among its messages.
+    Events,
+    /// That chat in its colour, on its wallpaper, the picker open.
+    ChatStyle,
 }
 
 /// `hush --snapshot <folder>`: renders made-up screens, light and dark, to PNGs there and quits,
@@ -144,6 +148,8 @@ fn snapshot(dir: std::path::PathBuf) {
                 ("search-in-chat", Demo::SearchInChat),
                 ("history", Demo::History),
                 ("link-preview", Demo::LinkPreview),
+                ("events", Demo::Events),
+                ("chat-style", Demo::ChatStyle),
             ];
             cx.spawn(async move |cx| {
                 for (mode, theme) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {

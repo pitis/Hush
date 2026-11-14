@@ -24,8 +24,10 @@ use crate::{key, text};
 mod actions;
 pub mod attach;
 pub mod compose;
+mod events;
 mod files;
 pub mod navigate;
+mod options;
 mod paging;
 mod previews;
 pub mod search;
@@ -161,6 +163,9 @@ pub struct Hush {
     /// The composer's styles and mentions.
     compose: compose::Compose,
     previews: previews::Previews,
+    /// The open chat's events among its messages.
+    events: events::Events,
+    options: options::Options,
 }
 
 /// The open core, for `quit`.
@@ -347,6 +352,8 @@ impl Hush {
             paging: Default::default(),
             compose: Default::default(),
             previews: Default::default(),
+            events: Default::default(),
+            options: Default::default(),
         }
     }
 
@@ -393,6 +400,14 @@ impl Hush {
                 }
                 if let crate::Demo::LinkPreview = screen {
                     app.demo_previews(window, cx);
+                }
+            }
+            crate::Demo::Events | crate::Demo::ChatStyle => {
+                app.screen = Screen::Chats;
+                app.chats = crate::demo::chats();
+                app.demo_events(cx);
+                if let crate::Demo::ChatStyle = screen {
+                    app.demo_style();
                 }
             }
             crate::Demo::Files => {
@@ -466,6 +481,8 @@ impl Hush {
                 self.forget_hit(key);
             }
             CoreEvent::MessageChanged { key, .. } => self.recheck_hit(key, cx),
+            CoreEvent::ChatEventAdded { conversation_id, kind } => self.event_added(conversation_id, *kind, cx),
+            CoreEvent::Error { .. } => self.resets_failed(),
             _ => {}
         }
         match event {
@@ -752,6 +769,7 @@ impl Hush {
         self.load_names(wanted, cx);
         self.messages_loaded(came, cx);
         self.reveal_found(cx);
+        self.reload_events(cx);
     }
 
     /// Looks up each unknown contact's name; a failed lookup is tried again next time.

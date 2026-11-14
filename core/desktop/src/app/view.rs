@@ -16,7 +16,8 @@ use sig_core::projection::{Conversation, ConversationKind, MessageStatus};
 use sig_core::{ConnectionState, HistoryStage};
 
 use super::actions::{self, view::ActionCx};
-use super::{files, join_step, matching, previews, Dialog, DialogKind, Hush, JoinStep, Screen};
+use super::options::{self, backed};
+use super::{events, files, join_step, matching, previews, Dialog, DialogKind, Hush, JoinStep, Screen};
 use crate::style::{self, Palette};
 use crate::{qr, text};
 
@@ -53,6 +54,13 @@ struct Row {
     actions: Rc<actions::RowActions>,
     /// Just opened from the search: outlined for a moment.
     found: bool,
+    /// What happened before it that isn't a message; for the last, after it too.
+    events: Vec<events::Line>,
+    after: Vec<events::Line>,
+    /// Gone once its timer runs out: an hourglass by its time.
+    disappears: bool,
+    /// The chat has a wallpaper: what isn't in a bubble gets a backing.
+    backed: bool,
 }
 
 /// The space beside incoming messages in a group: the sender's picture by the last of a run.
@@ -65,7 +73,8 @@ enum Gutter {
 impl Hush {
     /// The open chat's message `i` as its row shows it; built only for the rows on screen, so a
     /// long history costs nothing until it is scrolled to.
-    fn row(&self, group: bool, i: usize, now: chrono::DateTime<chrono::Local>) -> Option<Row> {
+    fn row(&self, c: &Conversation, i: usize, now: chrono::DateTime<chrono::Local>) -> Option<Row> {
+        let group = c.kind == ConversationKind::Group;
         let ms = &self.messages;
         let m = ms.get(i)?;
         let joins = |a: &sig_core::projection::Message, b: &sig_core::projection::Message| {
@@ -76,9 +85,12 @@ impl Hush {
         };
         let prev = i.checked_sub(1).map(|j| &ms[j]);
         let next = ms.get(i + 1);
-        let new_day = prev.is_none_or(|p| !text::same_day(p.sent_at, m.sent_at));
-        let first = new_day || !prev.is_some_and(|p| joins(p, m));
-        let last = !next.is_some_and(|n| joins(m, n));
+        // an event between two messages breaks their run
+        let (before, after) = (self.events_before(i), self.events_before(i + 1));
+        let above = before.last().map(|e| e.at).or(prev.map(|p| p.sent_at));
+        let new_day = above.is_none_or(|at| !text::same_day(at, m.sent_at));
+        let first = new_day || !before.is_empty() || !prev.is_some_and(|p| joins(p, m));
+        let last = !after.is_empty() || !next.is_some_and(|n| joins(m, n));
         let name = self.name(&m.author);
         let person = format!("c:{}", m.author);
         let files = self.files.of(m);
@@ -93,6 +105,8 @@ impl Hush {
         let time = text::bubble_time(m.sent_at);
         let status = m.is_outgoing.then_some(m.status);
         let said = status.map(|s| format!(", {}", text::status(s))).unwrap_or_default();
+        let disappears = m.expires_in > 0;
+        let gone = if disappears { ", disappears" } else { "" };
         Some(Row {
             day: new_day.then(|| text::day(m.sent_at, now)),
             outgoing: m.is_outgoing,
@@ -106,7 +120,7 @@ impl Hush {
                 },
                 _ => Gutter::Blank,
             },
-            label: format!("{name}: {spoken}. {time}{said}"),
+            label: format!("{name}: {spoken}. {time}{gone}{said}"),
             text: body,
             files,
             preview: self.preview_card(m),
@@ -117,6 +131,13 @@ impl Hush {
             status,
             actions: self.row_actions(m, now.timestamp_millis()),
             found: self.is_found(&m.key()),
+            events: self.event_lines(c, i, now),
+            after: match next {
+                None => self.event_lines(c, i + 1, now),
+                Some(_) => vec![],
+            },
+            disappears,
+            backed: c.wallpaper.is_some(),
         })
     }
 
@@ -692,7 +713,7 @@ impl Hush {
                 )
                 .child(empty_state("messages-square", title, detail, p));
         };
-        let (group, now) = (c.kind == ConversationKind::Group, chrono::Local::now());
+        let (open, now) = (c.clone(), chrono::Local::now());
         let out_fill = style::bubble_fill(c.chat_color.as_ref(), p.bubble_out);
         let title = text::title(c, self.own_aci.as_deref());
         let subtitle = match &self.connection {
@@ -739,6 +760,8 @@ impl Hush {
                     .flex_none()
                     .justify_center()
                     .px(px(16.))
+                    .relative()
+                    .pr(px(52.))
                     .window_control_area(WindowControlArea::Drag)
                     .child(
                         label("chat-title", Role::Heading, title)
@@ -753,13 +776,14 @@ impl Hush {
                                 .text_size(px(11.))
                                 .text_color(p.secondary),
                         )
-                    }),
+                    })
+                    .child(self.render_options(c, p, cx)),
             )
             .child(
                 self.with_paging(
                     MessageScroller::new("timeline", self.timeline.clone(), move |ix, _, cx| {
                         let app = this.upgrade();
-                        let row = app.as_ref().and_then(|app| app.read(cx).row(group, ix, now));
+                        let row = app.as_ref().and_then(|app| app.read(cx).row(&open, ix, now));
                         // a picture drawn with none decoded (new, or let go past the budget) is decoded
                         if app.is_some_and(|app| app.read(cx).files.wants_pictures()) {
                             let this = this.clone();
@@ -774,7 +798,8 @@ impl Hush {
                     })
                     .with_row_style(row_style),
                     p,
-                ),
+                )
+                .map(|timeline| options::with_wallpaper(self.with_events(timeline, c, p, cx), c, cx)),
             )
             .child(if answer_first {
                 let id = c.id.clone();
@@ -970,6 +995,7 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         .text_size(px(10.))
         .text_color(meta_color)
         .when(row.edited, |this| this.child("edited"))
+        .when(row.disappears, |this| this.child(icon("hourglass", 10., meta_color)))
         .child(row.time.clone())
         .children(row.status.map(|s| match s {
             MessageStatus::Failed => actions::view::retry(&row.actions, act, p),
@@ -1032,18 +1058,8 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
         .aria_label(row.label.clone())
         .w_full()
         .px(px(16.))
-        .children(row.day.clone().map(|day| {
-            div()
-                .w_full()
-                .pt(px(18.))
-                .pb(px(2.))
-                .flex()
-                .justify_center()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.secondary)
-                .child(day)
-        }))
+        .children(events::render(&row.events, row.backed, this, p))
+        .children(row.day.clone().map(|day| day_line(day, row.backed, p)))
         .child(
             h_flex()
                 .w_full()
@@ -1070,13 +1086,28 @@ fn render_row(row: &Row, out_fill: &Background, act: &ActionCx, this: &WeakEntit
                                 .text_size(px(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(color)
-                                .child(name)
+                                .child(backed(div().child(name), row.backed, p))
                         }))
                         .child(actions::view::beside(bubble, &row.actions, row.outgoing, act, p))
                         .children(actions::view::pill(&row.actions, row.outgoing, act, p)),
                 )
                 .map(|line| actions::view::with_menu(line, &row.actions, act)),
         )
+        .children(events::render(&row.after, row.backed, this, p))
+}
+
+/// A day separator in the timeline ("Today").
+pub(super) fn day_line(day: String, wallpaper: bool, p: Palette) -> Div {
+    div()
+        .w_full()
+        .pt(px(18.))
+        .pb(px(2.))
+        .flex()
+        .justify_center()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(p.secondary)
+        .child(backed(div().child(day), wallpaper, p))
 }
 
 /// Message requests, invitations, join requests and blocked chats are answered before anything is
