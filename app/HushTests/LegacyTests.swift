@@ -100,7 +100,8 @@ final class LegacyTests: XCTestCase {
         Legacy.adoptSettings(into: defaults, from: legacy)
         XCTAssertEqual(defaults.string(forKey: "appearance"), "dark")
         XCTAssertEqual(defaults.object(forKey: "showInMenuBar") as? Bool, false)
-        XCTAssertNil(defaults.persistentDomain(forName: legacy))
+        // the old settings are gone; macOS 27 keeps the emptied domain, where 26 removed it
+        XCTAssertEqual(defaults.persistentDomain(forName: legacy)?.keys.sorted() ?? [], [])
     }
 
     private func temporaryFolder() throws -> URL {
