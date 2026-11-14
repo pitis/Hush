@@ -688,6 +688,8 @@ final class AppStore {
 
     func deleteForEveryone(_ m: Message) async {
         guard let client else { return }
+        // ours to delete: its edit ends without the notice meant for a delete from elsewhere
+        if editing?.author == m.author && editing?.sentAt == m.sentAt { editing = nil }
         do { try await client.deleteForEveryone(key: MessageKey(author: m.author, sentAt: m.sentAt)) } catch {
             showError("Couldn't delete the message: \(Self.describe(error))")
         }
@@ -1639,11 +1641,18 @@ final class AppStore {
                     let pageKeys = Set(page.map { MessageKey(author: $0.author, sentAt: $0.sentAt) })
                     for key in changed.subtracting(pageKeys) {
                         let fresh = try await client.message(key: key)
+                        // the one replied to may have left the loaded window (a burst of new messages)
+                        if fresh?.deleted == true { endReplyOrEdit { $0 == key } }
                         guard generation == selectionGeneration,
                             let i = messages.firstIndex(where: { $0.author == key.author && $0.sentAt == key.sentAt })
                         else { continue }
                         // gone: its disappearing timer ran out
                         if let fresh { messages[i] = fresh } else { messages.remove(at: i) }
+                    }
+                    // deleted for everyone (by its author, anywhere); before the details, so ↩ meanwhile
+                    // can't quote it
+                    endReplyOrEdit { k in
+                        messages.contains { $0.deleted && $0.author == k.author && $0.sentAt == k.sentAt }
                     }
                     // details only for messages that are new or changed
                     let needDetails = messages.filter { m in
@@ -1652,9 +1661,6 @@ final class AppStore {
                     }
                     await loadDetails(for: needDetails, generation: generation)
                 } catch { append("query failed: \(error)") }
-                // deleted here or on the phone
-                endReplyOrEdit { k in messages.contains { $0.deleted && $0.author == k.author && $0.sentAt == k.sentAt }
-                }
             } while reloadMessagesAgain && generation == selectionGeneration
             if generation == selectionGeneration { reloadEvents() }
             if loadingGeneration == generation { loadingGeneration = nil }
