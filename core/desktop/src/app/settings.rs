@@ -560,7 +560,8 @@ impl Hush {
     }
 
     /// Starts over with a fresh core, all that showed forgotten (`AppStore.restart`); the key and
-    /// the notifications shown go with the data they belong to, unless relinking kept that.
+    /// the notifications shown go with the data they belong to, unless relinking or a restore kept
+    /// that.
     pub(super) fn restart(&mut self, forget_key: bool, window: &mut Window, cx: &mut Context<Self>) {
         // the old core is stopped: quitting has nothing of it to wait for
         if cx.has_global::<Core>() {
