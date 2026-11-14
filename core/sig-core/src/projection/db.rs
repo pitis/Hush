@@ -1732,6 +1732,7 @@ impl ProjectionDb {
                 .bind(ranges_to_row(new_ranges))
                 .execute(&mut *tx)
                 .await?;
+                let mut dropped: Vec<Option<String>> = vec![];
                 if res.rows_affected() == 1 {
                     // later ops may target the message by this revision's timestamp
                     sqlx::query("INSERT OR IGNORE INTO message_revisions VALUES (?1, ?2, ?3)")
@@ -1740,9 +1741,35 @@ impl ProjectionDb {
                         .bind(target.sent_at)
                         .execute(&mut *tx)
                         .await?;
+                    // a card whose link the new text doesn't have goes, with its image
+                    let url: Option<String> = sqlx::query_scalar(
+                        "SELECT url FROM link_previews WHERE message_author = ?1 AND message_sent_at = ?2",
+                    )
+                    .bind(&target.author)
+                    .bind(target.sent_at)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if url
+                        .is_some_and(|u| !crate::link_preview::previewable(new_body.as_deref().unwrap_or_default(), &u))
+                    {
+                        sqlx::query("DELETE FROM link_previews WHERE message_author = ?1 AND message_sent_at = ?2")
+                            .bind(&target.author)
+                            .bind(target.sent_at)
+                            .execute(&mut *tx)
+                            .await?;
+                        dropped = sqlx::query_scalar(
+                            "DELETE FROM attachments WHERE message_author = ?1 AND message_sent_at = ?2 AND position = -1
+                             RETURNING file",
+                        )
+                        .bind(&target.author)
+                        .bind(target.sent_at)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                    }
                 }
                 let m = finish_update(&mut tx, target, res.rows_affected()).await?;
                 tx.commit().await?;
+                self.remove_files(&dropped.into_iter().flatten().collect::<Vec<_>>());
                 Ok(changed(m))
             }
             Op::Delete { target } => {
@@ -5662,6 +5689,41 @@ mod tests {
         assert_eq!(db.search("second", None, 5).await.unwrap().len(), 1);
         assert!(db.search("typo", None, 5).await.unwrap().is_empty());
         assert_eq!(conv(&db, "c:alice").await.last_message_preview, "second");
+    }
+
+    #[tokio::test]
+    async fn an_edit_without_the_cards_link_drops_the_card_and_its_image() {
+        let files = TempFiles::new("edit-card");
+        let db = db().await.with_files(files.0.clone());
+        let key = k("alice", 1);
+        db.insert_message(&msg("alice", 1, "doc: https://docs.example/d/1"))
+            .await
+            .unwrap();
+        let preview = NewPreview {
+            url: "https://docs.example/d/1".into(),
+            title: Some("Google Docs".into()),
+            description: None,
+            image: Some(new_attachment("image/png", 3, false)),
+        };
+        db.apply(&add(key.clone(), vec![], Some(preview))).await.unwrap();
+        let image = db.link_preview(&key).await.unwrap().unwrap().image.unwrap().id;
+        db.start_download(image).await.unwrap().unwrap();
+        db.finish_download(image, Ok(b"png".to_vec())).await.unwrap();
+        assert!(files.0.join(image.to_string()).exists());
+        let edit = |body: &str, at| Op::Edit {
+            target: key.clone(),
+            new_body: Some(body.into()),
+            new_ranges: vec![],
+            edited_at: at,
+        };
+        db.apply(&edit("the doc: https://docs.example/d/1.", 10)).await.unwrap();
+        assert!(
+            db.link_preview(&key).await.unwrap().is_some(),
+            "its link is still there"
+        );
+        db.apply(&edit("the doc: https://docs.example/d/2", 20)).await.unwrap();
+        assert_eq!(db.link_preview(&key).await.unwrap(), None);
+        assert!(!files.0.join(image.to_string()).exists());
     }
 
     #[tokio::test]

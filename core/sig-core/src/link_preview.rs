@@ -206,12 +206,28 @@ fn image_type(bytes: &[u8]) -> Option<&'static str> {
 pub(crate) fn first_link(text: &str) -> Option<(String, Url)> {
     text.split_whitespace().find_map(|word| {
         let start = word.find("https://")?;
-        let link = word[start..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\'']);
+        let link = word[start..].trim_end_matches(CLOSING);
         let url = Url::parse(link)
             .ok()
             .filter(|u| u.scheme() == "https" && u.host_str().is_some())?;
         Some((link.to_string(), url))
     })
+}
+
+/// The punctuation that can end a sentence or close brackets around a link.
+const CLOSING: [char; 11] = ['.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\''];
+
+/// Whether a preview's `url` may have a card in a message saying `text`: an https link
+/// without a name before its host, written whole in the text (a word, or one in opening brackets
+/// or quotes, starts with it, and only closing punctuation follows), so the card can't name one
+/// place and open another.
+pub(crate) fn previewable(text: &str, url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none())
+        && text.split_whitespace().any(|word| {
+            word.trim_start_matches(['(', '[', '<', '"', '\''])
+                .strip_prefix(url)
+                .is_some_and(|rest| rest.chars().all(|c| CLOSING.contains(&c)))
+        })
 }
 
 /// How much of a page is read for its tags: they're in its head.
