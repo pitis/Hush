@@ -2303,7 +2303,7 @@ async fn handle(
     match &received {
         Received::QueueEmpty => tracing::info!("caught up with the server queue"),
         Received::Contacts => tracing::info!("contacts synced from the phone"),
-        Received::DecryptionError { sender, error } => {
+        Received::DecryptionError { sender, error, .. } => {
             tracing::warn!(chat = %db.opaque_id(&direct_id(sender)), %error, "a message couldn't be decrypted")
         }
         Received::RetryReceipt { sender, .. } => {
@@ -2320,9 +2320,11 @@ async fn handle(
             let _ = queues.storage.send(storage::Trigger::Connected);
         }
         Received::Contacts => sync_titles(m, db, l).await,
-        Received::DecryptionError { sender, error } => decryption_failed(db, l, sender, Some(&error)).await,
+        Received::DecryptionError { sender, error, story } => {
+            decryption_failed(db, l, sender, Some(&error), story).await
+        }
         // their device asks us to resend or restart the session; Hush doesn't, so a reset is offered
-        Received::RetryReceipt { sender, .. } => decryption_failed(db, l, sender, None).await,
+        Received::RetryReceipt { sender, .. } => decryption_failed(db, l, sender, None, false).await,
         Received::Content(content) => {
             if let Some(check) = key_check(&content.metadata, chrono::Utc::now().timestamp_millis()) {
                 let store = match check.to_pni {
@@ -2578,10 +2580,17 @@ async fn decryption_failed(
     l: &dyn EventListener,
     sender: ServiceId,
     error: Option<&SignalProtocolError>,
+    story: bool,
 ) {
     let conversation_id = direct_id(&sender);
     if matches!(error, Some(SignalProtocolError::DuplicatedMessage(..))) {
         tracing::info!(chat = %db.opaque_id(&conversation_id), "dropped a message delivered again");
+        return;
+    }
+    // Signal's clients show nothing for a story they can't decrypt. One whose sender key the
+    // server dropped while stories weren't delivered to us fails until the poster renews it.
+    if story {
+        tracing::info!(chat = %db.opaque_id(&conversation_id), "dropped a story that couldn't be decrypted");
         return;
     }
     // shown rather than dropped if the lookup fails, as messages are
@@ -3368,7 +3377,7 @@ mod tests {
     }
 
     /// A duplicate is dropped like Signal's clients do (no chat event, nothing to reset), and so
-    /// is a failure in a blocked chat; a real failure, ours or theirs, is shown.
+    /// are a story and a failure in a blocked chat; a real failure, ours or theirs, is shown.
     #[tokio::test]
     async fn only_a_real_decryption_failure_is_shown() {
         use crate::projection::ChatEventKind;
@@ -3378,13 +3387,20 @@ mod tests {
         let alice: ServiceId = Aci::from_uuid_bytes([1; 16]).into();
         let chat = crate::projection::ids::direct_id(&alice);
         let duplicate = SignalProtocolError::DuplicatedMessage(61, 58);
-        super::decryption_failed(&db, &sink, alice, Some(&duplicate)).await;
+        super::decryption_failed(&db, &sink, alice, Some(&duplicate), false).await;
         assert!(db.chat_events(&chat, 0).await.unwrap().is_empty());
         assert!(sink.0.lock().unwrap().is_empty());
         let broken = SignalProtocolError::InvalidMessage(CiphertextMessageType::Whisper, "decryption failed".into());
-        super::decryption_failed(&db, &sink, alice, Some(&broken)).await;
+        // a story: its sender key was dropped while stories weren't delivered to us
+        let no_key = SignalProtocolError::NoSenderKeyState {
+            distribution_id: presage::libsignal_service::prelude::Uuid::nil(),
+        };
+        super::decryption_failed(&db, &sink, alice, Some(&no_key), true).await;
+        assert!(db.chat_events(&chat, 0).await.unwrap().is_empty());
+        assert!(sink.0.lock().unwrap().is_empty());
+        super::decryption_failed(&db, &sink, alice, Some(&broken), false).await;
         // theirs: a retry receipt
-        super::decryption_failed(&db, &sink, alice, None).await;
+        super::decryption_failed(&db, &sink, alice, None, false).await;
         let events = db.chat_events(&chat, 0).await.unwrap();
         assert_eq!(events.len(), 2);
         assert!(events
@@ -3396,7 +3412,7 @@ mod tests {
                 if *a == chat && *b == chat
         ));
         db.block(&chat).await.unwrap();
-        super::decryption_failed(&db, &sink, alice, Some(&broken)).await;
+        super::decryption_failed(&db, &sink, alice, Some(&broken), false).await;
         assert_eq!(db.chat_events(&chat, 0).await.unwrap().len(), 2);
     }
 

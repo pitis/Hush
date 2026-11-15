@@ -11,13 +11,14 @@ crate-type = ["staticlib", "lib"]
 uniffi = { workspace = true, features = ["tokio"] }
 # pitis/presage's hush/group-fixes: whisperfish/presage#448 (group management) and #461
 # (decryption error kinds), plus our fixes that skip installed sticker packs and list their ids
-# (proposed upstream as #506), and #489 (a setting for whether the server delivers stories).
+# (proposed upstream as #506), #489 (a setting for whether the server delivers stories), and
+# ours telling a decryption error from a story apart (not proposed upstream yet).
 # #448 needs whisperfish/libsignal-service-rs#473: we pin its branch at 2c65d88, rebased on
 # upstream's #501 (attachment uploads send their length), with two group fixes: groups go through
 # /v2/groups, and invite-link joins leave joinFromInviteLink unset.
 # Back to whisperfish/presage once #448, #461, #489 and our fixes land there.
-presage = { git = "https://github.com/pitis/presage", rev = "e8eeebfdbd8dbf63e319a7476a2d779d2a3fb8e1" }
-presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "e8eeebfdbd8dbf63e319a7476a2d779d2a3fb8e1" }
+presage = { git = "https://github.com/pitis/presage", rev = "c2019edd8b5dc21585727713d27dc8caa8f55115" }
+presage-store-sqlite = { git = "https://github.com/pitis/presage", rev = "c2019edd8b5dc21585727713d27dc8caa8f55115" }
 # Reads the link-and-sync history archive. Same libsignal tag as libsignal-service's pins, so
 # the checkouts unify. `test-util` makes its `proto` (backup.proto types) and `export` (archive
 # writing, for tests) modules public.
