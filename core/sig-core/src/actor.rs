@@ -340,7 +340,11 @@ async fn run(
         // Only "not registered" means unlinked. Any other error must fail loudly: linking starts by
         // clearing the registration, so mistaking a read error for "unlinked" would destroy it.
         let manager = match Manager::load_registered(store.clone()).await {
-            Ok(m) => Some(m),
+            Ok(m) => {
+                // without it the server drops every story sent to us, unread
+                m.set_receive_stories(true);
+                Some(m)
+            }
             Err(presage::Error::NotYetRegisteredError) => None,
             Err(e) => {
                 return Err(CoreError::Storage {
@@ -1859,6 +1863,8 @@ async fn link(
         .await
         .map_err(|_| "the code expired before it was scanned".to_string())?;
     let mut m = result.map_err(|e| format!("linking failed: {e}"))?;
+    // before the first connection: without it the server drops every story sent to us, unread
+    m.set_receive_stories(true);
     if let Err(e) = m.request_contacts().await {
         l.on_event(CoreEvent::Error {
             message: format!("couldn't ask the phone for contacts: {e}"),
