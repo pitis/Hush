@@ -22,12 +22,11 @@ pub(crate) struct Fetched {
 }
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const MAX_PAGE: usize = 1024 * 1024;
 const MAX_IMAGE: usize = 2 * 1024 * 1024;
 
-/// Fetches `page` and its preview image: https only (redirects too), a page of at most 1 MB
-/// that is HTML, an image of at most 2 MB that is JPEG, PNG, WebP or GIF. Errors name the
-/// cause, never the page's content.
+/// Fetches `page` and its preview image: https only (redirects too), the head of a page that is
+/// HTML (the 256 KB `parse` reads: more would only cost time), an image of at most 2 MB that is
+/// JPEG, PNG, WebP or GIF. Errors name the cause, never the page's content.
 pub(crate) async fn fetch(page: &Url) -> Result<Fetched, String> {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -49,7 +48,7 @@ pub(crate) async fn fetch(page: &Url) -> Result<Fetched, String> {
         .user_agent("WhatsApp/2")
         .build()
         .map_err(|e| format!("no web client: {e}"))?;
-    let (html, final_url) = get(&client, page, MAX_PAGE, true, |t| t.starts_with("text/html")).await?;
+    let (html, final_url) = get(&client, page, MAX_HEAD, true, |t| t.starts_with("text/html")).await?;
     let info = parse(&String::from_utf8_lossy(&html), &final_url);
     let image = match &info.image {
         Some(url) => get(&client, url, MAX_IMAGE, false, |t| {
