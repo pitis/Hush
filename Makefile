@@ -4,7 +4,7 @@ XCB := xcodebuild -project app/Hush.xcodeproj -scheme Hush -destination 'platfor
 # the test host app prints harmless linkd/XPC noise on stderr; keep only what matters
 XCB_FILTER := { grep -vE 'com\.apple\.linkd|synchronousRemoteObjectProxy|Process Instance Registry|IDETestOperationsObserverDebug' || true; }
 
-.PHONY: help setup core project app run release perf desktop desktop-run test check format lint worktree update card
+.PHONY: help setup core project app run bundle release publish perf desktop desktop-run test check format lint worktree update card
 
 help: ## List available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -28,10 +28,12 @@ app: core project ## Build the Debug app into build/
 run: app ## Build and launch the Debug app
 	open build/Build/Products/Debug/Hush.app
 
-release: ## Build the Release app (release core: thin LTO, stripped) and install it in /Applications
+bundle: ## Build the Release app (release core: thin LTO, stripped) into build/
 	scripts/build-core.sh release
 	cd app && xcodegen -q
 	$(XCB) -configuration Release build -quiet 2>&1 | $(XCB_FILTER)
+
+release: bundle ## Build the Release app and install it in /Applications
 	@osascript -e 'quit app id "dev.pitis.hush"' 2>/dev/null; sleep 1
 	@# the app's old name: Hush moves its data over on first launch
 	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; rm -rf /Applications/Semaphore.app
@@ -40,6 +42,9 @@ release: ## Build the Release app (release core: thin LTO, stripped) and install
 	@# macOS refreshes a cached app icon only when the bundle's own date changes; ditto keeps the old one
 	touch /Applications/Hush.app
 	@echo "✓ /Applications/Hush.app"
+
+publish: ## Publish origin/main's Release app as a GitHub release: make publish [version=0.2]
+	scripts/publish.sh $(version)
 
 perf: ## Measure the installed app against the M1 budget (size, cold launch, idle RAM and CPU)
 	scripts/perf.sh
