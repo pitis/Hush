@@ -45,7 +45,8 @@ pub(crate) async fn fetch(page: &Url) -> Result<Fetched, String> {
                 attempt.follow()
             }
         }))
-        .user_agent("Mozilla/5.0 (Macintosh) link preview")
+        // what Signal's apps send: many sites (YouTube, Reddit, TikTok, Amazon) give only it a preview
+        .user_agent("WhatsApp/2")
         .build()
         .map_err(|e| format!("no web client: {e}"))?;
     let (html, final_url) = get(&client, page, MAX_PAGE, true, |t| t.starts_with("text/html")).await?;
@@ -419,6 +420,19 @@ mod tests {
     async fn live_page() {
         let f = fetch(&Url::parse("https://example.com/").unwrap()).await.unwrap();
         assert_eq!(f.info.title.as_deref(), Some("Example Domain"));
+    }
+
+    /// YouTube gives a preview only to the user agent Signal's apps send: run by hand
+    /// (`cargo test -- --ignored live_youtube`).
+    #[tokio::test]
+    #[ignore]
+    async fn live_youtube() {
+        let f = fetch(&Url::parse("https://youtu.be/dQw4w9WgXcQ").unwrap())
+            .await
+            .unwrap();
+        let title = f.info.title.unwrap_or_default();
+        assert!(title.contains("Never Gonna Give You Up"), "{title}");
+        assert!(f.image.is_some());
     }
 
     #[test]
