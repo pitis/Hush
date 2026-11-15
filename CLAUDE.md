@@ -53,7 +53,9 @@ answer, never for mechanics.
 - `make update` merges `origin/main`, or the stacked base until its PR is merged, into the
   branch; on a conflict it makes no merge and prints the `git merge` to run.
 - Remove a worktree with `git worktree remove` once its PR is merged or closed (check
-  `git status` there first). `worktrees/publish` stays: `make publish` reuses its build.
+  `git status` there first). `worktrees/publish` stays so `make publish` builds
+  incrementally; removing it is safe (the next publish recreates it, slowly). Don't edit or build
+  there by hand: `make publish` refuses local changes.
 
 ## Git
 

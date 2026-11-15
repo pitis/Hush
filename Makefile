@@ -33,7 +33,7 @@ bundle: ## Build the Release app (release core: thin LTO, stripped) into build/
 	cd app && xcodegen -q
 	$(XCB) -configuration Release build -quiet 2>&1 | $(XCB_FILTER)
 
-release: bundle ## Build the Release app and install it in /Applications
+release: bundle ## Build the Release app, quit the running one and install it in /Applications
 	@osascript -e 'quit app id "dev.pitis.hush"' 2>/dev/null; sleep 1
 	@# the app's old name: Hush moves its data over on first launch
 	@osascript -e 'quit app id "dev.pitis.semaphore"' 2>/dev/null; rm -rf /Applications/Semaphore.app
