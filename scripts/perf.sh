@@ -33,7 +33,7 @@ mem=0; cpu=0; n=0
 for _ in $(seq 1 12); do
   # top's second sample is the CPU of the last interval (ps %cpu is a slow-decaying average).
   # MEM is the physical footprint, Activity Monitor's Memory (the spec's measure); ps's RSS also
-  # counts clean shared pages (code, mapped files) and reads ~75 MB higher.
+  # counts clean shared pages (code, mapped files), which the system drops at will.
   read -r c m <<<"$(top -l 2 -s 4 -pid "$PID" -stats cpu,mem | tail -1)"
   cpu=$(python3 -c "print($cpu + $c)"); n=$((n + 1))
   mem=$(python3 -c "import sys; v = sys.argv[1].rstrip('+-'); print($mem + float(v[:-1]) * {'K': 1 / 1024, 'M': 1, 'G': 1024}[v[-1]])" "$m")
