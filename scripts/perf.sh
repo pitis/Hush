@@ -29,13 +29,15 @@ python3 -c "print(f'cold launch: {($end - $start):.2f} s   (budget: < 1 s; until
 PID=$(pgrep -x Hush)
 echo "idle: settling 30 s, then sampling for 60 s (leave the Mac alone)…"
 sleep 30
-rss=0; cpu=0; n=0
+mem=0; cpu=0; n=0
 for _ in $(seq 1 12); do
-  rss=$((rss + $(ps -o rss= -p "$PID")))
-  # top's second sample is the CPU of the last interval (ps %cpu is a slow-decaying average)
-  c=$(top -l 2 -s 4 -pid "$PID" -stats cpu | tail -1)
+  # top's second sample is the CPU of the last interval (ps %cpu is a slow-decaying average).
+  # MEM is the physical footprint, Activity Monitor's Memory (the spec's measure); ps's RSS also
+  # counts clean shared pages (code, mapped files), which the system drops at will.
+  read -r c m <<<"$(top -l 2 -s 4 -pid "$PID" -stats cpu,mem | tail -1)"
   cpu=$(python3 -c "print($cpu + $c)"); n=$((n + 1))
+  mem=$(python3 -c "import sys; v = sys.argv[1].rstrip('+-'); print($mem + float(v[:-1]) * {'K': 1 / 1024, 'M': 1, 'G': 1024}[v[-1]])" "$m")
   sleep 1
 done
-python3 -c "print(f'idle memory: {$rss / $n / 1024:.0f} MB   (budget: < 100 MB)')"
+python3 -c "print(f'idle memory: {$mem / $n:.0f} MB   (budget: < 100 MB; footprint, as in Activity Monitor)')"
 python3 -c "print(f'idle CPU: {$cpu / $n:.1f} %   (budget: ~0 %)')"
