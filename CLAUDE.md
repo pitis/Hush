@@ -41,7 +41,8 @@ answer, never for mechanics.
    finding that needs a product decision stays unfixed and goes to the owner. Then report the
    same in chat. The PR is ready for the owner only after this step.
 8. **Merge only on the owner's go**: squash (`gh pr merge --squash --delete-branch`), then
-   `make card issue=<n> status="Done"`.
+   `make card issue=<n> status="Done"`, then `make publish` (builds the merged app in
+   `worktrees/publish` and releases it on GitHub as the next version).
 
 ## Worktrees
 
@@ -52,7 +53,7 @@ answer, never for mechanics.
 - `make update` merges `origin/main`, or the stacked base until its PR is merged, into the
   branch; on a conflict it makes no merge and prints the `git merge` to run.
 - Remove a worktree with `git worktree remove` once its PR is merged or closed (check
-  `git status` there first).
+  `git status` there first). `worktrees/publish` stays: `make publish` reuses its build.
 
 ## Git
 
@@ -92,4 +93,5 @@ answer, never for mechanics.
 `make setup` · `make core` · `make project` · `make app` · `make run` · `make desktop` · `make desktop-run` ·
 `make format` · `make lint` ·
 `make test` · `make check` ·
-`make worktree name=… branch=…` · `make update` · `make card issue=… status=…`
+`make worktree name=… branch=…` · `make update` · `make card issue=… status=…` ·
+`make bundle` · `make publish [version=…]`
